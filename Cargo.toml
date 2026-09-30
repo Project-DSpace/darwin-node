@@ -219,7 +219,7 @@ webrtc-direct = [
 # change relies on (ADR-0018). A rev, not a branch, so the pin is immutable.
 # Drop it once a release includes the companion change. Versions are bumped at
 # release.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "7a44325907b9194ae3be8f66f207723c4b4fac42" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "7563b349b4cbbf6fb463839e12fd5387adbf1518" }
 
 [profile.release]
 lto = true
