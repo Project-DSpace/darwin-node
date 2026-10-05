@@ -279,6 +279,12 @@ impl NodeBuilder {
             engine.with_pointers(service.store().clone(), fresh_writes);
         }
 
+        // Fresh offers carry the upload's payment proof: listings are recorded
+        // from them as from client PUTs.
+        if let Some(listings) = protocol.listing_service() {
+            engine.with_listings(Arc::clone(listings));
+        }
+
         // ADR-0004: wire the engine's commitment state as the quote generator's
         // commitment source so quotes force their price from the live storage
         // commitment. Done here because the engine owns the commitment state and is
@@ -540,6 +546,8 @@ impl NodeBuilder {
             disk_reserve: config.storage.disk_reserve_mb.saturating_mul(MIB),
             migration: config.storage.migration.clone(),
         };
+        // The listing store leaves the same part of the disk free.
+        let disk_reserve = storage_config.disk_reserve;
         let storage = ChunkStore::new(storage_config)
             .await
             .map_err(|e| Error::Startup(format!("Failed to create LMDB storage: {e}")))?;
@@ -604,6 +612,7 @@ impl NodeBuilder {
         // Listings for envelope chunks, kept beside the chunks under the same root.
         let listings = crate::listings::ListingService::new(
             &config.root_dir,
+            disk_reserve,
             Arc::clone(&storage),
             listings_rpc_url,
             listings_vault,
@@ -1253,7 +1262,8 @@ impl RunningNode {
     }
 
     /// Answer one message on the listings topic, under the same concurrency
-    /// limit and shutdown rule as chunk requests.
+    /// limit and shutdown rule as chunk requests. An answer to one of this
+    /// node's own requests is handed to it without waiting for a permit.
     fn answer_listings_request(
         listings: Arc<crate::listings::ListingService>,
         p2p: Arc<P2PNode>,
@@ -1264,6 +1274,9 @@ impl RunningNode {
         children: &TaskTracker,
     ) {
         children.spawn(async move {
+            if listings.handle_response(&source, &data) {
+                return;
+            }
             let _permit = tokio::select! {
                 biased;
                 () = stopping.cancelled() => return,

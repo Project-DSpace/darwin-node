@@ -1,9 +1,16 @@
-//! Listed files.
+//! Listings: the payment records of files stored with an envelope.
 //!
-//! A listed file stores its data map in an envelope (see the `ant-listings`
-//! crate). When this node stores an envelope chunk it records a listing that
-//! carries the chunk's on-chain payment, and it answers listing requests on
-//! [`ant_listings::TOPIC`], separately from the chunk protocol.
+//! A file can store its data map, or a salted hash of it, in an envelope (see
+//! the `ant-listings` crate). When this node stores an envelope chunk it records
+//! a listing that carries the chunk's on-chain payment, with only the payment
+//! fields the envelope's flags show, and checks it with the chunk's close group
+//! shortly after. Listings in the index are kept in index order; the others
+//! only by address. A listing is deleted with its chunk.
+//!
+//! The node answers listing requests on [`ant_listings::TOPIC`]
+//! (`listings.v2`), separately from the chunk protocol: list requests page
+//! through the listings in the index, get requests return any listing by
+//! address. Messages on older listings topics are not answered.
 
 mod chain;
 mod service;

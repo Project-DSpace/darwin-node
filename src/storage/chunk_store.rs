@@ -257,11 +257,34 @@ pub struct ChunkStore {
     /// client PUTs, replication and repair alike. Set once, by the listings
     /// service.
     stored_observer: std::sync::OnceLock<StoredObserver>,
+    /// Told of each chunk the node gives up or loses: deleted by
+    /// [`Self::delete`], the pruner's path; shed with the legacy environment;
+    /// removed by the copier as unusable; or dropped by the file store as gone
+    /// or wrong. Set once, by the listings service. Shared with the file
+    /// store.
+    removed_observer: Arc<std::sync::OnceLock<RemovedObserver>>,
 }
 
 /// A function told of each newly stored chunk: see
 /// [`ChunkStore::set_stored_observer`].
 pub type StoredObserver = Box<dyn Fn(&XorName, &[u8]) + Send + Sync>;
+
+/// A function told of each chunk the node gives up: see
+/// [`ChunkStore::set_removed_observer`].
+pub type RemovedObserver = Box<dyn Fn(&XorName) + Send + Sync>;
+
+/// Where the removed-chunk observer is kept once set, with `files` telling it
+/// of the chunks the file store drops by itself.
+fn observe_dropped(files: &FileStore) -> Arc<std::sync::OnceLock<RemovedObserver>> {
+    let slot: Arc<std::sync::OnceLock<RemovedObserver>> = Arc::default();
+    let observer = Arc::clone(&slot);
+    files.set_dropped_hook(Box::new(move |address| {
+        if let Some(observer) = observer.get() {
+            observer(address);
+        }
+    }));
+    slot
+}
 
 impl ChunkStore {
     /// Open the store under `config.root_dir`.
@@ -281,6 +304,7 @@ impl ChunkStore {
             })
             .await?,
         );
+        let removed_observer = observe_dropped(&files);
 
         // Before anything looks at the legacy environment: a directory carrying its own
         // retirement mark is the remains of a removal a power loss interrupted, and is
@@ -380,6 +404,7 @@ impl ChunkStore {
                 .take(KEY_LOCK_LANES)
                 .collect(),
             stored_observer: std::sync::OnceLock::new(),
+            removed_observer,
         };
 
         let (file_keys, legacy_keys) = store.split_counts();
@@ -513,6 +538,25 @@ impl ChunkStore {
     pub fn set_stored_observer(&self, observer: StoredObserver) {
         if self.stored_observer.set(observer).is_err() {
             warn!("A stored-chunk observer is already set; keeping the first");
+        }
+    }
+
+    /// Set the function told of each chunk the node gives up or loses: each
+    /// successful [`Self::delete`], each key shed with the legacy environment,
+    /// each legacy record the copier removes as unusable, and each chunk the
+    /// file store drops because its file has gone or its bytes are wrong.
+    /// Replication may put a lost chunk back, so the observer should check
+    /// whether the chunk is held before acting. Only the first call has an
+    /// effect.
+    pub fn set_removed_observer(&self, observer: RemovedObserver) {
+        if self.removed_observer.set(observer).is_err() {
+            warn!("A removed-chunk observer is already set; keeping the first");
+        }
+    }
+
+    fn notify_removed(&self, address: &XorName) {
+        if let Some(observer) = self.removed_observer.get() {
+            observer(address);
         }
     }
 
@@ -895,6 +939,13 @@ impl ChunkStore {
     ///
     /// Returns [`Error::Storage`] if a file exists but cannot be removed.
     pub async fn delete(&self, address: &XorName) -> Result<bool> {
+        let deleted = self.delete_unobserved(address).await?;
+        self.notify_removed(address);
+        Ok(deleted)
+    }
+
+    /// [`Self::delete`], without telling the removed-chunk observer.
+    async fn delete_unobserved(&self, address: &XorName) -> Result<bool> {
         // Shared, like every other operation that touches the legacy environment. Without
         // it, retirement takes the exclusive guard and then waits for the environment to
         // go idle while deletes keep starting new work in it, and the wait never ends.
@@ -1235,6 +1286,7 @@ impl ChunkStore {
                             Ok(_) => {
                                 legacy.only.write().remove(key);
                                 report.unusable += 1;
+                                self.notify_removed(key);
                             }
                             Err(e) => warn!(
                                 "Oversized chunk {} could not be removed from the legacy \
@@ -1264,6 +1316,7 @@ impl ChunkStore {
                             Ok(_) => {
                                 legacy.only.write().remove(key);
                                 report.unusable += 1;
+                                self.notify_removed(key);
                             }
                             Err(e) => warn!(
                                 "Chunk {} does not match its address and could not be \
@@ -1847,11 +1900,17 @@ impl ChunkStore {
                 skipped_rollback_copies,
             }) = taken
             {
+                // The keys given up with the environment, for the removed-chunk observer.
+                let shed: Vec<XorName> = only.read().iter().copied().collect();
                 drop(only);
                 drop(pending);
                 drop(skipped_rollback_copies);
                 drop(lmdb);
-                return self.remove_legacy_dir(freed, retiring).await;
+                let freed = self.remove_legacy_dir(freed, retiring).await?;
+                for key in &shed {
+                    self.notify_removed(key);
+                }
+                return Ok(freed);
             }
             if attempt + 1 < RETIRE_UNWRAP_ATTEMPTS {
                 tokio::time::sleep(RETIRE_UNWRAP_BACKOFF).await;
@@ -4623,6 +4682,92 @@ mod tests {
             .await
             .expect("retire");
         assert!(!store.has_legacy());
+    }
+
+    /// The removed-chunk observer hears of every chunk the node gives up: each delete,
+    /// and each key shed with the legacy environment. Not of a key copied into files.
+    #[tokio::test]
+    async fn deletes_and_shed_keys_reach_the_removed_observer() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["r1", "r2"]).await;
+        let mut config = test_config(&dir);
+        config.migration.retire_legacy = true;
+        let store = ChunkStore::new(config).await.expect("open");
+        let removed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&removed);
+        store.set_removed_observer(Box::new(move |address| heard.lock().push(*address)));
+
+        // r1 is kept, copied into files; r2 is shed with the environment.
+        store
+            .copy_batch(&keys[..1], 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        open_the_retirement_gate(&store);
+        let proof = store
+            .verify_before_retire(0, &never_cancelled())
+            .await
+            .expect("verify");
+        store
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
+            .await
+            .expect("retire");
+        assert_eq!(*removed.lock(), vec![keys[1]]);
+
+        assert!(store.delete(&keys[0]).await.expect("delete"));
+        assert_eq!(*removed.lock(), vec![keys[1], keys[0]]);
+    }
+
+    #[tokio::test]
+    async fn chunks_dropped_as_unusable_reach_the_removed_observer() {
+        // A legacy record whose bytes don't hash to its key.
+        let dir = TempDir::new().expect("temp dir");
+        let (bad, _) = addressed("bad");
+        {
+            let lmdb = LmdbStorage::new(LmdbStorageConfig {
+                root_dir: dir.path().to_path_buf(),
+                verify_on_read: false,
+                max_map_size: 0,
+                disk_reserve: 0,
+            })
+            .await
+            .expect("open legacy");
+            lmdb.put_unchecked(&bad, &addressed("other").1)
+                .await
+                .expect("put");
+            lmdb.wait_idle().await;
+        }
+        let mut config = test_config(&dir);
+        config.verify_on_read = true;
+        let store = ChunkStore::new(config).await.expect("open");
+        let removed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&removed);
+        store.set_removed_observer(Box::new(move |address| heard.lock().push(*address)));
+        let report = store
+            .copy_batch(&[bad], 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        assert_eq!(report.unusable, 1);
+        assert_eq!(*removed.lock(), vec![bad]);
+
+        // Files the file store finds gone, or rotted.
+        let (gone, gone_bytes) = addressed("gone");
+        let (rotted, rotted_bytes) = addressed("rotted");
+        for (address, content) in [(&gone, &gone_bytes), (&rotted, &rotted_bytes)] {
+            assert!(store.put(address, content).await.expect("put"));
+        }
+        let file = |address: &XorName| {
+            let name = hex::encode(address);
+            std::fs::read_dir(dir.path().join(crate::storage::file_store::CHUNKS_DIR_NAME))
+                .expect("chunks")
+                .filter_map(|shard| Some(shard.ok()?.path().join(&name)))
+                .find(|path| path.exists())
+                .expect("chunk file")
+        };
+        std::fs::remove_file(file(&gone)).expect("remove");
+        std::fs::write(file(&rotted), b"not what it was").expect("rot");
+        assert_eq!(store.get(&gone).await.expect("get"), None);
+        assert!(store.get(&rotted).await.is_err());
+        assert_eq!(*removed.lock(), vec![bad, gone, rotted]);
     }
 
     #[tokio::test]

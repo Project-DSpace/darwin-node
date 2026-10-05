@@ -518,6 +518,31 @@ fn bytes_to_gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
+/// A function told of each chunk the store drops from its index by itself: a
+/// file found gone, or one whose bytes don't match its name. See
+/// [`FileStore::set_dropped_hook`].
+pub type DroppedHook = Box<dyn Fn(&XorName) + Send + Sync>;
+
+/// Where the [`DroppedHook`] is kept once set.
+#[derive(Default)]
+struct DroppedSlot(std::sync::OnceLock<DroppedHook>);
+
+impl DroppedSlot {
+    fn tell(&self, address: &XorName) {
+        if let Some(hook) = self.0.get() {
+            hook(address);
+        }
+    }
+}
+
+impl std::fmt::Debug for DroppedSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DroppedSlot")
+            .field(&self.0.get().is_some())
+            .finish()
+    }
+}
+
 /// Content-addressed store holding one immutable file per chunk.
 ///
 /// The filesystem is the sole authority. The in-memory index is a cache of what the
@@ -591,6 +616,8 @@ pub struct FileStore {
     health: Arc<std::sync::atomic::AtomicU64>,
     /// Size-aware free-space predicate.
     capacity: Arc<CapacityGuard>,
+    /// Told of each chunk dropped from the index other than by [`Self::delete`].
+    dropped: Arc<DroppedSlot>,
     /// Monotonic counter that makes temp filenames unique within this store.
     temp_seq: AtomicU64,
     /// Random per-instance discriminator for temp filenames.
@@ -702,6 +729,7 @@ impl FileStore {
             write_finished: Arc::new(tokio::sync::Notify::new()),
             health: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity,
+            dropped: Arc::default(),
             temp_seq: AtomicU64::new(0),
             nonce: rand::random(),
             lock,
@@ -1243,6 +1271,15 @@ impl FileStore {
         Ok(self.is_indexed(address))
     }
 
+    /// Set the function told of each chunk this store drops from its index by
+    /// itself: a file found gone, or one whose bytes don't match its name.
+    /// Only the first call has an effect.
+    pub fn set_dropped_hook(&self, hook: DroppedHook) {
+        if self.dropped.0.set(hook).is_err() {
+            warn!("A dropped-chunk hook is already set; keeping the first");
+        }
+    }
+
     /// Is this chunk one the node must not answer for?
     #[must_use]
     fn is_unservable(&self, address: &XorName) -> bool {
@@ -1703,6 +1740,7 @@ impl FileStore {
         // A cached pre-retirement proof would then stay valid over a store that had
         // quietly lost a chunk.
         let health = Arc::clone(&self.health);
+        let dropped = Arc::clone(&self.dropped);
         self.blocking_tracker
             .spawn_blocking(move || {
                 let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
@@ -1712,6 +1750,7 @@ impl FileStore {
                 let forgotten = index.write().remove(&key);
                 if forgotten {
                     health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    dropped.tell(&key);
                 }
                 forgotten
             })
@@ -1738,6 +1777,7 @@ impl FileStore {
         // cancelled verification whose caller dropped the last `FileStore` would unlink
         // inside a directory a second process had already been handed.
         let lease = Arc::clone(&self.lock);
+        let dropped = Arc::clone(&self.dropped);
         let outcome =
             self.blocking_tracker
                 .spawn_blocking(move || -> std::io::Result<bool> {
@@ -1753,6 +1793,7 @@ impl FileStore {
                         Ok(None) => {
                             index.write().remove(&key);
                             health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            dropped.tell(&key);
                             return Ok(true);
                         }
                         Err(e) => return Err(std::io::Error::other(e.to_string())),
@@ -1774,6 +1815,7 @@ impl FileStore {
                     }
                     index.write().remove(&key);
                     health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    dropped.tell(&key);
                     Ok(true)
                 })
                 .await;

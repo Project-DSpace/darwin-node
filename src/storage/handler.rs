@@ -863,7 +863,8 @@ impl AntProtocol {
             }
         }
 
-        // 5b. A listed file's envelope: its payment, found while the proof is at hand.
+        // 5b. An envelope, of any visibility: its payment, found while the proof is
+        //     at hand; only the fields its flags show are kept.
         let listing = match self.listing_for_put(&address, &request).await {
             Ok(listing) => listing,
             Err(response) => return response,
@@ -925,9 +926,10 @@ impl AntProtocol {
         }
     }
 
-    /// For a listed file's envelope, the listing to record once the chunk is
-    /// stored, found from the PUT's payment proof. `Err` is the response that
-    /// refuses the PUT, so the client can retry with the right proof.
+    /// For an envelope, of any visibility, the listing to record once the
+    /// chunk is stored, found from the PUT's payment proof. `Err` is the
+    /// response that refuses the PUT, so the client can retry with the right
+    /// proof.
     async fn listing_for_put(
         &self,
         address: &XorName,

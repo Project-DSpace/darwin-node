@@ -1821,6 +1821,8 @@ pub struct ReplicationEngine {
     pointers: Option<Arc<pointer::PointerReplication>>,
     /// Receiver for fresh pointer writes, taken by `start()`.
     pointer_fresh_rx: Option<mpsc::UnboundedReceiver<pointer::PointerFreshWrite>>,
+    /// Listings, recorded from fresh offers' payment proofs as from client PUTs.
+    listings: Option<Arc<crate::listings::ListingService>>,
     /// Sender for delayed possession-check events (ADR-0003). The fresh-write
     /// drainer pushes the responsible close-group peers here after each fresh
     /// replication; the possession-check scheduler drains the paired receiver.
@@ -1956,6 +1958,7 @@ impl ReplicationEngine {
             fresh_write_rx: Some(fresh_write_rx),
             pointers: None,
             pointer_fresh_rx: None,
+            listings: None,
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
             monetized_pin_tx,
@@ -2235,6 +2238,14 @@ impl ReplicationEngine {
             self.detached_task_tracker.clone(),
         )));
         self.pointer_fresh_rx = Some(fresh_writes);
+    }
+
+    /// Record listings from fresh offers too: an offer carries the upload's
+    /// payment proof, as a client PUT does.
+    ///
+    /// Call before [`Self::start`].
+    pub fn with_listings(&mut self, listings: Arc<crate::listings::ListingService>) {
+        self.listings = Some(listings);
     }
 
     /// The pointer replication, when enabled. Tests use it to drive rounds.
@@ -2916,6 +2927,7 @@ impl ReplicationEngine {
             paid_notify_admission_semaphore,
             paid_notify_responder_inflight,
             pointers: self.pointers.clone(),
+            listings: self.listings.clone(),
             shutdown: shutdown.clone(),
             detached_task_tracker,
         };
@@ -4371,6 +4383,8 @@ struct ReplicationMessageHandlerContext {
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Pointer replication, when this node stores pointers.
     pointers: Option<Arc<pointer::PointerReplication>>,
+    /// Listings, recorded from fresh offers' payment proofs.
+    listings: Option<Arc<crate::listings::ListingService>>,
     /// The engine's shutdown token, for detached responder work.
     ///
     /// Workers on [`Self::detached_task_tracker`] race this around their
@@ -6316,7 +6330,10 @@ async fn handle_fresh_offer(
 
     // Store the record.
     match ctx.storage.put(key, data).await {
-        Ok(_) => {
+        Ok(stored) => {
+            if let (true, Some(listings)) = (stored, &ctx.listings) {
+                listings.record_from_fresh_offer(*key, data, &attempt.proof_of_payment);
+            }
             send_replication_response(
                 source,
                 p2p_node,

@@ -942,6 +942,7 @@ impl Devnet {
             verify_on_read: true,
             ..ChunkStoreConfig::default()
         };
+        let disk_reserve = storage_config.disk_reserve;
         let storage = ChunkStore::new(storage_config)
             .await
             .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
@@ -988,6 +989,7 @@ impl Devnet {
 
         let listings = crate::listings::ListingService::new(
             storage.root_dir(),
+            disk_reserve,
             Arc::clone(&storage),
             listings_rpc_url,
             listings_vault,
@@ -1118,9 +1120,17 @@ impl Devnet {
                             if let Some(listings) = protocol_clone.listing_service().cloned() {
                                 let p2p = Arc::clone(&p2p_clone);
                                 tokio::spawn(async move {
+                                    if listings.handle_response(&source, &data) {
+                                        return;
+                                    }
                                     if let Some(response) = listings.handle_message(&data).await {
                                         let _ = p2p
-                                            .send_message(&source, ant_listings::TOPIC, response, &[])
+                                            .send_message(
+                                                &source,
+                                                ant_listings::TOPIC,
+                                                response,
+                                                &[],
+                                            )
                                             .await;
                                     }
                                 });
