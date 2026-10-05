@@ -1,0 +1,47 @@
+# Runs storage nodes with Docker Compose on any Linux server; the same setup as
+# unraid-storage-node.xml. Put your wallet address in REWARDS_ADDRESS below,
+# change any other settings you want, then:
+#
+#   docker compose up -d
+#   docker exec storage-node nodes status
+#
+# Each node uses two UDP ports: PORT_START and the ones after it, and
+# BROWSER_PORT_START and the ones after it. Forward them all (UDP) on your
+# router, same numbers outside and inside, unless your router has UPnP on.
+
+name: storage-node
+
+services:
+  storage-node:
+    image: ghcr.io/project-dspace/storage-node:latest
+    container_name: storage-node
+    restart: unless-stopped
+    # The nodes need their real ports and addresses, so no port mapping.
+    network_mode: host
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Give the nodes time to shut down cleanly.
+    stop_grace_period: 120s
+    environment:
+      # Ethereum-style wallet address (0x...) that receives your storage fees.
+      REWARDS_ADDRESS: "0xYOUR_WALLET_ADDRESS"
+      # How many nodes to run (1-6 for now). Each needs at least 20 GB of free
+      # disk space (about 35 GB recommended).
+      NODE_COUNT: 2
+      PORT_START: 10000
+      # 0 turns browser access off.
+      BROWSER_PORT_START: 11000
+      # Robinhood Chain RPC the nodes use to check payments.
+      RPC_URL: https://robinhood-rpc.publicnode.com
+      # Set to true if your connection has no working IPv6.
+      IPV4_ONLY: "false"
+      # Local port (127.0.0.1 only) of the node manager's status page and API.
+      MANAGER_PORT: 12600
+      # User and group the nodes run as; they own the data folder.
+      PUID: 99
+      PGID: 100
+    volumes:
+      # The nodes use the free space on the disk this folder is on.
+      - ./data:/data
