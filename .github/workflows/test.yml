@@ -41,8 +41,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Pinned, as upstream pinned it: a new anvil can break the EVM tests
+      # with no change here. v1.8.5 is the version the suite passed with.
       - name: Install Foundry (anvil)
         uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.5
 
       - name: Build the tests
         id: build
