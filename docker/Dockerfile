@@ -31,8 +31,8 @@ RUN chmod 755 /opt/ant/ant-node /entrypoint.sh /usr/local/bin/nodes
 # The XDG paths keep the node manager's state on the /data volume and let
 # `docker exec ... nodes` find it.
 ENV ANT_NETWORK_MODE=testnet \
-    ANT_EVM_PAYMENT_TOKEN=0x96ca806d020bf2a2c6b7ea62e0a1b318112ae180 \
-    ANT_EVM_PAYMENT_VAULT=0x69C5BB60dB609F0B9a5AE48F08d3dc98092b566C \
+    ANT_EVM_PAYMENT_TOKEN=0x511f76a3de41f000ec11ea4fd212fb3587c6cef3 \
+    ANT_EVM_PAYMENT_VAULT=0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B \
     BOOTSTRAP_PEERS="142.93.32.90:10000 165.22.193.90:10000" \
     RPC_URL=https://robinhood-rpc.publicnode.com \
     RPC_URLS="" \

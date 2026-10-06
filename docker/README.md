@@ -17,7 +17,7 @@ You'll need:
   As a guide, a node computer should have a 4-core CPU, 8 GB of RAM and 8 Mbps
   up and down.
 
-We're in a test phase: fees are paid in a test token with no real value yet.
+Fees are paid in DARWIN, the network's token, to the rewards address you set.
 
 ## 1. Forward the ports on your router
 
