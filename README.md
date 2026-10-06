@@ -557,8 +557,9 @@ The goal is not to maintain classical crypto forever, but to provide a **clean m
 ### Test Coverage
 
 Run `cargo test --features test-utils` (the EVM tests need Foundry's
-`anvil`). The library alone has about 1,300 tests. CI runs the suite on every
-push to main (`.github/workflows/test.yml`).
+`anvil`). The library alone has about 1,300 tests. While the repo is private,
+CI runs the suite weekly and by hand rather than on every push, to save Actions
+minutes (`.github/workflows/test.yml`).
 
 ### Data Types Supported
 
