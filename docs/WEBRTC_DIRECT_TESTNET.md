@@ -1,6 +1,6 @@
 # Browser-enabled local testnet
 
-This workflow starts a five-node local Autonomi network where every node has a
+This workflow starts a five-node local Darwin network where every node has a
 direct WebRTC Direct endpoint. Startup publishes a default immutable test file
 and serves browser bootstrap metadata; the companion site lives in the sibling
 `ant-client-browser-sdk` repository, with Rust/WASM from `ant-client-web-support`.
@@ -39,7 +39,7 @@ The services are:
 
 When `--serve-port` is omitted with `--webrtc-direct`, port 25000 is used. Pass
 `--public-file /path/to/file` to replace the built-in
-`autonomi-browser-testnet.txt`. The generated default is 5 MiB so the demo
+`darwin-browser-testnet.txt`. The generated default is 5 MiB so the demo
 necessarily reconstructs multiple storage records. A custom file may be up to
 1 GB (1,000,000,000 bytes) in this local in-memory launcher. The practical
 limit depends on the browser having enough available memory.

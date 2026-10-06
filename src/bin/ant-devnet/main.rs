@@ -220,7 +220,7 @@ async fn main() -> color_eyre::Result<()> {
 async fn load_public_file(
     path: Option<&std::path::Path>,
 ) -> color_eyre::Result<(String, String, Vec<u8>)> {
-    const DEFAULT_NAME: &str = "autonomi-browser-testnet.txt";
+    const DEFAULT_NAME: &str = "darwin-browser-testnet.txt";
     const DEFAULT_SEED: &[u8] = include_bytes!("../../../assets/browser-devnet-public.txt");
     const DEFAULT_SIZE: usize = 5 * 1024 * 1024;
     const MAX_FILE_SIZE: u64 = 1_000_000_000;

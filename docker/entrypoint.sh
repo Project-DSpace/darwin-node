@@ -50,7 +50,7 @@ if (( BROWSER_PORT_START != 0 )); then
 fi
 [[ -z "$PUBLIC_IP" || "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "PUBLIC_IP must be an IPv4 address"
 if [[ -n "${STORAGE_LIMIT_GB:-}" && "${STORAGE_LIMIT_GB:-0}" != 0 ]]; then
-    echo "STORAGE_LIMIT_GB is no longer used: like Autonomi's nodes, ours use the free space where /data lives."
+    echo "STORAGE_LIMIT_GB is no longer used: nodes use the free space where /data lives."
 fi
 read -ra rpc_urls <<<"${RPC_URLS:-$RPC_URL}"
 (( ${#rpc_urls[@]} > 0 )) || fail "Set RPC_URL"

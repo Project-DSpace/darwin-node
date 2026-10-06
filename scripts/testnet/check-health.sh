@@ -10,7 +10,7 @@ HEALTHY=0
 UNHEALTHY=0
 UNREACHABLE=0
 
-echo "=== Autonomi Node Health Check ==="
+echo "=== Darwin Node Health Check ==="
 echo "Checking nodes ${START_INDEX} to ${END_INDEX}"
 echo ""
 

@@ -12,7 +12,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WORKERS=("142.93.52.129" "24.199.82.114" "192.34.62.192" "159.223.131.196")
 START_INDICES=(0 50 100 150)
 
-echo "=== Autonomi Upgrade Test ==="
+echo "=== Darwin Upgrade Test ==="
 echo "Testing auto-upgrade functionality across 200-node testnet"
 echo ""
 

@@ -8,7 +8,7 @@ START_INDEX=${1:-0}
 COUNT=${2:-50}
 END_INDEX=$((START_INDEX + COUNT - 1))
 
-echo "=== Starting Autonomi Nodes ==="
+echo "=== Starting Darwin Nodes ==="
 echo "Starting nodes ${START_INDEX} to ${END_INDEX}"
 
 for i in $(seq $START_INDEX $END_INDEX); do

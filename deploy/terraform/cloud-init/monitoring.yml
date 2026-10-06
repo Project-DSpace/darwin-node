@@ -1,5 +1,5 @@
 #cloud-config
-# Autonomi Monitoring Server - Prometheus + Grafana
+# Darwin Monitoring Server - Prometheus + Grafana
 
 package_update: true
 package_upgrade: true
@@ -94,7 +94,7 @@ write_files:
               labels:
                 severity: critical
               annotations:
-                summary: "Autonomi node down"
+                summary: "Darwin node down"
                 description: "Node {{ $labels.instance }} has been down for more than 2 minutes"
 
             - alert: LowPeerCount
@@ -216,4 +216,4 @@ runcmd:
   # Start monitoring stack
   - cd /opt/monitoring && docker-compose up -d
 
-final_message: "Autonomi monitoring server ready - Grafana at :3000, Prometheus at :9090"
+final_message: "Darwin monitoring server ready - Grafana at :3000, Prometheus at :9090"

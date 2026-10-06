@@ -48,7 +48,7 @@ check_health() {
 }
 
 main() {
-    log "=== Autonomi Load Test ==="
+    log "=== Darwin Load Test ==="
     log "Chunk count: $CHUNK_COUNT"
     log "Chunk size: ${CHUNK_SIZE_KB}KB"
     log "Concurrency: $CONCURRENCY"

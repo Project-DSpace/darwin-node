@@ -435,7 +435,7 @@
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Autonomi Testnet Dashboard",
+  "title": "Darwin Testnet Dashboard",
   "uid": "ant-testnet",
   "version": 1
 }

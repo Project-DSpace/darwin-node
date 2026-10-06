@@ -1,6 +1,6 @@
 //! # ant-node
 //!
-//! A pure quantum-proof network node for the Autonomi decentralized network.
+//! A pure quantum-proof network node for the Darwin decentralized network.
 //!
 //! This crate provides a thin wrapper around `saorsa-core` that adds:
 //! - Auto-upgrade system with ML-DSA signature verification

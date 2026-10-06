@@ -2,7 +2,7 @@
 #
 # Empty in this fork. Upstream ships Autonomi's production bootstrap peers here,
 # and nodes load this file when no --bootstrap argument is given, so a node left
-# unconfigured would join Autonomi's network instead of ours. Our nodes always
+# unconfigured would join Autonomi's network instead of Darwin. Our nodes always
 # pass their bootstrap peers explicitly, through --bootstrap or their config file.
 #
 # Format: "ip:port" socket addresses.

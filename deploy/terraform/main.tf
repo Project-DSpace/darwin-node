@@ -1,4 +1,4 @@
-# Autonomi 500-Node Testnet Infrastructure
+# Darwin 500-Node Testnet Infrastructure
 # Deploys 5 worker droplets (100 nodes each) + 1 monitoring server
 
 terraform {

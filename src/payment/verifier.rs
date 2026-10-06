@@ -3598,9 +3598,8 @@ impl PaymentVerifier {
                 );
                 let advice = if looks_like_stale_client {
                     " This is exactly the pre-parity settlement amount, so the paying client is \
-                     too old to settle correctly. Run `ant update` to upgrade, or reinstall from \
-                     https://github.com/WithAutonomi/ant-client/releases/latest. Note the payment \
-                     that was already made cannot be recovered."
+                     too old to settle correctly. Run `darwin update` to upgrade. Note the \
+                     payment that was already made cannot be recovered."
                 } else {
                     ""
                 };
@@ -7375,7 +7374,7 @@ mod tests {
         // integers. This is the only message that reaches a client too old to
         // declare a settlement version at quote time.
         assert!(
-            err_msg.contains("too old to settle correctly") && err_msg.contains("ant update"),
+            err_msg.contains("too old to settle correctly") && err_msg.contains("darwin update"),
             "Error should tell the user to upgrade: {err_msg}"
         );
     }
@@ -7419,7 +7418,7 @@ mod tests {
             "Error should still name the underpayment: {err_msg}"
         );
         assert!(
-            !err_msg.contains("ant update"),
+            !err_msg.contains("darwin update"),
             "A partial shortfall must not be reported as an outdated client: {err_msg}"
         );
     }

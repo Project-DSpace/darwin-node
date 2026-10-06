@@ -15,7 +15,7 @@ ssh -o StrictHostKeyChecking=no root@${WORKER1} "
     mkdir -p /var/lib/ant/nodes/node-0
     cat > /etc/systemd/system/ant-node-0.service <<'EOF'
 [Unit]
-Description=Autonomi Genesis Node 0
+Description=Darwin Genesis Node 0
 After=network.target
 
 [Service]
@@ -56,7 +56,7 @@ ssh -o StrictHostKeyChecking=no root@${WORKER2} "
     mkdir -p /var/lib/ant/nodes/node-50
     cat > /etc/systemd/system/ant-node-50.service <<'EOF'
 [Unit]
-Description=Autonomi Genesis Node 50
+Description=Darwin Genesis Node 50
 After=network.target
 
 [Service]

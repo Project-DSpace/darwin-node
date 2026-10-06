@@ -1,5 +1,5 @@
 #cloud-config
-# Autonomi Worker Node - Runs ${nodes_per_worker} nodes
+# Darwin Worker Node - Runs ${nodes_per_worker} nodes
 
 package_update: true
 package_upgrade: true
@@ -71,7 +71,7 @@ write_files:
         # Create systemd service
         cat > /etc/systemd/system/$${SERVICE_NAME}.service <<EOF
       [Unit]
-      Description=Autonomi Node $${i} (Region: $${REGION})
+      Description=Darwin Node $${i} (Region: $${REGION})
       After=network-online.target
       Wants=network-online.target
 
@@ -210,4 +210,4 @@ runcmd:
   # Start nodes
   - /usr/local/bin/spawn-ant-nodes.sh
 
-final_message: "Autonomi worker node ready with ${nodes_per_worker} nodes in region ${region}"
+final_message: "Darwin worker node ready with ${nodes_per_worker} nodes in region ${region}"

@@ -4,7 +4,7 @@ This guide covers deploying ant-node for network testing, including consideratio
 
 ## Overview
 
-The Autonomi network uses multiple anti-Sybil mechanisms that can affect testnet deployments:
+The Darwin network uses multiple anti-Sybil mechanisms that can affect testnet deployments:
 
 1. **IP Diversity Enforcement**: Limits nodes per subnet and ASN
 2. **Node Age Verification**: Requires time-based trust accumulation

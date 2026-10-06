@@ -1,5 +1,5 @@
 #!/bin/bash
-# Autonomi Node Spawner - Deploy multiple nodes on a single host
+# Darwin Node Spawner - Deploy multiple nodes on a single host
 # Usage: ./spawn-nodes.sh [count] [bootstrap1] [bootstrap2] ...
 # Env: ANT_VERSION=0.1.0 to download a specific version from GitHub
 set -euo pipefail
@@ -46,7 +46,7 @@ download_binary() {
     echo "Installed ant-node v${version} to $BINARY_PATH"
 }
 
-echo "=== Autonomi Multi-Node Spawner ==="
+echo "=== Darwin Multi-Node Spawner ==="
 echo "Nodes to spawn: $NODE_COUNT"
 echo "Bootstrap nodes: ${BOOTSTRAP_NODES[*]}"
 echo "Binary: $BINARY_PATH"
@@ -105,7 +105,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     # Create systemd service
     cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
 [Unit]
-Description=Autonomi Node $i
+Description=Darwin Node $i
 After=network-online.target
 Wants=network-online.target
 

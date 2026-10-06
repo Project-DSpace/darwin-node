@@ -15,7 +15,7 @@ BOOTSTRAP1="142.93.52.129:12000"
 BOOTSTRAP2="24.199.82.114:12000"
 START_INDEX=${1:-0}
 
-echo "=== Autonomi Node Spawner ==="
+echo "=== Darwin Node Spawner ==="
 echo "Creating $NODE_COUNT nodes starting at index $START_INDEX"
 echo "Bootstrap nodes: $BOOTSTRAP1, $BOOTSTRAP2"
 
@@ -50,7 +50,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
 
     cat > /etc/systemd/system/ant-node-${NODE_INDEX}.service <<EOF
 [Unit]
-Description=Autonomi Node ${NODE_INDEX}
+Description=Darwin Node ${NODE_INDEX}
 After=network.target
 
 [Service]

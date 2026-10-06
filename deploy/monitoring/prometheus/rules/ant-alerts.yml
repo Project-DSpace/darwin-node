@@ -8,7 +8,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Autonomi node unreachable"
+          summary: "Darwin node unreachable"
           description: "Node {{ $labels.instance }} in {{ $labels.region }} has been down for more than 2 minutes"
 
       # Health status
@@ -18,7 +18,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Autonomi node unhealthy"
+          summary: "Darwin node unhealthy"
           description: "Node {{ $labels.instance }} is reporting unhealthy status for more than 5 minutes"
 
       # Peer connectivity

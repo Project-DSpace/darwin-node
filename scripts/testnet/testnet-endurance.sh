@@ -23,7 +23,7 @@ cd "$PROJECT_ROOT"
 
 mkdir -p "$LOG_DIR"
 
-echo "=== Autonomi Testnet Endurance Test ===" | tee -a "$LOG_FILE"
+echo "=== Darwin Testnet Endurance Test ===" | tee -a "$LOG_FILE"
 echo "Duration: ${DURATION_HOURS} hours" | tee -a "$LOG_FILE"
 echo "Bootstrap: ${BOOTSTRAP}" | tee -a "$LOG_FILE"
 echo "Log file: ${LOG_FILE}" | tee -a "$LOG_FILE"

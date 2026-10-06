@@ -1,5 +1,5 @@
 #!/bin/bash
-# Autonomi Node Manager - Start/stop/status for multiple nodes
+# Darwin Node Manager - Start/stop/status for multiple nodes
 # Usage: ./manage-nodes.sh [action] [options]
 set -euo pipefail
 
@@ -23,7 +23,7 @@ get_node_indices() {
 
 case "$ACTION" in
     start)
-        echo "Starting all ant nodes..."
+        echo "Starting all Darwin nodes..."
         for i in $(get_node_indices); do
             systemctl start "ant-node-$i" 2>/dev/null || true
         done
@@ -31,7 +31,7 @@ case "$ACTION" in
         ;;
 
     stop)
-        echo "Stopping all ant nodes..."
+        echo "Stopping all Darwin nodes..."
         for i in $(get_node_indices); do
             systemctl stop "ant-node-$i" 2>/dev/null || true
         done
@@ -39,7 +39,7 @@ case "$ACTION" in
         ;;
 
     restart)
-        echo "Restarting all ant nodes..."
+        echo "Restarting all Darwin nodes..."
         for i in $(get_node_indices); do
             systemctl restart "ant-node-$i" 2>/dev/null || true
             sleep 0.2  # Stagger restarts
@@ -62,7 +62,7 @@ case "$ACTION" in
             fi
         done
 
-        echo "=== Autonomi Node Status ==="
+        echo "=== Darwin Node Status ==="
         echo "Total nodes: $TOTAL"
         echo "Running: $RUNNING"
         echo "Failed: $FAILED"
@@ -130,7 +130,7 @@ case "$ACTION" in
         ;;
 
     cleanup)
-        echo "Cleaning up all ant nodes..."
+        echo "Cleaning up all Darwin nodes..."
 
         # Stop all nodes
         for i in $(get_node_indices); do

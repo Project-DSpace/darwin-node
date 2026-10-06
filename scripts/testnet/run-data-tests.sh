@@ -13,7 +13,7 @@ export ANT_TEST_BOOTSTRAP="142.93.52.129:12000,24.199.82.114:12000"
 export ANT_TEST_EXTERNAL=true
 export RUST_LOG=info
 
-echo "=== Autonomi Testnet Data Type Tests ==="
+echo "=== Darwin Testnet Data Type Tests ==="
 echo "Bootstrap: $ANT_TEST_BOOTSTRAP"
 echo ""
 

@@ -153,7 +153,7 @@ verify_data() {
 
 # Main test loop
 main() {
-    log "=== Autonomi Churn Test ==="
+    log "=== Darwin Churn Test ==="
     log "Duration: $DURATION_MINUTES minutes"
     log "Churn rate: $CHURN_RATE% ($((TOTAL_NODES * CHURN_RATE / 100)) nodes per cycle)"
     log "Churn interval: $CHURN_INTERVAL seconds"

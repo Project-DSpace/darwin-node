@@ -149,7 +149,7 @@ verify_data() {
 
 # Main test
 main() {
-    log "=== Autonomi Churn + Verification Test ==="
+    log "=== Darwin Churn + Verification Test ==="
     log "Addresses file: $ADDRESSES_FILE"
     log "Duration: $DURATION_MINUTES minutes"
     log "Churn rate: $CHURN_RATE%"

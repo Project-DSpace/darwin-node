@@ -1,5 +1,5 @@
 #!/bin/bash
-# Autonomi Network Validator - Checks health of entire testnet
+# Darwin Network Validator - Checks health of entire testnet
 # Usage: ./validate-network.sh [worker_ips_file]
 set -euo pipefail
 
@@ -12,7 +12,7 @@ MIN_PEERS=3
 MIN_DHT_SIZE=20
 HEALTH_THRESHOLD=0.99  # 99% nodes healthy
 
-echo "=== Autonomi Testnet Validator ==="
+echo "=== Darwin Testnet Validator ==="
 echo "Nodes per worker: $NODES_PER_WORKER"
 echo "Min peers: $MIN_PEERS"
 echo "Min DHT size: $MIN_DHT_SIZE"

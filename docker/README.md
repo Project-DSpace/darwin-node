@@ -1,8 +1,8 @@
 # Running storage nodes on Unraid
 
-This sets up storage nodes for our network in a Docker container on your Unraid
-server. Inside the container, Autonomi's own node manager runs the nodes, the
-same way Autonomi's operators run theirs. It takes about 15 minutes. You'll need:
+This sets up storage nodes for Darwin, our storage network, in a Docker
+container on your Unraid server. Inside the container, a node manager runs and
+looks after the nodes. It takes about 15 minutes. You'll need:
 
 - A **GitHub account** (free), to download the private image.
 - A **wallet address** for your storage fees: any Ethereum-style address
@@ -10,7 +10,7 @@ same way Autonomi's operators run theirs. It takes about 15 minutes. You'll need
 - **Access to your router**, to forward some UDP ports.
 - **Spare disk space**: at least 20 GB per node (about 35 GB recommended), plus
   for each node some memory, CPU and part of your internet connection.
-  Autonomi's guide for a node computer is a 4-core CPU, 8 GB of RAM and 8 Mbps
+  As a guide, a node computer should have a 4-core CPU, 8 GB of RAM and 8 Mbps
   up and down.
 
 We're in a test phase: fees are paid in a test token with no real value yet.
@@ -136,9 +136,9 @@ can confirm from the network side that your nodes are reachable.
 - **Different ports**: change **First UDP port** or **First browser UDP port**
   and click **Apply**. The nodes move to the new ports and keep their
   identities; change your router's port forwarding to match.
-- **When the disk gets full**: like Autonomi's, the node manager watches free
-  space where the data folder is. Below 1 GB free it warns in the log; below
-  500 MB it removes the node holding the least data (never the last one) and
+- **When the disk gets full**: the node manager watches free space where the
+  data folder is. Below 1 GB free it warns in the log; below 500 MB it
+  removes the node holding the least data (never the last one) and
   deletes that node's data, so the others have room. Removed nodes stay
   removed: free up space, run `docker exec storage-node nodes clear-evicted`,
   then restart the container to replace them, or lower **Number of nodes**.
@@ -152,7 +152,7 @@ Your nodes keep their identities and data: the container takes over the old
 container and:
 
 - remove the **Storage limit** variable (nodes now use the free space on the
-  disk, like Autonomi's);
+  disk);
 - set **Number of nodes** to match your disk, memory and connection;
 - add the browser port variable `BROWSER_PORT_START` = `11000` and forward
   those ports, or leave it out to keep browser access off;

@@ -1,4 +1,4 @@
-# Autonomi Testnet Prometheus Configuration
+# Darwin Testnet Prometheus Configuration
 # Scrapes metrics from 500 nodes across 5 workers
 
 global:

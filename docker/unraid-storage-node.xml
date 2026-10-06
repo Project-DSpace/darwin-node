@@ -6,7 +6,7 @@
   <Network>host</Network>
   <Privileged>false</Privileged>
   <Shell>bash</Shell>
-  <Overview>Runs storage nodes for our decentralised storage network, managed by Autonomi's node manager. Each node stores encrypted pieces of uploaded files, proves it still holds them, and earns storage fees in the network's token, paid to your wallet. Each node uses two UDP ports, one for storage and one for web browsers; see the setup guide for forwarding them on your router.</Overview>
+  <Overview>Runs storage nodes for Darwin, our decentralised storage network. Each node stores encrypted pieces of uploaded files, proves it still holds them, and earns storage fees in the network's token, paid to your wallet. Each node uses two UDP ports, one for storage and one for web browsers; see the setup guide for forwarding them on your router.</Overview>
   <Category>Network:Other</Category>
   <ExtraParams>--ulimit nofile=65536:65536 --stop-timeout 120</ExtraParams>
   <Config Name="Rewards wallet" Target="REWARDS_ADDRESS" Default="" Mode="" Description="Ethereum-style wallet address (0x...) that receives your storage fees." Type="Variable" Display="always" Required="true" Mask="false"/>

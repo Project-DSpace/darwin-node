@@ -8,7 +8,7 @@ use clap::{Parser, ValueEnum};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-/// Pure quantum-proof network node for the Autonomi decentralized network.
+/// Pure quantum-proof network node for the Darwin decentralized network.
 #[derive(Parser, Debug)]
 #[command(name = "ant-node")]
 #[command(author, version, about, long_about = None)]

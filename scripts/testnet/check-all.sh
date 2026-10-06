@@ -13,7 +13,7 @@ TOTAL_HEALTHY=0
 TOTAL_UNHEALTHY=0
 TOTAL_UNREACHABLE=0
 
-echo "=== Autonomi Testnet Health Check ==="
+echo "=== Darwin Testnet Health Check ==="
 echo ""
 
 for i in "${!WORKERS[@]}"; do

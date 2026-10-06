@@ -15,7 +15,7 @@ WORKERS=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_URL="https://github.com/WithAutonomi/ant-node/releases/download/v0.2.0/ant-node-cli-linux-x64.tar.gz"
 
-echo "=== Autonomi Testnet Deployment ==="
+echo "=== Darwin Testnet Deployment ==="
 echo "Deploying to ${#WORKERS[@]} droplets"
 echo ""
 

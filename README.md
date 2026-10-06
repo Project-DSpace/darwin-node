@@ -1,8 +1,10 @@
 # ant-node
 
-**The quantum-proof evolution of Autonomi network nodes.**
+**Quantum-proof nodes for the Darwin network.**
 
-ant-node is the next-generation node software for the Autonomi decentralized network, replacing the legacy ant-node with future-proof cryptography and advanced network security.
+ant-node is the next-generation node software for the Darwin decentralized network, replacing the legacy ant-node with future-proof cryptography and advanced network security.
+
+Based on [Autonomi's ant-node](https://github.com/WithAutonomi/ant-node) (MIT/Apache-2.0).
 
 > **Why Upgrade?** Current legacy ant-node uses Ed25519/X25519 cryptography that will be broken by quantum computers. Data encrypted today can be harvested and decrypted later. ant-node uses FIPS-approved post-quantum algorithms to protect your data forever.
 
@@ -51,14 +53,14 @@ Nation-state actors and sophisticated adversaries are already collecting encrypt
 
 *Symmetric algorithms remain secure with sufficient key sizes (256-bit), but key exchange and signatures are completely broken.
 
-### The Autonomi Network Risk
+### The Legacy Network Risk
 
 Legacy ant-node uses:
 - **BLS signatures** - Quantum vulnerable (elliptic curve based)
 - **Ed25519 signatures** - Quantum vulnerable (elliptic curve based)
 - **X25519 key exchange** - Quantum vulnerable (elliptic curve based)
 
-Even though the Autonomi nettwork self encrypted data is secure, he Autonomi network has metadata (signatures, encrypted keys) that will be compromised by quantum computers. **The time to act is now.**
+Even though self-encrypted data on the legacy network is secure, the legacy network has metadata (signatures, encrypted keys) that will be compromised by quantum computers. **The time to act is now.**
 
 ---
 
@@ -157,7 +159,7 @@ Based on **draft-seemann-quic-nat-traversal-02** (Marten Seemann & Eric Kinnear,
 
 **Why Not ICE/STUN?**
 
-| Aspect | ICE/STUN | Native QUIC (Autonomi) |
+| Aspect | ICE/STUN | Native QUIC (Darwin) |
 |--------|----------|----------------------|
 | **External Dependencies** | Requires STUN/TURN servers | None - 100% within QUIC |
 | **Protocol Complexity** | Separate signaling (SDP) | QUIC frames only |
@@ -381,7 +383,7 @@ Searches common locations:
 1. **Scan**: Enumerate all record files in legacy ant-node `record_store/`
 2. **Classify**: Identify record types (Chunk, Register, Scratchpad, GraphEntry)
 3. **Decrypt**: Decrypt AES-256-GCM-SIV encrypted records
-4. **Upload**: Store on Autonomi network
+4. **Upload**: Store on the Darwin network
 5. **Track**: Save progress for resume capability
 
 ### Progress Tracking
@@ -397,12 +399,12 @@ ant-node --migrate-ant-data ~/.local/share/safe/node
 
 | Data Type | Payment |
 |-----------|---------|
-| **Legacy Autonomi data** | FREE (already paid) |
+| **Legacy network data** | FREE (already paid) |
 | **New data** | EVM payment (Arbitrum One) |
 
 The three-layer verification:
 1. **LRU Cache**: Fast lookup of recently verified XorNames
-2. **Autonomi Check**: Query legacy network for existing data
+2. **Legacy Check**: Query the legacy network for existing data
 3. **EVM Verification**: Verify on-chain payment for new data
 
 ### CRDT Data: The Identity Challenge
@@ -429,7 +431,7 @@ This is by design. Adding classical crypto verification would:
 +---------------------------------------------------------------------+
 |                     TWO SEPARATE NETWORKS                            |
 +--------------------------------+------------------------------------+
-|      AUTONOMI NETWORK          |         AUTONOMI NETWORK           |
+|      LEGACY NETWORK            |         DARWIN NETWORK             |
 |      (Classical Crypto)        |         (Quantum Crypto)           |
 +--------------------------------+------------------------------------+
 |  Nodes: legacy ant-node        |  Nodes: ant-node                   |
@@ -448,14 +450,14 @@ This is by design. Adding classical crypto verification would:
 
 #### What This Means for Users
 
-| Data Type | Autonomi Legacy -> Autonomi PQ | Notes |
+| Data Type | Legacy -> Darwin | Notes |
 |-----------|-------------------|-------|
 | **Chunk** | Migratable | Content-addressed, no signature needed |
 | **Scratchpad** | New identity | Different address on PQ network |
 | **Pointer** | New identity | Different address on PQ network |
 | **GraphEntry** | New identity | Different address on PQ network |
 
-**Users don't "migrate" their CRDT data - they establish a new quantum-safe identity on the Autonomi network.**
+**Users don't "migrate" their CRDT data - they establish a new quantum-safe identity on the Darwin network.**
 
 #### The HybridClient Architecture
 
@@ -465,10 +467,10 @@ The HybridClient connects to **both networks simultaneously**:
 // HybridClient talks to TWO different networks
 let hybrid = HybridClient::new(config)?;
 
-// Read from Autonomi network (via legacy ant-node peers)
+// Read from the legacy network (via legacy ant-node peers)
 let legacy_data = hybrid.legacy().get_scratchpad(&ed25519_owner).await?;
 
-// Write to Autonomi network (via ant-node peers)
+// Write to the Darwin network (via ant-node peers)
 let new_scratchpad = hybrid.quantum().put_scratchpad(
     &mldsa_keypair,
     content_type,
@@ -483,11 +485,11 @@ let new_scratchpad = hybrid.quantum().put_scratchpad(
 
 **Strategy 1: Data Snapshot + New Identity**
 ```
-1. Read final state from Autonomi (LegacyClient)
+1. Read final state from the legacy network (LegacyClient)
 2. Generate new ML-DSA-65 keypair (new identity)
 3. Create equivalent Scratchpad on PQ network (QuantumClient)
 4. Update applications to use new address
-5. Old Autonomi data becomes read-only archive
+5. Old legacy data becomes a read-only archive
 ```
 
 **Strategy 2: Identity Registry**
@@ -500,7 +502,7 @@ let new_scratchpad = hybrid.quantum().put_scratchpad(
 
 **Strategy 3: Parallel Operation (Transition Period)**
 ```
-1. Autonomi network continues running for existing CRDT data
+1. The legacy network continues running for existing CRDT data
 2. Users gradually create new identities on PQ network
 3. Applications support both networks during transition
 4. Eventually deprecate legacy access
@@ -520,14 +522,14 @@ hybrid.quantum().store_chunk(chunk.data()).await?;
 
 #### Security Implications
 
-| Aspect | Autonomi (Legacy) | Autonomi (New) |
+| Aspect | Legacy network | Darwin |
 |--------|-------------------|--------------|
 | **Signatures** | Ed25519 | ML-DSA-65 |
 | **Quantum Safe** | Vulnerable | Protected |
-| **CRDT Updates** | Via Autonomi only | Via Autonomi PQ only |
+| **CRDT Updates** | Via legacy network only | Via Darwin only |
 | **Identity** | Ed25519 pubkey | ML-DSA-65 pubkey |
 
-**Critical**: Users cannot update their Autonomi CRDT data through PQ ant-nodes. To update legacy data, they must connect to the Autonomi network directly (which continues to run legacy ant-nodes).
+**Critical**: Users cannot update their legacy CRDT data through PQ ant-nodes. To update legacy data, they must connect to the legacy network directly (which continues to run legacy ant-nodes).
 
 #### Long-Term Vision
 
@@ -552,7 +554,7 @@ The goal is not to maintain classical crypto forever, but to provide a **clean m
 |-----------|--------|-------------|
 | **Core Library** | Complete | Full node implementation with client APIs |
 | **Data Types** | Complete | Chunk, Scratchpad, Pointer, GraphEntry |
-| **Payment Verification** | Complete | Autonomi lookup + EVM verification + LRU cache |
+| **Payment Verification** | Complete | Legacy network lookup + EVM verification + LRU cache |
 | **Migration Decryption** | Complete | AES-256-GCM-SIV decryption for legacy ant-node data |
 | **Auto-Upgrade** | Complete | Cross-platform with ML-DSA-65 signature verification |
 | **E2E Test Infrastructure** | Complete | Real P2P testnet with 25+ nodes |
@@ -591,13 +593,13 @@ The migration system is **fully implemented** and ready for use:
    - Record enumeration and classification
 
 3. **Client APIs** (`src/client/`)
-   - `QuantumClient`: Pure Autonomi PQ network operations
-   - `LegacyClient`: Read-only access to Autonomi legacy network
+   - `QuantumClient`: Pure Darwin (PQ) network operations
+   - `LegacyClient`: Read-only access to the legacy network
    - `HybridClient`: Seamless access to both networks
 
 4. **Payment Verification** (`src/payment/`)
-   - Three-layer verification: LRU cache -> Autonomi lookup -> EVM check
-   - Legacy data is FREE (already paid on Autonomi)
+   - Three-layer verification: LRU cache -> legacy network lookup -> EVM check
+   - Legacy data is FREE (already paid on the legacy network)
    - New data requires EVM payment (Arbitrum One)
 
 ### E2E Test Infrastructure
@@ -730,7 +732,7 @@ ant-node --upgrade-channel beta
 [upgrade]
 channel = "stable"
 check_interval_hours = 1
-github_repo = "WithAutonomi/ant-node"
+github_repo = "Project-DSpace/ant-node"
 stop_on_upgrade = false  # Set true when running under a service manager
 # staged_rollout_hours = 24  # For staged rollout
 ```
@@ -747,7 +749,7 @@ Create a service file at `/etc/systemd/system/ant-node.service`:
 
 ```ini
 [Unit]
-Description=Ant Node
+Description=Darwin Node
 After=network-online.target
 Wants=network-online.target
 
@@ -808,7 +810,7 @@ With WinSW, create `ant-node-service.xml`:
 ```xml
 <service>
   <id>ant-node</id>
-  <name>Ant Node</name>
+  <name>Darwin Node</name>
   <executable>C:\ant-node\ant-node.exe</executable>
   <arguments>--stop-on-upgrade</arguments>
   <onfailure action="restart" delay="5 sec"/>
@@ -869,7 +871,7 @@ ant-node
 
 ```bash
 # Clone the repository
-git clone https://github.com/WithAutonomi/ant-node
+git clone https://github.com/Project-DSpace/ant-node
 cd ant-node
 
 # Build release binary
@@ -1027,7 +1029,7 @@ bootstrap = [
 # Upgrades are always enabled; configure behavior here
 channel = "stable"
 check_interval_hours = 1
-github_repo = "WithAutonomi/ant-node"
+github_repo = "Project-DSpace/ant-node"
 stop_on_upgrade = false
 
 [migration]
@@ -1035,7 +1037,7 @@ auto_detect = true
 # ant_data_path = "~/.local/share/safe/node"  # Explicit path
 
 [payment]
-# Autonomi verification for legacy data
+# Verification of legacy data against the legacy network
 autonomi_enabled = true
 autonomi_timeout_secs = 30
 
@@ -1098,7 +1100,7 @@ RUST_LOG=ant_node=debug,saorsa_core=debug ./ant-node
 |---------|-------------|------------|
 | **saorsa-core** | Core networking and security library | [github.com/WithAutonomi/saorsa-core](https://github.com/WithAutonomi/saorsa-core) |
 | **saorsa-pqc** | Post-quantum cryptography primitives | [github.com/WithAutonomi/saorsa-pqc](https://github.com/WithAutonomi/saorsa-pqc) |
-| **ant-cli** | Unified CLI for file and chunk operations with EVM payments | Built into ant-node |
+| **darwin** | Client CLI for file and chunk operations with EVM payments | [github.com/Project-DSpace/ant-client](https://github.com/Project-DSpace/ant-client) |
 
 ---
 
