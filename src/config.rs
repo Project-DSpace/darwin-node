@@ -215,6 +215,16 @@ pub struct WebRtcDirectConfig {
 
     /// Maximum in-flight frame bytes attributable to one IPv4 address or IPv6 /64.
     pub max_in_flight_bytes_per_ip: usize,
+
+    /// New browser sessions one IPv4 address or IPv6 /64 may open at once,
+    /// before [`Self::new_sessions_per_minute_per_ip`] applies.
+    pub new_sessions_burst_per_ip: usize,
+
+    /// New browser sessions one IPv4 address or IPv6 /64 may open per minute
+    /// once its burst is spent. Every session costs an ICE, DTLS and SCTP
+    /// handshake; this keeps one source from opening and closing them
+    /// without end, which the concurrent limits above don't catch.
+    pub new_sessions_per_minute_per_ip: usize,
 }
 
 impl Default for WebRtcDirectConfig {
@@ -235,6 +245,8 @@ impl Default for WebRtcDirectConfig {
                 default_webrtc_direct_max_requests_per_second_per_connection(),
             max_in_flight_bytes: default_webrtc_direct_max_in_flight_bytes(),
             max_in_flight_bytes_per_ip: default_webrtc_direct_max_in_flight_bytes_per_ip(),
+            new_sessions_burst_per_ip: default_webrtc_direct_new_sessions_burst_per_ip(),
+            new_sessions_per_minute_per_ip: default_webrtc_direct_new_sessions_per_minute_per_ip(),
         }
     }
 }
@@ -281,6 +293,14 @@ const fn default_webrtc_direct_max_in_flight_bytes() -> usize {
 
 const fn default_webrtc_direct_max_in_flight_bytes_per_ip() -> usize {
     16 * 1024 * 1024
+}
+
+const fn default_webrtc_direct_new_sessions_burst_per_ip() -> usize {
+    12
+}
+
+const fn default_webrtc_direct_new_sessions_per_minute_per_ip() -> usize {
+    6
 }
 
 /// Auto-upgrade configuration.

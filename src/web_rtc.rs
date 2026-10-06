@@ -78,6 +78,7 @@ const FIRST_DATA_CHANNEL_TIMEOUT_ERROR: &str = "DataChannel opening timed out";
 const CHANNEL_CAPACITY_ERROR: &str = "global DataChannel capacity exhausted";
 const REQUEST_CAPACITY_ERROR: &str = "global request capacity exhausted";
 const REQUEST_RATE_ERROR: &str = "request rate limit exceeded";
+const SOURCE_SESSION_RATE_ERROR: &str = "too many new sessions from this source";
 const GLOBAL_BYTE_CAPACITY_ERROR: &str = "global in-flight byte capacity exhausted";
 const SOURCE_BYTE_CAPACITY_ERROR: &str = "source in-flight byte capacity exhausted";
 
@@ -278,6 +279,41 @@ struct SourceEntry {
     active_connections: usize,
     last_seen: Instant,
     quota: Arc<SourceQuota>,
+    /// New sessions this source may still open.
+    new_sessions: SessionRateBucket,
+}
+
+/// A source's allowance of new sessions: a burst, then a steady rate.
+struct SessionRateBucket {
+    tokens: f64,
+    capacity: f64,
+    per_second: f64,
+    refilled: Instant,
+}
+
+impl SessionRateBucket {
+    fn new(burst: usize, per_minute: usize, now: Instant) -> Self {
+        let capacity = burst.max(1) as f64;
+        Self {
+            tokens: capacity,
+            capacity,
+            per_second: per_minute as f64 / 60.0,
+            refilled: now,
+        }
+    }
+
+    /// Take one session from the allowance, if there is one.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.per_second).min(self.capacity);
+        self.refilled = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Default)]
@@ -309,6 +345,8 @@ struct ListenerResources {
     max_requests_per_second_per_ip: usize,
     max_requests_per_second_per_connection: usize,
     max_in_flight_bytes_per_ip: usize,
+    new_sessions_burst_per_ip: usize,
+    new_sessions_per_minute_per_ip: usize,
     max_tracked_sources: usize,
 }
 
@@ -343,6 +381,8 @@ impl ListenerResources {
             max_requests_per_second_per_ip: config.max_requests_per_second_per_ip,
             max_requests_per_second_per_connection: config.max_requests_per_second_per_connection,
             max_in_flight_bytes_per_ip: config.max_in_flight_bytes_per_ip,
+            new_sessions_burst_per_ip: config.new_sessions_burst_per_ip,
+            new_sessions_per_minute_per_ip: config.new_sessions_per_minute_per_ip,
             max_tracked_sources: config
                 .max_connections
                 .saturating_mul(TRACKED_SOURCE_MULTIPLIER)
@@ -386,9 +426,15 @@ impl ListenerResources {
                 state.sources.remove(&eviction);
             }
 
+            let now = Instant::now();
             let entry = state.sources.entry(ip).or_insert_with(|| SourceEntry {
                 active_connections: 0,
-                last_seen: Instant::now(),
+                last_seen: now,
+                new_sessions: SessionRateBucket::new(
+                    self.new_sessions_burst_per_ip,
+                    self.new_sessions_per_minute_per_ip,
+                    now,
+                ),
                 quota: Arc::new(SourceQuota {
                     bulk_responses: Arc::new(Semaphore::new(bulk_response_slots(
                         self.max_in_flight_bytes_per_ip,
@@ -404,6 +450,9 @@ impl ListenerResources {
             });
             if entry.active_connections >= self.max_connections_per_ip {
                 return Err(SOURCE_CONNECTION_CAPACITY_ERROR.to_string());
+            }
+            if !entry.new_sessions.try_take(now) {
+                return Err(SOURCE_SESSION_RATE_ERROR.to_string());
             }
             entry.active_connections += 1;
             entry.last_seen = Instant::now();
@@ -2283,6 +2332,39 @@ struct ServerState {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_sessions_from_one_source_are_a_burst_then_a_rate() {
+        let start = Instant::now();
+        let mut bucket = SessionRateBucket::new(3, 6, start);
+        assert!((0..3).all(|_| bucket.try_take(start)));
+        assert!(!bucket.try_take(start));
+        // Six a minute: the next one after ten seconds.
+        assert!(!bucket.try_take(start + Duration::from_secs(9)));
+        assert!(bucket.try_take(start + Duration::from_secs(10)));
+        assert!(!bucket.try_take(start + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn a_source_past_its_session_burst_is_refused_and_others_are_not() {
+        let config = WebRtcDirectConfig {
+            new_sessions_burst_per_ip: 2,
+            new_sessions_per_minute_per_ip: 0,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let source: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        let other: SocketAddr = "198.51.100.9:50000".parse().unwrap();
+        let first = resources.try_admit_connection(source).ok();
+        let second = resources.try_admit_connection(source).ok();
+        assert!(first.is_some() && second.is_some());
+        drop((first, second));
+        // Closed sessions don't give the allowance back: a source that
+        // opens and closes sessions in a loop runs out.
+        let refused = resources.try_admit_connection(source).err();
+        assert_eq!(refused.as_deref(), Some(SOURCE_SESSION_RATE_ERROR));
+        assert!(resources.try_admit_connection(other).is_ok());
+    }
     use ant_protocol::chunk::{
         PointerGetRequest, PointerGetResponse, PointerPutRequest, PointerPutResponse,
     };
