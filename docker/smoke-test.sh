@@ -11,8 +11,9 @@
 # kept; lowering NODE_COUNT retires a node; changing PORT_START moves the
 # nodes with identities kept; docker stop is clean and timely;
 # the node manager's disk-pressure eviction removes nodes (never the last)
-# when the disk is nearly full; a data folder mounted noexec is refused; and
-# production mode warns above 2 nodes.
+# when the disk is nearly full; a data folder mounted noexec is refused;
+# production mode warns above 2 nodes; the old PublicNode RPC_URL is pointed
+# out; and an RPC_URL of only spaces leaves the image's RPCs in place.
 set -euo pipefail
 
 IMAGE=${1:?usage: smoke-test.sh <image>}
@@ -25,13 +26,13 @@ COMMON=(--network host --stop-timeout 120 -e ANT_NETWORK_MODE=testnet -e REWARDS
 
 fail() {
     echo "FAILED: $*"
-    for c in seed smoke evict noexec; do
+    for c in seed smoke evict noexec rpc; do
         docker ps -a --format '{{.Names}}' | grep -qx $c || continue
         echo "--- $c log (last 40 lines)"; docker logs $c 2>&1 | grep -vE '^\s*$' | tail -40
     done
     exit 1
 }
-cleanup() { docker rm -f seed smoke evict noexec >/dev/null 2>&1 || true; sudo rm -rf "$WORK"; }
+cleanup() { docker rm -f seed smoke evict noexec rpc >/dev/null 2>&1 || true; sudo rm -rf "$WORK"; }
 trap cleanup EXIT
 
 count() { docker logs "$1" 2>&1 | grep -cE "$2" || true; }
@@ -123,12 +124,20 @@ echo "evicted: $evicted of 3"
 (( evicted == 2 )) || fail "expected 2 of 3 nodes evicted (never the last), got $evicted"
 docker exec evict nodes status >/dev/null || fail "node manager not answering after evictions"
 
-echo "== a data folder mounted noexec is refused; production mode warns above 2 nodes"
+echo "== a data folder mounted noexec is refused; production mode warns above 2 nodes; the old RPC_URL is pointed out"
 # In production mode although COMMON sets testnet: of two -e for the same
 # variable, Docker keeps the later one.
 docker run -d --name noexec "${COMMON[@]}" -e MANAGER_PORT=12604 --tmpfs /data:rw,noexec,size=100m \
-    -e ANT_NETWORK_MODE=production -e NODE_COUNT=3 -e PORT_START=10940 "$IMAGE" >/dev/null
+    -e ANT_NETWORK_MODE=production -e NODE_COUNT=3 -e PORT_START=10940 \
+    -e RPC_URL=https://robinhood-rpc.publicnode.com "$IMAGE" >/dev/null
 wait_for noexec 'mounted noexec' 1 30 || fail "a noexec data folder was not refused"
 (( $(count noexec 'WARNING: NODE_COUNT is 3') >= 1 )) || fail "no warning for 3 nodes in production mode"
+(( $(count noexec 'RPC_URL is PublicNode') >= 1 )) || fail "no notice for the old PublicNode RPC_URL"
+
+echo "== an RPC_URL of only spaces leaves the image's RPCs in place"
+# Refused at the noexec data folder too, which is checked after the settings.
+docker run -d --name rpc "${COMMON[@]}" -e MANAGER_PORT=12605 --tmpfs /data:rw,noexec,size=100m \
+    -e RPC_URL=" " -e PORT_START=10950 "$IMAGE" >/dev/null
+wait_for rpc 'mounted noexec' 1 30 || fail "an RPC_URL of only spaces was refused"
 
 echo "All smoke tests passed"
