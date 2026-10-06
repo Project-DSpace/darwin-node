@@ -869,11 +869,13 @@ On first startup, the node needs bootstrap peers to join the network.
 Upstream ships Autonomi's peers in `bootstrap_peers.toml` next to the binary;
 in this fork that file is empty, so pass Darwin's peers yourself, along with
 the Robinhood Chain payment settings (the binary otherwise checks payments on
-Arbitrum One):
+Arbitrum One). Set a fixed `--port` as well: the default, 0, picks a random
+port, which a node behind a router can't have forwarded (UDP):
 
 ```bash
 ./target/release/ant-node \
     --rewards-address 0xYOUR_WALLET_ADDRESS \
+    --port 10000 \
     --ipv4-only \
     --bootstrap "142.93.32.90:10000" \
     --bootstrap "165.22.193.90:10000" \
