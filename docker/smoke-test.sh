@@ -18,7 +18,9 @@ IMAGE=${1:?usage: smoke-test.sh <image>}
 WORK=$(mktemp -d)
 IP=$(hostname -I | awk '{print $1}')
 WALLET=0x000000000000000000000000000000000000dEaD   # test nodes earn nothing
-COMMON=(--network host --stop-timeout 120 -e REWARDS_ADDRESS=$WALLET -e PUID=$(id -u) -e PGID=$(id -g))
+# Testnet mode: the image defaults to production mode, which counts at most 2
+# nodes per IP, and every test node here runs on this one machine.
+COMMON=(--network host --stop-timeout 120 -e ANT_NETWORK_MODE=testnet -e REWARDS_ADDRESS=$WALLET -e PUID=$(id -u) -e PGID=$(id -g))
 
 fail() {
     echo "FAILED: $*"
@@ -120,9 +122,10 @@ echo "evicted: $evicted of 3"
 (( evicted == 2 )) || fail "expected 2 of 3 nodes evicted (never the last), got $evicted"
 docker exec evict nodes status >/dev/null || fail "node manager not answering after evictions"
 
-echo "== a data folder mounted noexec is refused"
-docker run -d --name noexec "${COMMON[@]}" -e MANAGER_PORT=12604 --tmpfs /data:rw,noexec,size=100m -e NODE_COUNT=1 \
-    -e PORT_START=10940 "$IMAGE" >/dev/null
+echo "== a data folder mounted noexec is refused; production mode warns above 2 nodes"
+docker run -d --name noexec "${COMMON[@]}" -e MANAGER_PORT=12604 --tmpfs /data:rw,noexec,size=100m \
+    -e ANT_NETWORK_MODE=production -e NODE_COUNT=3 -e PORT_START=10940 "$IMAGE" >/dev/null
 wait_for noexec 'mounted noexec' 1 30 || fail "a noexec data folder was not refused"
+(( $(count noexec 'WARNING: NODE_COUNT is 3') >= 1 )) || fail "no warning for 3 nodes in production mode"
 
 echo "All smoke tests passed"

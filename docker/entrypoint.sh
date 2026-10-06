@@ -40,6 +40,12 @@ done
 if (( NODE_COUNT > 6 )) && [[ "$ANT_NETWORK_MODE" == testnet ]]; then
     fail "NODE_COUNT is limited to 6 per machine while the network is in testnet mode"
 fi
+# In production mode a close group takes at most 2 nodes from one IP address,
+# so nodes beyond 2 add load without adding storage.
+if (( NODE_COUNT > 2 )) && [[ "$ANT_NETWORK_MODE" == production ]]; then
+    echo "WARNING: NODE_COUNT is $NODE_COUNT, but the network counts at most 2 nodes per IP address in any close group;" \
+        "nodes beyond 2 add load without adding storage. Set NODE_COUNT to 2."
+fi
 (( PORT_START >= 1024 && PORT_START <= 65536 - NODE_COUNT )) \
     || fail "PORT_START must leave room for $NODE_COUNT UDP ports between 1024 and 65535"
 if (( BROWSER_PORT_START != 0 )); then
@@ -52,8 +58,9 @@ fi
 if [[ -n "${STORAGE_LIMIT_GB:-}" && "${STORAGE_LIMIT_GB:-0}" != 0 ]]; then
     echo "STORAGE_LIMIT_GB is no longer used: nodes use the free space where /data lives."
 fi
-read -ra rpc_urls <<<"${RPC_URLS:-$RPC_URL}"
-(( ${#rpc_urls[@]} > 0 )) || fail "Set RPC_URL"
+# An operator's own RPC_URL replaces the image's RPC_URLS.
+read -ra rpc_urls <<<"${RPC_URL:-$RPC_URLS}"
+(( ${#rpc_urls[@]} > 0 )) || fail "Set RPC_URL or RPC_URLS"
 read -ra bootstrap <<<"$BOOTSTRAP_PEERS"
 
 # Settings every node inherits from the manager's environment.

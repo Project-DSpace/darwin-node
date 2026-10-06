@@ -23,24 +23,27 @@ COPY docker/entrypoint.sh /entrypoint.sh
 COPY docker/nodes /usr/local/bin/nodes
 RUN chmod 755 /opt/ant/ant-node /entrypoint.sh /usr/local/bin/nodes
 
-# Our network. Operators set REWARDS_ADDRESS, NODE_COUNT and usually
-# BROWSER_PORT_START; servers also set PUBLIC_IP and RPC_URLS. The rest change
-# only with a new image (for example the switch to the main token). Browser
-# access is off unless BROWSER_PORT_START is set (the Unraid template sets
-# 11000), so older installs don't advertise ports they never forwarded.
-# The XDG paths keep the node manager's state on the /data volume and let
-# `docker exec ... nodes` find it.
-ENV ANT_NETWORK_MODE=testnet \
+# Our network, set the way our servers run it: production mode (at most 2
+# nodes per IP count in any close group), IPv4 only, the 3 bootstrap servers,
+# and Robinhood Chain RPCs shared out over the nodes. Operators set
+# REWARDS_ADDRESS, NODE_COUNT and usually BROWSER_PORT_START; servers also set
+# PUBLIC_IP. RPC_URL, if set, replaces RPC_URLS with one provider of the
+# operator's choice. The token, vault and bootstrap peers change only with a
+# new image. Browser access is off unless BROWSER_PORT_START is set (the Unraid
+# template sets 11000), so older installs don't advertise ports they never
+# forwarded. The XDG paths keep the node manager's state on the /data volume
+# and let `docker exec ... nodes` find it.
+ENV ANT_NETWORK_MODE=production \
     ANT_EVM_PAYMENT_TOKEN=0x511f76a3de41f000ec11ea4fd212fb3587c6cef3 \
     ANT_EVM_PAYMENT_VAULT=0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B \
-    BOOTSTRAP_PEERS="142.93.32.90:10000 165.22.193.90:10000" \
-    RPC_URL=https://robinhood-rpc.publicnode.com \
-    RPC_URLS="" \
+    BOOTSTRAP_PEERS="142.93.32.90:10000 165.22.193.90:10000 142.93.96.232:10000" \
+    RPC_URL="" \
+    RPC_URLS="https://rpc.mainnet.chain.robinhood.com https://rpc.ordofi.network" \
     NODE_COUNT=1 \
     PORT_START=10000 \
     BROWSER_PORT_START=0 \
     PUBLIC_IP="" \
-    IPV4_ONLY=false \
+    IPV4_ONLY=true \
     MANAGER_PORT=12600 \
     PUID=99 \
     PGID=100 \
