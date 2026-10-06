@@ -1348,8 +1348,12 @@ mod tests {
         (listings, more)
     }
 
+    /// Wait for `condition`, checking every 20 ms. The background work the
+    /// tests wait for writes to disk, and with the whole suite running at
+    /// once a disk sync can take many seconds, so the deadline is far off:
+    /// a test that passes waits only as long as it needs.
     async fn wait_until(mut condition: impl AsyncFnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !condition().await {
             assert!(Instant::now() < deadline, "timed out");
             tokio::time::sleep(Duration::from_millis(20)).await;
