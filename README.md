@@ -1,12 +1,36 @@
-# ant-node
+# darwin-node
 
-**Quantum-proof nodes for the Darwin network.**
+**Quantum-proof storage nodes for the Darwin network.**
 
-ant-node is the next-generation node software for the Darwin decentralized network, replacing the legacy ant-node with future-proof cryptography and advanced network security.
+darwin-node is the node software for Darwin, our storage network. It is a fork
+of [Autonomi's ant-node](https://github.com/WithAutonomi/ant-node)
+(MIT/Apache-2.0) and keeps upstream's crate and binary name, `ant-node`. Most
+of this README is upstream's. Where it talks about the "legacy" network, it
+means Autonomi's earlier network, which Darwin never ran.
 
-Based on [Autonomi's ant-node](https://github.com/WithAutonomi/ant-node) (MIT/Apache-2.0).
+## What differs in this fork
 
-> **Why Upgrade?** Current legacy ant-node uses Ed25519/X25519 cryptography that will be broken by quantum computers. Data encrypted today can be harvested and decrypted later. ant-node uses FIPS-approved post-quantum algorithms to protect your data forever.
+- **Payments are in DARWIN on Robinhood Chain** (chain ID 4663): token
+  `0x511f76A3De41F000EC11EA4fD212fb3587c6cef3` through the payment vault
+  `0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B`, at prices set by
+  `PRICE_MULTIPLIER` in `vendor/ant-protocol` (32). The storage-node Docker
+  image sets this with `ANT_EVM_RPC_URL`, `ANT_EVM_PAYMENT_TOKEN` and
+  `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
+  (Autonomi's contracts): run it on Darwin only with those three set (see
+  [Join the Network](#join-the-network)).
+- **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
+  is empty on purpose, so an unconfigured node can't join Autonomi's network.
+  The image passes Darwin's bootstrap servers itself.
+- **Run nodes with the Docker image**: [docker/README.md](docker/README.md).
+  The network runs in production mode, which counts at most 2 nodes per IP
+  address in any close group, so run 2 nodes per IP.
+- **Releases are Linux x86_64 only**, built and signed by
+  `.github/workflows/release.yml`. Auto-upgrade reads this repository's
+  releases without credentials, so it does nothing while the repository is
+  private.
+- **Rate limits**: only new connections per IP and browser (WebRTC Direct)
+  sessions and requests are limited. Unpaid storage and quote requests are
+  not; see [Rate Limiting](#rate-limiting).
 
 ---
 
@@ -77,8 +101,8 @@ Even though self-encrypted data on the legacy network is secure, the legacy netw
 | **Trust System** | Manual metrics | EigenTrust++ with data integrity & replica health |
 | **Geographic Routing** | None | 7-region distribution (no entity holds multiple copies) |
 | **Eclipse Protection** | Limited | Diversity scoring, ASN limits, detection algorithms |
-| **Auto-Upgrade** | Manual | Cross-platform staged rollout with network protection |
-| **Rate Limiting** | Basic | 100 req/min per node, 500/min per IP |
+| **Auto-Upgrade** | Manual | Staged rollout of signed releases (this fork: Linux x86_64 only) |
+| **Rate Limiting** | Basic | New connections per IP; browser sessions and requests (see [Rate Limiting](#rate-limiting)) |
 | **Node Identity** | Ed25519 pubkey (unused, never signs data) | ML-DSA-65 pubkey (actively signs all operations) |
 | **Legacy Data** | N/A | Full support for classical encrypted data |
 
@@ -364,48 +388,20 @@ For connections, ant-node implements Happy Eyeballs:
 
 ## Migration from Legacy ant-node
 
-ant-node provides seamless migration from existing legacy ant-node installations.
-
-### Automatic Detection
-
-```bash
-# Auto-detect legacy ant-node data directories
-ant-node --migrate-ant-data auto
-```
-
-Searches common locations:
-- `~/.local/share/safe/node/`
-- `~/.safe/node/`
-- Platform-specific data directories
-
-### Migration Process
-
-1. **Scan**: Enumerate all record files in legacy ant-node `record_store/`
-2. **Classify**: Identify record types (Chunk, Register, Scratchpad, GraphEntry)
-3. **Decrypt**: Decrypt AES-256-GCM-SIV encrypted records
-4. **Upload**: Store on the Darwin network
-5. **Track**: Save progress for resume capability
-
-### Progress Tracking
-
-Migration can be interrupted and resumed:
-
-```bash
-# Migration continues from last checkpoint
-ant-node --migrate-ant-data ~/.local/share/safe/node
-```
+> **Not in this code.** This section is upstream's design for moving data
+> from Autonomi's legacy network. Neither upstream v0.21.0 nor this fork has
+> the migration tool: there is no `--migrate-ant-data` flag, no `[migration]`
+> config section and no legacy-network payment check. It does not apply to
+> Darwin, which has no legacy network.
 
 ### Payment Model
 
-| Data Type | Payment |
-|-----------|---------|
-| **Legacy network data** | FREE (already paid) |
-| **New data** | EVM payment (Arbitrum One) |
+Every new record is paid for on chain. In Darwin that is DARWIN on Robinhood
+Chain (see [What differs in this fork](#what-differs-in-this-fork)).
 
-The three-layer verification:
+Verification:
 1. **LRU Cache**: Fast lookup of recently verified XorNames
-2. **Legacy Check**: Query the legacy network for existing data
-3. **EVM Verification**: Verify on-chain payment for new data
+2. **EVM Verification**: Verify on-chain payment for new data
 
 ### CRDT Data: The Identity Challenge
 
@@ -554,20 +550,15 @@ The goal is not to maintain classical crypto forever, but to provide a **clean m
 |-----------|--------|-------------|
 | **Core Library** | Complete | Full node implementation with client APIs |
 | **Data Types** | Complete | Chunk, Scratchpad, Pointer, GraphEntry |
-| **Payment Verification** | Complete | Legacy network lookup + EVM verification + LRU cache |
-| **Migration Decryption** | Complete | AES-256-GCM-SIV decryption for legacy ant-node data |
-| **Auto-Upgrade** | Complete | Cross-platform with ML-DSA-65 signature verification |
+| **Payment Verification** | Complete | EVM verification + LRU cache |
+| **Auto-Upgrade** | Complete | ML-DSA-65 signature verification; this fork releases Linux x86_64 only |
 | **E2E Test Infrastructure** | Complete | Real P2P testnet with 25+ nodes |
 
 ### Test Coverage
 
-```
-Library Unit Tests:     104 passing
-E2E Unit Tests:          35 passing
-E2E Integration Tests:   49 passing (real P2P testnet)
-------------------------------------
-Total:                  188 tests
-```
+Run `cargo test --features test-utils` (the EVM tests need Foundry's
+`anvil`). The library alone has about 1,300 tests. CI runs the suite on every
+push to main (`.github/workflows/test.yml`).
 
 ### Data Types Supported
 
@@ -580,27 +571,10 @@ Total:                  188 tests
 
 ### Migration Capability
 
-The migration system is **fully implemented** and ready for use:
-
-1. **Decryption Module** (`src/migration/decrypt.rs`)
-   - AES-256-GCM-SIV decryption with HKDF key derivation
-   - Handles embedded nonces from legacy ant-node format
-   - Full round-trip encryption/decryption verified
-
-2. **Scanner Module** (`src/migration/scanner.rs`)
-   - Auto-detection of legacy ant-node data directories
-   - Cross-platform path discovery
-   - Record enumeration and classification
-
-3. **Client APIs** (`src/client/`)
-   - `QuantumClient`: Pure Darwin (PQ) network operations
-   - `LegacyClient`: Read-only access to the legacy network
-   - `HybridClient`: Seamless access to both networks
-
-4. **Payment Verification** (`src/payment/`)
-   - Three-layer verification: LRU cache -> legacy network lookup -> EVM check
-   - Legacy data is FREE (already paid on the legacy network)
-   - New data requires EVM payment (Arbitrum One)
+None in this code: there is no `src/migration`, and `src/client/` only
+re-exports the shared protocol types from `ant_protocol` (the client is
+[darwin-client](https://github.com/Project-DSpace/darwin-client)). Payment
+verification (`src/payment/`) checks the LRU cache, then the payment on chain.
 
 ### E2E Test Infrastructure
 
@@ -629,17 +603,15 @@ default immutable file is published at startup, see
 |-------|--------|--------|
 | **Phase 1** | Core implementation | Complete |
 | **Phase 2** | E2E test infrastructure | Complete |
-| **Phase 3** | Testnet deployment | In Progress |
-| **Phase 4** | Migration tooling CLI | Planned |
-| **Phase 5** | Mainnet preparation | Planned |
+| **Phase 3** | Darwin production network | Running since 2026-10-06 |
 
 ---
 
 ## Auto-Upgrade System
 
-ant-node automatically stays up-to-date with secure, verified upgrades across **all platforms** - Windows, macOS, and Linux.
+ant-node automatically stays up-to-date with secure, verified upgrades. Upstream releases for Windows, macOS and Linux; this fork releases **Linux x86_64 only** (`ant-node-cli-linux-x64`), so nodes on other platforms don't upgrade themselves. Nodes read the releases of `Project-DSpace/darwin-node` without credentials, so while the repository is private they find none and stay on their version until their container is recreated.
 
-### Cross-Platform Support
+### Cross-Platform Support (upstream)
 
 | Platform | Architecture | Binary |
 |----------|--------------|--------|
@@ -742,6 +714,8 @@ stop_on_upgrade = false  # Set true when running under a service manager
 ## Running as a Service
 
 For production deployments, run ant-node under a service manager so it restarts automatically after upgrades.
+
+In Darwin, use the Docker image ([docker/README.md](docker/README.md)) instead. If you run the binary under a service manager anyway, add the settings from [Join the Network](#join-the-network) to the command line, since the examples below would start a node with no peers that checks payments on Arbitrum One. This fork releases Linux x86_64 only, so the macOS and Windows examples apply to builds from source.
 
 ### systemd (Linux)
 
@@ -872,7 +846,7 @@ ant-node
 ```bash
 # Clone the repository
 git clone https://github.com/Project-DSpace/darwin-node
-cd ant-node
+cd darwin-node
 
 # Build release binary
 cargo build --release
@@ -891,21 +865,24 @@ cargo build --release
 ### Join the Network
 
 On first startup, the node needs bootstrap peers to join the network.
-Production bootstrap peers are shipped in `bootstrap_peers.toml` alongside
-the binary and are loaded automatically:
-
-```bash
-# Starts and auto-discovers bootstrap_peers.toml next to the binary
-./target/release/ant-node
-```
-
-You can also specify bootstrap peers explicitly:
+Upstream ships Autonomi's peers in `bootstrap_peers.toml` next to the binary;
+in this fork that file is empty, so pass Darwin's peers yourself, along with
+the Robinhood Chain payment settings (the binary otherwise checks payments on
+Arbitrum One):
 
 ```bash
 ./target/release/ant-node \
-    --bootstrap "10.0.0.1:10000" \
-    --bootstrap "10.0.0.2:10000"
+    --rewards-address 0xYOUR_WALLET_ADDRESS \
+    --ipv4-only \
+    --bootstrap "142.93.32.90:10000" \
+    --bootstrap "165.22.193.90:10000" \
+    --bootstrap "142.93.96.232:10000" \
+    --evm-rpc-url https://rpc.mainnet.chain.robinhood.com \
+    --evm-payment-token 0x511f76A3De41F000EC11EA4fD212fb3587c6cef3 \
+    --evm-payment-vault 0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B
 ```
+
+The Docker image does all of this for you ([docker/README.md](docker/README.md)).
 
 ### Full Configuration
 
@@ -914,7 +891,7 @@ You can also specify bootstrap peers explicitly:
     --root-dir ~/.ant-node \
     --port 12000 \
     --upgrade-channel stable \
-    --migrate-ant-data auto \
+    --enable-logging \
     --log-level info
 ```
 
@@ -942,13 +919,23 @@ Options:
         Bootstrap peer socket addresses (can be specified multiple times)
         Example: 1.2.3.4:10000
 
-    --migrate-ant-data <PATH>
-        Path to legacy ant-node data directory to migrate
-        Use 'auto' for automatic detection
-
     --upgrade-channel <CHANNEL>
         Release channel: stable, beta
         [default: stable]
+
+    --network-mode <MODE>
+        production, testnet or development
+        [default: production]
+
+    --rewards-address <ADDRESS>
+        Wallet that receives storage fees
+
+    --evm-rpc-url <URL>, --evm-payment-token <ADDRESS>, --evm-payment-vault <ADDRESS>
+        Custom EVM network; all three together replace --evm-network
+        (default: arbitrum-one). Darwin: Robinhood Chain, DARWIN token and vault
+
+    --enable-logging
+        Turn on log output; the other --log-* options need it
 
     --log-level <LEVEL>
         Log verbosity: trace, debug, info, warn, error
@@ -960,6 +947,8 @@ Options:
     -V, --version
         Print version information
 ```
+
+Run `ant-node --help` for the full list.
 
 ---
 
@@ -976,7 +965,8 @@ Configuration sources (highest to lowest priority):
 
 The `bootstrap_peers.toml` file provides initial peers for joining the network.
 It is shipped alongside the binary in release archives and auto-discovered on startup
-when no `--bootstrap` CLI argument is provided.
+when no `--bootstrap` CLI argument is provided. In this fork the shipped file
+is empty (`peers = []`); pass peers with `--bootstrap` or `ANT_BOOTSTRAP`.
 
 **Format:**
 ```toml
@@ -1008,10 +998,18 @@ peers = [
 ```bash
 export ANT_ROOT_DIR=~/.ant-node
 export ANT_PORT=12000
-export ANT_LOG_LEVEL=info
-export ANT_AUTO_UPGRADE=true
 export ANT_UPGRADE_CHANNEL=stable
+export ANT_NETWORK_MODE=production
+export ANT_IPV4_ONLY=true
+export ANT_REWARDS_ADDRESS=0xYOUR_WALLET_ADDRESS
+export ANT_EVM_RPC_URL=https://rpc.mainnet.chain.robinhood.com
+export ANT_EVM_PAYMENT_TOKEN=0x511f76A3De41F000EC11EA4fD212fb3587c6cef3
+export ANT_EVM_PAYMENT_VAULT=0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B
+export RUST_LOG=info   # log level, with ANT_ENABLE_LOGGING=true
 ```
+
+Every option has an `ANT_*` variable; `ant-node --help` lists them.
+Upgrades are always on: there is no switch to turn them off.
 
 ### Configuration File
 
@@ -1031,23 +1029,12 @@ channel = "stable"
 check_interval_hours = 1
 github_repo = "Project-DSpace/darwin-node"
 stop_on_upgrade = false
-
-[migration]
-auto_detect = true
-# ant_data_path = "~/.local/share/safe/node"  # Explicit path
-
-[payment]
-# Verification of legacy data against the legacy network
-autonomi_enabled = true
-autonomi_timeout_secs = 30
-
-# EVM verification for new data
-evm_enabled = true
-evm_network = "arbitrum-one"
-
-# Cache configuration
-cache_capacity = 100000
 ```
+
+The file can't set payments: the command line (or its `ANT_*` variables)
+always sets the rewards address, the EVM network and the cache, and replaces
+any `[payment]` section. The same goes for `network_mode` and the upgrade
+channel. There is no `[migration]` section.
 
 ---
 
@@ -1055,13 +1042,16 @@ cache_capacity = 100000
 
 ### Rate Limiting
 
-Protects against denial-of-service attacks:
+What is limited:
 
-| Limit | Value |
-|-------|-------|
-| Requests per node per minute | 100 |
-| Requests per IP per minute | 500 |
-| Concurrent connections per IP | 10 |
+| Limit | Where | Value |
+|-------|-------|-------|
+| New connections per IP | saorsa-core transport | 1,000 per 60 s, burst 100 |
+| Browser (WebRTC Direct) sessions and requests | `WebRtcDirectConfig` in `src/config.rs` | per IP, per session and in total |
+
+Not limited (a known gap): unpaid chunk PUTs and quote requests over the
+storage protocol. A peer holding quotes can send unpaid PUTs, and each one
+costs the node chain RPC calls.
 
 ### Blacklist Management
 
@@ -1137,7 +1127,7 @@ cargo fmt
 
 ---
 
-**ant-node**: Securing the future of decentralized data, one quantum-proof node at a time.
+**darwin-node**: Securing the future of decentralized data, one quantum-proof node at a time.
 
 ### Shared browser application protocol
 
