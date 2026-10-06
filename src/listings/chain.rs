@@ -143,11 +143,12 @@ struct VaultLog {
 }
 
 impl Chain {
-    /// A client for the chain at `rpc_url`.
+    /// Tests only: a client for the chain at `rpc_url` alone.
     ///
     /// # Errors
     ///
     /// Returns an error if the HTTP client can't be built.
+    #[cfg(test)]
     pub fn new(rpc_url: String) -> Result<Self> {
         Self::with_rpcs(vec![rpc_url])
     }
