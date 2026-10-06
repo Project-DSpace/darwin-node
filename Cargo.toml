@@ -243,8 +243,14 @@ webrtc = { path = "vendor/webrtc" }
 # Copy-free sends (ADR-0017): saorsa-core's `send_message` takes
 # `impl Into<Bytes>`, and saorsa-transport writes owned buffers to QUIC
 # streams without copying. Drop both once releases include them.
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "c0022b871961c7f373f2ccde815385816962de98" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
+# Fetched from our mirrors of upstream's repos: these commits sit on an
+# upstream feature branch that may be deleted once merged.
+saorsa-core = { git = "https://github.com/Project-DSpace/saorsa-core", rev = "c0022b871961c7f373f2ccde815385816962de98" }
+saorsa-transport = { git = "https://github.com/Project-DSpace/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
+
+# saorsa-core names saorsa-transport by upstream's git URL: the same mirror.
+[patch."https://github.com/WithAutonomi/saorsa-transport"]
+saorsa-transport = { git = "https://github.com/Project-DSpace/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
 
 [profile.release]
 lto = true
