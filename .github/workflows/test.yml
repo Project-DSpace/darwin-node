@@ -45,15 +45,19 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
 
       - name: Build the tests
+        id: build
         run: cargo test --locked --features test-utils --no-run
 
       - name: Library and binaries
         run: cargo test --locked --features test-utils --lib --bins
 
-      # One target at a time, so every target reports even if an earlier one
-      # fails. The ones upstream ran single-threaded (e2e flakes on hosted
-      # runners otherwise; the disk tests measure the disk) still are.
+      # Run whether or not the library tests passed, as long as the tests
+      # built, and one target at a time, so every target reports even if an
+      # earlier one fails. The ones upstream ran single-threaded (e2e flakes
+      # on hosted runners otherwise; the disk tests measure the disk) still
+      # are.
       - name: Integration tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         run: |
           shopt -s nullglob
