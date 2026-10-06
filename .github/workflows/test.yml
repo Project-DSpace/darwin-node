@@ -1,0 +1,67 @@
+# Runs the test suite on every push to main: the library and binaries, then
+# each integration test. Kept apart from build.yml so a failing test doesn't
+# stop the image from being built; check both before tagging a release.
+#
+# Upstream ran these on pull requests (their ci.yml, removed in 09d41b4). We
+# push to main, so this runs there. The EVM tests start a local Anvil chain,
+# hence Foundry.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build the tests
+        run: cargo test --locked --features test-utils --no-run
+
+      - name: Library and binaries
+        run: cargo test --locked --features test-utils --lib --bins
+
+      # One target at a time, so every target reports even if an earlier one
+      # fails. The ones upstream ran single-threaded (e2e flakes on hosted
+      # runners otherwise; the disk tests measure the disk) still are.
+      - name: Integration tests
+        shell: bash
+        run: |
+          shopt -s nullglob
+          serial=" e2e migration_reclaims_disk migration_crash_safety storage_scale "
+          failed=()
+          for target in tests/*.rs tests/*/mod.rs; do
+            name=${target#tests/}; name=${name%/mod.rs}; name=${name%.rs}
+            args=()
+            if [[ "$serial" == *" $name "* ]]; then args=(-- --test-threads=1); fi
+            echo "::group::$name"
+            cargo test --locked --features test-utils --test "$name" "${args[@]}" || failed+=("$name")
+            echo "::endgroup::"
+          done
+          if (( ${#failed[@]} > 0 )); then
+            echo "::error::failed: ${failed[*]}"
+            exit 1
+          fi
