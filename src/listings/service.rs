@@ -29,7 +29,7 @@
 //! A listing is deleted with its chunk. Listings are served on
 //! [`ant_listings::TOPIC`].
 
-use super::chain::{Chain, Fetched, Search};
+use super::chain::{listings_rpc_urls, Chain, Fetched, Search};
 use super::store::ListingStore;
 use crate::ant_protocol::{XorName, CLOSE_GROUP_SIZE};
 use crate::error::{Error, Result};
@@ -188,7 +188,7 @@ impl ListingService {
         let service = Arc::new(Self {
             store,
             chunks: Arc::clone(&chunks),
-            chain: Chain::new(rpc_url)?,
+            chain: Chain::with_rpcs(listings_rpc_urls(&rpc_url))?,
             vault,
             p2p: RwLock::new(None),
             waiting: Waiting::default(),

@@ -12,6 +12,7 @@ use ant_listings::{ListingPayment, Lookup, PaymentLog, PaymentReceipt, DATA_PAYM
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -87,16 +88,48 @@ impl Search {
     }
 }
 
+/// Robinhood Chain's public RPCs. A node on one of them reads listings'
+/// payments through the others too: a provider can refuse a method these
+/// reads need (PublicNode refuses `eth_getLogs`, which finding a payment
+/// whose transaction hash is hidden takes).
+const ROBINHOOD_PUBLIC_RPCS: [&str; 3] = [
+    "https://robinhood-rpc.publicnode.com",
+    "https://rpc.ordofi.network",
+    "https://rpc.mainnet.chain.robinhood.com",
+];
+
+/// The RPCs a node on `rpc_url` reads listings' payments through: its own,
+/// then, if it is one of Robinhood Chain's public RPCs, the others. Payments
+/// for storage are checked through `rpc_url` alone, as before.
+#[must_use]
+pub fn listings_rpc_urls(rpc_url: &str) -> Vec<String> {
+    let own = rpc_url.trim_end_matches('/');
+    let mut urls = vec![rpc_url.to_string()];
+    if ROBINHOOD_PUBLIC_RPCS.contains(&own) {
+        urls.extend(
+            ROBINHOOD_PUBLIC_RPCS
+                .iter()
+                .filter(|url| **url != own)
+                .map(|url| (*url).to_string()),
+        );
+    }
+    urls
+}
+
 /// A JSON-RPC client for the payment chain.
 pub struct Chain {
     http: reqwest::Client,
-    rpc_url: String,
+    /// The RPCs to read through. A call starts at the last one that
+    /// answered and moves on to the next when one fails.
+    rpc_urls: Vec<String>,
+    /// Index in `rpc_urls` of the last RPC that answered.
+    answered: AtomicUsize,
     /// The timestamps of blocks read so far, by block number, used only to
     /// narrow searches for the block at a time.
     known_blocks: Mutex<BTreeMap<u64, u64>>,
     /// Bounds the searches for a quote's payment by time running at once.
     time_searches: Semaphore,
-    /// Tests only: a mock chain answering every call in place of `rpc_url`.
+    /// Tests only: a mock chain answering every call in place of the RPCs.
     #[cfg(test)]
     mock: Mutex<Option<std::sync::Arc<Mutex<tests::MockChain>>>>,
 }
@@ -116,13 +149,27 @@ impl Chain {
     ///
     /// Returns an error if the HTTP client can't be built.
     pub fn new(rpc_url: String) -> Result<Self> {
+        Self::with_rpcs(vec![rpc_url])
+    }
+
+    /// A client for the chain through `rpc_urls`, first to last.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rpc_urls` is empty or the HTTP client can't be
+    /// built.
+    pub fn with_rpcs(rpc_urls: Vec<String>) -> Result<Self> {
+        if rpc_urls.is_empty() {
+            return Err(Error::Network("listings RPC client: no RPC".into()));
+        }
         let http = reqwest::Client::builder()
             .timeout(RPC_TIMEOUT)
             .build()
             .map_err(|e| Error::Network(format!("listings RPC client: {e}")))?;
         Ok(Self {
             http,
-            rpc_url,
+            rpc_urls,
+            answered: AtomicUsize::new(0),
             known_blocks: Mutex::new(BTreeMap::new()),
             time_searches: Semaphore::new(MAX_TIME_SEARCHES),
             #[cfg(test)]
@@ -515,6 +562,8 @@ impl Chain {
         Ok(fetched)
     }
 
+    /// Call `method` on the RPC that last answered, then on the others in
+    /// turn until one answers; every RPC's error if none does.
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         #[cfg(test)]
         {
@@ -523,9 +572,30 @@ impl Chain {
                 return rpc_result(method, &mock.lock().answer(method, &params));
             }
         }
+        let count = self.rpc_urls.len();
+        let first = self.answered.load(Ordering::Relaxed) % count;
+        let mut errors = Vec::new();
+        for index in (0..count).map(|offset| (first + offset) % count) {
+            match self.call_rpc(&self.rpc_urls[index], method, &params).await {
+                Ok(result) => {
+                    self.answered.store(index, Ordering::Relaxed);
+                    return Ok(result);
+                }
+                Err(e) => {
+                    if count > 1 {
+                        crate::logging::debug!("{e} (RPC {index} of {count})");
+                    }
+                    errors.push(e.to_string());
+                }
+            }
+        }
+        Err(Error::Network(errors.join("; ")))
+    }
+
+    async fn call_rpc(&self, rpc_url: &str, method: &str, params: &Value) -> Result<Value> {
         let response: Value = self
             .http
-            .post(&self.rpc_url)
+            .post(rpc_url)
             .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
             .send()
             .await
@@ -671,6 +741,9 @@ pub mod tests {
         pub calls: Vec<String>,
         /// The first and last block of every `eth_getLogs` call made.
         pub log_ranges: Vec<(u64, u64)>,
+        /// Methods answered with HTTP 403 when served, as PublicNode
+        /// answers `eth_getLogs`.
+        pub refused: Vec<&'static str>,
     }
 
     impl MockChain {
@@ -767,15 +840,28 @@ pub mod tests {
                     tokio::spawn(async move {
                         while let Some(body) = read_request(&mut socket).await {
                             let request: Value = serde_json::from_slice(&body).unwrap();
-                            let response = chain
-                                .lock()
-                                .answer(request["method"].as_str().unwrap(), &request["params"]);
-                            let body = response.to_string();
-                            let reply = format!(
-                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                                 content-length: {}\r\n\r\n{body}",
-                                body.len()
-                            );
+                            let method = request["method"].as_str().unwrap();
+                            let response = {
+                                let mut chain = chain.lock();
+                                if chain.refused.iter().any(|refused| *refused == method) {
+                                    chain.calls.push(method.to_string());
+                                    None
+                                } else {
+                                    Some(chain.answer(method, &request["params"]))
+                                }
+                            };
+                            let reply = match response {
+                                Some(response) => {
+                                    let body = response.to_string();
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                         content-length: {}\r\n\r\n{body}",
+                                        body.len()
+                                    )
+                                }
+                                None => "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n"
+                                    .to_string(),
+                            };
                             if socket.write_all(reply.as_bytes()).await.is_err() {
                                 return;
                             }
@@ -1130,6 +1216,68 @@ pub mod tests {
     fn widest_log_range(mock: &Mutex<MockChain>) -> Option<u64> {
         let ranges = std::mem::take(&mut mock.lock().log_ranges);
         ranges.iter().map(|(from, to)| to - from + 1).max()
+    }
+
+    #[tokio::test]
+    async fn a_call_an_rpc_refuses_goes_to_the_next_one() {
+        // The first RPC refuses eth_getLogs, as PublicNode does; the second
+        // answers everything. A quote's payment is found by its logs.
+        let mut refusing = chain_with(1000, &[(900, 5)]);
+        refusing.refused = vec!["eth_getLogs"];
+        let refusing = Arc::new(Mutex::new(refusing));
+        let answering = Arc::new(Mutex::new(chain_with(1000, &[(900, 5)])));
+        let urls = vec![
+            MockChain::serve(Arc::clone(&refusing)).await,
+            MockChain::serve(Arc::clone(&answering)).await,
+        ];
+        let lookup = Lookup::Quote {
+            quote_hash: [5; 32],
+            block_number: None,
+            search_from: 0,
+            not_after: None,
+        };
+        let shown = ListingPayment::default();
+
+        // Through the refusing RPC alone, the search fails.
+        let alone = Chain::new(urls[0].clone()).unwrap();
+        let error = alone.fetch(&lookup, &shown, &VAULT, Search::Brief).await;
+        assert!(format!("{error:?}").contains("403"), "{error:?}");
+
+        // With the second behind it, the payment is found.
+        let chain = Chain::with_rpcs(urls).unwrap();
+        let found = chain.fetch(&lookup, &shown, &VAULT, Search::Brief).await;
+        assert_eq!(found.unwrap().len(), 1);
+        assert!(log_calls(&answering) > 0);
+        // Later calls start at the RPC that answered.
+        let refused_before = refusing.lock().calls.len();
+        let found = chain.fetch(&lookup, &shown, &VAULT, Search::Brief).await;
+        assert_eq!(found.unwrap().len(), 1);
+        assert_eq!(refusing.lock().calls.len(), refused_before);
+    }
+
+    #[test]
+    fn a_node_on_a_public_rpc_reads_listings_through_the_others_too() {
+        assert_eq!(
+            listings_rpc_urls("https://robinhood-rpc.publicnode.com/"),
+            vec![
+                "https://robinhood-rpc.publicnode.com/",
+                "https://rpc.ordofi.network",
+                "https://rpc.mainnet.chain.robinhood.com",
+            ]
+        );
+        assert_eq!(
+            listings_rpc_urls("https://rpc.mainnet.chain.robinhood.com"),
+            vec![
+                "https://rpc.mainnet.chain.robinhood.com",
+                "https://robinhood-rpc.publicnode.com",
+                "https://rpc.ordofi.network",
+            ]
+        );
+        // Its own provider, or a local chain: that one alone.
+        assert_eq!(
+            listings_rpc_urls("http://127.0.0.1:8545"),
+            vec!["http://127.0.0.1:8545"]
+        );
     }
 
     #[tokio::test]
