@@ -11,7 +11,8 @@
 # kept; lowering NODE_COUNT retires a node; changing PORT_START moves the
 # nodes with identities kept; docker stop is clean and timely;
 # the node manager's disk-pressure eviction removes nodes (never the last)
-# when the disk is nearly full; and a data folder mounted noexec is refused.
+# when the disk is nearly full; a data folder mounted noexec is refused; and
+# production mode warns above 2 nodes.
 set -euo pipefail
 
 IMAGE=${1:?usage: smoke-test.sh <image>}
@@ -123,6 +124,8 @@ echo "evicted: $evicted of 3"
 docker exec evict nodes status >/dev/null || fail "node manager not answering after evictions"
 
 echo "== a data folder mounted noexec is refused; production mode warns above 2 nodes"
+# In production mode although COMMON sets testnet: of two -e for the same
+# variable, Docker keeps the later one.
 docker run -d --name noexec "${COMMON[@]}" -e MANAGER_PORT=12604 --tmpfs /data:rw,noexec,size=100m \
     -e ANT_NETWORK_MODE=production -e NODE_COUNT=3 -e PORT_START=10940 "$IMAGE" >/dev/null
 wait_for noexec 'mounted noexec' 1 30 || fail "a noexec data folder was not refused"
