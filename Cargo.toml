@@ -243,9 +243,10 @@ ant-protocol = { path = "vendor/ant-protocol" }
 webrtc = { path = "vendor/webrtc" }
 # Copy-free sends (ADR-0017): saorsa-core's `send_message` takes
 # `impl Into<Bytes>`, and saorsa-transport writes owned buffers to QUIC
-# streams without copying. Drop both once releases include them.
-# Fetched from our mirrors of upstream's repos: these commits sit on an
-# upstream feature branch that may be deleted once merged.
+# streams without copying. Upstream merged both into main on 2026-10-06
+# (saorsa-core #166, saorsa-transport #171), but no crates.io release has
+# them yet (saorsa-core 0.28.0, saorsa-transport 0.37.0): drop both pins once
+# releases include them. Fetched from our mirrors of upstream's repos.
 saorsa-core = { git = "https://github.com/Project-DSpace/saorsa-core", rev = "c0022b871961c7f373f2ccde815385816962de98" }
 saorsa-transport = { git = "https://github.com/Project-DSpace/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
 
