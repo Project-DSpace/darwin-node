@@ -61,13 +61,44 @@ pub(crate) async fn browser_payment_network(
     let chain_id = match network {
         evmlib::Network::ArbitrumOne => 42_161,
         evmlib::Network::ArbitrumSepoliaTest => 421_614,
-        evmlib::Network::Custom(_) => payment_chain_id(network.rpc_url()).await?,
+        evmlib::Network::Custom(_) => payment_chain_id_retrying(network.rpc_url()).await?,
     };
     Ok(BrowserPaymentNetwork {
         chain_id,
         payment_token_address: format!("{:?}", network.payment_token_address()),
         payment_vault_address: format!("{:?}", network.payment_vault_address()),
     })
+}
+
+/// Rounds of chain ID reads at start before the node gives up: one failed
+/// read must not keep it down.
+#[cfg(any(feature = "webrtc-direct", test))]
+const CHAIN_ID_ROUNDS: u32 = 4;
+
+/// The chain ID through `rpc_url`, then through the other public RPCs of the
+/// same chain ([`crate::listings::listings_rpc_urls`]), in rounds 2, 4 and 8 s
+/// apart; the last error if no RPC answers in any round.
+#[cfg(any(feature = "webrtc-direct", test))]
+async fn payment_chain_id_retrying(rpc_url: &reqwest::Url) -> crate::Result<u64> {
+    let urls: Vec<reqwest::Url> = crate::listings::listings_rpc_urls(rpc_url.as_str())
+        .iter()
+        .filter_map(|url| url.parse().ok())
+        .collect();
+    let mut last = None;
+    for round in 0..CHAIN_ID_ROUNDS {
+        if round > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1 << round)).await;
+        }
+        for url in &urls {
+            match payment_chain_id(url).await {
+                Ok(chain_id) => return Ok(chain_id),
+                Err(e) => last = Some(e),
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        crate::Error::Config("no RPC to read the custom EVM chain ID from".to_string())
+    }))
 }
 
 #[cfg(any(feature = "webrtc-direct", test))]
@@ -164,7 +195,46 @@ impl BrowserDevnetManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::browser_payment_network;
+    use super::{browser_payment_network, payment_chain_id_retrying};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An RPC answering `eth_chainId` with 4663, after failing its first
+    /// `failures` requests with HTTP 503; its URL and the request count.
+    async fn flaky_rpc(failures: usize) -> (reqwest::Url, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = vec![0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let reply = if seen.fetch_add(1, Ordering::SeqCst) < failures {
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_string()
+                } else {
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":"0x1237"}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (url, count)
+    }
+
+    #[tokio::test]
+    async fn a_failed_chain_id_read_at_start_is_tried_again() {
+        let (url, count) = flaky_rpc(1).await;
+        assert_eq!(payment_chain_id_retrying(&url).await.unwrap(), 4663);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn builtin_payment_identity_contains_only_chain_and_contracts(

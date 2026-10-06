@@ -16,4 +16,5 @@ mod chain;
 mod service;
 mod store;
 
+pub(crate) use chain::listings_rpc_urls;
 pub use service::ListingService;
