@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.21.0+ds.4"
+version = "0.21.0+ds.5"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Darwin decentralized network"
@@ -237,6 +237,9 @@ webrtc-direct = [
 
 [patch.crates-io]
 ant-protocol = { path = "vendor/ant-protocol" }
+# Closing a browser session cancels a DTLS handshake still in progress
+# (vendor/webrtc/VENDORED.md).
+webrtc = { path = "vendor/webrtc" }
 # Copy-free sends (ADR-0017): saorsa-core's `send_message` takes
 # `impl Into<Bytes>`, and saorsa-transport writes owned buffers to QUIC
 # streams without copying. Drop both once releases include them.
