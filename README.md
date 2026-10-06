@@ -732,7 +732,7 @@ ant-node --upgrade-channel beta
 [upgrade]
 channel = "stable"
 check_interval_hours = 1
-github_repo = "Project-DSpace/ant-node"
+github_repo = "Project-DSpace/darwin-node"
 stop_on_upgrade = false  # Set true when running under a service manager
 # staged_rollout_hours = 24  # For staged rollout
 ```
@@ -871,7 +871,7 @@ ant-node
 
 ```bash
 # Clone the repository
-git clone https://github.com/Project-DSpace/ant-node
+git clone https://github.com/Project-DSpace/darwin-node
 cd ant-node
 
 # Build release binary
@@ -1029,7 +1029,7 @@ bootstrap = [
 # Upgrades are always enabled; configure behavior here
 channel = "stable"
 check_interval_hours = 1
-github_repo = "Project-DSpace/ant-node"
+github_repo = "Project-DSpace/darwin-node"
 stop_on_upgrade = false
 
 [migration]
@@ -1100,7 +1100,7 @@ RUST_LOG=ant_node=debug,saorsa_core=debug ./ant-node
 |---------|-------------|------------|
 | **saorsa-core** | Core networking and security library | [github.com/WithAutonomi/saorsa-core](https://github.com/WithAutonomi/saorsa-core) |
 | **saorsa-pqc** | Post-quantum cryptography primitives | [github.com/WithAutonomi/saorsa-pqc](https://github.com/WithAutonomi/saorsa-pqc) |
-| **darwin** | Client CLI for file and chunk operations with EVM payments | [github.com/Project-DSpace/ant-client](https://github.com/Project-DSpace/ant-client) |
+| **darwin** | Client CLI for file and chunk operations with EVM payments | [github.com/Project-DSpace/darwin-client](https://github.com/Project-DSpace/darwin-client) |
 
 ---
 

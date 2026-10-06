@@ -4,7 +4,7 @@
 # local devnet with EVM payments.
 #
 # This script:
-# 1. Builds ant-devnet (this repo) and the `ant` CLI (../ant-client)
+# 1. Builds ant-devnet (this repo) and the `darwin` CLI (../darwin-client)
 # 2. Starts a devnet with EVM payment enforcement (Anvil + nodes)
 # 3. Uploads a small random file for every combination of readable (yes/no),
 #    in the index (yes/no) and the 32 sets of shown payment fields. For each:
@@ -34,7 +34,7 @@
 # (`start_node`), as `tests/e2e/testnet.rs` does.
 #
 # Environment:
-#   ANT_CLIENT_DIR               ant-client checkout (default: ../ant-client)
+#   ANT_CLIENT_DIR               darwin-client checkout (default: ../darwin-client)
 #   ANT_TEST_SKIP_BUILD=1        don't build; use ANT_DEVNET and ANT_CLI
 #   ANT_DEVNET, ANT_CLI          binaries (default: the builds below)
 #   ANT_TEST_CARGO_PROFILE       cargo profile to build (default: release)
@@ -56,7 +56,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ANT_CLIENT_DIR="${ANT_CLIENT_DIR:-${PROJECT_DIR}/../ant-client}"
+ANT_CLIENT_DIR="${ANT_CLIENT_DIR:-${PROJECT_DIR}/../darwin-client}"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ant_e2e_listings.XXXXXX")"
 MANIFEST_FILE="${WORK_DIR}/manifest.json"
 CHAIN_ONLY_MANIFEST="${WORK_DIR}/chain-only-manifest.json"
@@ -884,12 +884,12 @@ else
     profile_dir="${CARGO_PROFILE}"
     [ "${profile_dir}" = "dev" ] && profile_dir="debug"
     (cd "${PROJECT_DIR}" && cargo build --profile "${CARGO_PROFILE}" --bin ant-devnet 2>&1 | tail -3)
-    (cd "${ANT_CLIENT_DIR}" && cargo build --profile "${CARGO_PROFILE}" -p ant-cli --bin ant 2>&1 | tail -3)
+    (cd "${ANT_CLIENT_DIR}" && cargo build --profile "${CARGO_PROFILE}" -p ant-cli --bin darwin 2>&1 | tail -3)
     ANT_DEVNET="${ANT_DEVNET:-$(target_dir "${PROJECT_DIR}")/${profile_dir}/ant-devnet}"
-    ANT_CLI="${ANT_CLI:-$(target_dir "${ANT_CLIENT_DIR}")/${profile_dir}/ant}"
+    ANT_CLI="${ANT_CLI:-$(target_dir "${ANT_CLIENT_DIR}")/${profile_dir}/darwin}"
 fi
 ANT_DEVNET="${ANT_DEVNET:-${PROJECT_DIR}/target/release/ant-devnet}"
-ANT_CLI="${ANT_CLI:-${ANT_CLIENT_DIR}/target/release/ant}"
+ANT_CLI="${ANT_CLI:-${ANT_CLIENT_DIR}/target/release/darwin}"
 for binary in "${ANT_DEVNET}" "${ANT_CLI}"; do
     if [ ! -x "${binary}" ]; then
         echo "ERROR: ${binary} not found"

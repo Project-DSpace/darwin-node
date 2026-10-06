@@ -500,7 +500,7 @@ impl Default for UpgradeConfig {
 }
 
 fn default_github_repo() -> String {
-    "Project-DSpace/ant-node".to_string()
+    "Project-DSpace/darwin-node".to_string()
 }
 
 /// Default base directory for node data (platform data dir for "ant").
