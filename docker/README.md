@@ -19,13 +19,21 @@ You'll need:
 
 Fees are paid in DARWIN, the network's token, to the rewards address you set.
 
+The image comes set up for the network as our servers run it: production mode,
+IPv4 only, the 3 bootstrap servers (142.93.32.90, 165.22.193.90 and
+142.93.96.232, UDP port 10000) and Robinhood Chain RPCs. You don't need to set
+any of these.
+
+Running nodes from before 2026-10-06? See [Rejoining after the 2026-10-06
+reset](#rejoining-after-the-2026-10-06-reset).
+
 ## 1. Forward the ports on your router
 
 Each node uses two UDP ports: one for the storage network and one for web
-browsers fetching files. With 2 nodes, forward **UDP 10000–10001** and **UDP
-11000–11001** to your server's local IP address (with 6 nodes, 10000–10005 and
-11000–11005). The exact menu depends on your router; it is usually called "Port
-forwarding" or "Virtual servers". Use the same port numbers outside and inside.
+browsers fetching files. Run 2 nodes and forward **UDP 10000–10001** and
+**UDP 11000–11001** to your server's local IP address. The exact menu depends
+on your router; it is usually called "Port forwarding" or "Virtual servers".
+Use the same port numbers outside and inside.
 
 Use either manual forwarding or your router's automatic forwarding (UPnP) for
 the storage ports, not both: the nodes ask UPnP-capable routers for those
@@ -44,15 +52,20 @@ If the server runs a firewall (such as `ufw`), open the same UDP ports there too
 
    ```
    mkdir ~/storage-node && cd ~/storage-node
-   curl -fsSLO https://raw.githubusercontent.com/Project-DSpace/ant-node/main/docker/docker-compose.yml
+   curl -fsSLO https://raw.githubusercontent.com/Project-DSpace/darwin-node/main/docker/docker-compose.yml
    ```
+
+   The darwin-node repository is private for now, so this link returns 404
+   (not found) until it is public again. Until then, ask us for the file.
 
 2. Open `docker-compose.yml` and fill in:
    - **`REWARDS_ADDRESS`**: your `0x…` address, in place of
      `0xYOUR_WALLET_ADDRESS`.
-   - **`NODE_COUNT`**: start with one or two, and add more later as your disk,
-     memory and connection allow (6 at most for now). Each node needs at least
-     20 GB of free disk space.
+   - **`NODE_COUNT`**: 2 (or 1 if your disk, memory or connection is
+     short). The network counts at most 2 nodes per IP address in any close
+     group, so more than 2 nodes add load without adding storage, and the
+     container warns about it. Each node needs at least 20 GB of free disk
+     space.
    - **The data folder**: node data goes in `data` next to the file. To use
      another disk, change `./data` in the `volumes` line to a folder on that
      disk, such as `/mnt/storage/storage-node:/data`. The nodes measure free
@@ -77,7 +90,7 @@ Within a minute you should see:
 Added node on UDP port 10000
 Added node on UDP port 10001
 Running 2 node(s) on UDP ports 10000-10001; browser access: UDP 11000-11001; storage fees go to 0x…
-[node-1] … Successfully connected to 2 bootstrap peers
+[node-1] … Successfully connected to 3 bootstrap peers
 ```
 
 If it stops with `REWARDS_ADDRESS is not a wallet address`, put your wallet
@@ -110,8 +123,34 @@ Run these in the folder with `docker-compose.yml`.
   deletes that node's data, so the others have room. Removed nodes stay
   removed: free up space, run `docker exec storage-node nodes clear-evicted`,
   then `docker compose restart` to replace them, or lower `NODE_COUNT`.
-- **No IPv6?** If the logs show connection problems and your connection has no
-  working IPv6, set `IPV4_ONLY` to `"true"` and run `docker compose up -d`.
+- **IPv4 only**: the network runs on IPv4. Leave `IPV4_ONLY` at `"true"`.
+
+## Rejoining after the 2026-10-06 reset
+
+On 2026-10-06 the network restarted in production mode, paying in DARWIN, and
+the old network's data was wiped. Nodes from before then hold data and
+settings for the old network (testnet mode, up to 6 nodes, IPv6 on), so start
+them fresh. With Docker Compose, in the folder with `docker-compose.yml`:
+
+1. Stop the container: `docker compose down`.
+2. Wipe the data folder: `sudo rm -rf ./data/*` (or the folder in your
+   `volumes` line).
+3. Replace `docker-compose.yml` with the current one (step 2 above) and put
+   your `REWARDS_ADDRESS` back in. If you keep your old file instead, set
+   `NODE_COUNT` to 2 and `IPV4_ONLY` to `"true"`, and delete the `RPC_URL`
+   line.
+4. Pull the new image and recreate the container: `docker compose pull`, then
+   `docker compose up -d`.
+
+On Unraid: stop the container, then wipe its data folder in the Unraid
+terminal (for the default folder, `rm -rf /mnt/user/appdata/storage-node/*`).
+Edit the container: set **Number of nodes** to 2, **IPv4 only** to `true` and
+clear **Blockchain RPC** (both under "Show more settings"), remove any
+**Storage limit** variable, and set **Extra Parameters** as in [Add the
+container](#add-the-container). Click **Apply**: Unraid downloads the current
+image and recreates the container.
+
+The nodes start with new identities; your rewards address stays the same.
 
 ## On Unraid
 
@@ -125,8 +164,12 @@ above, then:
 
    ```
    curl -fsSL -o /boot/config/plugins/dockerMan/templates-user/my-storage-node.xml \
-     https://raw.githubusercontent.com/Project-DSpace/ant-node/main/docker/unraid-storage-node.xml
+     https://raw.githubusercontent.com/Project-DSpace/darwin-node/main/docker/unraid-storage-node.xml
    ```
+
+   As with the Compose file, this link returns 404 while the darwin-node
+   repository is private. Until then, ask us for the file or fill in Add
+   Container by hand (below).
 
 2. In Unraid, go to **Docker → Add Container**, and choose **storage-node** from
    the Template list.
@@ -146,8 +189,9 @@ Without the template file, fill in Add Container by hand instead: Repository
 `/data` → `/mnt/user/appdata/storage-node`, and variables `REWARDS_ADDRESS`
 (your wallet), `NODE_COUNT` (2) and `BROWSER_PORT_START` (11000). Under
 **Advanced view → Extra Parameters**, add
-`--ulimit nofile=65536:65536 --stop-timeout 120` (stopping the nodes cleanly
-can take a minute or two).
+`--ulimit nofile=65536:65536 --stop-timeout 120 --log-opt max-size=100m --log-opt max-file=3`
+(stopping the nodes cleanly can take a minute or two, and the log options keep
+the container's log from filling the disk).
 
 ### Check it's working
 
@@ -166,17 +210,3 @@ only** under "Show more settings"), then click **Apply**. For updates, click
 **Check for Updates** on the Docker tab, then **Apply Update**. Run the
 `docker exec` commands in the Unraid terminal, using your container's name if
 it isn't `storage-node`, and restart the container from the Docker tab.
-
-### Upgrading from the first version
-
-Your nodes keep their identities and data: the container takes over the old
-`node-<port>` folders on its first start. After **Apply Update**, edit the
-container and:
-
-- remove the **Storage limit** variable (nodes now use the free space on the
-  disk);
-- set **Number of nodes** to match your disk, memory and connection;
-- add the browser port variable `BROWSER_PORT_START` = `11000` and forward
-  those ports, or leave it out to keep browser access off;
-- change **Extra Parameters** to
-  `--ulimit nofile=65536:65536 --stop-timeout 120`.

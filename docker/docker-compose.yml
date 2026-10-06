@@ -8,6 +8,10 @@
 # Each node uses two UDP ports: PORT_START and the ones after it, and
 # BROWSER_PORT_START and the ones after it. Forward them all (UDP) on your
 # router, same numbers outside and inside, unless your router has UPnP on.
+# With 2 nodes that is 10000-10001 and 11000-11001.
+#
+# The image sets the network itself: production mode, the 3 bootstrap servers
+# and Robinhood Chain RPCs. See docker/README.md in the darwin-node repository.
 
 name: storage-node
 
@@ -24,19 +28,28 @@ services:
         hard: 65536
     # Give the nodes time to shut down cleanly.
     stop_grace_period: 120s
+    # Keep the container's log from filling the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "3"
     environment:
       # Ethereum-style wallet address (0x...) that receives your storage fees.
       REWARDS_ADDRESS: "0xYOUR_WALLET_ADDRESS"
-      # How many nodes to run (1-6 for now). Each needs at least 20 GB of free
-      # disk space (about 35 GB recommended).
+      # How many nodes to run: 2, or 1 on a small machine. The network counts
+      # at most 2 nodes per IP address in any close group, so more add load
+      # without adding storage. Each needs at least 20 GB of free disk space
+      # (about 35 GB recommended).
       NODE_COUNT: 2
       PORT_START: 10000
       # 0 turns browser access off.
       BROWSER_PORT_START: 11000
-      # Robinhood Chain RPC the nodes use to check payments.
-      RPC_URL: https://robinhood-rpc.publicnode.com
-      # Set to true if your connection has no working IPv6.
-      IPV4_ONLY: "false"
+      # Robinhood Chain RPC the nodes use to check payments. Leave it out to
+      # use the image's list; set it to use your own provider instead.
+      # RPC_URL: https://your-provider.example
+      # The network runs on IPv4.
+      IPV4_ONLY: "true"
       # Local port (127.0.0.1 only) of the node manager's status page and API.
       MANAGER_PORT: 12600
       # User and group the nodes run as; they own the data folder.
