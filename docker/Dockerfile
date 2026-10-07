@@ -8,7 +8,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Autonomi's published `ant` release. Its node manager is the same code as in
-# our client fork (no changes there); only the node binary is ours.
+# our client fork (no changes there); only the node binary is ours. Its
+# archive has no licence or notice files, so docker/NOTICE names the release:
+# update it when ANT_VERSION changes.
 ARG ANT_VERSION=0.3.9
 ARG ANT_SHA256=fec136205c6e8dff1289ccdd922a306e3f4d3ac2f7480d9f4b6b78488ea0b4e6
 RUN curl -fsSL -o /tmp/ant.tar.gz \
