@@ -72,6 +72,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Upstream's step (their #243), run for our one target, the runner's own.
+      # Collects, unaltered, the licence, copyright and notice files of every
+      # crate the build resolves, including build-time tools, and fails if any
+      # crate's licence is outside the policy or its texts cannot be found (see
+      # the script and its config). The token raises the GitHub rate limit for
+      # licence files fetched from crates' repositories.
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/third_party_notices/generate.py
+          --config scripts/third_party_notices/config.toml
+          --output THIRD-PARTY-NOTICES.txt
+          --target x86_64-unknown-linux-gnu
+
       - name: Build
         run: cargo build --release --locked --bin ant-node
 
@@ -87,12 +106,18 @@ jobs:
           fi
 
       # Same name and layout as Autonomi's release: nodes find the archive by
-      # "linux-x64" and take the file named ant-node out of it.
+      # "linux-x64" and take the file named ant-node out of it. As in
+      # Autonomi's archives, it also carries the project's licence files, the
+      # third-party notices and the Rust standard library's notices from the
+      # toolchain that built the binary; whatever installs a release extracts
+      # only ant-node, so the extra files do not affect upgrades.
       - name: Package
         run: |
           mkdir dist
-          cp target/release/ant-node config/bootstrap_peers.toml dist/
-          tar -C dist -czf ant-node-cli-linux-x64.tar.gz ant-node bootstrap_peers.toml
+          cp target/release/ant-node config/bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt dist/
+          cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" dist/RUST-STD-COPYRIGHT.html
+          tar -C dist -czf ant-node-cli-linux-x64.tar.gz ant-node bootstrap_peers.toml \
+            LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html
           cp sign/release-signing-key.pub .
 
       - uses: actions/upload-artifact@v4
@@ -155,6 +180,8 @@ jobs:
             "Running nodes install it by themselves within the staged-rollout window." \
             "The archive is signed with ML-DSA-65; check it with:" \
             "ant-keygen verify --key release-signing-key.pub --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig" \
+            "" \
+            "The archive also contains LICENSE-MIT and LICENSE-APACHE, plus THIRD-PARTY-NOTICES.txt and RUST-STD-COPYRIGHT.html with the licences and copyright notices of the third-party code in the binary and of the tools used to build it." \
             > notes.md
           gh release create "$TAG" --verify-tag --latest \
             --title "Storage node $TAG" --notes-file notes.md \
