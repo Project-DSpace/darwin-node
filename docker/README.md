@@ -210,3 +210,12 @@ only** under "Show more settings"), then click **Apply**. For updates, click
 **Check for Updates** on the Docker tab, then **Apply Update**. Run the
 `docker exec` commands in the Unraid terminal, using your container's name if
 it isn't `storage-node`, and restart the container from the Docker tab.
+
+## Licences
+
+The licences and notices of the software in the image are in
+`/usr/share/doc/storage-node/` inside it (`docker exec storage-node ls
+/usr/share/doc/storage-node` lists them). `NOTICE` says what each program is
+and where its source is. `THIRD-PARTY-NOTICES.txt` has the licences of the
+code built into the node, including self_encryption, which the node links
+under GPL-3.0 with a linking exception.
