@@ -120,7 +120,8 @@ bao = "0.13.1"
 # by the `webrtc-direct` feature.
 saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
 # Only the test-utils devnet helper that seeds public files for browser tests
-# uses it, so release builds do not link it.
+# uses it directly. Upstream's release builds do not link it, but ours do:
+# vendor/ant-listings decodes envelopes with its DataMap.
 self_encryption = { version = "0.36", optional = true }
 
 [target.'cfg(unix)'.dependencies]
