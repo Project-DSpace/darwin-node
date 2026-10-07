@@ -1,6 +1,7 @@
 # Builds the Linux node binary on every push to main, packages it as the
 # storage-node Docker image (run by home operators and our servers), tests the
-# image on an isolated network and publishes it.
+# image on an isolated network and publishes it. Also checks that the
+# third-party notices a release ships can be generated.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and multi-platform releases.
@@ -30,6 +31,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Generates THIRD-PARTY-NOTICES.txt for the release target, as release.yml
+  # does, so a dependency change that leaves a gap (a licence outside the
+  # policy, a missing licence text, possible native code with no reviewed
+  # entry in scripts/third_party_notices/config.toml) fails here within
+  # minutes, not when a release is tagged. Needs only Python and cargo's view
+  # of the dependency graph, no build.
+  notices:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The token raises the GitHub rate limit for licence files fetched from
+      # crates' repositories.
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/third_party_notices/generate.py
+          --config scripts/third_party_notices/config.toml
+          --output THIRD-PARTY-NOTICES.txt
+          --target x86_64-unknown-linux-gnu
+
   linux-x64:
     if: ${{ !inputs.reuse_build }}
     # Pinned to the servers' Ubuntu release: a binary built against a newer
