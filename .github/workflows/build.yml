@@ -7,7 +7,9 @@
 # and multi-platform releases.
 #
 # Run by hand with `reuse_build` set to an earlier run's ID to test image
-# changes against that run's node binary instead of rebuilding it.
+# changes against that run's node binary instead of rebuilding it. The image
+# takes its licence and notice files from that build too, so builds from
+# before they were packaged with the binary can't be reused.
 
 name: Build
 
@@ -73,13 +75,32 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The same notices as a release's (see the notices job), for the image.
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/third_party_notices/generate.py
+          --config scripts/third_party_notices/config.toml
+          --output THIRD-PARTY-NOTICES.txt
+          --target x86_64-unknown-linux-gnu
+
       - name: Build
         run: cargo build --release --locked --bin ant-node
 
+      # The binary and its bootstrap file, plus what the image ships in
+      # /usr/share/doc/storage-node/ (docker/Dockerfile): the project's licence
+      # files, the third-party notices and the Rust standard library's notices
+      # from the toolchain that built the binary, as in a release archive.
       - name: Package
         run: |
           mkdir dist
-          cp target/release/ant-node config/bootstrap_peers.toml dist/
+          cp target/release/ant-node config/bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt dist/
+          cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" dist/RUST-STD-COPYRIGHT.html
           tar -C dist -czf ant-node-linux-x64.tar.gz .
           sha256sum ant-node-linux-x64.tar.gz > SHA256SUMS.txt
 

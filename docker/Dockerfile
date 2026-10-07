@@ -19,6 +19,10 @@ RUN curl -fsSL -o /tmp/ant.tar.gz \
     && rm -rf /tmp/ant*
 
 COPY dist/ant-node dist/bootstrap_peers.toml /opt/ant/
+# Licences and notices. The build packages ant-node's with the binary; NOTICE
+# covers `ant` too, whose release archive has none of its own.
+COPY dist/LICENSE-MIT dist/LICENSE-APACHE dist/THIRD-PARTY-NOTICES.txt dist/RUST-STD-COPYRIGHT.html \
+     docker/NOTICE /usr/share/doc/storage-node/
 COPY docker/entrypoint.sh /entrypoint.sh
 COPY docker/nodes /usr/local/bin/nodes
 RUN chmod 755 /opt/ant/ant-node /entrypoint.sh /usr/local/bin/nodes

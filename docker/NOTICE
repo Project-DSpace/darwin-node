@@ -1,0 +1,26 @@
+Licences and notices for the storage-node image
+
+ant-node (/opt/ant/ant-node)
+  The storage node, built from https://github.com/Project-DSpace/darwin-node,
+  a fork of Autonomi's ant-node. Licensed under MIT OR Apache-2.0: see
+  LICENSE-MIT and LICENSE-APACHE. THIRD-PARTY-NOTICES.txt has the licences
+  and notices of the third-party code compiled into it, among it
+  self_encryption under GPL-3.0 with a linking exception, and
+  RUST-STD-COPYRIGHT.html those of the Rust standard library.
+
+ant (/usr/local/bin/ant)
+  The node manager: the unmodified `ant` binary from Autonomi's release
+  ant-cli-v0.3.9 (archive ant-0.3.9-x86_64-unknown-linux-musl.tar.gz),
+  https://github.com/WithAutonomi/ant-client/releases/tag/ant-cli-v0.3.9.
+  Source: https://github.com/WithAutonomi/ant-client at tag ant-cli-v0.3.9
+  (commit fd7e7d04252f311f745c4ec978122515ce7e86b6).
+  Copyright (c) 2026 Autonomi. Licensed under MIT OR Apache-2.0, on the
+  terms in LICENSE-MIT and LICENSE-APACHE here, with this copyright line in
+  place of ant-node's.
+  It links self_encryption 0.36.0, which is under GPL-3.0 with a linking
+  exception: the exception permits linking the unmodified library into an
+  executable distributed under other terms, and the library itself remains
+  under GPL-3.0. Its LICENSE, with the exception and the GPL-3.0 text, is
+  reproduced in THIRD-PARTY-NOTICES.txt, as ant-node links the same release.
+  Its source is
+  https://static.crates.io/crates/self_encryption/self_encryption-0.36.0.crate.
