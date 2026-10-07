@@ -72,14 +72,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Upstream generates THIRD-PARTY-NOTICES.txt at this point (their #243),
-      # with scripts/third_party_notices/. We leave that step out until it
-      # passes on our build, where it fails: vendor/ant-listings links
-      # self_encryption, which is GPL-3.0 with a linking exception and outside
-      # the script's policy, and through it rayon-core, whose `links` key needs
-      # a [native.rayon-core] entry. Upstream's release builds do not link
-      # self_encryption. When the step comes back, run the script in test.yml
-      # as well, so a gap fails a pull request instead of a tag.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Upstream's step (their #243), run for our one target, the runner's own.
+      # Collects, unaltered, the licence, copyright and notice files of every
+      # crate the build resolves, including build-time tools, and fails if any
+      # crate's licence is outside the policy or its texts cannot be found (see
+      # the script and its config). Unlike upstream's, our release links
+      # self_encryption (GPL-3.0 with a linking exception), through
+      # vendor/ant-listings; the config's [exception.self_encryption] covers
+      # it. build.yml runs the same check on every push to main, so a gap
+      # shows there before a tag. The token raises the GitHub rate limit for
+      # licence files fetched from crates' repositories.
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/third_party_notices/generate.py
+          --config scripts/third_party_notices/config.toml
+          --output THIRD-PARTY-NOTICES.txt
+          --target x86_64-unknown-linux-gnu
 
       - name: Build
         run: cargo build --release --locked --bin ant-node
@@ -97,18 +111,17 @@ jobs:
 
       # Same name and layout as Autonomi's release: nodes find the archive by
       # "linux-x64" and take the file named ant-node out of it. As in
-      # Autonomi's archives, it also carries the project's licence files and
-      # the Rust standard library's notices from the toolchain that built the
-      # binary (not yet their third-party notices, see above); whatever
-      # installs a release extracts only ant-node, so the extra files do not
-      # affect upgrades.
+      # Autonomi's archives, it also carries the project's licence files, the
+      # third-party notices and the Rust standard library's notices from the
+      # toolchain that built the binary; whatever installs a release extracts
+      # only ant-node, so the extra files do not affect upgrades.
       - name: Package
         run: |
           mkdir dist
-          cp target/release/ant-node config/bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE dist/
+          cp target/release/ant-node config/bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt dist/
           cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" dist/RUST-STD-COPYRIGHT.html
           tar -C dist -czf ant-node-cli-linux-x64.tar.gz ant-node bootstrap_peers.toml \
-            LICENSE-MIT LICENSE-APACHE RUST-STD-COPYRIGHT.html
+            LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html
           cp sign/release-signing-key.pub .
 
       - uses: actions/upload-artifact@v4
@@ -172,7 +185,7 @@ jobs:
             "The archive is signed with ML-DSA-65; check it with:" \
             "ant-keygen verify --key release-signing-key.pub --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig" \
             "" \
-            "The archive also contains LICENSE-MIT and LICENSE-APACHE, plus RUST-STD-COPYRIGHT.html with the licences and copyright notices of the Rust standard library in the binary." \
+            "The archive also contains LICENSE-MIT and LICENSE-APACHE, plus THIRD-PARTY-NOTICES.txt and RUST-STD-COPYRIGHT.html with the licences and copyright notices of the third-party code in the binary and of the tools used to build it." \
             > notes.md
           gh release create "$TAG" --verify-tag --latest \
             --title "Storage node $TAG" --notes-file notes.md \
