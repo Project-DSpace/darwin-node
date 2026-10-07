@@ -33,6 +33,11 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # Line tables only, not full debug info, so the test build fits on the
+    # runner's disk (the test profile inherits dev); backtraces still give
+    # file and line.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
@@ -48,9 +53,24 @@ jobs:
         with:
           version: v1.8.5
 
+      # Private repos' 2-vCPU runners have about 14 GB free, and the test build
+      # filled it: the linker died with "ld terminated with signal 7 [Bus
+      # error]". This job uses none of these preinstalled toolchains.
+      - name: Free disk space
+        run: |
+          df -h /
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$dir" ]; then sudo rm -rf "$dir"; fi
+          done
+          df -h /
+
       - name: Build the tests
         id: build
         run: cargo test --locked --features test-utils --no-run
+
+      - name: Disk space after the build
+        if: ${{ !cancelled() }}
+        run: df -h /
 
       - name: Library and binaries
         run: cargo test --locked --features test-utils --lib --bins
