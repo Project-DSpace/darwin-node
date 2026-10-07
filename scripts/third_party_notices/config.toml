@@ -89,6 +89,17 @@ note = "the published crate also contains a .minimax/ folder of AI-assistant fil
 [remark.security-framework]
 note = "its THIRD_PARTY file covers documentation adapted from Apple's Security Framework under the Apple Public Source License 2.0; that documentation is not compiled into this build."
 
+# Ours: crates.io releases we patch with a modified copy in vendor/ (see
+# Cargo.toml), whose Source is therefore a path in this repository.
+
+[remark.ant-protocol]
+version = "3.1.0"
+note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this release is built from; its Source above is that copy. The one change is PRICE_MULTIPLIER in src/payment/pricing.rs (see vendor/ant-protocol/VENDORED.md)."
+
+[remark.webrtc]
+version = "0.14.0"
+note = "a modified copy of the crates.io release, kept in vendor/webrtc of the repository this release is built from; its Source above is that copy. The one change makes RTCDtlsTransport::stop() in src/dtls_transport/mod.rs cancel a DTLS handshake still in progress (see vendor/webrtc/VENDORED.md)."
+
 # Crates whose published files and repository contain no text of any licence
 # they are offered under. Each entry is for one reviewed version; it supplies
 # the canonical text of one of those licences, pinned by checksum, and says
