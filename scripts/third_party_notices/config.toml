@@ -67,6 +67,9 @@ note = "its C and assembly code derives from BoringSSL; LICENSE, LICENSE-BoringS
 [native.blake3]
 note = "the C and assembly implementations are part of BLAKE3 and share the crate's licence."
 
+[native.rayon-core]
+note = "declares a `links` key only to prevent two copies in one build; it builds no native code."
+
 [native.cc]
 note = "a build tool; its one C file is compiled on the build machine to detect the C compiler, and nothing from it is linked."
 
@@ -83,14 +86,29 @@ note = "ships the Windows import library that windows-rs links against on Window
 version = "0.37.0"
 note = "the published crate also contains a .minimax/ folder of AI-assistant files (Python tools and .NET DLLs) committed to its repository by mistake; nothing in it is compiled or linked into this build."
 
+# Crates whose licence the policy above does not cover, kept only after review.
+# Each entry is for one reviewed version, names the licence it is
+# redistributed under (whose text must be among its files), and says why that
+# is acceptable.
+
+[exception.self_encryption]
+version = "0.36.0"
+licence = "GPL-3.0"
+reason = "GPL-3.0 with a linking exception, set out at the top of its LICENSE file, which is reproduced in full. The exception permits linking the unmodified library with independent modules into an executable distributed under other terms, provided each module's own licence terms are met; the library itself remains under GPL-3.0, and its exact source is the Source link above. This build links it through ant-listings, which the node uses to read the envelopes of listed files, each holding a self_encryption data map."
+
 # Explanations printed with a crate's entry, for licence or notice files that
 # could mislead without context.
 
 [remark.security-framework]
 note = "its THIRD_PARTY file covers documentation adapted from Apple's Security Framework under the Apple Public Source License 2.0; that documentation is not compiled into this build."
 
-# Ours: crates.io releases we patch with a modified copy in vendor/ (see
-# Cargo.toml), whose Source is therefore a path in this repository.
+# Ours: crates kept in vendor/ (see Cargo.toml), whose Source is therefore a
+# path in this repository: a copy of our darwin-listings crate, and modified
+# copies of crates.io releases we patch.
+
+[remark.ant-listings]
+version = "0.2.0"
+note = "an unchanged copy of Project-DSpace/darwin-listings v0.2.0 (commit e3cf6bbfbd64, without its .github folder), kept in vendor/ant-listings of the repository this release is built from; its Source above is that copy (see vendor/ant-listings/VENDORED.md)."
 
 [remark.ant-protocol]
 version = "3.1.0"
