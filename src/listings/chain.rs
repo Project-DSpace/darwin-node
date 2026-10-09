@@ -99,8 +99,9 @@ const ROBINHOOD_PUBLIC_RPCS: [&str; 3] = [
 ];
 
 /// The RPCs a node on `rpc_url` reads listings' payments through: its own,
-/// then, if it is one of Robinhood Chain's public RPCs, the others. Payments
-/// for storage are checked through `rpc_url` alone, as before.
+/// then, if it is one of Robinhood Chain's public RPCs, the others. Storage
+/// payments are checked through the same RPCs (`PaymentVerifier`, from
+/// ds.8), so one busy provider doesn't make a node refuse a paid chunk.
 #[must_use]
 pub fn listings_rpc_urls(rpc_url: &str) -> Vec<String> {
     let own = rpc_url.trim_end_matches('/');

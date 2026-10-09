@@ -18,6 +18,15 @@ means Autonomi's earlier network, which Darwin never ran.
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
   (Autonomi's contracts): run it on Darwin only with those three set (see
   [Join the Network](#join-the-network)).
+- **Payment checks fall back across RPCs** (from ds.8). A node reads a
+  storage payment (`completedPayments`, or a batch's
+  `getCompletedMerklePayment`) through its own RPC and, when that is one of
+  Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a
+  second apart. Only a failed call moves on: any answer, even that nothing
+  was paid, settles the check. Upstream reads once, through one RPC, so a
+  provider answering `-32005 the network is busy` made nodes refuse paid
+  chunks. Reads of listings' payments have fallen back the same way since
+  ds.4.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself.

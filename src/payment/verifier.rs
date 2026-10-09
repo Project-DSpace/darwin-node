@@ -56,6 +56,16 @@ pub const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 524_288;
 const PAID_QUOTE_PAYMENT_MULTIPLIER: u64 = 3;
 const PAYMENT_VERIFY_SLOW_LOG_MS: u128 = 500;
 
+/// Rounds of an on-chain payment read before the check fails. Each round
+/// tries the node's RPC and then the chain's other public RPCs
+/// ([`crate::listings::listings_rpc_urls`]), so a provider that answers
+/// `-32005 the network is busy` or drops a call doesn't make the node refuse
+/// a chunk that was paid for.
+const PAYMENT_READ_ROUNDS: u32 = 2;
+
+/// The pause before each later round of a payment read.
+const PAYMENT_READ_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Number of nearest DHT peers accepted for paid-quote issuer locality.
 ///
 /// This is the Kademlia K width, intentionally wider than `CLOSE_GROUP_SIZE`.
@@ -1975,20 +1985,73 @@ impl PaymentVerifier {
             }
         }
 
-        let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
         let vault_address = *self.config.evm.network.payment_vault_address();
-        let contract = payment_vault::interface::IPaymentVault::new(vault_address, provider);
-
-        let result = contract.completedPayments(quote_hash).call().await;
-        // V2-834: EVM RPC is counted per call (bodies live inside alloy).
-        super::traffic::record(
-            super::traffic::EvmRpcCall::CompletedPayments,
-            result.is_ok(),
-        );
-        let result =
-            result.map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
+        let result = self
+            .read_payment(
+                super::traffic::EvmRpcCall::CompletedPayments,
+                |url| async move {
+                    let provider = evmlib::utils::http_provider(url);
+                    payment_vault::interface::IPaymentVault::new(vault_address, provider)
+                        .completedPayments(quote_hash)
+                        .call()
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .await
+            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
 
         Ok((Amount::from(result.amount), Some(result.rewardsAddress.0)))
+    }
+
+    /// The RPCs a payment is read through: the node's own, then, if it is one
+    /// of Robinhood Chain's public RPCs, the others.
+    fn payment_rpc_urls(&self) -> Vec<reqwest::Url> {
+        let own = self.config.evm.network.rpc_url();
+        let mut urls: Vec<reqwest::Url> = crate::listings::listings_rpc_urls(own.as_str())
+            .iter()
+            .filter_map(|url| url.parse().ok())
+            .collect();
+        if urls.is_empty() {
+            urls.push(own.clone());
+        }
+        urls
+    }
+
+    /// `read` through each of [`Self::payment_rpc_urls`] in turn, in up to
+    /// [`PAYMENT_READ_ROUNDS`] rounds [`PAYMENT_READ_BACKOFF`] apart, until
+    /// one answers. Only a failed call moves on: an answer, even that nothing
+    /// was paid, settles the read. Each call is counted as `call` in the RPC
+    /// traffic counts. The last error if no RPC answers.
+    async fn read_payment<T, F, Fut>(
+        &self,
+        call: super::traffic::EvmRpcCall,
+        mut read: F,
+    ) -> std::result::Result<T, String>
+    where
+        F: FnMut(reqwest::Url) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, String>>,
+    {
+        let urls = self.payment_rpc_urls();
+        let mut last = String::from("no RPC to read the payment through");
+        for round in 0..PAYMENT_READ_ROUNDS {
+            if round > 0 {
+                tokio::time::sleep(PAYMENT_READ_BACKOFF).await;
+            }
+            for url in &urls {
+                let result = read(url.clone()).await;
+                // V2-834: EVM RPC is counted per call (bodies live inside alloy).
+                super::traffic::record(call, result.is_ok());
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(e) => {
+                        debug!("{call:?} read failed; trying the next RPC");
+                        last = e;
+                    }
+                }
+            }
+        }
+        Err(last)
     }
 
     fn validate_paid_quote_peer_binding(
@@ -3433,14 +3496,19 @@ impl PaymentVerifier {
             info
         } else {
             // Query on-chain for completed merkle payment
-            let info =
-                payment_vault::get_completed_merkle_payment(&self.config.evm.network, pool_hash)
-                    .await;
-            // V2-834: EVM RPC is counted per call (bodies live inside alloy).
-            super::traffic::record(
-                super::traffic::EvmRpcCall::CompletedMerklePayment,
-                info.is_ok(),
-            );
+            let vault_address = *self.config.evm.network.payment_vault_address();
+            let info = self
+                .read_payment(
+                    super::traffic::EvmRpcCall::CompletedMerklePayment,
+                    |url| async move {
+                        let provider = evmlib::utils::http_provider(url);
+                        payment_vault::handler::PaymentVaultHandler::new(vault_address, provider)
+                            .get_completed_merkle_payment(pool_hash)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                )
+                .await;
             let info = info.map_err(|e| {
                 let pool_hex = hex::encode(pool_hash);
                 Error::Payment(format!(
@@ -3837,6 +3905,93 @@ mod tests {
             price_floor: PriceFloorConfig::default(),
         };
         PaymentVerifier::new(config)
+    }
+
+    /// A verifier whose payments are read through `rpc_url`.
+    fn verifier_reading_through(rpc_url: &str) -> PaymentVerifier {
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig {
+                network: EvmNetwork::new_custom(
+                    rpc_url,
+                    "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3",
+                    "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B",
+                ),
+            },
+            cache_capacity: 100,
+            close_group_size: CLOSE_GROUP_SIZE,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
+            price_floor: PriceFloorConfig::default(),
+        };
+        PaymentVerifier::new(config)
+    }
+
+    #[test]
+    fn payments_are_read_through_the_nodes_rpc_then_the_other_public_ones() {
+        let urls: Vec<String> = verifier_reading_through("https://rpc.mainnet.chain.robinhood.com")
+            .payment_rpc_urls()
+            .iter()
+            .map(|url| url.as_str().trim_end_matches('/').to_string())
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://rpc.mainnet.chain.robinhood.com",
+                "https://robinhood-rpc.publicnode.com",
+                "https://rpc.ordofi.network",
+            ]
+        );
+        // An operator's own RPC (a local chain here) is the only one.
+        let own = verifier_reading_through("http://127.0.0.1:8545").payment_rpc_urls();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].as_str(), "http://127.0.0.1:8545/");
+    }
+
+    #[tokio::test]
+    async fn a_payment_read_moves_on_only_when_a_call_fails() {
+        let verifier = verifier_reading_through("https://rpc.mainnet.chain.robinhood.com");
+        let call = crate::payment::traffic::EvmRpcCall::CompletedPayments;
+
+        // The node's RPC fails, the next answers: its answer, after 2 calls.
+        let mut calls = 0;
+        let answer = verifier
+            .read_payment(call, |url| {
+                calls += 1;
+                let busy = calls == 1;
+                async move {
+                    if busy {
+                        Err("-32005 the network is busy".to_string())
+                    } else {
+                        Ok(url.host_str().unwrap_or_default().to_string())
+                    }
+                }
+            })
+            .await;
+        assert_eq!(answer.as_deref(), Ok("robinhood-rpc.publicnode.com"));
+        assert_eq!(calls, 2);
+
+        // An answer settles the read, even one saying nothing was paid.
+        let mut calls = 0;
+        let answer = verifier
+            .read_payment(call, |_| {
+                calls += 1;
+                async { Ok(0_u64) }
+            })
+            .await;
+        assert_eq!(answer, Ok(0));
+        assert_eq!(calls, 1);
+
+        // No RPC answers: every RPC in every round, then the last error.
+        let mut calls = 0;
+        let answer: std::result::Result<u64, String> = verifier
+            .read_payment(call, |_| {
+                calls += 1;
+                let n = calls;
+                async move { Err(format!("failure {n}")) }
+            })
+            .await;
+        let rounds = usize::try_from(PAYMENT_READ_ROUNDS).unwrap_or(usize::MAX);
+        assert_eq!(calls, 3 * rounds);
+        assert_eq!(answer, Err(format!("failure {}", 3 * rounds)));
     }
 
     #[test]
