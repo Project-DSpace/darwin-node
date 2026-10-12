@@ -39,7 +39,9 @@ use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::listings::ListingService;
 use crate::logging::{debug, info, warn};
-use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
+use crate::payment::{
+    PaymentVerifier, QuoteGenerator, VerificationContext, BATCH_PAYMENTS_REFUSED,
+};
 use crate::pointer::PointerService;
 use crate::replication::admission;
 use crate::replication::config::K_BUCKET_SIZE;
@@ -1150,8 +1152,29 @@ impl AntProtocol {
         }
     }
 
-    /// Handle a merkle candidate quote request.
+    /// Handle a merkle candidate quote request: refused in this fork, before
+    /// anything is signed.
+    ///
+    /// A batch is paid on-chain before any PUT, so refusing at quote time is
+    /// what keeps clients from spending money this node would not honour.
+    /// Upstream's signing path is kept below, unused, so merges stay cheap.
+    #[allow(clippy::unused_self)]
     fn handle_merkle_candidate_quote(
+        &self,
+        request: &MerkleCandidateQuoteRequest,
+    ) -> MerkleCandidateQuoteResponse {
+        debug!(
+            "Refusing merkle candidate quote request for {}: {BATCH_PAYMENTS_REFUSED}",
+            hex::encode(request.address)
+        );
+        MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(
+            BATCH_PAYMENTS_REFUSED.to_string(),
+        ))
+    }
+
+    /// Upstream's merkle candidate quote: signs a candidate node for a batch.
+    #[allow(dead_code)]
+    fn sign_merkle_candidate_quote(
         &self,
         request: &MerkleCandidateQuoteRequest,
     ) -> MerkleCandidateQuoteResponse {
@@ -1858,22 +1881,19 @@ mod tests {
         assert_eq!(stats.chunks_stored, 0);
     }
 
+    /// This fork refuses batch payments at quote time, before anything is
+    /// signed: a batch is paid before any PUT, so this is where refusing
+    /// costs the client nothing.
     #[tokio::test]
-    async fn test_merkle_candidate_quote_request() {
-        use ant_protocol::payment::verify::verify_merkle_candidate_signature;
-        use evmlib::merkle_payments::MerklePaymentCandidateNode;
-
-        // create_test_protocol already wires ML-DSA-65 signing
+    async fn test_merkle_candidate_quote_request_is_refused() {
         let (protocol, _temp) = create_test_protocol().await;
-
-        let address = [0x77; 32];
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_secs();
 
         let request = MerkleCandidateQuoteRequest {
-            address,
+            address: [0x77; 32],
             data_type: DATA_TYPE_CHUNK,
             data_size: 4096,
             merkle_payment_timestamp: timestamp,
@@ -1882,10 +1902,8 @@ mod tests {
             request_id: 600,
             body: ChunkMessageBody::MerkleCandidateQuoteRequest(request),
         };
-        let msg_bytes = msg.encode().expect("encode request");
-
         let response_bytes = protocol
-            .try_handle_request(&msg_bytes)
+            .try_handle_request(&msg.encode().expect("encode request"))
             .await
             .expect("handle merkle candidate quote")
             .expect("expected response");
@@ -1894,30 +1912,17 @@ mod tests {
         assert_eq!(response.request_id, 600);
         match response.body {
             ChunkMessageBody::MerkleCandidateQuoteResponse(
-                MerkleCandidateQuoteResponse::Success { candidate_node, .. },
-            ) => {
-                let candidate: MerklePaymentCandidateNode =
-                    rmp_serde::from_slice(&candidate_node).expect("deserialize candidate node");
-
-                // Verify ML-DSA-65 signature
-                assert!(
-                    verify_merkle_candidate_signature(&candidate),
-                    "ML-DSA-65 candidate signature must be valid"
-                );
-
-                assert_eq!(candidate.merkle_payment_timestamp, timestamp);
-                // Node-calculated price based on records stored
-                assert!(candidate.price >= evmlib::common::Amount::ZERO);
-            }
-            other => panic!("expected MerkleCandidateQuoteResponse::Success, got: {other:?}"),
+                MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(reason)),
+            ) => assert_eq!(reason, BATCH_PAYMENTS_REFUSED),
+            other => panic!("expected the batch-payment refusal, got: {other:?}"),
         }
     }
 
-    /// A current client gets a quote through the versioned request, exactly as
-    /// it would through the legacy one. The gate must be invisible to clients
-    /// that can pay.
+    /// A current client asking for a batch quote through the versioned request
+    /// is refused the same way: settling correctly does not make a batch
+    /// acceptable.
     #[tokio::test]
-    async fn v2_merkle_quote_is_served_at_the_current_settlement_version() {
+    async fn v2_merkle_quote_is_refused_at_the_current_settlement_version() {
         let (protocol, _temp) = create_test_protocol().await;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1940,9 +1945,9 @@ mod tests {
         assert_eq!(response.request_id, 700);
         match response.body {
             ChunkMessageBody::MerkleCandidateQuoteResponse(
-                MerkleCandidateQuoteResponse::Success { .. },
-            ) => {}
-            other => panic!("expected Success, got: {other:?}"),
+                MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(reason)),
+            ) => assert_eq!(reason, BATCH_PAYMENTS_REFUSED),
+            other => panic!("expected the batch-payment refusal, got: {other:?}"),
         }
     }
 
@@ -2071,31 +2076,25 @@ mod tests {
     #[tokio::test]
     async fn unversioned_requests_are_still_served() {
         let (protocol, _temp) = create_test_protocol().await;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_secs();
 
+        // Single-node: this fork refuses merkle quotes whatever the version.
         let msg = ChunkMessage {
             request_id: 704,
-            body: ChunkMessageBody::MerkleCandidateQuoteRequest(MerkleCandidateQuoteRequest {
+            body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
                 address: [0xCC; 32],
-                data_type: DATA_TYPE_CHUNK,
                 data_size: 4096,
-                merkle_payment_timestamp: timestamp,
+                data_type: DATA_TYPE_CHUNK,
             }),
         };
         let response_bytes = protocol
             .try_handle_request(&msg.encode().expect("encode request"))
             .await
-            .expect("handle legacy merkle candidate quote")
+            .expect("handle legacy quote")
             .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         match response.body {
-            ChunkMessageBody::MerkleCandidateQuoteResponse(
-                MerkleCandidateQuoteResponse::Success { .. },
-            ) => {}
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { .. }) => {}
             other => panic!("expected Success for a legacy request, got: {other:?}"),
         }
     }

@@ -18,9 +18,17 @@ means Autonomi's earlier network, which Darwin never ran.
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
   (Autonomi's contracts): run it on Darwin only with those three set (see
   [Join the Network](#join-the-network)).
+- **Batch payments are refused** (from ds.9). Nodes take per-chunk
+  (single-node) payments only. A merkle candidate quote request, versioned
+  or not, is answered `QuoteFailed("merkle (batch) payments are not
+  accepted; pay per chunk")` before anything is signed: a batch is paid
+  on-chain before any PUT, so refusing the quote is what keeps a client from
+  paying for storage it won't get. A merkle proof on a PUT or a fresh
+  replication offer is refused with the same message. Neighbour-sync repair
+  carries no proof, so chunks already stored keep being repaired. Upstream's
+  merkle code stays compiled, unused, so merges stay cheap.
 - **Payment checks fall back across RPCs** (from ds.8). A node reads a
-  storage payment (`completedPayments`, or a batch's
-  `getCompletedMerklePayment`) through its own RPC and, when that is one of
+  storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a
   second apart. Only a failed call moves on: any answer, even that nothing
   was paid, settles the check. Upstream reads once, through one RPC, so a
