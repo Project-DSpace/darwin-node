@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.21.0+ds.8"
+version = "0.21.0+ds.9"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Darwin decentralized network"
