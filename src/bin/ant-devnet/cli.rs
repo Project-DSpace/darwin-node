@@ -95,6 +95,11 @@ pub struct Cli {
     #[arg(long)]
     pub host: Option<std::net::Ipv4Addr>,
 
+    /// Bind the nodes IPv4 only instead of dual-stack. For hosts that can't
+    /// bind an IPv6 socket, where dual-stack nodes fail to start.
+    #[arg(long)]
+    pub ipv4_only: bool,
+
     /// EVM network for node payment verification. `arbitrum-sepolia` makes
     /// nodes verify against the real deployed Arbitrum Sepolia contracts —
     /// no local Anvil and no embedded wallet key (bring your own funded
@@ -142,6 +147,13 @@ mod tests {
         assert_eq!(cli.host, Some(Ipv4Addr::new(192, 168, 1, 100)));
         assert_eq!(cli.evm_network.as_deref(), Some("arbitrum-sepolia"));
         assert_eq!(cli.serve_port, Some(25_000));
+    }
+
+    /// Nodes are dual-stack unless `--ipv4-only` is given.
+    #[test]
+    fn ipv4_only_is_off_unless_asked() {
+        assert!(!Cli::parse_from(["ant-devnet"]).ipv4_only);
+        assert!(Cli::parse_from(["ant-devnet", "--ipv4-only"]).ipv4_only);
     }
 
     /// A non-IPv4 `--host` is rejected by clap's value parser.

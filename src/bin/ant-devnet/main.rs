@@ -114,6 +114,7 @@ async fn main() -> color_eyre::Result<()> {
         ));
     }
     config.advertise_ip = cli.host;
+    config.ipv4_only = cli.ipv4_only;
     config.webrtc_direct = cli.webrtc_direct;
     if let Some(base_port) = cli.webrtc_direct_base_port {
         config.webrtc_direct_base_port = base_port;

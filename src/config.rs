@@ -128,6 +128,11 @@ pub struct NodeConfig {
     #[serde(default)]
     pub webrtc_direct: WebRtcDirectConfig,
 
+    /// Rate limits on unpaid storage-protocol requests (quotes and PUTs that
+    /// end unpaid), per peer and per IP. Paid PUTs are never limited.
+    #[serde(default)]
+    pub rate_limits: RequestRateLimitConfig,
+
     /// Directory for persisting the close group cache.
     ///
     /// When `None` (default), the node's `root_dir` is used — the cache
@@ -303,6 +308,58 @@ const fn default_webrtc_direct_new_sessions_per_minute_per_ip() -> usize {
     6
 }
 
+/// Rate limits on unpaid requests over the native storage protocol.
+///
+/// Each limit is a token bucket holding one second of its rate, kept per
+/// authenticated peer and per source IP (an IPv4 address or an IPv6 /64), in
+/// `src/storage/rate_limit.rs`. A rate of 0 refuses every request it
+/// governs.
+///
+/// Quote requests (single-node and merkle, versioned or not) spend a token on
+/// arrival. An unpaid PUT (one that ends in "payment required" or a payment
+/// failure) spends a token after the fact, and a PUT is refused up front while
+/// its peer's or IP's unpaid bucket is empty; paid PUTs never spend one.
+///
+/// The defaults follow the one request-rate precedent upstream set: the
+/// browser listener's per-IP limit
+/// ([`WebRtcDirectConfig::max_requests_per_second_per_ip`], 32 per second).
+/// The per-peer limits use the same value, so a peer is never held tighter
+/// than its address; they matter when a request's IP is unknown. No one has
+/// chosen these numbers for native traffic yet: they await Dan's
+/// confirmation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RequestRateLimitConfig {
+    /// Quote requests one peer may make per second.
+    pub quote_requests_per_second_per_peer: usize,
+
+    /// Quote requests one IPv4 address or IPv6 /64 may make per second.
+    pub quote_requests_per_second_per_ip: usize,
+
+    /// Unpaid PUTs one peer may make per second.
+    pub unpaid_puts_per_second_per_peer: usize,
+
+    /// Unpaid PUTs one IPv4 address or IPv6 /64 may make per second.
+    pub unpaid_puts_per_second_per_ip: usize,
+}
+
+impl Default for RequestRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            quote_requests_per_second_per_peer: default_unpaid_requests_per_second(),
+            quote_requests_per_second_per_ip: default_unpaid_requests_per_second(),
+            unpaid_puts_per_second_per_peer: default_unpaid_requests_per_second(),
+            unpaid_puts_per_second_per_ip: default_unpaid_requests_per_second(),
+        }
+    }
+}
+
+/// Every unpaid-request limit's default: the browser listener's per-IP request
+/// rate (see [`RequestRateLimitConfig`]). Awaiting Dan's confirmation.
+const fn default_unpaid_requests_per_second() -> usize {
+    default_webrtc_direct_max_requests_per_second_per_ip()
+}
+
 /// Auto-upgrade configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradeConfig {
@@ -440,6 +497,7 @@ impl Default for NodeConfig {
             payment: PaymentConfig::default(),
             storage: StorageConfig::default(),
             webrtc_direct: WebRtcDirectConfig::default(),
+            rate_limits: RequestRateLimitConfig::default(),
             close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
             log_level: default_log_level(),

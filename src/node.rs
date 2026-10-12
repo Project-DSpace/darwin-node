@@ -621,7 +621,8 @@ impl NodeBuilder {
 
         let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
             .with_pointer_service(pointers)
-            .with_listing_service(listings);
+            .with_listing_service(listings)
+            .with_rate_limits(&config.rate_limits);
 
         info!(
             "ANT protocol handler initialized with ML-DSA-65 signing (protocol={CHUNK_PROTOCOL_ID})"
@@ -1104,10 +1105,12 @@ impl RunningNode {
     }
 
     /// Handle one inbound protocol message and send whatever it produced.
+    #[allow(clippy::too_many_arguments)]
     async fn answer_one_request(
         protocol: &Arc<AntProtocol>,
         p2p: &Arc<P2PNode>,
         source: &saorsa_core::identity::PeerId,
+        source_ip: Option<std::net::IpAddr>,
         data: &[u8],
         data_type: &str,
         response_topic: &str,
@@ -1120,11 +1123,10 @@ impl RunningNode {
         let handled = protocol
             .try_handle_request_with_context(
                 data,
-                Some(ChunkRequestContext::new(
-                    source.to_string(),
-                    received_at,
-                    queue_wait,
-                )),
+                Some(
+                    ChunkRequestContext::new(source.to_string(), received_at, queue_wait)
+                        .with_ip(source_ip),
+                ),
             )
             .await;
         let telemetry = handled.get_telemetry;
@@ -1193,10 +1195,13 @@ impl RunningNode {
                 if let P2PEvent::Message {
                     topic,
                     source: Some(source),
+                    transport_source,
                     data,
                     ..
                 } = event
                 {
+                    // Keys the per-IP limits on unpaid requests; local only.
+                    let source_ip = transport_source.as_ref().and_then(MultiAddr::ip);
                     if topic == ant_listings::TOPIC {
                         if let Some(listings) = listings.clone() {
                             Self::answer_listings_request(
@@ -1250,6 +1255,7 @@ impl RunningNode {
                                 &protocol,
                                 &p2p,
                                 &source,
+                                source_ip,
                                 &data,
                                 data_type,
                                 response_topic,

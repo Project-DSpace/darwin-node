@@ -32,6 +32,15 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Why this fork refuses merkle (batch) payments, both at quote time and on a
+/// proof.
+///
+/// A batch is paid on-chain before any storer sees a PUT, so a node that
+/// refuses the PUT has let the client spend money for nothing. Darwin nodes
+/// take per-chunk (single-node) payments only. Upstream's merkle code is kept
+/// compiled so merges stay cheap; only the entry points refuse.
+pub const BATCH_PAYMENTS_REFUSED: &str = "merkle (batch) payments are not accepted; pay per chunk";
+
 /// Minimum allowed size for a payment proof in bytes.
 ///
 /// This minimum ensures the proof contains at least a basic cryptographic hash or identifier.
@@ -1258,8 +1267,12 @@ impl PaymentVerifier {
 
                     // Detect proof type from version tag byte
                     match detect_proof_type(proof) {
+                        // Darwin refuses batch payments in every context
+                        // (see `BATCH_PAYMENTS_REFUSED`). Neighbour-sync
+                        // repair carries no proof and never reaches here, so
+                        // chunks already stored keep being repaired.
                         Some(ProofType::Merkle) => {
-                            self.verify_merkle_payment(target, proof, context).await?;
+                            return Err(Error::Payment(BATCH_PAYMENTS_REFUSED.to_string()));
                         }
                         Some(ProofType::SingleNode) => {
                             let parsed = deserialize_single_node_proof(proof).map_err(|e| {
@@ -3406,7 +3419,12 @@ impl PaymentVerifier {
     /// 3. If not cached, query on-chain for payment info
     /// 4. Validate the proof against on-chain data
     /// 5. Cache the pool hash for subsequent chunk verifications in the same batch
+    ///
+    /// Unreachable from `verify_payment` in this fork, which refuses merkle
+    /// proofs (`BATCH_PAYMENTS_REFUSED`); kept, and still unit-tested, so
+    /// upstream merges stay cheap.
     #[allow(clippy::too_many_lines)]
+    #[allow(dead_code)]
     async fn verify_merkle_payment(
         &self,
         target: &PaymentTarget,
@@ -3838,6 +3856,77 @@ mod tests {
     use saorsa_pqc::pqc::types::MlDsaSecretKey;
     use saorsa_pqc::pqc::MlDsaOperations;
     use std::time::SystemTime;
+
+    impl PaymentVerifier {
+        /// `verify_payment` as upstream has it, merkle proofs included.
+        ///
+        /// This fork refuses merkle proofs in `verify_payment`
+        /// (`BATCH_PAYMENTS_REFUSED`) but keeps upstream's merkle verification
+        /// compiled; the merkle tests below call it through this, with the
+        /// same cache, size checks and caching as upstream's path.
+        async fn verify_payment_upstream_merkle(
+            &self,
+            xorname: &XorName,
+            payment_proof: Option<&[u8]>,
+            context: VerificationContext,
+        ) -> Result<PaymentStatus> {
+            let target = PaymentTarget::same(*xorname);
+            let Some(proof) =
+                payment_proof.filter(|proof| detect_proof_type(proof) == Some(ProofType::Merkle))
+            else {
+                return self.verify_payment(xorname, payment_proof, context).await;
+            };
+            if self.check_payment_required_keyed(target, context) == PaymentStatus::CachedAsVerified
+            {
+                return Ok(PaymentStatus::CachedAsVerified);
+            }
+            if proof.len() < MIN_PAYMENT_PROOF_SIZE_BYTES
+                || proof.len() > MAX_PAYMENT_PROOF_SIZE_BYTES
+            {
+                return Err(Error::Payment(format!(
+                    "Payment proof size out of bounds: {} bytes",
+                    proof.len()
+                )));
+            }
+            self.verify_merkle_payment(&target, proof, context).await?;
+            if context.is_store_admission() {
+                self.cache.insert_key(target);
+            } else {
+                self.cache.insert_paid_list_verified_key(target);
+            }
+            Ok(PaymentStatus::PaymentVerified)
+        }
+    }
+
+    /// This fork refuses every merkle proof, even one that would pass every
+    /// upstream check, in every verification context.
+    #[tokio::test]
+    async fn merkle_proofs_are_refused_in_every_context() {
+        let verifier = create_test_verifier();
+        let (merkle_proof, _pool_hash, xorname, _timestamp) = make_valid_merkle_proof();
+        let tagged =
+            crate::payment::proof::serialize_merkle_proof(&merkle_proof).expect("serialize");
+        for context in [
+            VerificationContext::ClientPut,
+            VerificationContext::FreshReplication,
+            VerificationContext::PaidListAdmission,
+        ] {
+            let err = verifier
+                .verify_payment(&xorname, Some(&tagged), context)
+                .await
+                .expect_err("a merkle proof must be refused");
+            assert!(
+                format!("{err}").contains(BATCH_PAYMENTS_REFUSED),
+                "{context:?}: {err}"
+            );
+        }
+        assert!(
+            !verifier
+                .cache
+                .contains_client_put_verified_key(&PaymentTarget::same(xorname)),
+            "a refused merkle proof must not be cached as paid"
+        );
+    }
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
     /// pre-populate the cache to bypass on-chain verification.
@@ -6467,7 +6556,7 @@ mod tests {
             VerificationContext::PaidListAdmission,
         ] {
             let err = verifier
-                .verify_payment(&xorname, Some(&tagged), context)
+                .verify_payment_upstream_merkle(&xorname, Some(&tagged), context)
                 .await
                 .expect_err("duplicate candidate PeerIds must fail fresh admission closeness");
             assert!(
@@ -6495,7 +6584,7 @@ mod tests {
         merkle_garbage.extend_from_slice(&[0xAB; 63]);
 
         let result = verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &xorname,
                 Some(&merkle_garbage),
                 VerificationContext::ClientPut,
@@ -7055,7 +7144,7 @@ mod tests {
         let wrong_xorname = [0xFFu8; 32];
 
         let result = verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &wrong_xorname,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
@@ -7088,7 +7177,11 @@ mod tests {
         }
 
         let result = verifier
-            .verify_payment(&xorname, Some(&bad_proof), VerificationContext::ClientPut)
+            .verify_payment_upstream_merkle(
+                &xorname,
+                Some(&bad_proof),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert!(result.is_err(), "Should reject malformed merkle body");
@@ -7259,7 +7352,7 @@ mod tests {
             crate::payment::proof::serialize_merkle_proof(&merkle_proof).expect("serialize");
 
         let result = verifier
-            .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
+            .verify_payment_upstream_merkle(&xorname, Some(&tagged), VerificationContext::ClientPut)
             .await;
 
         assert!(
@@ -7291,7 +7384,7 @@ mod tests {
         }
 
         let result = verifier
-            .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
+            .verify_payment_upstream_merkle(&xorname, Some(&tagged), VerificationContext::ClientPut)
             .await;
 
         assert!(
@@ -7337,7 +7430,7 @@ mod tests {
         }
 
         let result = verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &xorname,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
@@ -7386,7 +7479,7 @@ mod tests {
         }
 
         let result = verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &xorname,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
@@ -7422,7 +7515,7 @@ mod tests {
         }
 
         let result = verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &xorname,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
@@ -7462,7 +7555,7 @@ mod tests {
         }
 
         let result = verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &xorname,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
@@ -7511,7 +7604,7 @@ mod tests {
         let err_msg = format!(
             "{}",
             verifier
-                .verify_payment(
+                .verify_payment_upstream_merkle(
                     &xorname,
                     Some(&tagged_proof),
                     VerificationContext::ClientPut,
@@ -7560,7 +7653,7 @@ mod tests {
         let err_msg = format!(
             "{}",
             verifier
-                .verify_payment(
+                .verify_payment_upstream_merkle(
                     &xorname,
                     Some(&tagged_proof),
                     VerificationContext::ClientPut
@@ -7609,7 +7702,7 @@ mod tests {
         }
 
         let result = verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &xorname,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
@@ -7653,7 +7746,7 @@ mod tests {
             }
 
             let result = verifier
-                .verify_payment(
+                .verify_payment_upstream_merkle(
                     &xorname,
                     Some(&tagged_proof),
                     VerificationContext::ClientPut,
@@ -7871,7 +7964,7 @@ mod tests {
             .put(pool_hash, parity_settled_pool_info(ts));
 
         let result = verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &xorname,
                 Some(&tagged_proof),
                 VerificationContext::PaidListAdmission,
@@ -7900,7 +7993,11 @@ mod tests {
 
         for (xorname, tagged) in &proofs {
             let result = verifier
-                .verify_payment(xorname, Some(tagged), VerificationContext::ClientPut)
+                .verify_payment_upstream_merkle(
+                    xorname,
+                    Some(tagged),
+                    VerificationContext::ClientPut,
+                )
                 .await;
             assert!(result.is_ok(), "both chunks must be admitted: {result:?}");
         }
@@ -7925,7 +8022,11 @@ mod tests {
             .put(first_pool, parity_settled_pool_info(first_ts));
         for (xorname, tagged) in &first {
             verifier
-                .verify_payment(xorname, Some(tagged), VerificationContext::ClientPut)
+                .verify_payment_upstream_merkle(
+                    xorname,
+                    Some(tagged),
+                    VerificationContext::ClientPut,
+                )
                 .await
                 .expect("first pool admitted");
         }
@@ -7942,7 +8043,7 @@ mod tests {
             .lock()
             .put(second_pool, parity_settled_pool_info(second_ts));
         verifier
-            .verify_payment(
+            .verify_payment_upstream_merkle(
                 &second_xorname,
                 Some(&second_tagged),
                 VerificationContext::ClientPut,
@@ -7978,7 +8079,11 @@ mod tests {
                 let tagged = tagged.clone();
                 handles.push(tokio::spawn(async move {
                     verifier
-                        .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
+                        .verify_payment_upstream_merkle(
+                            &xorname,
+                            Some(&tagged),
+                            VerificationContext::ClientPut,
+                        )
                         .await
                 }));
             }

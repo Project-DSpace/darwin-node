@@ -13,8 +13,9 @@
 #    from the chain, and every way to download it: by address (or the
 #    withheld message), with --datamap, and with --proof
 # 4. Uploads with a name and content type, on private files too
-# 5. Uploads a file of 64 or more chunks: merkle batches, then one per-chunk
-#    payment for the remainder and the envelope
+# 5. Uploads a file of 64 or more chunks, over the old batch threshold: the
+#    client pays per chunk (the nodes refuse merkle batches), so every chunk
+#    and the envelope must be paid per chunk, with no batch paid on-chain
 # 6. Checks `ant listings`: exactly the uploads in the index, in index order,
 #    hidden fields absent, the right check levels, `--since`
 # 7. Checks `ant listing <address>` for the uploads outside the index
@@ -29,18 +30,20 @@
 # or WSL. ant-devnet and ant must be built against the same ant-listings
 # (version 2 envelopes, topic listings.v2).
 #
-# The devnet's nodes start dual-stack. On a host without IPv6 they fail to
-# start; add `.ipv6(false)` to the core config in `src/devnet.rs`
-# (`start_node`), as `tests/e2e/testnet.rs` does.
+# The devnet's nodes start dual-stack, or IPv4-only (`ant-devnet
+# --ipv4-only`) on a host that can't bind an IPv6 loopback socket.
 #
 # Environment:
 #   ANT_CLIENT_DIR               darwin-client checkout (default: ../darwin-client)
 #   ANT_TEST_SKIP_BUILD=1        don't build; use ANT_DEVNET and ANT_CLI
 #   ANT_DEVNET, ANT_CLI          binaries (default: the builds below)
 #   ANT_TEST_CARGO_PROFILE       cargo profile to build (default: release)
-#   ANT_TEST_DEVNET_NODES        node count (default: 25; merkle needs 16+)
+#   ANT_TEST_DEVNET_NODES        node count (default: 25)
 #   ANT_TEST_BOOTSTRAP_COUNT     bootstrap nodes (default: 3)
 #   ANT_TEST_DEVNET_LOG_LEVEL    devnet log level (default: warn)
+#   ANT_TEST_IPV4_ONLY           1: start the devnet IPv4-only; 0: dual-stack;
+#                                default: IPv4-only when this host can't bind
+#                                an IPv6 loopback socket
 #   ANT_TEST_STABILIZE_SECS      wait after the devnet starts (default: 15)
 #   ANT_TEST_SHOWN_SETS          shown sets to test, as bit masks 0-31 (bit 0
 #                                tx hash, 1 block, 2 timestamp, 3 log index,
@@ -85,6 +88,7 @@ FIELD_NAMES=(tx-hash block timestamp log-index quote)
 
 DEVNET_PID=""
 ANVIL_PID=""
+ANVIL_WINPID=""
 ANT_MANIFEST="${MANIFEST_FILE}"
 RPC_URL=""
 WALLET_KEY=""
@@ -128,6 +132,10 @@ cleanup() {
     if [ -n "${ANVIL_PID}" ] && kill -0 "${ANVIL_PID}" 2>/dev/null; then
         echo "Stopping Anvil (PID ${ANVIL_PID})..."
         kill "${ANVIL_PID}" 2>/dev/null || true
+    fi
+    if [ -n "${ANVIL_WINPID}" ]; then
+        echo "Stopping Anvil (Windows PID ${ANVIL_WINPID})..."
+        taskkill //F //PID "${ANVIL_WINPID}" >/dev/null 2>&1 || true
     fi
     if command -v pkill >/dev/null 2>&1; then
         pkill -P $$ 2>/dev/null || true
@@ -247,9 +255,20 @@ command -v "${PY}" >/dev/null 2>&1 || { echo "ERROR: ${PY} not found (set PY)"; 
 CAST="${CAST:-cast}"
 command -v "${CAST}" >/dev/null 2>&1 || { echo "ERROR: cast (Foundry) not found (set CAST)"; exit 1; }
 command -v anvil >/dev/null 2>&1 || { echo "ERROR: anvil (Foundry) not found on PATH"; exit 1; }
-if ! "${PY}" -c 'import socket; socket.socket(socket.AF_INET6).close()' 2>/dev/null; then
-    echo "WARNING: this host has no IPv6. The devnet's nodes start only if src/devnet.rs"
-    echo "         (start_node) builds its core config with .ipv6(false)."
+# The devnet's nodes start dual-stack unless told otherwise; a host that
+# can't bind an IPv6 loopback socket needs them IPv4-only.
+IPV4_ONLY="${ANT_TEST_IPV4_ONLY:-}"
+if [ -z "${IPV4_ONLY}" ]; then
+    if "${PY}" -c 'import socket; s = socket.socket(socket.AF_INET6); s.bind(("::1", 0)); s.close()' 2>/dev/null; then
+        IPV4_ONLY=0
+    else
+        IPV4_ONLY=1
+        echo "This host has no IPv6: starting the devnet IPv4-only."
+    fi
+fi
+DEVNET_IP_FLAGS=()
+if [ "${IPV4_ONLY}" = "1" ]; then
+    DEVNET_IP_FLAGS+=(--ipv4-only)
 fi
 
 # The checks on the CLI's JSON output and the chain, in Python.
@@ -285,11 +304,22 @@ SHOWS_WALLET = ("the payment fields shown give away the paying wallet to anyone 
 INDEX_SHOWS_WALLET = ("a listing in the index shows roughly when it was paid, which can be "
                       "matched against the vault's payments to find the paying wallet")
 MAX_CHUNK_SIZE = 4_190_208       # self_encryption: a file under 3 of these is 3 chunks
-MERKLE_EXACT_MIN_BATCH = 32      # an upload's chunks left under this are paid per chunk
-MERKLE_THRESHOLD = 64            # from this many content chunks, Auto pays in batches
+MERKLE_THRESHOLD = 64            # the old batch threshold: the large upload is over it
 HOUR = 3600
 
 PROBLEMS = []
+
+# Python on Windows writes \r\n to a pipe; the script compares lines ending in
+# \n.
+for stream in (sys.stdout, sys.stderr):
+    stream.reconfigure(newline="\n")
+
+
+def same_path(printed, expected):
+    """Whether the CLI's path is the script's: on Windows it joins with a
+    backslash."""
+    return printed is not None and (os.path.normcase(os.path.normpath(printed))
+                                    == os.path.normcase(os.path.normpath(expected)))
 
 
 def problem(text):
@@ -456,12 +486,12 @@ def cmd_upload(path, readable, in_index, bits, file, name, content_type, min_con
     if readable:
         if datamap is not None:
             problem(f"a readable upload saved a data map: {datamap}")
-    elif datamap != file + ".datamap":
+    elif not same_path(datamap, file + ".datamap"):
         problem(f"data map saved as {datamap!r}, expected {file}.datamap")
     elif not os.path.isfile(datamap):
         problem(f"{datamap} is missing")
     if envelope:
-        if record != file + ".record":
+        if not same_path(record, file + ".record"):
             problem(f"record saved as {record!r}, expected {file}.record")
         elif not os.path.isfile(record):
             problem(f"{record} is missing")
@@ -500,13 +530,22 @@ def cast_json(cast, *args):
     if out.returncode != 0:
         problem(f"cast {' '.join(args)}: {out.stderr.strip()[:200]}")
         finish()
-    return json.loads(out.stdout)
+    value = json.loads(out.stdout)
+    # Newer cast (1.8) wraps some commands' JSON, `cast block` among them:
+    # {"schema_version", "success", "data", "errors"}.
+    if isinstance(value, dict) and "schema_version" in value and "data" in value:
+        if not value.get("success"):
+            problem(f"cast {' '.join(args)}: {value.get('errors')}")
+            finish()
+        value = value["data"]
+    return value
 
 
 def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
     """The vault transactions in blocks first..last, read with cast: one
-    per-chunk payment for everything (`single`), or merkle batches and one
-    per-chunk payment for the remainder and the envelope (`large`)."""
+    per-chunk payment for everything (`single`), or per-chunk payments only,
+    no merkle batch, for an upload of 64 chunks or more (`large`): the nodes
+    refuse batch payments."""
     vault, dpm_topic, mpm_topic = vault.lower(), dpm_topic.lower(), mpm_topic.lower()
     total = int(total)
     txs = []
@@ -544,21 +583,21 @@ def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
     else:
         content = total - 1
         if content < MERKLE_THRESHOLD:
-            problem(f"{content} content chunks: under {MERKLE_THRESHOLD}, no batch expected")
-        rest = content % MERKLE_EXACT_MIN_BATCH
-        if not batches:
-            problem("no merkle batch payment (did Auto fall back to per-chunk payments? "
-                    "a merkle batch needs 16 nodes answering)")
-        elif sum(tx["leaves"] for tx in batches) != content - rest:
-            problem(f"batches paid {sum(tx['leaves'] for tx in batches)} chunks, "
-                    f"expected {content - rest}")
-        if len(per_chunk) != 1:
-            problem(f"{len(per_chunk)} per-chunk payments, expected 1 for the remainder "
-                    "and the envelope")
-        elif len(per_chunk[0]["payments"]) != rest + 1:
-            problem(f"the per-chunk payment paid {len(per_chunk[0]['payments'])} chunks, "
-                    f"expected {rest} + the envelope")
-    pay = per_chunk[0] if len(per_chunk) == 1 else None
+            problem(f"{content} content chunks: under {MERKLE_THRESHOLD}, not a large upload "
+                    "(the old batch threshold)")
+        if batches:
+            problem(f"{len(batches)} merkle batch payment(s) on-chain: the nodes must refuse "
+                    "batches at quote time, before the client pays")
+        paid = sum(len(tx["payments"]) for tx in per_chunk)
+        if paid != total:
+            problem(f"per-chunk payments paid {paid} chunks, expected all {total} "
+                    "(the content and the envelope)")
+    # The envelope is paid last, so a large upload's record is checked
+    # against its last per-chunk payment.
+    if mode == "single":
+        pay = per_chunk[0] if len(per_chunk) == 1 else None
+    else:
+        pay = max(per_chunk, key=lambda tx: tx["block"]) if per_chunk else None
     finish(PAY_TX=pay and pay["hash"], PAY_BLOCK=pay and pay["block"],
            PAY_TS=pay and pay["time"],
            PAY_LOGS=pay and ",".join(f"{index}:{quote}" for index, quote in pay["payments"]),
@@ -901,9 +940,6 @@ echo "ant:        ${ANT_CLI}"
 echo ""
 
 # Step 2: Start devnet with EVM
-#
-# Merkle batch payments (Step 5) need 16 nodes answering for each pool, so
-# the default is well above that.
 echo "=== Step 2: Starting devnet with EVM (${DEVNET_NODES} nodes, ${BOOTSTRAP_COUNT} bootstrap) ==="
 "${ANT_DEVNET}" \
     --nodes "${DEVNET_NODES}" \
@@ -914,6 +950,7 @@ echo "=== Step 2: Starting devnet with EVM (${DEVNET_NODES} nodes, ${BOOTSTRAP_C
     --stabilization-timeout-secs 180 \
     --enable-logging \
     --log-level "${DEVNET_LOG_LEVEL}" \
+    ${DEVNET_IP_FLAGS[@]+"${DEVNET_IP_FLAGS[@]}"} \
     > "${DEVNET_LOG}" 2>&1 &
 DEVNET_PID=$!
 echo "Devnet starting (PID ${DEVNET_PID}), waiting for manifest..."
@@ -924,9 +961,8 @@ while [ ! -f "${MANIFEST_FILE}" ] && [ ${WAIT_COUNT} -lt ${MAX_WAIT} ]; do
     if ! kill -0 "${DEVNET_PID}" 2>/dev/null; then
         echo "ERROR: Devnet process died before producing manifest."
         tail -30 "${DEVNET_LOG}" 2>/dev/null || true
-        if grep -qiE "dual-stack|Failed to create transport|Address family not supported" "${DEVNET_LOG}" 2>/dev/null; then
-            echo "This host may have no IPv6: add .ipv6(false) to the devnet's core config"
-            echo "(src/devnet.rs, start_node), as tests/e2e/testnet.rs does."
+        if [ "${IPV4_ONLY}" != "1" ] && grep -qiE "dual-stack|Failed to create transport|Address family not supported" "${DEVNET_LOG}" 2>/dev/null; then
+            echo "This host may have no IPv6: rerun with ANT_TEST_IPV4_ONLY=1."
         fi
         exit 1
     fi
@@ -954,7 +990,15 @@ NEAREST=$(( NODE_COUNT < 7 ? NODE_COUNT : 7 ))
 # Anvil, and cleanup stops it.
 ANVIL_PID=$(ps -A -o pid= -o ppid= -o comm= 2>/dev/null \
     | awk -v parent="${DEVNET_PID}" '$2 == parent && $3 ~ /(^|\/)anvil$/ { print $1; exit }' || true)
-if [ -z "${ANVIL_PID}" ]; then
+# Git Bash on Windows: `ps` can't list it, and the devnet, a native process,
+# ignores SIGINT there (stop_devnet kills it), so Anvil is found by the port it
+# listens on and stopped by its Windows process ID.
+if [ -z "${ANVIL_PID}" ] && command -v taskkill >/dev/null 2>&1; then
+    ANVIL_PORT=$(printf '%s' "${RPC_URL}" | sed -nE 's#^[a-z]+://[^/]*:([0-9]+).*#\1#p')
+    ANVIL_WINPID=$(netstat -ano 2>/dev/null | tr -d '\r' \
+        | awk -v suffix=":${ANVIL_PORT}" '$1 == "TCP" && $4 == "LISTENING" && substr($2, length($2) - length(suffix) + 1) == suffix { print $5; exit }' || true)
+fi
+if [ -z "${ANVIL_PID}" ] && [ -z "${ANVIL_WINPID}" ]; then
     echo "WARNING: Anvil's process not found among the devnet's children; stop it by hand"
     echo "         after the test if it is still running (${RPC_URL})."
 fi
@@ -1195,8 +1239,9 @@ echo ""
 
 # Step 5: An upload of 64 chunks or more
 #
-# Auto mode pays its content in merkle batches of 256, 128, 64 and 32, then
-# one per-chunk payment for the chunks left and the envelope.
+# Over the old batch threshold (64 chunks). The client pays per chunk, in
+# transactions of up to 64 chunks, and the nodes refuse batch payments, so
+# the upload must be paid per chunk, with no batch paid on-chain.
 echo "=== Step 5: An upload of 64 or more chunks ==="
 if [ "${ANT_TEST_SKIP_LARGE:-0}" = "1" ]; then
     echo "  Skipping (ANT_TEST_SKIP_LARGE=1)"
@@ -1231,7 +1276,7 @@ else
         fi
         eval "${vars}"
         if [ "${ok}" = 1 ]; then
-            pass "${LARGE_LABEL}: ${TOTAL_CHUNKS} chunks: merkle batches, then one payment for the rest and the envelope (${VAULT_TXS} vault transactions)"
+            pass "${LARGE_LABEL}: ${TOTAL_CHUNKS} chunks paid per chunk, no batch (${VAULT_TXS} vault transactions)"
         else
             fail_with "${LARGE_LABEL}: payments" "${LARGE_PROBLEMS}"
         fi

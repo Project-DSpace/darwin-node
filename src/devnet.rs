@@ -99,6 +99,7 @@ async fn handle_chunk_message(
     protocol: Arc<AntProtocol>,
     p2p: Arc<P2PNode>,
     source: PeerId,
+    source_ip: Option<std::net::IpAddr>,
     data: Vec<u8>,
     node_index: usize,
     received_at: Instant,
@@ -106,11 +107,10 @@ async fn handle_chunk_message(
     let handled = protocol
         .try_handle_request_with_context(
             &data,
-            Some(ChunkRequestContext::new(
-                source.to_string(),
-                received_at.into(),
-                Duration::ZERO,
-            )),
+            Some(
+                ChunkRequestContext::new(source.to_string(), received_at.into(), Duration::ZERO)
+                    .with_ip(source_ip),
+            ),
         )
         .await;
     let telemetry = handled.get_telemetry;
@@ -192,6 +192,7 @@ pub type Result<T> = std::result::Result<T, DevnetError>;
 /// Each configuration is automatically isolated with unique ports and
 /// data directories to prevent collisions when running multiple devnets.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent switches, as in the CLI
 pub struct DevnetConfig {
     /// Number of nodes to spawn (default: 25).
     pub node_count: usize,
@@ -234,6 +235,10 @@ pub struct DevnetConfig {
 
     /// First UDP port in the WebRTC Direct node range (0 = allocate).
     pub webrtc_direct_base_port: u16,
+
+    /// Bind the nodes IPv4 only instead of dual-stack, for hosts that can't
+    /// bind an IPv6 socket (as `ant-node --ipv4-only`).
+    pub ipv4_only: bool,
 }
 
 impl Default for DevnetConfig {
@@ -258,6 +263,7 @@ impl Default for DevnetConfig {
             advertise_ip: None,
             webrtc_direct: false,
             webrtc_direct_base_port: 0,
+            ipv4_only: false,
         }
     }
 }
@@ -1000,7 +1006,10 @@ impl Devnet {
         Ok(
             AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
                 .with_pointer_service(pointers)
-                .with_listing_service(listings),
+                .with_listing_service(listings)
+                // The same limits as a production node, so a devnet shows
+                // what clients will meet.
+                .with_rate_limits(&crate::config::RequestRateLimitConfig::default()),
         )
     }
 
@@ -1011,6 +1020,7 @@ impl Devnet {
 
         let mut core_config = CoreNodeConfig::builder()
             .port(node.port)
+            .ipv6(!self.config.ipv4_only)
             .local(self.config.advertise_ip.is_none())
             .max_message_size(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE)
             .build()
@@ -1112,6 +1122,7 @@ impl Devnet {
                     if let P2PEvent::Message {
                         topic,
                         source: Some(source),
+                        transport_source,
                         data,
                         ..
                     } = event
@@ -1148,6 +1159,7 @@ impl Devnet {
                                 protocol,
                                 p2p,
                                 source,
+                                transport_source.as_ref().and_then(MultiAddr::ip),
                                 data,
                                 node_index,
                                 received_at,

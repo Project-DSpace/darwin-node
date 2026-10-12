@@ -23,6 +23,10 @@
 //! Both refusals are unreachable in production today (`MIN` and `CURRENT` are
 //! both the first declarable version), so they are driven here by crafting the
 //! versions directly, which is what a future settlement bump will make real.
+//!
+//! This fork refuses merkle (batch) payments, so on the merkle path the two
+//! "served" cases come back refused with `BATCH_PAYMENTS_REFUSED` instead.
+//! The version gate runs first, so the two version refusals are unchanged.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -34,6 +38,7 @@ use ant_node::ant_protocol::{
     ProtocolError, CURRENT_SETTLEMENT_VERSION, MIN_SUPPORTED_SETTLEMENT_VERSION,
 };
 use ant_node::client::send_and_await_chunk_response;
+use ant_node::payment::BATCH_PAYMENTS_REFUSED;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use serial_test::serial;
@@ -258,16 +263,24 @@ async fn settlement_version_gate_observed_on_live_network() {
         "REGRESSION: an unversioned single-node quote was not served: {legacy:?}"
     );
     assert!(
-        matches!(legacy_merkle, MerkleCandidateQuoteResponse::Success { .. }),
-        "REGRESSION: an unversioned merkle quote was not served: {legacy_merkle:?}"
+        matches!(
+            &legacy_merkle,
+            MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(reason))
+                if reason == BATCH_PAYMENTS_REFUSED
+        ),
+        "an unversioned merkle quote was not refused as a batch payment: {legacy_merkle:?}"
     );
     assert!(
         matches!(current, ChunkQuoteResponse::Success { .. }),
         "REGRESSION: the gate is not invisible to a current client: {current:?}"
     );
     assert!(
-        matches!(current_merkle, MerkleCandidateQuoteResponse::Success { .. }),
-        "REGRESSION: the gate is not invisible to a current merkle client: {current_merkle:?}"
+        matches!(
+            &current_merkle,
+            MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(reason))
+                if reason == BATCH_PAYMENTS_REFUSED
+        ),
+        "a current merkle quote was not refused as a batch payment: {current_merkle:?}"
     );
 
     match refused {

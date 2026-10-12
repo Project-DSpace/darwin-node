@@ -1,15 +1,17 @@
-//! E2E tests for merkle batch payment verification across live nodes.
+//! E2E tests for merkle batch payments across live nodes.
 //!
-//! These tests validate merkle payment security and correctness by sending
-//! crafted merkle proofs to live testnet nodes with `payment_enforcement: true`.
+//! This fork refuses merkle (batch) payments: every merkle-tagged proof is
+//! refused with [`BATCH_PAYMENTS_REFUSED`], before any of upstream's merkle
+//! checks run. These tests send crafted merkle proofs to live testnet nodes
+//! with `payment_enforcement: true` and check that refusal.
 //!
 //! **Test Coverage**:
-//! - Merkle-tagged garbage rejected
-//! - Valid merkle proof with wrong xorname rejected
-//! - Merkle proof with tampered candidate signatures rejected
+//! - Merkle-tagged garbage refused
+//! - Valid merkle proof with wrong xorname refused
+//! - Merkle proof with tampered candidate signatures refused
 //! - Merkle proof construction, serialization, and size validation
-//! - Concurrent merkle proof verification across multiple nodes
-//! - Pay-yourself attack rejected (fabricated candidate pool)
+//! - Concurrent merkle proofs refused across multiple nodes
+//! - A merkle proof whose payment is on record (pool cache pre-filled) refused
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -21,7 +23,8 @@ use ant_node::ant_protocol::{
 };
 use ant_node::compute_address;
 use ant_node::payment::{
-    serialize_merkle_proof, MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
+    serialize_merkle_proof, BATCH_PAYMENTS_REFUSED, MAX_PAYMENT_PROOF_SIZE_BYTES,
+    MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
 use ant_node::CLOSE_GROUP_SIZE;
 use bytes::Bytes;
@@ -45,16 +48,12 @@ use tracing::info;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Check if a `ChunkMessageBody` indicates a rejection (payment or address error).
+/// Check that a `ChunkMessageBody` is this fork's refusal of a batch payment.
 fn is_rejection(body: &ChunkMessageBody) -> bool {
     matches!(
         body,
-        ChunkMessageBody::PutResponse(
-            ChunkPutResponse::PaymentRequired { .. }
-                | ChunkPutResponse::Error(
-                    ProtocolError::PaymentFailed(_) | ProtocolError::AddressMismatch { .. }
-                )
-        )
+        ChunkMessageBody::PutResponse(ChunkPutResponse::Error(ProtocolError::PaymentFailed(msg)))
+            if msg.contains(BATCH_PAYMENTS_REFUSED)
     )
 }
 
@@ -587,6 +586,8 @@ async fn test_attack_merkle_proof_cross_address_replay() -> Result<(), Box<dyn s
 // Category 7: Pay-yourself attack — fabricated candidate pool
 // ===========================================================================
 
+/// Upstream's pay-yourself attack, now refused as a batch payment.
+///
 /// Attack: build a merkle proof where all 16 candidate `pub_keys` are
 /// attacker-generated (not real network peers) and all 16 `reward_address`
 /// fields point to a single attacker-controlled wallet. The payer funds the
@@ -682,39 +683,13 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
         .await
         .map_err(|e| format!("Send failed: {e}"))?;
 
-    // Extract the error message so the test can report WHY verification
-    // passed or failed. The pay-yourself defence is the ONLY layer capable of
-    // rejecting this proof once on-chain lookup is bypassed — if the response
-    // is a Success or an unrelated error, the attack works.
-    match response.body {
-        // Match the specific matched-count rejection wording, not just any
-        // "closeness" substring. The sparse-network short-circuit (returns
-        // <13 peers) and the matched-count check (matched < 13) both
-        // contain "closeness" in their messages, so a loose match would
-        // accept a passing test for the wrong reason on undersized
-        // testnets. The matched-count message is "candidate pub_keys do
-        // not match the network's closest peers".
-        ChunkMessageBody::PutResponse(ChunkPutResponse::Error(ProtocolError::PaymentFailed(
-            ref msg,
-        ))) if msg.contains("candidate pub_keys do not match") => {
-            info!("Correctly rejected pay-yourself attack at matched-count check: {msg}");
-        }
-        ChunkMessageBody::PutResponse(ChunkPutResponse::Success { .. }) => {
-            panic!(
-                "Pay-yourself attack SUCCEEDED: verifier accepted a pool of 16 attacker-generated \
-                 candidates all rewarding the payer. Merkle closeness defence is missing."
-            );
-        }
-        other => {
-            panic!(
-                "Pay-yourself attack was rejected for the WRONG reason — expected the \
-                 matched-count rejection (\"candidate pub_keys do not match...\"), got: \
-                 {other:?}. Either the testnet was too sparse (<13 peers returned) and the \
-                 sparse-network short-circuit fired instead, or a verifier check other than \
-                 fabricated-pool closeness failed first."
-            );
-        }
-    }
+    // Upstream checked here that the fabricated pool fails the closeness
+    // check. This fork refuses every merkle proof before that check, even
+    // one whose payment is on record, so the refusal is what must come back.
+    assert!(
+        is_rejection(&response.body),
+        "A merkle proof MUST be refused as a batch payment, got: {response:?}"
+    );
 
     harness.teardown().await?;
     Ok(())

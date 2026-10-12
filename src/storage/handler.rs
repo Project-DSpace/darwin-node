@@ -39,11 +39,14 @@ use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::listings::ListingService;
 use crate::logging::{debug, info, warn};
-use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
+use crate::payment::{
+    PaymentVerifier, QuoteGenerator, VerificationContext, BATCH_PAYMENTS_REFUSED,
+};
 use crate::pointer::PointerService;
 use crate::replication::admission;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
+use crate::storage::rate_limit::RequestLimiter;
 use crate::storage::traffic::{self, ChunkRequestKind, ChunkResponseKey};
 use crate::storage::ChunkStore;
 use ant_listings::Listing;
@@ -51,6 +54,7 @@ use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use saorsa_core::P2PNode;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,6 +84,9 @@ pub struct ChunkRequestContext {
     source_peer: String,
     received_at: Instant,
     queue_wait_ms: u64,
+    /// IP the request arrived from, when the transport knows it: keys the
+    /// per-IP limits on unpaid requests (this fork).
+    ip: Option<IpAddr>,
 }
 
 impl ChunkRequestContext {
@@ -89,9 +96,20 @@ impl ChunkRequestContext {
             source_peer,
             received_at,
             queue_wait_ms: duration_ms(queue_wait),
+            ip: None,
         }
     }
+
+    /// Record the IP the request arrived from.
+    #[must_use]
+    pub(crate) const fn with_ip(mut self, ip: Option<IpAddr>) -> Self {
+        self.ip = ip;
+        self
+    }
 }
+
+/// Why an over-limit request was refused (see `storage::rate_limit`).
+const RATE_LIMITED: &str = "rate limited";
 
 /// A decoded protocol request and, for GETs, its pending one-shot telemetry.
 ///
@@ -354,6 +372,10 @@ pub struct AntProtocol {
     /// Records and serves listings for the envelope chunks this node stores.
     /// `None` on a node built without a listing store.
     listings: Option<Arc<ListingService>>,
+    /// Limits on unpaid requests per peer and per IP (this fork). `None`
+    /// limits nothing; requests with no router context (the browser adapter,
+    /// which has its own limits, and tests) are never limited.
+    rate_limits: Option<RequestLimiter>,
 }
 
 impl AntProtocol {
@@ -393,7 +415,16 @@ impl AntProtocol {
             p2p_node: RwLock::new(None),
             pointers: None,
             listings: None,
+            rate_limits: None,
         }
+    }
+
+    /// Limit unpaid requests (quotes, and PUTs that end unpaid) per peer and
+    /// per IP, as `config` says.
+    #[must_use]
+    pub fn with_rate_limits(mut self, config: &crate::config::RequestRateLimitConfig) -> Self {
+        self.rate_limits = Some(RequestLimiter::new(config));
+        self
     }
 
     /// Record and serve listings with `listings`.
@@ -606,6 +637,7 @@ impl AntProtocol {
         self.handle_message_with_context(message, None).await.0
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_message_with_context(
         &self,
         message: ChunkMessage,
@@ -618,10 +650,14 @@ impl AntProtocol {
         let request_id = message.request_id;
         let mut get_telemetry = None;
 
+        if let Some((body, key)) = self.refuse_quote_over_limit(&message.body, context.as_ref()) {
+            return (Some(ChunkMessage { request_id, body }), None, Some(key));
+        }
+
         // Each arm yields the response body and its V2-834 traffic key.
         let (response_body, traffic_key) = match message.body {
             ChunkMessageBody::PutRequest(req) => {
-                let response = self.handle_put(req).await;
+                let response = self.handle_put(req, context.as_ref()).await;
                 let key = ChunkResponseKey::of_put(&response);
                 (ChunkMessageBody::PutResponse(response), key)
             }
@@ -672,7 +708,23 @@ impl AntProtocol {
                 let started = Instant::now();
                 let record_size = req.record.len();
                 let response = match &self.pointers {
-                    Some(service) => service.handle_put(req).await,
+                    // Pointer PUTs share the chunk PUTs' unpaid budget.
+                    Some(_) if !self.put_allowed(context.as_ref()) => {
+                        PointerPutResponse::Error(ProtocolError::Internal(format!(
+                            "{RATE_LIMITED}: too many unpaid PUTs from this peer or address"
+                        )))
+                    }
+                    Some(service) => {
+                        let response = service.handle_put(req).await;
+                        if matches!(
+                            response,
+                            PointerPutResponse::PaymentRequired { .. }
+                                | PointerPutResponse::Error(ProtocolError::PaymentFailed(_))
+                        ) {
+                            self.charge_unpaid_put(context.as_ref());
+                        }
+                        response
+                    }
                     None => PointerPutResponse::Error(ProtocolError::StorageFailed(
                         "this node does not store pointers".to_string(),
                     )),
@@ -725,11 +777,15 @@ impl AntProtocol {
     /// The event uses `target: "ant_node::storage::rpc_latency"` so that
     /// Elasticsearch / Kibana can build p50/p95/p99 store-RPC latency
     /// histograms from the existing telegraf log forwarding.
-    async fn handle_put(&self, request: ChunkPutRequest) -> ChunkPutResponse {
+    async fn handle_put(
+        &self,
+        request: ChunkPutRequest,
+        context: Option<&ChunkRequestContext>,
+    ) -> ChunkPutResponse {
         let start = std::time::Instant::now();
         let addr_hex = hex::encode(request.address);
         let chunk_size = request.content.len();
-        let response = self.handle_put_inner(request).await;
+        let response = self.handle_put_inner(request, context).await;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome: &'static str = match &response {
             ChunkPutResponse::Success { .. } => "success",
@@ -751,10 +807,24 @@ impl AntProtocol {
 
     /// Inner body of `handle_put` — see the wrapper for the per-RPC latency log.
     #[allow(clippy::too_many_lines)]
-    async fn handle_put_inner(&self, request: ChunkPutRequest) -> ChunkPutResponse {
+    async fn handle_put_inner(
+        &self,
+        request: ChunkPutRequest,
+        context: Option<&ChunkRequestContext>,
+    ) -> ChunkPutResponse {
         let address = request.address;
         let addr_hex = hex::encode(address);
         debug!("Handling PUT request for {addr_hex}");
+
+        // 0. Refuse while this peer's or IP's unpaid-PUT budget is spent,
+        //    before any hashing or payment work. Only PUTs that end unpaid
+        //    spend it (`charge_unpaid_put`), so paid uploads never do.
+        if !self.put_allowed(context) {
+            debug!("Refusing PUT for {addr_hex}: too many unpaid PUTs from its peer or address");
+            return ChunkPutResponse::Error(ProtocolError::Internal(format!(
+                "{RATE_LIMITED}: too many unpaid PUTs from this peer or address"
+            )));
+        }
 
         // 1. Validate chunk size
         if request.content.len() > MAX_CHUNK_SIZE {
@@ -861,11 +931,13 @@ impl AntProtocol {
                 // Payment verified or cached
             }
             Ok(_) => {
+                self.charge_unpaid_put(context);
                 return ChunkPutResponse::PaymentRequired {
                     message: "Payment required for new chunk".to_string(),
                 };
             }
             Err(e) => {
+                self.charge_unpaid_put(context);
                 return ChunkPutResponse::Error(ProtocolError::PaymentFailed(e.to_string()));
             }
         }
@@ -874,7 +946,10 @@ impl AntProtocol {
         //     at hand; only the fields its flags show are kept.
         let listing = match self.listing_for_put(&address, &request).await {
             Ok(listing) => listing,
-            Err(response) => return response,
+            Err(response) => {
+                self.charge_unpaid_put(context);
+                return response;
+            }
         };
 
         // 6. Store chunk
@@ -928,6 +1003,57 @@ impl AntProtocol {
                 ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
             }
         }
+    }
+
+    /// Whether a PUT may proceed: false only while its peer's or IP's unpaid
+    /// budget is spent. Spends nothing.
+    fn put_allowed(&self, context: Option<&ChunkRequestContext>) -> bool {
+        match (&self.rate_limits, context) {
+            (Some(limits), Some(context)) => limits.allow_put(&context.source_peer, context.ip),
+            _ => true,
+        }
+    }
+
+    /// Charge a PUT that ended unpaid to its peer's and IP's budget.
+    fn charge_unpaid_put(&self, context: Option<&ChunkRequestContext>) {
+        if let (Some(limits), Some(context)) = (&self.rate_limits, context) {
+            limits.charge_unpaid_put(&context.source_peer, context.ip);
+        }
+    }
+
+    /// Refuse a quote request of any kind when its peer or IP is over its
+    /// quote rate, with that kind's error response and traffic key. Spends a
+    /// token from both when it is not refused.
+    fn refuse_quote_over_limit(
+        &self,
+        body: &ChunkMessageBody,
+        context: Option<&ChunkRequestContext>,
+    ) -> Option<(ChunkMessageBody, ChunkResponseKey)> {
+        let key = match body {
+            ChunkMessageBody::QuoteRequest(_) => ChunkResponseKey::Quote,
+            ChunkMessageBody::QuoteRequestV2(_) => ChunkResponseKey::QuoteV2,
+            ChunkMessageBody::MerkleCandidateQuoteRequest(_) => ChunkResponseKey::MerkleQuote,
+            ChunkMessageBody::MerkleCandidateQuoteRequestV2(_) => ChunkResponseKey::MerkleQuoteV2,
+            _ => return None,
+        };
+        let (limits, context) = (self.rate_limits.as_ref()?, context?);
+        if limits.allow_quote(&context.source_peer, context.ip) {
+            return None;
+        }
+        debug!(
+            "Refusing quote request from {}: over its quote rate",
+            context.source_peer
+        );
+        let refusal = ProtocolError::QuoteFailed(RATE_LIMITED.to_string());
+        let body = match key {
+            ChunkResponseKey::MerkleQuote | ChunkResponseKey::MerkleQuoteV2 => {
+                ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
+                    refusal,
+                ))
+            }
+            _ => ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(refusal)),
+        };
+        Some((body, key))
     }
 
     /// For an envelope, of any visibility, the listing to record once the
@@ -1150,8 +1276,29 @@ impl AntProtocol {
         }
     }
 
-    /// Handle a merkle candidate quote request.
+    /// Handle a merkle candidate quote request: refused in this fork, before
+    /// anything is signed.
+    ///
+    /// A batch is paid on-chain before any PUT, so refusing at quote time is
+    /// what keeps clients from spending money this node would not honour.
+    /// Upstream's signing path is kept below, unused, so merges stay cheap.
+    #[allow(clippy::unused_self)]
     fn handle_merkle_candidate_quote(
+        &self,
+        request: &MerkleCandidateQuoteRequest,
+    ) -> MerkleCandidateQuoteResponse {
+        debug!(
+            "Refusing merkle candidate quote request for {}: {BATCH_PAYMENTS_REFUSED}",
+            hex::encode(request.address)
+        );
+        MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(
+            BATCH_PAYMENTS_REFUSED.to_string(),
+        ))
+    }
+
+    /// Upstream's merkle candidate quote: signs a candidate node for a batch.
+    #[allow(dead_code)]
+    fn sign_merkle_candidate_quote(
         &self,
         request: &MerkleCandidateQuoteRequest,
     ) -> MerkleCandidateQuoteResponse {
@@ -1858,22 +2005,19 @@ mod tests {
         assert_eq!(stats.chunks_stored, 0);
     }
 
+    /// This fork refuses batch payments at quote time, before anything is
+    /// signed: a batch is paid before any PUT, so this is where refusing
+    /// costs the client nothing.
     #[tokio::test]
-    async fn test_merkle_candidate_quote_request() {
-        use ant_protocol::payment::verify::verify_merkle_candidate_signature;
-        use evmlib::merkle_payments::MerklePaymentCandidateNode;
-
-        // create_test_protocol already wires ML-DSA-65 signing
+    async fn test_merkle_candidate_quote_request_is_refused() {
         let (protocol, _temp) = create_test_protocol().await;
-
-        let address = [0x77; 32];
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_secs();
 
         let request = MerkleCandidateQuoteRequest {
-            address,
+            address: [0x77; 32],
             data_type: DATA_TYPE_CHUNK,
             data_size: 4096,
             merkle_payment_timestamp: timestamp,
@@ -1882,10 +2026,8 @@ mod tests {
             request_id: 600,
             body: ChunkMessageBody::MerkleCandidateQuoteRequest(request),
         };
-        let msg_bytes = msg.encode().expect("encode request");
-
         let response_bytes = protocol
-            .try_handle_request(&msg_bytes)
+            .try_handle_request(&msg.encode().expect("encode request"))
             .await
             .expect("handle merkle candidate quote")
             .expect("expected response");
@@ -1894,30 +2036,17 @@ mod tests {
         assert_eq!(response.request_id, 600);
         match response.body {
             ChunkMessageBody::MerkleCandidateQuoteResponse(
-                MerkleCandidateQuoteResponse::Success { candidate_node, .. },
-            ) => {
-                let candidate: MerklePaymentCandidateNode =
-                    rmp_serde::from_slice(&candidate_node).expect("deserialize candidate node");
-
-                // Verify ML-DSA-65 signature
-                assert!(
-                    verify_merkle_candidate_signature(&candidate),
-                    "ML-DSA-65 candidate signature must be valid"
-                );
-
-                assert_eq!(candidate.merkle_payment_timestamp, timestamp);
-                // Node-calculated price based on records stored
-                assert!(candidate.price >= evmlib::common::Amount::ZERO);
-            }
-            other => panic!("expected MerkleCandidateQuoteResponse::Success, got: {other:?}"),
+                MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(reason)),
+            ) => assert_eq!(reason, BATCH_PAYMENTS_REFUSED),
+            other => panic!("expected the batch-payment refusal, got: {other:?}"),
         }
     }
 
-    /// A current client gets a quote through the versioned request, exactly as
-    /// it would through the legacy one. The gate must be invisible to clients
-    /// that can pay.
+    /// A current client asking for a batch quote through the versioned request
+    /// is refused the same way: settling correctly does not make a batch
+    /// acceptable.
     #[tokio::test]
-    async fn v2_merkle_quote_is_served_at_the_current_settlement_version() {
+    async fn v2_merkle_quote_is_refused_at_the_current_settlement_version() {
         let (protocol, _temp) = create_test_protocol().await;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1940,9 +2069,9 @@ mod tests {
         assert_eq!(response.request_id, 700);
         match response.body {
             ChunkMessageBody::MerkleCandidateQuoteResponse(
-                MerkleCandidateQuoteResponse::Success { .. },
-            ) => {}
-            other => panic!("expected Success, got: {other:?}"),
+                MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(reason)),
+            ) => assert_eq!(reason, BATCH_PAYMENTS_REFUSED),
+            other => panic!("expected the batch-payment refusal, got: {other:?}"),
         }
     }
 
@@ -2071,32 +2200,217 @@ mod tests {
     #[tokio::test]
     async fn unversioned_requests_are_still_served() {
         let (protocol, _temp) = create_test_protocol().await;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_secs();
 
+        // Single-node: this fork refuses merkle quotes whatever the version.
         let msg = ChunkMessage {
             request_id: 704,
-            body: ChunkMessageBody::MerkleCandidateQuoteRequest(MerkleCandidateQuoteRequest {
+            body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
                 address: [0xCC; 32],
-                data_type: DATA_TYPE_CHUNK,
                 data_size: 4096,
-                merkle_payment_timestamp: timestamp,
+                data_type: DATA_TYPE_CHUNK,
             }),
         };
         let response_bytes = protocol
             .try_handle_request(&msg.encode().expect("encode request"))
             .await
-            .expect("handle legacy merkle candidate quote")
+            .expect("handle legacy quote")
             .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         match response.body {
-            ChunkMessageBody::MerkleCandidateQuoteResponse(
-                MerkleCandidateQuoteResponse::Success { .. },
-            ) => {}
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { .. }) => {}
             other => panic!("expected Success for a legacy request, got: {other:?}"),
+        }
+    }
+
+    fn limits(per_peer: usize, per_ip: usize) -> crate::config::RequestRateLimitConfig {
+        crate::config::RequestRateLimitConfig {
+            quote_requests_per_second_per_peer: per_peer,
+            quote_requests_per_second_per_ip: per_ip,
+            unpaid_puts_per_second_per_peer: per_peer,
+            unpaid_puts_per_second_per_ip: per_ip,
+        }
+    }
+
+    async fn create_limited_protocol(per_peer: usize, per_ip: usize) -> (AntProtocol, TempDir) {
+        let (protocol, temp) = create_test_protocol().await;
+        (protocol.with_rate_limits(&limits(per_peer, per_ip)), temp)
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn ip(last: u8) -> Option<IpAddr> {
+        Some(IpAddr::from([203, 0, 113, last]))
+    }
+
+    /// Send `body` as the router would, from `peer` at `ip`.
+    async fn send_as(
+        protocol: &AntProtocol,
+        peer: &str,
+        ip: Option<IpAddr>,
+        body: ChunkMessageBody,
+    ) -> ChunkMessageBody {
+        let msg = ChunkMessage {
+            request_id: 1,
+            body,
+        };
+        let context =
+            ChunkRequestContext::new(peer.to_string(), Instant::now(), Duration::ZERO).with_ip(ip);
+        let bytes = protocol
+            .try_handle_request_with_context(&msg.encode().expect("encode"), Some(context))
+            .await
+            .response
+            .expect("handle")
+            .expect("response");
+        ChunkMessage::decode(&bytes).expect("decode").body
+    }
+
+    fn quote_request(seed: u8) -> ChunkMessageBody {
+        ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+            address: [seed; 32],
+            data_size: 4096,
+            data_type: DATA_TYPE_CHUNK,
+        })
+    }
+
+    fn is_rate_limited_quote(body: &ChunkMessageBody) -> bool {
+        matches!(
+            body,
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(reason)))
+                | ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
+                    ProtocolError::QuoteFailed(reason)
+                ))
+                if reason == RATE_LIMITED
+        )
+    }
+
+    fn is_rate_limited_put(body: &ChunkMessageBody) -> bool {
+        matches!(
+            body,
+            ChunkMessageBody::PutResponse(ChunkPutResponse::Error(ProtocolError::Internal(reason)))
+                if reason.starts_with(RATE_LIMITED)
+        )
+    }
+
+    fn unpaid_put(i: usize) -> ChunkMessageBody {
+        let content = Bytes::from(format!("unpaid chunk {i}"));
+        let address = ChunkStore::compute_address(&content);
+        ChunkMessageBody::PutRequest(ChunkPutRequest::new(address, content))
+    }
+
+    /// A flood of quote requests from one peer is cut to about a second's
+    /// burst; another peer, at another address, is still served.
+    #[tokio::test]
+    async fn quote_flood_from_one_peer_is_rate_limited() {
+        let (protocol, _temp) = create_limited_protocol(4, 1_000).await;
+        let mut limited = 0;
+        for seed in 0..20 {
+            if is_rate_limited_quote(
+                &send_as(&protocol, "flooder", ip(1), quote_request(seed)).await,
+            ) {
+                limited += 1;
+            }
+        }
+        assert!(
+            limited >= 14,
+            "only {limited} of 20 quote requests were limited"
+        );
+
+        // Merkle quote requests spend the same budget.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let merkle = ChunkMessageBody::MerkleCandidateQuoteRequestV2(
+            MerkleCandidateQuoteRequestV2::new([0x42; 32], 4096, timestamp),
+        );
+        assert!(is_rate_limited_quote(
+            &send_as(&protocol, "flooder", ip(1), merkle).await
+        ));
+
+        match send_as(&protocol, "bystander", ip(2), quote_request(0xEE)).await {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { .. }) => {}
+            other => panic!("another peer must still be quoted, got: {other:?}"),
+        }
+    }
+
+    /// Many peer identities behind one address share its limit.
+    #[tokio::test]
+    async fn quote_flood_from_one_ip_is_rate_limited_across_peers() {
+        let (protocol, _temp) = create_limited_protocol(1_000, 4).await;
+        let mut limited = 0;
+        for seed in 0..20 {
+            let peer = format!("sybil-{seed}");
+            if is_rate_limited_quote(&send_as(&protocol, &peer, ip(3), quote_request(seed)).await) {
+                limited += 1;
+            }
+        }
+        assert!(
+            limited >= 14,
+            "only {limited} of 20 quote requests were limited"
+        );
+        match send_as(&protocol, "sybil-0", ip(4), quote_request(0xED)).await {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { .. }) => {}
+            other => panic!("another address must still be quoted, got: {other:?}"),
+        }
+    }
+
+    /// Unpaid PUTs spend the budget and are then refused up front; a peer at
+    /// another address still reaches payment verification.
+    #[tokio::test]
+    async fn unpaid_put_flood_is_rate_limited() {
+        let (protocol, _temp) = create_limited_protocol(4, 4).await;
+        let mut limited = 0;
+        for i in 0..20 {
+            let body = send_as(&protocol, "flooder", ip(5), unpaid_put(i)).await;
+            if is_rate_limited_put(&body) {
+                limited += 1;
+            } else {
+                assert!(
+                    matches!(
+                        body,
+                        ChunkMessageBody::PutResponse(
+                            ChunkPutResponse::PaymentRequired { .. }
+                                | ChunkPutResponse::Error(ProtocolError::PaymentFailed(_))
+                        )
+                    ),
+                    "an unpaid PUT must be refused for payment: {body:?}"
+                );
+            }
+        }
+        assert!(
+            limited >= 14,
+            "only {limited} of 20 unpaid PUTs were limited"
+        );
+
+        let body = send_as(&protocol, "bystander", ip(6), unpaid_put(100)).await;
+        assert!(
+            !is_rate_limited_put(&body),
+            "another peer must not be limited: {body:?}"
+        );
+    }
+
+    /// Paid PUTs never spend the unpaid budget, however many there are.
+    #[tokio::test]
+    async fn paid_puts_are_never_rate_limited() {
+        let (protocol, _temp) = create_limited_protocol(1, 1).await;
+        for i in 0..20 {
+            let content = Bytes::from(format!("paid chunk {i}"));
+            let address = ChunkStore::compute_address(&content);
+            protocol.payment_verifier().cache_insert(address);
+            let body = send_as(
+                &protocol,
+                "payer",
+                ip(7),
+                ChunkMessageBody::PutRequest(ChunkPutRequest::new(address, content)),
+            )
+            .await;
+            assert!(
+                matches!(
+                    body,
+                    ChunkMessageBody::PutResponse(ChunkPutResponse::Success { .. })
+                ),
+                "paid PUT {i} must be stored: {body:?}"
+            );
         }
     }
 

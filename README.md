@@ -18,9 +18,17 @@ means Autonomi's earlier network, which Darwin never ran.
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
   (Autonomi's contracts): run it on Darwin only with those three set (see
   [Join the Network](#join-the-network)).
+- **Batch payments are refused** (from ds.9). Nodes take per-chunk
+  (single-node) payments only. A merkle candidate quote request, versioned
+  or not, is answered `QuoteFailed("merkle (batch) payments are not
+  accepted; pay per chunk")` before anything is signed: a batch is paid
+  on-chain before any PUT, so refusing the quote is what keeps a client from
+  paying for storage it won't get. A merkle proof on a PUT or a fresh
+  replication offer is refused with the same message. Neighbour-sync repair
+  carries no proof, so chunks already stored keep being repaired. Upstream's
+  merkle code stays compiled, unused, so merges stay cheap.
 - **Payment checks fall back across RPCs** (from ds.8). A node reads a
-  storage payment (`completedPayments`, or a batch's
-  `getCompletedMerklePayment`) through its own RPC and, when that is one of
+  storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a
   second apart. Only a failed call moves on: any answer, even that nothing
   was paid, settles the check. Upstream reads once, through one RPC, so a
@@ -47,9 +55,11 @@ means Autonomi's earlier network, which Darwin never ran.
   library's `RUST-STD-COPYRIGHT.html`. The Docker image has them in
   `/usr/share/doc/storage-node/`, with a `NOTICE` for the `ant` node manager
   it bundles.
-- **Rate limits**: only new connections per IP and browser (WebRTC Direct)
-  sessions and requests are limited. Unpaid storage and quote requests are
-  not; see [Rate Limiting](#rate-limiting).
+- **Unpaid requests are rate-limited** (from ds.9), per peer and per IP
+  (IPv4 address or IPv6 /64): quote requests of every kind, and PUTs (chunk
+  and pointer) that end unpaid. Upstream limits only new connections per IP
+  and browser (WebRTC Direct) sessions and requests. Paid PUTs are never
+  limited. See [Rate Limiting](#rate-limiting).
 
 ---
 
@@ -1070,10 +1080,18 @@ What is limited:
 |-------|-------|-------|
 | New connections per IP | saorsa-core transport | 1,000 per 60 s, burst 100 |
 | Browser (WebRTC Direct) sessions and requests | `WebRtcDirectConfig` in `src/config.rs` | per IP, per session and in total |
+| Quote requests (single-node and merkle, any version) | `RequestRateLimitConfig` in `src/config.rs` | 32 per second per peer and per IP |
+| Unpaid PUTs (chunk and pointer) | `RequestRateLimitConfig` in `src/config.rs` | 32 per second per peer and per IP |
 
-Not limited (a known gap): unpaid chunk PUTs and quote requests over the
-storage protocol. A peer holding quotes can send unpaid PUTs, and each one
-costs the node chain RPC calls.
+The last two are this fork's (`src/storage/rate_limit.rs`): token buckets
+holding one second of their rate, keyed by peer and by IP (an IPv4 address or
+an IPv6 /64). An over-limit quote request is answered
+`QuoteFailed("rate limited")`. A PUT that ends in "payment required" or a
+payment failure spends a token from its peer's and IP's bucket, and a PUT is
+refused up front (`Internal("rate limited: ...")`, before any hashing or
+payment check) while either bucket is empty, so paid PUTs never spend one.
+Requests over the browser listener keep its own limits instead. The values
+follow the browser listener's per-IP request rate and await confirmation.
 
 ### Blacklist Management
 
