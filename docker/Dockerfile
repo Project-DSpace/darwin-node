@@ -29,8 +29,9 @@ COPY docker/entrypoint.sh /entrypoint.sh
 COPY docker/nodes /usr/local/bin/nodes
 RUN chmod 755 /opt/ant/ant-node /entrypoint.sh /usr/local/bin/nodes
 
-# Our network, set the way our servers run it: production mode (at most 2
-# nodes per IP count in any close group), IPv4 only, the 3 bootstrap servers,
+# Our network, set the way our servers run it: production mode (each node's
+# routing table takes at most 2 nodes from one IP in each bucket and among the
+# 20 nearest), IPv4 only, the 3 bootstrap servers,
 # and Robinhood Chain RPCs shared out over the nodes. Operators set
 # REWARDS_ADDRESS, NODE_COUNT and usually BROWSER_PORT_START; servers also set
 # PUBLIC_IP. RPC_URL, if set, replaces RPC_URLS with one provider of the

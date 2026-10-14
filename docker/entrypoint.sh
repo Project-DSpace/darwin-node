@@ -40,11 +40,13 @@ done
 if (( NODE_COUNT > 6 )) && [[ "$ANT_NETWORK_MODE" == testnet ]]; then
     fail "NODE_COUNT is limited to 6 per machine while the network is in testnet mode"
 fi
-# In production mode a close group takes at most 2 nodes from one IP address,
-# so nodes beyond 2 add load without adding storage.
+# In production mode each node's routing table takes at most 2 nodes from one
+# IP address in each bucket and among the 20 nodes nearest it (saorsa-core's
+# IP diversity limits), so nodes beyond 2 on one IP are turned away from some
+# of those places and add load for less storage.
 if (( NODE_COUNT > 2 )) && [[ "$ANT_NETWORK_MODE" == production ]]; then
-    echo "WARNING: NODE_COUNT is $NODE_COUNT, but the network counts at most 2 nodes per IP address in any close group;" \
-        "nodes beyond 2 add load without adding storage. Set NODE_COUNT to 2."
+    echo "WARNING: NODE_COUNT is $NODE_COUNT, but in production mode each node's routing table takes at most 2 nodes from one IP address" \
+        "in each bucket and among the 20 nodes nearest it; nodes beyond 2 add load for less storage. Set NODE_COUNT to 2."
 fi
 (( PORT_START >= 1024 && PORT_START <= 65536 - NODE_COUNT )) \
     || fail "PORT_START must leave room for $NODE_COUNT UDP ports between 1024 and 65535"

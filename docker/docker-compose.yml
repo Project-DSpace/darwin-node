@@ -37,10 +37,10 @@ services:
     environment:
       # Ethereum-style wallet address (0x...) that receives your storage fees.
       REWARDS_ADDRESS: "0xYOUR_WALLET_ADDRESS"
-      # How many nodes to run: 2, or 1 on a small machine. The network counts
-      # at most 2 nodes per IP address in any close group, so more add load
-      # without adding storage. Each needs at least 20 GB of free disk space
-      # (about 35 GB recommended).
+      # How many nodes to run: 2, or 1 on a small machine. Each node's routing
+      # table takes at most 2 nodes from one IP address in each bucket and
+      # among the 20 nodes nearest it, so more add load for less storage. Each
+      # needs at least 20 GB of free disk space (about 35 GB recommended).
       NODE_COUNT: 2
       PORT_START: 10000
       # 0 turns browser access off.

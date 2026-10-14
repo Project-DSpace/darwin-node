@@ -55,8 +55,11 @@ means Autonomi's earlier network, which Darwin never ran.
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself.
 - **Run nodes with the Docker image**: [docker/README.md](docker/README.md).
-  The network runs in production mode, which counts at most 2 nodes per IP
-  address in any close group, so run 2 nodes per IP.
+  The network runs in production mode, in which each node's routing table
+  takes at most 2 nodes from one IP address, and 5 from one /24 subnet, in
+  each bucket and among the 20 nodes nearest that node. More nodes on one IP
+  are turned away from some of those places and add load for less storage,
+  so run 2 nodes per IP.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
   releases without credentials.

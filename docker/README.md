@@ -59,10 +59,10 @@ If the server runs a firewall (such as `ufw`), open the same UDP ports there too
    - **`REWARDS_ADDRESS`**: your `0x…` address, in place of
      `0xYOUR_WALLET_ADDRESS`.
    - **`NODE_COUNT`**: 2 (or 1 if your disk, memory or connection is
-     short). The network counts at most 2 nodes per IP address in any close
-     group, so more than 2 nodes add load without adding storage, and the
-     container warns about it. Each node needs at least 20 GB of free disk
-     space.
+     short). Each node's routing table takes at most 2 nodes from one IP
+     address in each bucket and among the 20 nodes nearest it, so more than 2
+     nodes add load for less storage, and the container warns about it. Each
+     node needs at least 20 GB of free disk space.
    - **The data folder**: node data goes in `data` next to the file. To use
      another disk, change `./data` in the `volumes` line to a folder on that
      disk, such as `/mnt/storage/storage-node:/data`. The nodes measure free

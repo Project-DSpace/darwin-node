@@ -23,8 +23,9 @@ IMAGE=${1:?usage: smoke-test.sh <image>}
 WORK=$(mktemp -d)
 IP=$(hostname -I | awk '{print $1}')
 WALLET=0x000000000000000000000000000000000000dEaD   # test nodes earn nothing
-# Testnet mode: the image defaults to production mode, which counts at most 2
-# nodes per IP, and every test node here runs on this one machine.
+# Testnet mode: the image defaults to production mode, whose routing tables
+# take at most 2 nodes from one IP into each bucket, and every test node here
+# runs on this one machine.
 COMMON=(--network host --stop-timeout 120 -e ANT_NETWORK_MODE=testnet -e REWARDS_ADDRESS=$WALLET -e PUID=$(id -u) -e PGID=$(id -g))
 
 fail() {
