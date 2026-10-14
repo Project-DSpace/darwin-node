@@ -148,6 +148,9 @@ impl NodeBuilder {
         let p2p_node = P2PNode::new(core_config)
             .await
             .map_err(|e| Error::Startup(format!("Failed to create P2P node: {e}")))?;
+        if !self.config.relay_serving {
+            Self::stop_relay_serving(&p2p_node);
+        }
 
         // Create upgrade monitor
         let upgrade_monitor = {
@@ -307,6 +310,22 @@ impl NodeBuilder {
             Self::spawn_storage_migration(protocol.storage(), p2p, &engine, shutdown.clone());
 
         Ok((Some(engine), migration_task))
+    }
+
+    /// Refuse MASQUE relay sessions from now on (`relay_serving = false`).
+    ///
+    /// saorsa-core gives every node that is not a client a relay server, on which any
+    /// peer can open a session and have this node send UDP for it to any address, and
+    /// it has a switch for that server that nothing in saorsa-core calls. Flipped here,
+    /// before `start()`, so the node refuses sessions before it joins the network: a
+    /// refused peer is told 503, as by a relay that is full, and tries its next
+    /// candidate. The transport accepts connections from inside `P2PNode::new`, so a
+    /// session opened in the moment before this call would still be served.
+    fn stop_relay_serving(p2p_node: &P2PNode) {
+        p2p_node.transport().set_relay_serving_enabled(false);
+        info!(
+            "Relay serving is off (relay_serving = false): this node refuses MASQUE relay sessions"
+        );
     }
 
     /// Build the saorsa-core `NodeConfig` from our config.
@@ -1611,6 +1630,40 @@ mod tests {
         let diversity = core.diversity_config.expect("diversity");
         assert_eq!(diversity.max_per_ip, Some(usize::MAX));
         assert_eq!(diversity.max_per_subnet, Some(usize::MAX));
+    }
+
+    /// What `stop_relay_serving` relies on, checked against saorsa-transport's relay
+    /// server itself: it serves by default, and once switched off it refuses a session,
+    /// whether the peer asks to send to one address or to any, with a 503 and before
+    /// binding a socket for it. Nothing upstream calls or tests the switch, so a
+    /// dependency update that changes what it does fails here.
+    #[tokio::test]
+    async fn a_relay_server_switched_off_refuses_every_session() {
+        use saorsa_transport::masque::{ConnectUdpRequest, MasqueRelayConfig, MasqueRelayServer};
+
+        let relay: std::net::SocketAddr = "203.0.113.1:10000".parse().unwrap();
+        let peer: std::net::SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        let target: std::net::SocketAddr = "192.0.2.9:53".parse().unwrap();
+
+        let server = MasqueRelayServer::new(MasqueRelayConfig::default(), relay);
+        assert!(
+            server.is_relay_serving_enabled(),
+            "saorsa-transport serves relays unless told not to"
+        );
+
+        server.set_relay_serving_enabled(false);
+        for request in [
+            ConnectUdpRequest::bind_any(),
+            ConnectUdpRequest::target(target),
+        ] {
+            let response = server
+                .handle_connect_request(&request, peer, None)
+                .await
+                .unwrap();
+            assert_eq!(response.status, 503, "{request:?} must be refused");
+            assert!(response.proxy_public_address.is_none());
+        }
+        assert_eq!(server.session_count().await, 0);
     }
 
     #[test]

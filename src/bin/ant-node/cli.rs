@@ -28,6 +28,14 @@ pub struct Cli {
     #[arg(long, env = "ANT_IPV4_ONLY")]
     pub ipv4_only: bool,
 
+    /// Serve as a MASQUE relay for other peers: true or false.
+    /// With false, the node refuses relay sessions, on which a peer can
+    /// send UDP through this node to any address; it can still use other
+    /// peers' relays. Overrides `relay_serving` in a config file. When
+    /// neither sets it, the node serves relays, as saorsa-core does.
+    #[arg(long, env = "ANT_RELAY_SERVING", value_name = "BOOL")]
+    pub relay_serving: Option<bool>,
+
     /// Disable the browser listener, overriding config and endpoint flags.
     #[arg(long, env = "ANT_DISABLE_WEBRTC_DIRECT")]
     pub disable_webrtc_direct: bool,
@@ -251,6 +259,9 @@ impl Cli {
 
         config.port = self.port;
         config.ipv4_only = self.ipv4_only;
+        if let Some(relay_serving) = self.relay_serving {
+            config.relay_serving = relay_serving;
+        }
         if let Some(bind) = self.webrtc_direct_bind {
             config.webrtc_direct.enabled = true;
             config.webrtc_direct.bind = bind;
@@ -441,6 +452,82 @@ mod tests {
         let cli = Cli::try_parse_from(["ant-node", "--webrtc-port", "45000"])?;
 
         assert_eq!(cli.webrtc_direct_port, Some(45_000));
+        Ok(())
+    }
+
+    const RELAY_SERVING_ENV: &str = "ANT_RELAY_SERVING";
+
+    fn relay_serving(args: &[&str]) -> Result<bool, Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from(std::iter::once("ant-node").chain(args.iter().copied()))?;
+        let (config, _) = cli.into_config()?;
+        Ok(config.relay_serving)
+    }
+
+    // The tests that read or set ANT_RELAY_SERVING run serially: the
+    // environment is shared by the whole test process.
+    #[test]
+    #[serial_test::serial]
+    fn relay_serving_is_on_by_default() -> Result<(), Box<dyn std::error::Error>> {
+        std::env::remove_var(RELAY_SERVING_ENV);
+        assert!(relay_serving(&[])?);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn relay_serving_is_set_by_its_variable_or_flag() -> Result<(), Box<dyn std::error::Error>> {
+        std::env::remove_var(RELAY_SERVING_ENV);
+        assert!(!relay_serving(&["--relay-serving", "false"])?);
+        assert!(relay_serving(&["--relay-serving", "true"])?);
+
+        std::env::set_var(RELAY_SERVING_ENV, "false");
+        let from_env = relay_serving(&[]);
+        let flag_over_env = relay_serving(&["--relay-serving", "true"]);
+        std::env::set_var(RELAY_SERVING_ENV, "true");
+        let on_from_env = relay_serving(&[]);
+        std::env::remove_var(RELAY_SERVING_ENV);
+
+        assert!(
+            !from_env?,
+            "ANT_RELAY_SERVING=false must turn relay serving off"
+        );
+        assert!(flag_over_env?, "the flag must override the variable");
+        assert!(on_from_env?);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn relay_serving_takes_only_true_or_false() {
+        std::env::remove_var(RELAY_SERVING_ENV);
+        // clap parses the variable's value as it does the flag's, so an empty
+        // ANT_RELAY_SERVING is refused too. Not set here: the other tests in
+        // this module parse the environment in parallel and would fail on it.
+        for value in ["no", "0", "off", "False", ""] {
+            assert!(
+                Cli::try_parse_from(["ant-node", "--relay-serving", value]).is_err(),
+                "--relay-serving {value:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn relay_serving_in_a_config_file_holds_unless_overridden(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        std::env::remove_var(RELAY_SERVING_ENV);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "relay_serving = false\n")?;
+        let path = path.to_str().ok_or("temp path is not UTF-8")?;
+
+        assert!(!relay_serving(&["--config", path])?);
+        assert!(relay_serving(&[
+            "--config",
+            path,
+            "--relay-serving",
+            "true"
+        ])?);
         Ok(())
     }
 }

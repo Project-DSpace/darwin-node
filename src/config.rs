@@ -96,6 +96,15 @@ pub struct NodeConfig {
     #[serde(default)]
     pub ipv4_only: bool,
 
+    /// Serve as a MASQUE relay for other peers.
+    ///
+    /// saorsa-core gives every node that is not a client a relay server, on
+    /// which any peer can open a session and send UDP through this node to
+    /// any address. When false, the node refuses new relay sessions; it can
+    /// still use other peers' relays. Default: true, saorsa-core's behaviour.
+    #[serde(default = "default_relay_serving")]
+    pub relay_serving: bool,
+
     /// Bootstrap peer addresses.
     #[serde(default)]
     pub bootstrap: Vec<SocketAddr>,
@@ -433,6 +442,7 @@ impl Default for NodeConfig {
             root_dir: default_root_dir(),
             port: 0,
             ipv4_only: false,
+            relay_serving: default_relay_serving(),
             bootstrap: Vec::new(),
             network_mode: NetworkMode::default(),
             testnet: TestnetConfig::default(),
@@ -551,6 +561,11 @@ fn default_max_message_size() -> usize {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+/// saorsa-core serves relays on every node that is not a client.
+const fn default_relay_serving() -> bool {
+    true
 }
 
 const fn default_check_interval() -> u64 {
@@ -811,6 +826,15 @@ mod tests {
         assert_eq!(partial.webrtc_direct.max_connections, 48);
         let disabled: NodeConfig = toml::from_str("[webrtc_direct]\nenabled = false").unwrap();
         assert!(!disabled.webrtc_direct.enabled);
+    }
+
+    #[test]
+    fn relay_serving_is_on_unless_the_file_turns_it_off() {
+        assert!(NodeConfig::default().relay_serving);
+        let absent: NodeConfig = toml::from_str("").unwrap();
+        assert!(absent.relay_serving);
+        let off: NodeConfig = toml::from_str("relay_serving = false").unwrap();
+        assert!(!off.relay_serving);
     }
 
     #[test]
