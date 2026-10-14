@@ -70,9 +70,10 @@ means Autonomi's earlier network, which Darwin never ran.
   library's `RUST-STD-COPYRIGHT.html`. The Docker image has them in
   `/usr/share/doc/storage-node/`, with a `NOTICE` for the `ant` node manager
   it bundles.
-- **Rate limits**: only new connections per IP and browser (WebRTC Direct)
-  sessions and requests are limited. Unpaid storage and quote requests are
-  not; see [Rate Limiting](#rate-limiting).
+- **Rate limits**: only browser (WebRTC Direct) sessions and requests are
+  limited. New connections over saorsa-core's rate per IP are only logged,
+  and unpaid storage and quote requests aren't limited; see [Rate
+  Limiting](#rate-limiting).
 
 ---
 
@@ -144,9 +145,13 @@ Even though self-encrypted data on the legacy network is secure, the legacy netw
 | **Geographic Routing** | None | 7-region distribution (no entity holds multiple copies) |
 | **Eclipse Protection** | Limited | Diversity scoring, ASN limits, detection algorithms |
 | **Auto-Upgrade** | Manual | Staged rollout of signed releases (this fork: Linux x86_64 only) |
-| **Rate Limiting** | Basic | New connections per IP; browser sessions and requests (see [Rate Limiting](#rate-limiting)) |
+| **Rate Limiting** | Basic | Browser sessions and requests; new connections per IP are only logged (see [Rate Limiting](#rate-limiting)) |
 | **Node Identity** | Ed25519 pubkey (unused, never signs data) | ML-DSA-65 pubkey (actively signs all operations) |
 | **Legacy Data** | N/A | Full support for classical encrypted data |
+
+The Sybil resistance, node limiting, geographic routing and eclipse
+protection rows are upstream's design. What this code applies is in
+[Routing-Table Admission](#routing-table-admission).
 
 ---
 
@@ -267,6 +272,13 @@ This ensures that **everyone can contribute to the network**, democratizing part
 ---
 
 ## Network Hardening
+
+> **Upstream's design, mostly not in this code.** Of what follows,
+> saorsa-core applies only IP limits in each node's routing table and
+> trust-based replacement, as described in [Routing-Table
+> Admission](#routing-table-admission). Node IDs are not bound to IP
+> addresses, and there are no ASN, VPN, node-age, resource-proof or
+> geographic checks.
 
 ### Multi-Layer Sybil Resistance
 
@@ -1096,12 +1108,40 @@ What is limited:
 
 | Limit | Where | Value |
 |-------|-------|-------|
-| New connections per IP | saorsa-core transport | 1,000 per 60 s, burst 100 |
 | Browser (WebRTC Direct) sessions and requests | `WebRtcDirectConfig` in `src/config.rs` | per IP, per session and in total |
+| Storage and listings requests handled at once | `start_protocol_routing` in `src/node.rs` | 64 per node, from all peers together |
+
+Logged only: saorsa-core's transport counts new connections, per IP and in
+total, against 1,000 per 60 s with bursts of 100. A connection over the
+limit gets a `Rate-limited incoming connection` warning in the log, but
+stays open, and its messages are handled like any other's.
 
 Not limited (a known gap): unpaid chunk PUTs and quote requests over the
 storage protocol. A peer holding quotes can send unpaid PUTs, and each one
-costs the node chain RPC calls.
+costs the node chain RPC calls. Requests beyond the 64 being handled wait
+their turn, with no limit on how many wait or on any one peer's share.
+
+### Routing-Table Admission
+
+A node's ID is the BLAKE3 hash of its ML-DSA-65 public key, so anyone can
+make as many as they like. When saorsa-core adds a peer to a node's routing
+table, it applies:
+
+- **IP diversity**, in production mode: at most 2 peers with one IP
+  address, and 5 from one /24 (IPv4) or /48 (IPv6) subnet, in each bucket
+  and among the 20 peers nearest the node. A closer peer over a limit takes
+  the place of the farthest one on that address or subnet, unless that one
+  has a trust score of 0.7 or more and was seen recently. Testnet and
+  development mode lift both limits. The limits apply within each node's
+  own routing table: they don't cap how many nodes from one IP are among
+  the 7 that store a chunk.
+- **Trust**: when a bucket is full, the peer with the lowest trust score
+  below saorsa-core's swap threshold gives way to a newcomer above it.
+
+Nothing else is checked: there is no blacklist, no ASN or geographic check,
+no eclipse detection and no node-age or resource proof. [Network
+Hardening](#network-hardening) above describes upstream's design, not this
+code.
 
 ### Relay Serving
 
@@ -1112,34 +1152,20 @@ drops traffic to those ports, only the sending half works.
 `ANT_RELAY_SERVING=false` turns relay serving off (see [What differs in this
 fork](#what-differs-in-this-fork)).
 
-### Blacklist Management
+### Logs
 
-Automatically blacklists nodes that:
-- Repeatedly violate rate limits
-- Fail trust score thresholds
-- Exhibit malicious behavior patterns
-
-### Eclipse Attack Detection
-
-Monitors for attempts to isolate nodes:
-- Diversity scoring ensures varied peer selection
-- ASN limits prevent single-provider dominance
-- Geographic distribution prevents regional isolation
-- Connection history analysis detects patterns
-
-### Audit Logging
-
-All security-relevant events are logged:
-- Connection attempts
-- Rate limit violations
-- Trust score changes
-- Blacklist modifications
-
-Enable detailed logging:
+Logging is off unless `--enable-logging` (or `ANT_ENABLE_LOGGING=true`) is
+set. `--log-level` and `RUST_LOG` take one level for every module:
+`error`, `warn`, `info`, `debug` or `trace`. A directive such as
+`ant_node=debug` is refused, and the node exits at start. For debug output:
 
 ```bash
-RUST_LOG=ant_node=debug,saorsa_core=debug ./ant-node
+RUST_LOG=debug ./ant-node --enable-logging
 ```
+
+At `info`, the log shows rate-limited connections (as warnings), each change
+to the 20 peers nearest the node (`K-closest peer swap completed`) and each
+relay session the node serves.
 
 ---
 
