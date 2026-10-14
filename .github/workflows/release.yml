@@ -13,6 +13,11 @@
 # on a commit that changes .github/workflows, so this only publishes an
 # existing tag. The signing key is the RELEASE_SIGNING_KEY_HEX secret of the
 # `release` environment, which only v*+ds.* tags can use.
+#
+# Once the release is published, the latest job points the storage-node
+# image's :latest, which home operators run, at the image the Build workflow
+# made from the tagged commit when it was pushed to main. Nothing else moves
+# :latest, so it only ever follows an approved, signed release.
 
 name: Release
 
@@ -193,3 +198,96 @@ jobs:
             --title "Storage node $TAG" --notes-file notes.md \
             ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig \
             SHA256SUMS.txt release-signing-key.pub
+
+  # Points :latest at the image the Build workflow made from this commit. A
+  # job of its own, after the approved publish, so it holds no signing key and
+  # can be re-run alone. The image is the one that run smoke-tested and pushed
+  # as :<commit>, found by the digest the run recorded, so a later run pushing
+  # the same commit tag can't change what :latest gets.
+  latest:
+    needs: [build, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      IMAGE: ghcr.io/project-dspace/storage-node
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      # Re-running an older release's job must not move :latest back.
+      - name: Check this is the latest release
+        run: |
+          latest=$(gh release view --json tagName --jq .tagName)
+          if [[ "$latest" != "$TAG" ]]; then
+            echo "::error::$TAG is not the latest release ($latest is); :latest is left as it is"
+            exit 1
+          fi
+
+      # The run from the push of this commit to main, waited for if it is
+      # still going. Only a push run built the node binary from this commit
+      # itself; one run by hand may reuse another run's.
+      - name: Wait for the Build workflow's image of this commit
+        id: build_run
+        run: |
+          run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/build.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=push -f branch=main -f per_page=1 \
+            --jq '.workflow_runs[0].id // empty')
+          if [[ -z "$run" ]]; then
+            echo "::error::no Build run from a push of $GITHUB_SHA to main: tag a commit that Build ran for on main"
+            exit 1
+          fi
+          echo "Build run $run"
+          if ! gh run watch "$run" --exit-status --interval 30 > /dev/null; then
+            echo "::error::Build run $run did not succeed: re-run it, then this job"
+            exit 1
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Read the image's digest
+        id: image
+        env:
+          RUN: ${{ steps.build_run.outputs.run }}
+        run: |
+          if ! gh run download "$RUN" --name storage-node-digest --dir "$RUNNER_TEMP/digest"; then
+            echo "::error::Build run $RUN has no storage-node-digest artifact (expired?): re-run it, then this job"
+            exit 1
+          fi
+          digest=$(cat "$RUNNER_TEMP/digest/storage-node-digest.txt")
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Build run $RUN recorded '$digest', not a digest"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the registry
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      # The image's node must be this release's.
+      - name: Check the image's node version
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          reported=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$DIGEST" --version)
+          if [[ "$reported" != "ant-node $VERSION" ]]; then
+            echo "::error::$IMAGE@$DIGEST has '$reported', not ant-node $VERSION"
+            exit 1
+          fi
+
+      # With one source, imagetools create copies the manifest as it is, so
+      # :latest has the same digest as the image it names.
+      - name: Point latest at it
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          RUN: ${{ steps.build_run.outputs.run }}
+        run: |
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+          now=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
+          if [[ "$now" != "$DIGEST" ]]; then
+            echo "::error::$IMAGE:latest is $now, not $DIGEST"
+            exit 1
+          fi
+          echo "$IMAGE:latest is now $DIGEST: $TAG, from Build run $RUN" | tee -a "$GITHUB_STEP_SUMMARY"

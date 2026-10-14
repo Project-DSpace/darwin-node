@@ -99,7 +99,9 @@ address in `docker-compose.yml` and run `docker compose up -d` again.
 
 Run these in the folder with `docker-compose.yml`.
 
-- **Updates**: `docker compose pull`, then `docker compose up -d`.
+- **Updates**: `docker compose pull`, then `docker compose up -d`. The
+  image's `:latest`, which the Compose file and the Unraid template use,
+  moves to each new release when it is published.
 - **Keep it running**: nodes that are offline for long get dropped by the
   network and stop earning. Restarts and reboots are fine: the container
   starts again with Docker.

@@ -62,7 +62,10 @@ means Autonomi's earlier network, which Darwin never ran.
   so run 2 nodes per IP.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
-  releases without credentials.
+  releases without credentials. The storage-node image's `:latest` moves
+  only when a release is published (from ds.10): release.yml then points it
+  at the image the Build workflow made from the release's commit. A push to
+  main publishes the image as `:<commit>` only.
 - **Release builds link self_encryption** (GPL-3.0 with MaidSafe's linking
   exception), which upstream's don't: `vendor/ant-listings` reads the data
   maps in file envelopes with it. The exception lets the binary be

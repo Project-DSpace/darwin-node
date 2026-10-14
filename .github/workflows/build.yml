@@ -1,7 +1,12 @@
 # Builds the Linux node binary on every push to main, packages it as the
 # storage-node Docker image (run by home operators and our servers), tests the
-# image on an isolated network and publishes it. Also checks that the
-# third-party notices a release ships can be generated.
+# image on an isolated network and publishes it as :<commit>. Also checks that
+# the third-party notices a release ships can be generated.
+#
+# It never publishes :latest, which home operators run: release.yml points
+# :latest at the image a push run here made from a release's commit, once that
+# release is approved and published. Each run records the digest it pushed
+# (the storage-node-digest artifact) for that.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and multi-platform releases.
@@ -153,9 +158,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           load: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
 
       # Runs the image on a small isolated network (never the live one):
       # joining, browser addresses, restarts, taking over the previous image's
@@ -177,7 +180,21 @@ jobs:
       - name: Publish
         run: docker push "$IMAGE:${{ github.sha }}"
 
-      # Only main moves :latest, which home operators update from.
-      - name: Publish as latest
-        if: github.ref == 'refs/heads/main'
-        run: docker push "$IMAGE:latest"
+      # The digest this run pushed, read back from the registry. release.yml
+      # copies exactly this image to :latest, so a later run that pushes the
+      # same commit tag again (a reuse_build run, say) can't change what
+      # :latest gets.
+      - name: Record the image digest
+        run: |
+          docker buildx imagetools inspect "$IMAGE:${{ github.sha }}" --format '{{json .Manifest}}' \
+            | jq -r .digest > storage-node-digest.txt
+          digest=$(cat storage-node-digest.txt)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected digest: $digest"; exit 1; }
+          echo "$IMAGE:${{ github.sha }} is $digest"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: storage-node-digest
+          path: storage-node-digest.txt
+          if-no-files-found: error
+          retention-days: 30
