@@ -114,10 +114,14 @@ Run these in the folder with `docker-compose.yml`.
 - **Different ports**: change `PORT_START` or `BROWSER_PORT_START` and run
   `docker compose up -d`. The nodes move to the new ports and keep their
   identities; change your router's port forwarding to match.
-- **When the disk gets full**: the node manager watches free
-  space where the data folder is. Below 1 GB free it warns in the log; below
-  500 MB it removes the node holding the least data (never the last one) and
-  deletes that node's data, so the others have room. Removed nodes stay
+- **When the disk gets full**: the node manager checks the free space where
+  the data folder is every 30 seconds. At 1 GiB (1,024 MiB) free or less,
+  `docker exec storage-node nodes status` shows a warning naming the node that
+  would be removed next, as does the manager's `GET /api/v1/health` on
+  `127.0.0.1:MANAGER_PORT`; nothing is written to the log. At 500 MiB free or
+  less, it removes the node holding the least data (never the last one),
+  deletes that node's data so the others have room, and logs `Evicted node`
+  with how much it freed. Removed nodes stay
   removed: free up space, run `docker exec storage-node nodes clear-evicted`,
   then `docker compose restart` to replace them, or lower `NODE_COUNT`.
 - **IPv4 only**: the network runs on IPv4. Leave `IPV4_ONLY` at `"true"`.
