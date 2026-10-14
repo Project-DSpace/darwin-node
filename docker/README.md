@@ -55,9 +55,6 @@ If the server runs a firewall (such as `ufw`), open the same UDP ports there too
    curl -fsSLO https://raw.githubusercontent.com/Project-DSpace/darwin-node/main/docker/docker-compose.yml
    ```
 
-   The darwin-node repository is private for now, so this link returns 404
-   (not found) until it is public again. Until then, ask us for the file.
-
 2. Open `docker-compose.yml` and fill in:
    - **`REWARDS_ADDRESS`**: your `0x…` address, in place of
      `0xYOUR_WALLET_ADDRESS`.
@@ -176,10 +173,6 @@ above, then:
    curl -fsSL -o /boot/config/plugins/dockerMan/templates-user/my-storage-node.xml \
      https://raw.githubusercontent.com/Project-DSpace/darwin-node/main/docker/unraid-storage-node.xml
    ```
-
-   As with the Compose file, this link returns 404 while the darwin-node
-   repository is private. Until then, ask us for the file or fill in Add
-   Container by hand (below).
 
 2. In Unraid, go to **Docker → Add Container**, and choose **storage-node** from
    the Template list.

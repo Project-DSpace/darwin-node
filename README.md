@@ -59,8 +59,7 @@ means Autonomi's earlier network, which Darwin never ran.
   address in any close group, so run 2 nodes per IP.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
-  releases without credentials, so it does nothing while the repository is
-  private.
+  releases without credentials.
 - **Release builds link self_encryption** (GPL-3.0 with MaidSafe's linking
   exception), which upstream's don't: `vendor/ant-listings` reads the data
   maps in file envelopes with it. The exception lets the binary be
@@ -600,9 +599,8 @@ The goal is not to maintain classical crypto forever, but to provide a **clean m
 ### Test Coverage
 
 Run `cargo test --features test-utils` (the EVM tests need Foundry's
-`anvil`). The library alone has about 1,300 tests. While the repo is private,
-CI runs the suite weekly and by hand rather than on every push, to save Actions
-minutes (`.github/workflows/test.yml`).
+`anvil`). The library alone has about 1,300 tests. CI runs the suite weekly
+and by hand, not on every push (`.github/workflows/test.yml`).
 
 ### Data Types Supported
 
@@ -653,7 +651,7 @@ default immutable file is published at startup, see
 
 ## Auto-Upgrade System
 
-ant-node automatically stays up-to-date with secure, verified upgrades. Upstream releases for Windows, macOS and Linux; this fork releases **Linux x86_64 only** (`ant-node-cli-linux-x64`), so nodes on other platforms don't upgrade themselves. Nodes read the releases of `Project-DSpace/darwin-node` without credentials, so while the repository is private they find none and stay on their version until their container is recreated.
+ant-node automatically stays up-to-date with secure, verified upgrades. Upstream releases for Windows, macOS and Linux; this fork releases **Linux x86_64 only** (`ant-node-cli-linux-x64`), so nodes on other platforms don't upgrade themselves. Nodes read the releases of `Project-DSpace/darwin-node` without credentials.
 
 ### Cross-Platform Support (upstream)
 
