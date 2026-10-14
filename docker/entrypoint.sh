@@ -70,6 +70,15 @@ if [[ "${RPC_URL:-}" == *robinhood-rpc.publicnode.com* ]]; then
         "delete RPC_URL to use the image's RPCs."
 fi
 read -ra bootstrap <<<"$BOOTSTRAP_PEERS"
+# ANT_RELAY_SERVING reaches every node as it is: false turns relay serving
+# off, true or unset leaves the node's default (on). Empty or only spaces,
+# as an Unraid field can be, counts as unset, since nodes refuse it.
+relay_serving=${ANT_RELAY_SERVING:-}
+if [[ -z "${relay_serving//[[:space:]]/}" ]]; then
+    unset ANT_RELAY_SERVING
+elif [[ "$relay_serving" != true && "$relay_serving" != false ]]; then
+    fail "ANT_RELAY_SERVING must be true or false"
+fi
 
 # Settings every node inherits from the manager's environment.
 export ANT_EVM_RPC_URL="${rpc_urls[0]}" ANT_METRICS_PORT=0

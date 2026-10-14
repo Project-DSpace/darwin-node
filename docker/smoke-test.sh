@@ -13,7 +13,10 @@
 # the node manager's disk-pressure eviction removes nodes (never the last)
 # when the disk is nearly full; a data folder mounted noexec is refused;
 # production mode warns above 2 nodes; the old PublicNode RPC_URL is pointed
-# out; and an RPC_URL of only spaces leaves the image's RPCs in place.
+# out; an RPC_URL of only spaces leaves the image's RPCs in place;
+# ANT_RELAY_SERVING=false reaches every node and switches its relay server
+# off, while nodes without it keep serving; and an ANT_RELAY_SERVING other
+# than true or false is refused, an empty one ignored.
 set -euo pipefail
 
 IMAGE=${1:?usage: smoke-test.sh <image>}
@@ -26,13 +29,13 @@ COMMON=(--network host --stop-timeout 120 -e ANT_NETWORK_MODE=testnet -e REWARDS
 
 fail() {
     echo "FAILED: $*"
-    for c in seed smoke evict noexec rpc; do
+    for c in seed smoke evict noexec rpc relay; do
         docker ps -a --format '{{.Names}}' | grep -qx $c || continue
         echo "--- $c log (last 40 lines)"; docker logs $c 2>&1 | grep -vE '^\s*$' | tail -40
     done
     exit 1
 }
-cleanup() { docker rm -f seed smoke evict noexec rpc >/dev/null 2>&1 || true; sudo rm -rf "$WORK"; }
+cleanup() { docker rm -f seed smoke evict noexec rpc relay >/dev/null 2>&1 || true; sudo rm -rf "$WORK"; }
 trap cleanup EXIT
 
 count() { docker logs "$1" 2>&1 | grep -cE "$2" || true; }
@@ -52,15 +55,19 @@ docker run -d --name seed "${COMMON[@]}" -e MANAGER_PORT=12601 -e NODE_COUNT=1 -
 wait_for seed 'Running 1 node' 1 60 || fail "seed did not start"
 [[ "$(registry "$WORK/seed" '.nodes["1"].bootstrap_peers | length')" == 0 ]] || fail "the seed lists itself as a bootstrap peer"
 
-echo "== three nodes joining the seed, browser ports 11910-11912"
+echo "== three nodes joining the seed, browser ports 11910-11912, relay serving off"
 run_smoke() { # node_count [port_start]
     docker run -d --name smoke "${COMMON[@]}" -e MANAGER_PORT=12602 -e NODE_COUNT=$1 -e PORT_START=${2:-10910} \
-        -e BROWSER_PORT_START=11910 -e PUBLIC_IP=$IP -e BOOTSTRAP_PEERS="$IP:10900" \
+        -e BROWSER_PORT_START=11910 -e PUBLIC_IP=$IP -e BOOTSTRAP_PEERS="$IP:10900" -e ANT_RELAY_SERVING=false \
         -v "$WORK/smoke:/data" "$IMAGE" >/dev/null
 }
 run_smoke 3
 wait_for smoke 'Running 3 node' 1 60 || fail "smoke container did not start 3 nodes"
 wait_for smoke '\[node-[0-9]+\].*Successfully connected to [1-9]' 3 || fail "nodes did not join the seed"
+# The node's own line, then saorsa-transport's from the relay server itself.
+wait_for smoke '\[node-[0-9]+\].*Relay serving is off' 3 || fail "ANT_RELAY_SERVING=false did not reach all 3 nodes"
+wait_for smoke '\[node-[0-9]+\].*Relay serving disabled' 3 || fail "the nodes' relay servers were not switched off"
+(( $(count seed 'Relay serving (is off|disabled)') == 0 )) || fail "relay serving is off on the seed, which doesn't set ANT_RELAY_SERVING"
 for i in 1 2 3; do
     sudo grep -qE "^/ip4/$IP/udp/1191$((i - 1))/webrtc-direct/certhash/u[A-Za-z0-9_-]+/p2p/[0-9a-f]{64}$" \
         "$WORK/smoke/nodes/node-$i/webrtc-direct.multiaddr" || fail "node-$i did not publish its browser address"
@@ -134,10 +141,15 @@ wait_for noexec 'mounted noexec' 1 30 || fail "a noexec data folder was not refu
 (( $(count noexec 'WARNING: NODE_COUNT is 3') >= 1 )) || fail "no warning for 3 nodes in production mode"
 (( $(count noexec 'RPC_URL is PublicNode') >= 1 )) || fail "no notice for the old PublicNode RPC_URL"
 
-echo "== an RPC_URL of only spaces leaves the image's RPCs in place"
+echo "== an RPC_URL of only spaces leaves the image's RPCs in place; an empty ANT_RELAY_SERVING is ignored"
 # Refused at the noexec data folder too, which is checked after the settings.
 docker run -d --name rpc "${COMMON[@]}" -e MANAGER_PORT=12605 --tmpfs /data:rw,noexec,size=100m \
-    -e RPC_URL=" " -e PORT_START=10950 "$IMAGE" >/dev/null
-wait_for rpc 'mounted noexec' 1 30 || fail "an RPC_URL of only spaces was refused"
+    -e RPC_URL=" " -e ANT_RELAY_SERVING= -e PORT_START=10950 "$IMAGE" >/dev/null
+wait_for rpc 'mounted noexec' 1 30 || fail "an RPC_URL of only spaces or an empty ANT_RELAY_SERVING was refused"
+
+echo "== an ANT_RELAY_SERVING other than true or false is refused"
+docker run -d --name relay "${COMMON[@]}" -e MANAGER_PORT=12606 --tmpfs /data:rw,noexec,size=100m \
+    -e ANT_RELAY_SERVING=no -e PORT_START=10960 "$IMAGE" >/dev/null
+wait_for relay 'ANT_RELAY_SERVING must be true or false' 1 30 || fail "ANT_RELAY_SERVING=no was not refused"
 
 echo "All smoke tests passed"

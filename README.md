@@ -35,6 +35,15 @@ means Autonomi's earlier network, which Darwin never ran.
   provider answering `-32005 the network is busy` made nodes refuse paid
   chunks. Reads of listings' payments have fallen back the same way since
   ds.4.
+- **Relay serving can be turned off** (from ds.10). saorsa-core gives every
+  node a MASQUE relay server, on which any peer can open a session and have
+  the node send UDP for it to any address. `ANT_RELAY_SERVING=false` (or
+  `--relay-serving false`, or `relay_serving = false` in a config file)
+  flips saorsa-core's switch for it, which nothing upstream calls, as the
+  node starts: relay session requests are then answered 503, as by a full
+  relay. The node can still use other peers' relays. Unset, nodes serve
+  relays, as upstream's do. The Docker image passes the variable through to
+  every node.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself.
@@ -945,6 +954,10 @@ Options:
         Force IPv4-only mode (disable dual-stack).
         Use on hosts without working IPv6.
 
+    --relay-serving <BOOL>
+        Serve MASQUE relay sessions for other peers: true or false
+        [default: true]
+
     --bootstrap <ADDR>
         Bootstrap peer socket addresses (can be specified multiple times)
         Example: 1.2.3.4:10000
@@ -1031,6 +1044,7 @@ export ANT_PORT=12000
 export ANT_UPGRADE_CHANNEL=stable
 export ANT_NETWORK_MODE=production
 export ANT_IPV4_ONLY=true
+export ANT_RELAY_SERVING=true   # the default; false refuses relay sessions
 export ANT_REWARDS_ADDRESS=0xYOUR_WALLET_ADDRESS
 export ANT_EVM_RPC_URL=https://rpc.mainnet.chain.robinhood.com
 export ANT_EVM_PAYMENT_TOKEN=0x511f76A3De41F000EC11EA4fD212fb3587c6cef3
@@ -1048,6 +1062,7 @@ Upgrades are always on: there is no switch to turn them off.
 ```toml
 root_dir = "~/.ant-node"
 port = 0  # Auto-select
+relay_serving = true  # false: refuse MASQUE relay sessions
 bootstrap = [
     "10.0.0.1:10000",
     "10.0.0.2:10000",
@@ -1082,6 +1097,15 @@ What is limited:
 Not limited (a known gap): unpaid chunk PUTs and quote requests over the
 storage protocol. A peer holding quotes can send unpaid PUTs, and each one
 costs the node chain RPC calls.
+
+### Relay Serving
+
+Unless relay serving is off, a node accepts MASQUE relay sessions from any
+peer and sends UDP for them, from its own address, to any address. Replies
+reach it on a port it binds at random for each session, so where a firewall
+drops traffic to those ports, only the sending half works.
+`ANT_RELAY_SERVING=false` turns relay serving off (see [What differs in this
+fork](#what-differs-in-this-fork)).
 
 ### Blacklist Management
 

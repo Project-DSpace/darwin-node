@@ -124,6 +124,16 @@ Run these in the folder with `docker-compose.yml`.
   removed: free up space, run `docker exec storage-node nodes clear-evicted`,
   then `docker compose restart` to replace them, or lower `NODE_COUNT`.
 - **IPv4 only**: the network runs on IPv4. Leave `IPV4_ONLY` at `"true"`.
+- **Relaying for other nodes**: each node also runs a relay, on which anyone
+  on the network can open a session and have your node send UDP for them, to
+  any address, from your IP address. Replies come back to a port the relay picks
+  at random for each session, so behind a router or firewall that doesn't let
+  them in, only the sending works. To turn relaying off, add
+  `ANT_RELAY_SERVING: "false"` under `environment:` in `docker-compose.yml`
+  and run `docker compose up -d` (on Unraid, add a variable
+  `ANT_RELAY_SERVING` with the value `false`). Each node then logs `Relay
+  serving is off` when it starts; storing and earning don't change. Leave it
+  out, or set `"true"`, to keep relaying on.
 
 ## Rejoining after the 2026-10-06 reset
 
