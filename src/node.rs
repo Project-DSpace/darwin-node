@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -1208,7 +1209,7 @@ impl RunningNode {
         let listings = protocol.listing_service().cloned();
 
         self.protocol_task = Some(tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
+            while let Some(event) = next_routing_event(&mut events).await {
                 if let P2PEvent::Message {
                     topic,
                     source: Some(source),
@@ -1324,6 +1325,34 @@ impl RunningNode {
     /// Request the node to shut down.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+}
+
+/// The next event for the protocol routing loop, or `None` once the event stream has
+/// closed.
+///
+/// The loop reads saorsa-core's event broadcast, which keeps a fixed number of events
+/// (`DEFAULT_EVENT_CHANNEL_CAPACITY`, 1,000) for its subscribers. One that falls further
+/// behind than that gets `RecvError::Lagged`: the oldest events are gone, but the receiver
+/// still works and its next `recv` returns the oldest event still held. Ending the loop
+/// there, as `while let Ok(..)` did, left the node connected and looking healthy while it
+/// answered no request again until it restarted. So it warns and carries on, and the
+/// requests among the skipped events go unanswered, as lost messages do. Only `Closed`,
+/// after which `recv` never yields again, ends it. The replication engine treats its own
+/// subscription the same way.
+async fn next_routing_event<T: Clone>(events: &mut broadcast::Receiver<T>) -> Option<T> {
+    loop {
+        match events.recv().await {
+            Ok(event) => return Some(event),
+            Err(RecvError::Lagged(missed)) => warn!(
+                "Protocol message routing fell {missed} P2P events behind and skipped them; \
+                 requests among them go unanswered"
+            ),
+            Err(RecvError::Closed) => {
+                warn!("P2P event stream closed; protocol message routing stopped");
+                return None;
+            }
+        }
     }
 }
 
@@ -1664,6 +1693,34 @@ mod tests {
             assert!(response.proxy_public_address.is_none());
         }
         assert_eq!(server.session_count().await, 0);
+    }
+
+    /// The routing loop's receive step: a receiver that fell behind the broadcast
+    /// carries on with the oldest events still held, and only a closed stream ends it.
+    #[tokio::test]
+    async fn routing_carries_on_after_falling_behind_and_ends_when_the_stream_closes() {
+        let (events, mut rx) = broadcast::channel::<u32>(4);
+        for event in 0..10 {
+            events.send(event).unwrap();
+        }
+        // 6 of the 10 were overwritten before the first read, which reports the lag.
+        for expected in 6..10 {
+            assert_eq!(next_routing_event(&mut rx).await, Some(expected));
+        }
+        events.send(10).unwrap();
+        assert_eq!(next_routing_event(&mut rx).await, Some(10));
+
+        // Falling behind again later is no different.
+        for event in 11..20 {
+            events.send(event).unwrap();
+        }
+        assert_eq!(next_routing_event(&mut rx).await, Some(16));
+
+        drop(events);
+        for expected in 17..20 {
+            assert_eq!(next_routing_event(&mut rx).await, Some(expected));
+        }
+        assert_eq!(next_routing_event(&mut rx).await, None);
     }
 
     #[test]

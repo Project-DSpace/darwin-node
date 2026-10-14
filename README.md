@@ -44,6 +44,13 @@ means Autonomi's earlier network, which Darwin never ran.
   relay. The node can still use other peers' relays. Unset, nodes serve
   relays, as upstream's do. The Docker image passes the variable through to
   every node.
+- **Request routing survives falling behind** (from ds.10). The loop that
+  hands chunk and listings requests to their handlers reads saorsa-core's
+  event broadcast, which keeps 1,000 events. Upstream's loop stopped for good
+  when it fell further behind than that, and the node then answered no
+  request while it stayed connected and looked healthy. This one logs a
+  warning, skips the events it missed and carries on, as the replication
+  engine already did; only a closed stream ends it.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself.
