@@ -3,16 +3,16 @@
 # being built; run it by hand and check both before tagging a release.
 #
 # Upstream ran these on pull requests (their ci.yml, removed in 09d41b4).
-# While this repo is private it runs weekly and by hand, not on every push:
-# the org's free plan gives its private repos about 2,000 Actions minutes a
-# month, which Build and Release need too, and a run is long (upstream's took
-# 39 minutes on 4-vCPU runners; private repos get 2 vCPUs). Run it on pushes
-# to main again once the repo is public. The EVM tests start a local Anvil
-# chain, hence Foundry.
+# It runs on every push to main, weekly and by hand. (While this repo was
+# private, 2026-10-06 to 2026-10-13, it ran only weekly and by hand: the org's
+# free plan gives private repos about 2,000 Actions minutes a month, and a run
+# is long.) The EVM tests start a local Anvil chain, hence Foundry.
 
 name: Test
 
 on:
+  push:
+    branches: [main]
   schedule:
     # Mondays, 03:23 UTC: GitHub delays or drops scheduled runs most at the
     # top of the hour.
