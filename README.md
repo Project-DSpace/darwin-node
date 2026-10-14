@@ -1201,7 +1201,7 @@ Contributions are welcome! Please follow these guidelines:
 cargo test
 
 # Run with debug logging
-RUST_LOG=debug cargo run
+RUST_LOG=debug cargo run -- --enable-logging
 
 # Check for issues
 cargo clippy -- -D warnings
