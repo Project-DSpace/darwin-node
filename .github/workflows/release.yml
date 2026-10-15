@@ -277,14 +277,15 @@ jobs:
             exit 1
           fi
 
-      # With one source, imagetools create copies the manifest as it is, so
-      # :latest has the same digest as the image it names.
+      # --prefer-index=false copies the manifest as it is, so :latest has the
+      # same digest as the image it names (by default imagetools wraps a
+      # single image in a new index, with a digest of its own).
       - name: Point latest at it
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
           RUN: ${{ steps.build_run.outputs.run }}
         run: |
-          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
           now=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
           if [[ "$now" != "$DIGEST" ]]; then
             echo "::error::$IMAGE:latest is $now, not $DIGEST"
