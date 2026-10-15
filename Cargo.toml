@@ -214,6 +214,13 @@ webrtc-direct = [
     "saorsa-transport/webrtc-direct",
 ]
 
+[patch.crates-io]
+# The published 4.0.0 carries pointers (ADR-0016) but not the final state this
+# change relies on (ADR-0018). A rev, not a branch, so the pin is immutable.
+# Drop it once a release includes the companion change. Versions are bumped at
+# release.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "718f60682bb3704b68fbba0bea34f2a0416fa876" }
+
 [profile.release]
 lto = true
 codegen-units = 1

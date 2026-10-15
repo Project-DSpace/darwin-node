@@ -884,8 +884,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "4.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c269f3a7c2e117cf444b97a8326d3583a8b016b3ce688c39ec5310bdebc367c5"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=718f60682bb3704b68fbba0bea34f2a0416fa876#718f60682bb3704b68fbba0bea34f2a0416fa876"
 dependencies = [
  "blake3",
  "bytes",
