@@ -922,11 +922,11 @@ pub fn log_migration_complete(kept: u64, shed: u64, freed_bytes: u64) {
 /// per-volume lock would not know, because it serialises one volume and this is a
 /// network-wide question.
 ///
-/// Measured against [`storage_admission_width`], not the close group, so the migration is
-/// never more willing to drop a chunk than the pruner is. The pruner treats the wider
-/// group as strictly in-range and refuses to delete inside it; shedding ranks that the
-/// pruner protects would make a one-off migration weaker than the thing that runs every
-/// day.
+/// Measured against [`storage_admission_width`], not the close group. The pruner treats
+/// the wider group as strictly in-range and never erases inside it, and beyond it erases
+/// only under disk pressure and past its erase floor (`replication::retention`). Shedding
+/// keeps its own gates instead: it happens once, only when the copier has run out of
+/// room, and needs the same possession proofs.
 pub const SHEDDABLE_TAIL_RANKS: usize = 2;
 
 /// How many nodes of one close group may be giving chunks up at the same time.
@@ -1282,8 +1282,8 @@ async fn peers_publishing_a_recent_commitment(context: &MigrationContext) -> Has
 ///
 /// Split out from the routing lookup so the rule itself is testable without a network.
 /// `width` is [`storage_admission_width`], not the close-group size: a key this node is
-/// outside the admission group for is one the pruner would delete anyway, and inside it
-/// only the last [`SHEDDABLE_TAIL_RANKS`] positions may go.
+/// outside the admission group for is one the pruner treats as out of range, and inside
+/// it only the last [`SHEDDABLE_TAIL_RANKS`] positions may go.
 #[must_use]
 pub fn rank_is_sheddable(rank: GroupRank, width: usize) -> bool {
     // A group no wider than the tail has no tail to give up. Saturating alone would set

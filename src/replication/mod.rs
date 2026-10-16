@@ -31,6 +31,7 @@ pub mod protocol;
 pub mod pruning;
 pub mod quorum;
 pub mod recent_provers;
+pub mod retention;
 pub mod scheduling;
 pub mod slice;
 pub mod storage_commitment_audit;
@@ -1660,6 +1661,9 @@ pub struct ReplicationEngine {
     storage: Arc<ChunkStore>,
     /// Persistent paid-for-list.
     paid_list: Arc<PaidList>,
+    /// Disk-pressure state shared by the chunk and pointer prune passes: the
+    /// only state in which they erase records.
+    disk_retention: Arc<retention::DiskRetention>,
     /// Payment verifier for `PoP` validation.
     payment_verifier: Arc<PaymentVerifier>,
     /// Replication pipeline queues.
@@ -1892,6 +1896,7 @@ impl ReplicationEngine {
 
         let initial_neighbors = NeighborSyncState::new_cycle(Vec::new());
         let config = Arc::new(config);
+        let disk_retention = Arc::new(retention::DiskRetention::for_store(&storage));
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
         // ADR-0004: monetized-pin channel (verifier -> first-audit drainer).
@@ -1906,6 +1911,7 @@ impl ReplicationEngine {
             p2p_node,
             storage,
             paid_list,
+            disk_retention,
             payment_verifier,
             queues: Arc::new(RwLock::new(ReplicationQueues::new())),
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
@@ -3390,6 +3396,7 @@ impl ReplicationEngine {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
         let paid_list = Arc::clone(&self.paid_list);
+        let disk_retention = Arc::clone(&self.disk_retention);
         let queues = Arc::clone(&self.queues);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
@@ -3464,6 +3471,7 @@ impl ReplicationEngine {
                         &audit_challenge_coordinator,
                         &gossip_audit,
                         pointers.as_ref(),
+                        &disk_retention,
                     ) => {}
                 }
             }
@@ -7709,6 +7717,7 @@ async fn run_neighbor_sync_round(
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     gossip_audit: &GossipAuditTrigger,
     pointers: Option<&Arc<pointer::PointerReplication>>,
+    disk_retention: &retention::DiskRetention,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -7734,8 +7743,9 @@ async fn run_neighbor_sync_round(
 
         // Post-cycle pruning (Section 11) — runs without holding sync_state.
         // Prune candidacy is unconditional once the hysteresis elapses;
-        // bootstrap state only defers the remote prune-confirmation audits
-        // until bootstrap has drained.
+        // records are erased only under disk pressure, and bootstrap state
+        // defers the remote prune-confirmation audits until bootstrap has
+        // drained. Both passes share one disk-pressure state.
         let allow_remote_prune_audits = !bootstrapping && bootstrap_state.read().await.is_drained();
         pruning::run_prune_pass_with_context(pruning::PrunePassContext {
             self_id: &self_id,
@@ -7748,11 +7758,16 @@ async fn run_neighbor_sync_round(
             allow_remote_prune_audits,
             commitment_state: Some(commitment_state),
             audit_challenge_coordinator,
+            retention: disk_retention,
         })
         .await;
         if let Some(pointers) = pointers {
             pointers
-                .prune_pass(allow_remote_prune_audits, Some(commitment_state))
+                .prune_pass(
+                    allow_remote_prune_audits,
+                    Some(commitment_state),
+                    disk_retention,
+                )
                 .await;
         }
 
@@ -7770,12 +7785,10 @@ async fn run_neighbor_sync_round(
             let old_sync_times = std::mem::take(&mut state.last_sync_times);
             let old_bootstrap_claims = std::mem::take(&mut state.bootstrap_claims);
             let old_bootstrap_claim_history = std::mem::take(&mut state.bootstrap_claim_history);
-            let old_prune_cursor = state.prune_cursor;
             *state = NeighborSyncState::new_cycle(neighbors);
             state.last_sync_times = old_sync_times;
             state.bootstrap_claims = old_bootstrap_claims;
             state.bootstrap_claim_history = old_bootstrap_claim_history;
-            state.prune_cursor = old_prune_cursor;
         }
     }
 
@@ -10342,7 +10355,8 @@ async fn rebuild_and_rotate_commitment(
     // close group is excluded from the NEXT commitment, so once its last gossip
     // ages past GOSSIP_ANSWERABILITY_TTL it falls out of the in-window retained
     // set, `ResponderCommitmentState::is_held` goes false,
-    // and the pruner (which until then vetoes its deletion) reclaims it. Without
+    // and the pruner (which until then vetoes its deletion) may erase it once
+    // the disk needs the room. Without
     // this filter the pruner's reprieve would keep re-committing stale keys
     // forever (the rebuild reads all_keys, so a retained-on-disk key would be
     // re-committed and re-gossiped every rotation — a permanent pin).
@@ -10354,7 +10368,8 @@ async fn rebuild_and_rotate_commitment(
         }
     }
     // The same rule for pointers: an out-of-range pointer leaves the next
-    // commitment, and the pruner reclaims it once no retained slot holds it.
+    // commitment, and the pruner may erase it, under disk pressure, once no
+    // retained slot holds it.
     let mut pointer_keys = Vec::new();
     for state in pointers.map(PointerStore::held_states).unwrap_or_default() {
         if admission::is_responsible(&self_id, &state.address, p2p, config.close_group_size).await {
@@ -10393,8 +10408,8 @@ async fn rebuild_and_rotate_commitment(
         // `None` and the gossip-emit sites stop re-emitting and re-stamping it.
         // The retired slot then ages out by its gossip-answerability TTL while
         // remaining answerable for in-flight pins until then. Once it ages out,
-        // `is_held` flips false and the pruner reclaims the now-uncommitted,
-        // out-of-range chunks. (Calling `age_out` alone would leave `current()`
+        // `is_held` flips false and the pruner may erase the now-uncommitted,
+        // out-of-range chunks under disk pressure. (Calling `age_out` alone would leave `current()`
         // pointing at the stale root, which the gossip loop would keep
         // re-stamping — pinning its keys forever.)
         debug!(

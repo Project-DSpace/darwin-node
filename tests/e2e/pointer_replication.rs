@@ -18,6 +18,7 @@ use ant_node::replication::audit::AuditTickResult;
 use ant_node::replication::commitment::pointer_leaf_hash;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::pointer::{PointerFreshWrite, PointerReplication};
+use ant_node::replication::retention::{DiskRetention, DiskSpace};
 use ant_node::ReplicationConfig;
 use ant_protocol::pointer::{Pointer, PointerState, PointerTarget, PointerTargetKind};
 use bytes::Bytes;
@@ -469,6 +470,22 @@ fn prune_network(paid_width: usize) -> TestNetworkConfig {
     }
 }
 
+/// Disk-pressure state for an explicit prune pass, fixed so the test does not
+/// depend on the host's disk: under pressure (5% free) or not (50% free), with
+/// every out-of-range address beyond the erase floor. The harness is too small
+/// for a real floor: ten times the distance to a node's 7th-nearest peer is
+/// past the end of the key space.
+fn disk_state(under_pressure: bool) -> DiskRetention {
+    let retention = DiskRetention::new(std::env::temp_dir());
+    let available = if under_pressure { 5 } else { 50 };
+    retention.set_space_for_test(Some(DiskSpace {
+        available,
+        total: 100,
+    }));
+    retention.set_floor_for_test(Some([0u8; 32]));
+    retention
+}
+
 /// The node, out of five, that is outside the retention width for `record`.
 async fn out_of_range_node(harness: &TestHarness, record: &Pointer) -> usize {
     let view = harness.test_node(0).expect("node");
@@ -489,13 +506,13 @@ async fn out_of_range_node(harness: &TestHarness, record: &Pointer) -> usize {
         .expect("one node is outside a width of four in five")
 }
 
-/// Pruning deletes a record the node is no longer responsible for once the
-/// current close group prove they hold it, and keeps it while they do not.
+/// A node keeps a record it is no longer responsible for while its disk has
+/// room, even when the close group holds it. Under disk pressure it erases the
+/// record once the current close group prove they hold it, and keeps it while
+/// they do not.
 #[tokio::test]
 #[serial]
 async fn pruning_deletes_only_once_the_close_group_proves_it_holds_the_record() {
-    // A paid width no five-node network can complete, so deletion needs the
-    // close group's proof rather than taking the far-away fast path.
     let harness = TestHarness::setup_with_config(prune_network(20))
         .await
         .expect("setup");
@@ -508,30 +525,47 @@ async fn pruning_deletes_only_once_the_close_group_proves_it_holds_the_record() 
         .put_bytes(&record.to_bytes())
         .await
         .expect("put");
+    let pressured = disk_state(true);
 
     // Nobody else holds it yet: nothing proves it is safe to drop.
     let everyone: Vec<usize> = (0..harness.node_count()).collect();
     exchange_hints(&harness, &everyone, &[pruner]).await;
     let pruner_node = harness.test_node(pruner).expect("node");
     let pruning = replication(pruner_node);
-    pruning
-        .prune_pass(true, Some(commitments(pruner_node)))
+    let unproven = pruning
+        .prune_pass(true, Some(commitments(pruner_node)), &pressured)
         .await;
+    assert!(unproven.disk_pressure);
+    assert_eq!(unproven.pruned, 0);
     assert!(
         holds(harness.test_node(pruner).expect("node"), &record),
         "the only copy was pruned"
     );
 
-    // Once the rest hold it, the close group proves it and the pruner drops it.
+    // The rest hold it now. While the disk has room, the record is kept.
     for i in others(&harness, &[pruner]) {
         store(harness.test_node(i).expect("node"))
             .put_bytes(&record.to_bytes())
             .await
             .expect("put");
     }
-    pruning
-        .prune_pass(true, Some(commitments(pruner_node)))
+    let roomy = pruning
+        .prune_pass(true, Some(commitments(pruner_node)), &disk_state(false))
         .await;
+    assert!(!roomy.disk_pressure);
+    assert_eq!(roomy.candidates, 1);
+    assert_eq!(roomy.beyond_floor, 1);
+    assert_eq!(roomy.pruned, 0);
+    assert!(
+        holds(harness.test_node(pruner).expect("node"), &record),
+        "a node with room erased a record it keeps"
+    );
+
+    // Under disk pressure, the close group proves it and the pruner drops it.
+    let erased = pruning
+        .prune_pass(true, Some(commitments(pruner_node)), &pressured)
+        .await;
+    assert_eq!(erased.pruned, 1);
     assert!(
         held(harness.test_node(pruner).expect("node"), &record).is_none(),
         "the record was not pruned though the close group holds it"
@@ -540,11 +574,12 @@ async fn pruning_deletes_only_once_the_close_group_proves_it_holds_the_record() 
     harness.teardown().await.expect("teardown");
 }
 
-/// A node outside even a complete paid-width group drops the record without
-/// asking anyone, as a chunk is.
+/// A node outside even a complete paid-width group still needs the close
+/// group's proof: it never drops a record without asking, under disk pressure
+/// or not, and while bootstrapping it asks nobody, so it keeps the record.
 #[tokio::test]
 #[serial]
-async fn a_node_far_outside_the_group_prunes_without_asking() {
+async fn a_node_far_outside_the_group_keeps_the_record_without_the_groups_proof() {
     let harness = TestHarness::setup_with_config(prune_network(3))
         .await
         .expect("setup");
@@ -559,21 +594,35 @@ async fn a_node_far_outside_the_group_prunes_without_asking() {
         .expect("put");
 
     let pruner_node = harness.test_node(pruner).expect("node");
-    replication(pruner_node)
-        .prune_pass(false, Some(commitments(pruner_node)))
+    let pressured = disk_state(true);
+    let bootstrapping = replication(pruner_node)
+        .prune_pass(false, Some(commitments(pruner_node)), &pressured)
         .await;
+    assert_eq!(bootstrapping.pruned, 0);
     assert!(
-        held(pruner_node, &record).is_none(),
-        "a far-away record was kept"
+        holds(pruner_node, &record),
+        "a far-away record was dropped without the close group's proof"
+    );
+
+    // Allowed to ask, but nobody else holds it: still kept.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[pruner]).await;
+    let unproven = replication(pruner_node)
+        .prune_pass(true, Some(commitments(pruner_node)), &pressured)
+        .await;
+    assert_eq!(unproven.pruned, 0);
+    assert!(
+        holds(pruner_node, &record),
+        "a far-away record was dropped though no one else holds it"
     );
 
     harness.teardown().await.expect("teardown");
 }
 
 /// A pointer a retained storage commitment still holds is never pruned, as a
-/// chunk is not: a peer pinning that commitment may yet audit it, and a node
-/// that had deleted it would fail. Once no retained commitment holds it, it
-/// goes.
+/// chunk is not, even under disk pressure with the close group holding it: a
+/// peer pinning that commitment may yet audit it, and a node that had deleted
+/// it would fail. Once no retained commitment holds it, it goes.
 #[tokio::test]
 #[serial]
 async fn pruning_keeps_a_pointer_a_retained_commitment_still_holds() {
@@ -590,6 +639,15 @@ async fn pruning_keeps_a_pointer_a_retained_commitment_still_holds() {
         .put_bytes(&record.to_bytes())
         .await
         .expect("put");
+    for i in others(&harness, &[pruner]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put");
+    }
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[pruner]).await;
+    let pressured = disk_state(true);
 
     // The commitment the node gossiped while it was still responsible.
     let (node_pk, node_sk) = owner();
@@ -603,18 +661,21 @@ async fn pruning_keeps_a_pointer_a_retained_commitment_still_holds() {
     let state = commitments(pruner_node);
     state.rotate(committed);
 
-    replication(pruner_node)
-        .prune_pass(false, Some(state))
+    let vetoed = replication(pruner_node)
+        .prune_pass(true, Some(state), &pressured)
         .await;
+    assert_eq!(vetoed.held_by_commitment, 1);
+    assert_eq!(vetoed.pruned, 0);
     assert!(
         holds(pruner_node, &record),
         "a pointer a retained commitment holds was pruned"
     );
 
     state.clear_all();
-    replication(pruner_node)
-        .prune_pass(false, Some(state))
+    let erased = replication(pruner_node)
+        .prune_pass(true, Some(state), &pressured)
         .await;
+    assert_eq!(erased.pruned, 1);
     assert!(
         held(pruner_node, &record).is_none(),
         "the pointer was kept after no commitment held it"

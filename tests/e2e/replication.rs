@@ -22,9 +22,10 @@ use ant_node::replication::protocol::{
     ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
 };
 use ant_node::replication::pruning;
+use ant_node::replication::retention::{DiskRetention, DiskSpace};
 use ant_node::replication::scheduling::ReplicationQueues;
 use ant_node::replication::types::{NeighborSyncState, RepairProofs};
-use ant_node::storage::XorName;
+use ant_node::storage::{ChunkStore, XorName};
 use ant_node::ReplicationConfig;
 use bytes::Bytes;
 use saorsa_core::identity::PeerId;
@@ -121,8 +122,6 @@ fn prune_test_config(close_group_size: usize) -> ReplicationConfig {
     ReplicationConfig {
         close_group_size,
         quorum_threshold: 1,
-        // Keep the width-20 view incomplete in the five-node harness so these
-        // tests exercise the remote-audit path rather than the fast path.
         paid_list_close_group_size: 20,
         prune_hysteresis_duration: Duration::ZERO,
         ..ReplicationConfig::default()
@@ -1369,14 +1368,35 @@ async fn test_audit_absent_key_returns_sentinel() {
     harness.teardown().await.expect("teardown");
 }
 
+/// Disk-pressure state for an explicit prune pass, fixed so the test does not
+/// depend on the host's disk: under pressure (5% free) or not (50% free), with
+/// every out-of-range key beyond the erase floor. The harness is too small for
+/// a real floor: ten times the distance to a node's 7th-nearest peer is past
+/// the end of the key space.
+fn test_retention(storage: &ChunkStore, under_pressure: bool) -> DiskRetention {
+    let retention = DiskRetention::for_store(storage);
+    let available = if under_pressure { 5 } else { 50 };
+    retention.set_space_for_test(Some(DiskSpace {
+        available,
+        total: 100,
+    }));
+    retention.set_floor_for_test(Some([0u8; 32]));
+    retention
+}
+
 /// Prune pass requires remote storage proofs before deleting local records.
 ///
 /// This drives `run_prune_pass` against live nodes so prune-confirmation audits
 /// travel over the real replication request/response path. The repair-proof
 /// table stays EMPTY throughout: prune candidacy and prune-audit target
 /// selection must not depend on prior neighbor-sync repair hints.
+///
+/// Nothing is erased, or even audited, while the disk has room or within the
+/// erase floor, however many peers hold the record; under disk pressure and
+/// beyond the floor the record goes only once the target peers prove storage.
 #[tokio::test]
 #[serial]
+#[allow(clippy::too_many_lines)]
 async fn test_prune_pass_requires_remote_confirmation_before_delete() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
@@ -1400,6 +1420,8 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
             .paid_list(),
     );
     let pruner_peer = *pruner_p2p.peer_id();
+    let pressured = test_retention(&pruner_storage, true);
+    let roomy = test_retention(&pruner_storage, false);
 
     // Even with all target peers storing the record, pruning must be blocked
     // while remote prune audits are not allowed during bootstrap/drain — but
@@ -1423,6 +1445,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: false,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(blocked.records_pruned, 0);
@@ -1451,6 +1474,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: false,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(blocked_again.records_pruned, 0);
@@ -1459,6 +1483,58 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         Some(first_seen),
         "repeated deferrals must preserve the original first-seen time"
     );
+
+    // With bootstrap drained and every target holding the record, a node whose
+    // disk has room keeps it, and does not even audit it.
+    let kept = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        allow_remote_prune_audits: true,
+        commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &roomy,
+    })
+    .await;
+    assert!(!kept.disk_pressure);
+    assert_eq!(kept.records_candidates, 1);
+    assert_eq!(kept.records_beyond_floor, 1);
+    assert_eq!(
+        kept.records_audits_attempted, 0,
+        "without disk pressure nothing is audited for erasure"
+    );
+    assert_eq!(kept.records_pruned, 0);
+    assert!(
+        pruner_storage.exists(&gate_address).expect("exists"),
+        "a node with room keeps out-of-range records"
+    );
+
+    // Under disk pressure, a record within the erase floor is kept too.
+    let within_floor = test_retention(&pruner_storage, true);
+    within_floor.set_floor_for_test(None);
+    let floored = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        allow_remote_prune_audits: true,
+        commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &within_floor,
+    })
+    .await;
+    assert!(floored.disk_pressure);
+    assert_eq!(floored.records_beyond_floor, 0);
+    assert_eq!(floored.records_audits_attempted, 0);
+    assert_eq!(floored.records_pruned, 0);
+    assert!(pruner_storage.exists(&gate_address).expect("exists"));
 
     let confirmed = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
         self_id: &pruner_peer,
@@ -1471,13 +1547,15 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
+    assert!(confirmed.disk_pressure);
     assert_eq!(confirmed.records_audits_attempted, 1);
     assert_eq!(confirmed.records_pruned, 1);
     assert!(
         !pruner_storage.exists(&gate_address).expect("exists"),
-        "record should be pruned after all target peers prove storage"
+        "under disk pressure, the record should be pruned after all target peers prove storage"
     );
 
     // If any current close-group peer lacks the record, the prune pass must
@@ -1507,6 +1585,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(incomplete.records_pruned, 0);
@@ -1538,6 +1617,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(complete.records_pruned, 1);
@@ -1556,8 +1636,8 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
 /// `Absent` confirmed failure. The veto applies to DELETION only: the
 /// out-of-range timer starts immediately even while the key is held. Once it is
 /// no longer committed (e.g. it has aged out of the retention window, simulated
-/// here by passing `None`), the same out-of-range record becomes prunable.
-/// Drives the real `run_prune_pass` against live nodes.
+/// here by passing `None`), the same out-of-range record becomes prunable under
+/// disk pressure. Drives the real `run_prune_pass` against live nodes.
 #[tokio::test]
 #[serial]
 async fn test_prune_veto_for_committed_out_of_range_key() {
@@ -1582,6 +1662,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
             .paid_list(),
     );
     let pruner_peer = *pruner_p2p.peer_id();
+    let pressured = test_retention(&pruner_storage, true);
 
     // An out-of-range record fully confirmed on its remote close group — so the
     // ONLY thing that can keep it on the pruner is the retention veto.
@@ -1614,7 +1695,8 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
     assert!(committed.is_held(&address), "test setup: key must be held");
 
     // With the key still committed, an otherwise-fully-prunable out-of-range
-    // record is VETOED — but the out-of-range timer still starts.
+    // record is VETOED even under disk pressure — but the out-of-range timer
+    // still starts.
     let vetoed = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
         self_id: &pruner_peer,
         storage: &pruner_storage,
@@ -1626,6 +1708,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         allow_remote_prune_audits: true,
         commitment_state: Some(&committed),
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(
@@ -1646,7 +1729,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
     );
 
     // Once it is no longer committed (aged out of the retention window — modelled
-    // by `None`), the same out-of-range record is prunable.
+    // by `None`), the same out-of-range record is prunable under disk pressure.
     let pruned = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
         self_id: &pruner_peer,
         storage: &pruner_storage,
@@ -1658,6 +1741,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(
@@ -1683,7 +1767,8 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
 /// old repair-proof gate silently deferred candidacy here forever — the
 /// production "pruning is hardly taking place" incident.
 ///
-/// This test also pins both sides of the 6-of-7 possession threshold:
+/// This test also pins both sides of the 6-of-7 possession threshold, under
+/// disk pressure and beyond the erase floor:
 /// - below the threshold (5 of 7 proofs) the record must never be deleted,
 ///   no matter how many passes run (absent peers answer
 ///   `ABSENT_KEY_DIGEST`, which never counts positively);
@@ -1703,8 +1788,6 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
     let pruner_idx = 3;
     let config = ReplicationConfig {
         close_group_size: PROD_CLOSE_GROUP_SIZE,
-        // The ten-node harness cannot complete width 20, so this test remains
-        // specifically about the 6-of-7 remote-proof path.
         paid_list_close_group_size: 20,
         prune_hysteresis_duration: Duration::ZERO,
         ..ReplicationConfig::default()
@@ -1727,6 +1810,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
             .paid_list(),
     );
     let pruner_peer = *pruner_p2p.peer_id();
+    let pressured = test_retention(&pruner_storage, true);
 
     // `find_remote_prune_candidate` guarantees the pruner is outside the
     // width-9 storage-retention group for the key (and outside the strict 7).
@@ -1762,6 +1846,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
             allow_remote_prune_audits: true,
             commitment_state: None,
             audit_challenge_coordinator: &audit_challenge_coordinator,
+            retention: &pressured,
         })
         .await;
         assert_eq!(
@@ -1805,6 +1890,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(
@@ -1818,8 +1904,8 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
 
 /// Hysteresis lifecycle against live nodes: a record outside the retention
 /// width is marked immediately, is NOT a candidate while the hysteresis is
-/// running, and becomes a candidate that prunes — with an empty
-/// `RepairProofs` table — once continuously out of range for the full
+/// running, and becomes a candidate that prunes under disk pressure — with an
+/// empty `RepairProofs` table — once continuously out of range for the full
 /// (test-shortened) hysteresis.
 #[tokio::test]
 #[serial]
@@ -1853,6 +1939,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
             .paid_list(),
     );
     let pruner_peer = *pruner_p2p.peer_id();
+    let pressured = test_retention(&pruner_storage, true);
 
     let (content, address, targets) =
         find_remote_prune_candidate(&harness, pruner_idx, close_group_size, "hysteresis").await;
@@ -1875,6 +1962,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(marked.records_marked_out_of_range, 1);
@@ -1897,6 +1985,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(pending.records_marked_out_of_range, 0);
@@ -1922,6 +2011,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &pressured,
     })
     .await;
     assert_eq!(matured.records_candidates, 1);
@@ -1972,6 +2062,8 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
     let pruner_protocol = pruner.ant_protocol.as_ref().expect("pruner protocol");
     let pruner_storage = pruner_protocol.storage();
     let pruner_peer = *pruner_p2p.peer_id();
+    // Paid-entry pruning does not depend on disk pressure.
+    let roomy = test_retention(&pruner_storage, false);
 
     // Standalone paid list so the engine's own paid state stays untouched.
     let paid_dir = tempfile::tempdir().expect("tempdir");
@@ -1998,6 +2090,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &roomy,
     })
     .await;
     assert_eq!(
@@ -2033,6 +2126,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        retention: &roomy,
     })
     .await;
     assert_eq!(

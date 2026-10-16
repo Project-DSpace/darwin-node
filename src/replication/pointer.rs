@@ -18,10 +18,13 @@
 //!   the best state a quorum of them hold exactly, and fetches it from one of
 //!   them. The record verifies itself; the quorum stands in for the payment
 //!   proof, as presence quorum does for a chunk.
-//! - **Pruning.** A record this node has been out of range of for the
-//!   hysteresis period is deleted — at once if the node is far outside the
-//!   group, otherwise only once all but one of the current close group prove
-//!   they hold that state or a newer one by returning a valid record.
+//! - **Pruning.** A record this node has been out of range of is kept, served
+//!   and hinted while the disk has room. Under disk pressure (see
+//!   [`super::retention`]), a record out of range for the hysteresis period
+//!   and farther from the node than the erase floor may be erased, farthest
+//!   first, each only once all but one of the current close group prove they
+//!   hold that state or a newer one by returning a valid record, however far
+//!   the node is from the group.
 //! - **Possession.** Some minutes after offering a fresh state, the node asks
 //!   each close-group member for the record. A member that is still responsible
 //!   and cannot produce that state or a newer one is penalised.
@@ -33,6 +36,7 @@
 //! neighbour-sync round pushes hints, empty or not, so capability is learned
 //! within a cycle.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,6 +71,7 @@ use crate::replication::protocol::{
     ReplicationMessageBody, MAX_POINTER_HINTS_PER_MESSAGE, MAX_POINTER_STATE_REQUEST_ADDRESSES,
 };
 use crate::replication::pruning::prune_proofs_needed;
+use crate::replication::retention::{self, DiskRetention};
 use crate::storage::{CapacityVerdict, ChunkStore};
 
 use super::REPLICATION_TRUST_WEIGHT;
@@ -99,11 +104,74 @@ const MAX_UNDECIDED_ROUNDS: u32 = 5;
 /// Wait before retrying an undecided address, doubled each round.
 const UNDECIDED_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Most prune candidates examined per pass.
+/// Most records a pass asks the close group about before erasing, farthest
+/// from the node first.
 const MAX_PRUNE_CANDIDATES_PER_PASS: usize = 256;
 
 /// One peer's answer about one address: the state it holds there, if any.
 type StateAnswer = ((PeerId, XorName), Option<PointerState>);
+
+/// What one pointer prune pass found and did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PointerPruneResult {
+    /// Records held.
+    pub total: usize,
+    /// Records this node is within the retention width of.
+    pub in_range: usize,
+    /// Records first seen out of range this pass.
+    pub newly_marked: usize,
+    /// Out-of-range records still inside the hysteresis period.
+    pub hysteresis_pending: usize,
+    /// Records out of range for the whole hysteresis period.
+    pub candidates: usize,
+    /// Candidates a retained storage commitment still holds.
+    pub held_by_commitment: usize,
+    /// Whether the node was under disk pressure for this pass, the only state
+    /// in which it erases records.
+    pub disk_pressure: bool,
+    /// Candidates strictly beyond the erase floor.
+    pub beyond_floor: usize,
+    /// Records erased this pass.
+    pub pruned: usize,
+}
+
+/// Everything that must hold, at the moment of erasure, for a pointer record
+/// to be erased.
+// Independent conditions of one decision, each read from a different place;
+// a state machine would hide which of them failed.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PointerEraseCheck {
+    /// The node is under disk pressure.
+    pub(crate) under_disk_pressure: bool,
+    /// The address is strictly beyond the erase floor.
+    pub(crate) beyond_floor: bool,
+    /// All but one of the current close group proved they hold this state or
+    /// a newer one.
+    pub(crate) others_hold: bool,
+    /// A retained storage commitment still holds the address.
+    pub(crate) committed: bool,
+    /// The node is within the retention width of the address again.
+    pub(crate) responsible: bool,
+    /// How long the address has been continuously out of range, if it is.
+    pub(crate) out_of_range_for: Option<Duration>,
+    /// The out-of-range wait.
+    pub(crate) hysteresis: Duration,
+}
+
+/// Whether a pointer record may be erased: every condition of
+/// [`PointerEraseCheck`] must hold. Nothing stands in for the close group's
+/// proof, however far the node is from the address.
+pub(crate) fn pointer_may_be_erased(check: &PointerEraseCheck) -> bool {
+    check.under_disk_pressure
+        && check.beyond_floor
+        && check.others_hold
+        && !check.committed
+        && !check.responsible
+        && check
+            .out_of_range_for
+            .is_some_and(|waited| waited >= check.hysteresis)
+}
 
 /// A pointer state this node accepted from a paying client, to be offered to
 /// the rest of its close group.
@@ -1033,11 +1101,18 @@ impl PointerReplication {
     // Pruning
     // -----------------------------------------------------------------------
 
-    /// Delete records this node has been out of range of for the hysteresis
-    /// period, where that is safe. Run when a neighbour-sync cycle completes.
+    /// Track the records this node is out of range of, and erase some of them
+    /// when the disk needs the room. Run when a neighbour-sync cycle completes.
+    ///
+    /// A record out of range is kept, served and hinted while the disk has
+    /// room. Under disk pressure, records out of range for the hysteresis
+    /// period and strictly beyond the erase floor are erased farthest from the
+    /// node first, each only once all but one of the current close group prove
+    /// they hold it, until the pressure is over (see [`super::retention`]).
     ///
     /// `allow_remote` is false while bootstrapping: candidacy is still tracked,
-    /// but nothing that needs other peers' proof is decided.
+    /// but nothing that needs other peers' proof is decided, so nothing is
+    /// erased.
     ///
     /// A record a retained storage commitment still commits to is never
     /// deleted, exactly as for a chunk: an auditor pinning that commitment may
@@ -1046,23 +1121,54 @@ impl PointerReplication {
         &self,
         allow_remote: bool,
         commitment_state: Option<&ResponderCommitmentState>,
-    ) {
+        retention: &DiskRetention,
+    ) -> PointerPruneResult {
         let committed = |address: &XorName| commitment_state.is_some_and(|cs| cs.is_held(address));
         let self_id = *self.p2p.peer_id();
-        let retention = storage_admission_width(self.config.close_group_size);
+        let self_xor = *self_id.as_bytes();
+        let retention_width = storage_admission_width(self.config.close_group_size);
         let now = Instant::now();
         let held = self.store.held_states();
+        let mut result = PointerPruneResult {
+            total: held.len(),
+            disk_pressure: retention.refresh(),
+            ..PointerPruneResult::default()
+        };
+        let floor = retention
+            .floor_from_routing_table(&self.p2p, &self_id, self.config.close_group_size)
+            .await;
 
         let mut candidates = Vec::new();
         for state in &held {
-            if admission::is_responsible(&self_id, &state.address, &self.p2p, retention).await {
+            if admission::is_responsible(&self_id, &state.address, &self.p2p, retention_width).await
+            {
                 self.out_of_range.lock().remove(&state.address);
+                result.in_range += 1;
                 continue;
             }
-            let first_seen = *self.out_of_range.lock().entry(state.address).or_insert(now);
-            if now.duration_since(first_seen) >= self.config.prune_hysteresis_duration {
-                candidates.push(*state);
+            let first_seen = {
+                let mut out_of_range = self.out_of_range.lock();
+                match out_of_range.entry(state.address) {
+                    Entry::Occupied(entry) => *entry.get(),
+                    Entry::Vacant(entry) => {
+                        result.newly_marked += 1;
+                        *entry.insert(now)
+                    }
+                }
+            };
+            if now.duration_since(first_seen) < self.config.prune_hysteresis_duration {
+                result.hysteresis_pending += 1;
+                continue;
             }
+            result.candidates += 1;
+            if retention::is_beyond_floor(&self_xor, &state.address, floor.as_ref()) {
+                result.beyond_floor += 1;
+            }
+            if committed(&state.address) {
+                result.held_by_commitment += 1;
+                continue;
+            }
+            candidates.push(*state);
         }
         {
             let held: HashSet<XorName> = held.iter().map(|state| state.address).collect();
@@ -1071,43 +1177,94 @@ impl PointerReplication {
                 .retain(|address, _| held.contains(address));
         }
 
-        let mut deleted = 0usize;
-        for state in candidates.into_iter().take(MAX_PRUNE_CANDIDATES_PER_PASS) {
-            if self.shutdown.is_cancelled() {
-                return;
-            }
-            if committed(&state.address) {
-                continue;
-            }
-            let wide = self
-                .p2p
-                .dht_manager()
-                .find_closest_nodes_local_with_self(
-                    &state.address,
-                    self.config.paid_list_close_group_size,
-                )
-                .await;
-            let far = wide.len() >= self.config.paid_list_close_group_size
-                && !wide.iter().any(|node| node.peer_id == self_id);
-            let confirmed = if far {
-                true
-            } else if allow_remote && !*self.is_bootstrapping.read().await {
-                self.others_hold(&state).await
-            } else {
-                false
-            };
-            // Revalidate just before deleting: the group may have moved back.
-            if confirmed
-                && !committed(&state.address)
-                && !admission::is_responsible(&self_id, &state.address, &self.p2p, retention).await
-                && self.delete(&state.address).await
-            {
-                deleted += 1;
-            }
+        // The close group is asked for proof only where an erasure could
+        // follow: under disk pressure, beyond the floor, once bootstrap allows
+        // asking anyone.
+        let may_ask = allow_remote && !*self.is_bootstrapping.read().await;
+        let ordered: Vec<PointerState> = if may_ask {
+            retention::erase_order(
+                result.disk_pressure,
+                &self_xor,
+                floor.as_ref(),
+                candidates,
+                |state| state.address,
+            )
+            .into_iter()
+            .take(MAX_PRUNE_CANDIDATES_PER_PASS)
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let erased = retention::erase_while_under_pressure(retention, ordered, move |state| {
+            self.erase_if_proven(state, commitment_state, retention)
+        })
+        .await;
+        result.pruned = erased.into_iter().filter(|erased| *erased).count();
+
+        info!(
+            "Pointer prune pass complete: total={} in_range={} newly_marked={} \
+             hysteresis_pending={} candidates={} held_by_commitment={} disk_pressure={} \
+             beyond_floor={} pruned={}",
+            result.total,
+            result.in_range,
+            result.newly_marked,
+            result.hysteresis_pending,
+            result.candidates,
+            result.held_by_commitment,
+            u8::from(result.disk_pressure),
+            result.beyond_floor,
+            result.pruned,
+        );
+        result
+    }
+
+    /// Erase one candidate if all but one of its close group prove they hold
+    /// it and every check still passes just before deleting. Returns whether
+    /// it was erased.
+    async fn erase_if_proven(
+        &self,
+        state: PointerState,
+        commitment_state: Option<&ResponderCommitmentState>,
+        retention: &DiskRetention,
+    ) -> bool {
+        if self.shutdown.is_cancelled() {
+            return false;
         }
-        if deleted > 0 {
-            info!("Pruned {deleted} pointer records this node is no longer responsible for");
+        let others_hold = self.others_hold(&state).await;
+        if !others_hold {
+            return false;
         }
+        // Re-check just before deleting: the group may have moved back, a
+        // commitment may hold the record again, or the floor may have moved.
+        let self_id = *self.p2p.peer_id();
+        let floor = retention
+            .floor_from_routing_table(&self.p2p, &self_id, self.config.close_group_size)
+            .await;
+        let responsible = admission::is_responsible(
+            &self_id,
+            &state.address,
+            &self.p2p,
+            storage_admission_width(self.config.close_group_size),
+        )
+        .await;
+        let check = PointerEraseCheck {
+            under_disk_pressure: retention.under_pressure(),
+            beyond_floor: retention::is_beyond_floor(
+                self_id.as_bytes(),
+                &state.address,
+                floor.as_ref(),
+            ),
+            others_hold,
+            committed: commitment_state.is_some_and(|cs| cs.is_held(&state.address)),
+            responsible,
+            out_of_range_for: self
+                .out_of_range
+                .lock()
+                .get(&state.address)
+                .map(Instant::elapsed),
+            hysteresis: self.config.prune_hysteresis_duration,
+        };
+        pointer_may_be_erased(&check) && self.delete(&state.address).await
     }
 
     /// Whether all but one of the current close group prove they hold `ours`
@@ -1300,5 +1457,117 @@ mod tests {
     #[test]
     fn a_group_nobody_can_be_asked_in_is_undecided() {
         assert_eq!(evaluate(None, 0, &[], 0), Verdict::Undecided);
+    }
+
+    // -- Erasure --------------------------------------------------------------
+
+    const WAIT: Duration = Duration::from_hours(72);
+
+    /// A pointer every condition allows erasing.
+    fn erasable() -> PointerEraseCheck {
+        PointerEraseCheck {
+            under_disk_pressure: true,
+            beyond_floor: true,
+            others_hold: true,
+            committed: false,
+            responsible: false,
+            out_of_range_for: Some(WAIT),
+            hysteresis: WAIT,
+        }
+    }
+
+    fn at(address: XorName) -> PointerState {
+        PointerState {
+            address,
+            ..state(1, 1, 1)
+        }
+    }
+
+    #[test]
+    fn a_pointer_is_erased_only_when_every_condition_holds() {
+        assert!(pointer_may_be_erased(&erasable()));
+    }
+
+    #[test]
+    fn no_pointer_is_erased_without_disk_pressure_even_with_full_proof() {
+        let check = PointerEraseCheck {
+            under_disk_pressure: false,
+            ..erasable()
+        };
+        assert!(!pointer_may_be_erased(&check));
+    }
+
+    #[test]
+    fn no_pointer_is_erased_under_pressure_without_the_close_groups_proof() {
+        // However far the node is from the group: far beyond the floor, past
+        // the wait, under pressure, the proof is still required.
+        let check = PointerEraseCheck {
+            others_hold: false,
+            ..erasable()
+        };
+        assert!(!pointer_may_be_erased(&check));
+    }
+
+    #[test]
+    fn no_pointer_within_the_floor_is_erased() {
+        let check = PointerEraseCheck {
+            beyond_floor: false,
+            ..erasable()
+        };
+        assert!(!pointer_may_be_erased(&check));
+    }
+
+    #[test]
+    fn a_committed_back_in_range_or_waiting_pointer_is_kept() {
+        for check in [
+            PointerEraseCheck {
+                committed: true,
+                ..erasable()
+            },
+            PointerEraseCheck {
+                responsible: true,
+                ..erasable()
+            },
+            PointerEraseCheck {
+                out_of_range_for: None,
+                ..erasable()
+            },
+            PointerEraseCheck {
+                out_of_range_for: Some(WAIT.saturating_sub(Duration::from_secs(1))),
+                ..erasable()
+            },
+        ] {
+            assert!(!pointer_may_be_erased(&check), "{check:?}");
+        }
+    }
+
+    #[test]
+    fn pointers_are_considered_farthest_first_and_only_beyond_the_floor() {
+        let node = [0u8; 32];
+        let floor = [0x20u8; 32];
+        let candidates = vec![
+            at([0x10; 32]),
+            at([0xF0; 32]),
+            at([0x40; 32]),
+            at([0x80; 32]),
+        ];
+
+        let ordered: Vec<XorName> =
+            retention::erase_order(true, &node, Some(&floor), candidates.clone(), |s| s.address)
+                .iter()
+                .map(|s| s.address)
+                .collect();
+        assert_eq!(ordered, vec![[0xF0; 32], [0x80; 32], [0x40; 32]]);
+
+        assert!(
+            retention::erase_order(false, &node, Some(&floor), candidates.clone(), |s| s
+                .address)
+            .is_empty(),
+            "nothing is considered without disk pressure"
+        );
+        assert!(
+            retention::erase_order(true, &node, None, candidates, |s| s.address).is_empty(),
+            "nothing is considered without a floor"
+        );
     }
 }
