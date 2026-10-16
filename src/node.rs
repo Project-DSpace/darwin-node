@@ -521,9 +521,11 @@ impl NodeBuilder {
     /// Start moving this node off the legacy LMDB chunk store, if it still has one.
     ///
     /// Started after the replication engine rather than with the store, because the
-    /// copier needs two things only the engine has: the commitment state, which owns the
-    /// retention veto on deleting the old store, and live routing, which is how the node
-    /// knows which chunks it is among the closest to and therefore must never give up.
+    /// copier needs what only the engine has: the commitment state, which owns the
+    /// retention veto on deleting the old store, live routing, which is how the node
+    /// knows which chunks it is among the closest to and therefore must never give up,
+    /// and the disk-pressure state the prune passes share, without which it gives
+    /// nothing up.
     fn spawn_storage_migration(
         store: Arc<ChunkStore>,
         p2p: &Arc<P2PNode>,
@@ -543,6 +545,7 @@ impl NodeBuilder {
             audit_challenge_coordinator: Some(Arc::clone(engine.audit_challenge_coordinator())),
             peer_commitments: Some(Arc::clone(engine.last_commitment_by_peer())),
             close_group_size: engine.config().close_group_size,
+            disk_retention: Some(Arc::clone(engine.disk_retention())),
         };
         Some(tokio::spawn(async move {
             crate::storage::migration::run(store, context, shutdown).await;

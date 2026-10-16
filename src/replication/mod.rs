@@ -2020,6 +2020,13 @@ impl ReplicationEngine {
         &self.sync_state
     }
 
+    /// The disk-pressure state the prune passes share, for the storage
+    /// migration, which gives nothing up while the disk has room either.
+    #[must_use]
+    pub fn disk_retention(&self) -> &Arc<retention::DiskRetention> {
+        &self.disk_retention
+    }
+
     /// The audit-challenge coordinator, for the storage migration's possession challenges.
     #[must_use]
     pub fn audit_challenge_coordinator(&self) -> &Arc<AuditChallengeCoordinator> {

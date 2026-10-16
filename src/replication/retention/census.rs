@@ -476,8 +476,10 @@ const ERASE_SITES: &[EraseSite] = &[
         1,
         "Retires the legacy store once every record copied to files is verified there and \
          every record given up (shed) is proven held by all but one of its current close \
-         group. Shedding needs the copier to have run out of room; it keeps its own gates \
-         rather than the prune passes' (ADR-0014, ADR-0005 amendment of 2026-10-16).",
+         group. Shedding needs the copier to have run out of room and the disk to be under \
+         the prune passes' disk pressure, measured again just before the removal; the \
+         floor and the order do not apply, since the store frees nothing until it is \
+         removed whole (ADR-0014, note of 2026-10-16).",
     ),
     site(
         "src/upgrade/binary_cache.rs",
