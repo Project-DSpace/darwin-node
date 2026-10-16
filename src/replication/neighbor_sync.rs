@@ -59,9 +59,9 @@ pub(crate) struct PeerSyncHints {
 /// `CLOSE_GROUP_SIZE` nearest to `K` in our `SelfInclusiveRT`).
 ///
 /// This intentionally scans all locally stored records, not only records for
-/// which this node is still responsible. Out-of-range records retained by
-/// prune hysteresis therefore continue to repair their new close group before
-/// this node is allowed to delete them.
+/// which this node is still responsible. Out-of-range records, which a node
+/// keeps while its disk has room, therefore keep repairing their new close
+/// group for as long as this node holds them.
 pub async fn build_replica_hints_for_peer(
     peer: &PeerId,
     storage: &Arc<ChunkStore>,

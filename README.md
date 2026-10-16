@@ -51,6 +51,20 @@ means Autonomi's earlier network, which Darwin never ran.
   request while it stayed connected and looked healthy. This one logs a
   warning, skips the events it missed and carries on, as the replication
   engine already did; only a closed stream ends it.
+- **Nodes keep data while the disk has room** (from ds.11). A node keeps the records and
+  pointers it holds after it stops being responsible for them, and goes on
+  serving them and offering them to their close group. Its prune passes erase
+  only when free space on the disk holding its data falls below 10%, and then
+  only records out of range for three days and far from it (more than 10
+  times the distance to its 7th-nearest peer), farthest first, each after the
+  nodes now nearest to the record prove they hold it, until 15% is free again
+  or nothing else qualifies. A node still moving off the legacy LMDB store
+  gives up the chunks it could not copy only under the same disk pressure,
+  each proven held elsewhere. Upstream deletes such records once they have
+  been out of range for three days, whether or not the disk needs the room. A
+  test (`src/replication/retention/census.rs`) lists the calls in `src/` that
+  delete files, directories or table entries, with the reason each is there,
+  so a change that adds one fails the test suite until it is reviewed.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself.
@@ -1171,7 +1185,16 @@ RUST_LOG=debug ./ant-node --enable-logging
 
 At `info`, the log shows rate-limited connections (as warnings), each change
 to the 20 peers nearest the node (`K-closest peer swap completed`) and each
-relay session the node serves.
+relay session the node serves. It also shows one line per prune pass, about
+every neighbour-sync cycle: `Prune pass complete: …` for chunks and `Pointer
+prune pass complete: …` for pointers. `disk_pressure=1` means the node may
+erase records (free space fell below 10% and is not yet back to 15%),
+`beyond_floor=` counts the records far enough from it to be erased, and the
+`pruned=` before `; paid` counts the records erased in that pass; the one
+after `paid` counts payment bookkeeping entries, which are dropped whatever
+the disk. `Disk pressure:` and `Disk pressure over:` mark when erasing may
+start and when it stops, and `Free space on the record store's partition
+could not be measured` that it stopped because the disk could not be read.
 
 ---
 

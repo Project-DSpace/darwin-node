@@ -339,7 +339,8 @@ const MAX_RETAINED_GOSSIPED_SLOTS: usize = 16;
 /// Sized so it strictly dominates the longest realistic auditor pin lifetime —
 /// well above the neighbor-sync gossip cadence and per-peer cooldown (≤1 h) —
 /// while staying far below the prune hysteresis (days), so once a stale key
-/// stops being gossiped the pruner reclaims it promptly. At
+/// stops being gossiped its deletion veto lapses long before the pruner could
+/// erase it (which it does only under disk pressure). At
 /// `RETAINED_GOSSIPED_COMMITMENTS = 2` this is `(2 + 1) ×` the 1 h rotation
 /// interval = 3 h.
 pub(crate) const GOSSIP_ANSWERABILITY_TTL: Duration = Duration::from_hours(3);

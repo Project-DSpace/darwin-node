@@ -19,7 +19,7 @@ REGISTRY=$STATE/node_registry.json
 NODES=/data/nodes                    # node-<id>: one node's data (its --root-dir)
 LOGS=/data/logs                      # node-<id>/logs: one node's daily log files
 RETIRED=/data/retired                # nodes removed by lowering NODE_COUNT, kept 3 days
-MIN_FREE_PER_NODE=$((20 * 1024 ** 3)) # Autonomi's recommended minimum per node
+MIN_FREE_PER_NODE=$((20 * 1024 ** 3)) # Autonomi's recommended minimum disk per node
 
 fail() { echo "$*" >&2; exit 1; }
 as_user() { setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"; }
@@ -138,10 +138,14 @@ fi
 rm -f "$STATE/daemon.pid" "$STATE/daemon.port" "$NODES"/node-*/node.pid
 find "$RETIRED" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +
 
+# Nodes keep the data they hold while the disk has room, so a disk they have
+# filled is normal: the space their own data takes counts as theirs.
 avail=$(df -B1 --output=avail /data | tail -n 1 | tr -d ' ')
-if (( avail < NODE_COUNT * MIN_FREE_PER_NODE )); then
-    echo "WARNING: only $((avail / 1024 ** 3)) GiB free under /data, below the $((NODE_COUNT * 20)) GiB recommended for $NODE_COUNT node(s)." \
-        "Each node needs at least 20 GB of free disk space; nodes that drop below this minimum are treated as full and risk being shunned by the network."
+held=$(du -sb "$NODES" 2>/dev/null | cut -f1) || held=0
+usable=$((avail + ${held:-0}))
+if (( usable < NODE_COUNT * MIN_FREE_PER_NODE )); then
+    echo "WARNING: only $((usable / 1024 ** 3)) GiB free under /data, counting what the nodes already hold, below the $((NODE_COUNT * 20)) GiB recommended for $NODE_COUNT node(s)." \
+        "Each node needs at least 20 GB of disk space; with less, the disk fills sooner and the node manager may remove a node to make room."
 fi
 
 # A node runs its own copy of the binary (and may upgrade it itself), so give

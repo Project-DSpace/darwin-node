@@ -13,7 +13,9 @@ You'll need:
   starting with `0x`, for example from MetaMask.
 - **Access to your router**, to forward some UDP ports.
 - **Spare disk space**: at least 20 GB per node (about 35 GB recommended), plus
-  for each node some memory, CPU and part of your internet connection.
+  for each node some memory, CPU and part of your internet connection. The
+  nodes keep the data they hold while the disk has room, so over time they
+  can grow to use most of it (see [When the disk gets full](#day-to-day)).
   As a guide, a node computer should have a 4-core CPU, 8 GB of RAM and 8 Mbps
   up and down.
 
@@ -116,7 +118,29 @@ Run these in the folder with `docker-compose.yml`.
 - **Different ports**: change `PORT_START` or `BROWSER_PORT_START` and run
   `docker compose up -d`. The nodes move to the new ports and keep their
   identities; change your router's port forwarding to match.
-- **When the disk gets full**: the node manager checks the free space where
+- **When the disk gets full**: each node keeps every record it holds,
+  including ones the network no longer needs from it, while the disk has
+  room. When free space on the disk with the data folder falls below 10%,
+  each node may erase records it has been out of range of for three days
+  (counted from when it last started) and that are far from it (more than ten
+  times the distance to its 7th-nearest node), farthest first, each only after
+  the nodes now nearest to the record prove they hold it, until 15% is free or
+  nothing else qualifies. While the network is small (under about 70 nodes) no
+  record is that far, so nothing is erased (`beyond_floor=0` in the prune line
+  shows it), and the disk keeps filling until the node manager's limits below
+  apply. On a file system that returns space late (ZFS, btrfs, or one with
+  snapshots), a node may erase more in one pass than it needed to; every
+  record it erases is still held by the nodes that proved it. Its log shows
+  `Disk pressure:` when erasing may start, `Disk pressure over:` when it stops,
+  and `could not be measured` if it stopped because the disk could not be
+  read. Each prune pass logs `disk_pressure=1` while erasing is allowed,
+  `beyond_floor=` how many records are far enough to be erased, and how many
+  it erased: the `pruned=` before `; paid`, since the one after it counts
+  payment bookkeeping entries, which go whatever the disk. A node still moving
+  off the older LMDB store gives up the chunks it could not copy only under
+  the same disk pressure. At startup the container warns if free space under
+  `/data`, counting what the nodes already hold, is below 20 GB per node.
+  Separately, the node manager checks the free space where
   the data folder is every 30 seconds. At 1 GiB (1,024 MiB) free or less,
   `docker exec storage-node nodes status` shows a warning naming the node that
   would be removed next, as does the manager's `GET /api/v1/health` on
@@ -190,7 +214,8 @@ above, then:
      Secondary storage set to Array). If `appdata` lives only on a cache drive,
      pick a folder on the disk you want the nodes to use instead: the nodes
      measure free space where the folder is, and on `/mnt/user` that's the
-     whole array's free space.
+     whole array's free space, so they keep data until the whole array is
+     below 10% free.
 4. Click **Apply**. Unraid downloads the image and starts the nodes.
 
 Without the template file, fill in Add Container by hand instead: Repository

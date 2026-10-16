@@ -12,9 +12,11 @@
 //!    the existing retention contract: a key the node is still answerable for under a
 //!    gossiped commitment vetoes the delete.
 //! 2. **Every node sheds the same chunk at once.** A node only sheds when it cannot fit
-//!    its own payload, and it sheds by close-group rank, furthest first. A chunk has
-//!    exactly one 7th-closest and one 6th-closest holder, so it is only ever a shed
-//!    candidate for two of its seven holders, and the staged rollout brings that to one.
+//!    its own payload and its disk is under the prune passes' disk pressure (free space
+//!    below 10%, see [`crate::replication::retention`]), and it sheds by close-group rank,
+//!    furthest first. A chunk has exactly one 7th-closest and one 6th-closest holder, so
+//!    it is only ever a shed candidate for two of its seven holders, and the staged
+//!    rollout brings that to one.
 //!
 //! # Three releases
 //!
@@ -922,11 +924,12 @@ pub fn log_migration_complete(kept: u64, shed: u64, freed_bytes: u64) {
 /// per-volume lock would not know, because it serialises one volume and this is a
 /// network-wide question.
 ///
-/// Measured against [`storage_admission_width`], not the close group, so the migration is
-/// never more willing to drop a chunk than the pruner is. The pruner treats the wider
-/// group as strictly in-range and refuses to delete inside it; shedding ranks that the
-/// pruner protects would make a one-off migration weaker than the thing that runs every
-/// day.
+/// Measured against [`storage_admission_width`], not the close group. The pruner treats
+/// the wider group as strictly in-range and never erases inside it, and beyond it erases
+/// only under disk pressure and past its erase floor (`replication::retention`). Shedding
+/// follows the same disk-pressure rule and needs the same possession proofs, but not the
+/// floor or the order: it happens once, only when the copier has run out of room, and
+/// frees nothing until the legacy store is removed whole.
 pub const SHEDDABLE_TAIL_RANKS: usize = 2;
 
 /// How many nodes of one close group may be giving chunks up at the same time.
@@ -1002,6 +1005,9 @@ pub struct MigrationContext {
     >,
     /// Close-group width.
     pub close_group_size: usize,
+    /// The node's disk-pressure state, shared with the prune passes. Nothing is given up
+    /// while the disk has room, and nothing at all without it (`None` in devnet and tests).
+    pub disk_retention: Option<Arc<crate::replication::retention::DiskRetention>>,
 }
 
 /// How many of the peers auditing this node now have seen its reduced commitment.
@@ -1106,6 +1112,19 @@ impl MigrationContext {
     #[must_use]
     pub fn shed_width(&self) -> usize {
         storage_admission_width(self.close_group_size)
+    }
+
+    /// Is this node's disk under pressure, measured now?
+    ///
+    /// The rule the prune passes erase by: a node keeps everything it holds while its disk
+    /// has room, so it gives nothing up unless free space is below 10% (and has not yet
+    /// been back to 15%). Without a disk-pressure state there is no measurement, which
+    /// counts as no pressure.
+    #[must_use]
+    pub fn under_disk_pressure(&self) -> bool {
+        self.disk_retention
+            .as_ref()
+            .is_some_and(|state| state.refresh())
     }
 
     /// This node's position in `key`'s admission group.
@@ -1282,8 +1301,8 @@ async fn peers_publishing_a_recent_commitment(context: &MigrationContext) -> Has
 ///
 /// Split out from the routing lookup so the rule itself is testable without a network.
 /// `width` is [`storage_admission_width`], not the close-group size: a key this node is
-/// outside the admission group for is one the pruner would delete anyway, and inside it
-/// only the last [`SHEDDABLE_TAIL_RANKS`] positions may go.
+/// outside the admission group for is one the pruner treats as out of range, and inside
+/// it only the last [`SHEDDABLE_TAIL_RANKS`] positions may go.
 #[must_use]
 pub fn rank_is_sheddable(rank: GroupRank, width: usize) -> bool {
     // A group no wider than the tail has no tail to give up. Saturating alone would set
@@ -1721,6 +1740,7 @@ async fn bridge_tick(
 }
 
 /// Decide whether the node may give up what it could not copy.
+#[allow(clippy::too_many_lines)]
 async fn evaluate_shed(
     store: &Arc<ChunkStore>,
     context: &MigrationContext,
@@ -1749,6 +1769,19 @@ async fn evaluate_shed(
             "This node cannot fit {short_by} chunk(s) in the file store and shedding is \
              turned off. Add disk, or set storage.migration.allow_shed. Until then it \
              keeps serving from both stores and the legacy environment stays."
+        );
+        return false;
+    }
+
+    // The prune passes' rule: a node keeps what it holds while its disk has room. The
+    // copier stops at its own slack, which on a small disk comes before the pressure does;
+    // the node then serves from both stores until the disk needs the room.
+    if !context.under_disk_pressure() {
+        info!(
+            "This node cannot fit {short_by} chunk(s) in the file store, but its disk has \
+             room ({}% or more free). It gives nothing up and keeps serving from both stores \
+             until free space falls below that.",
+            crate::replication::retention::DISK_PRESSURE_START_PERCENT
         );
         return false;
     }
@@ -1924,9 +1957,20 @@ async fn shedding_is_still_safe(
 ) -> Option<RetireOutcome> {
     // Nothing below is reached until the node has reduced its commitment (the phase
     // is `Committed`) and that reduction has been rebuilt and published. What remains
-    // is to confirm the close group has actually *received* it, and that the chunks
-    // being given up still exist elsewhere. Only then is anything deleted.
+    // is to confirm the disk still needs the room, that the close group has actually
+    // *received* the reduction, and that the chunks being given up still exist
+    // elsewhere. Only then is anything deleted.
     if !shedding.is_empty() {
+        // Measured again here, at the last moment: hours pass between the decision to
+        // shed and the removal, and the prune passes may have made room meanwhile.
+        if !context.under_disk_pressure() {
+            debug!(
+                "Legacy environment not retired: its disk has room again, so the {} \
+                 chunk(s) this node would give up stay",
+                shedding.len()
+            );
+            return Some(RetireOutcome::NoWorkToSerialise);
+        }
         // A rotation is not the same as neighbours knowing. Until they have the
         // smaller key set they keep auditing this node against the one it used to
         // hold, and a wave of audit failures is as damaging as losing the chunks.
@@ -2059,6 +2103,7 @@ fn blocked_before_the_gates(
 }
 
 /// One pass of the retirement gate.
+#[allow(clippy::too_many_lines)]
 async fn retire_tick(
     store: &Arc<ChunkStore>,
     context: &MigrationContext,
@@ -2111,6 +2156,18 @@ async fn retire_tick(
         // covers it.
         *verified = None;
         return RetireOutcome::Working;
+    }
+
+    // Removing the legacy store gives up whatever is still only in it, which waits for
+    // disk pressure like every other erasure. Asked before the verification, which
+    // re-reads the whole store, so a node waiting for that does not re-read it for
+    // nothing.
+    if !store.legacy_only_keys().is_empty() && !context.under_disk_pressure() {
+        debug!(
+            "Legacy environment not retired yet: its disk has room, so the chunk(s) only \
+             it holds stay"
+        );
+        return RetireOutcome::NoWorkToSerialise;
     }
 
     // The real report from a recent pass, never a fabricated one. Reuse deliberately does
@@ -2413,6 +2470,7 @@ mod tests {
                 audit_challenge_coordinator: None,
                 peer_commitments: None,
                 close_group_size: 7,
+                disk_retention: None,
             },
             shutdown.clone(),
         ));
@@ -2525,6 +2583,7 @@ mod tests {
                 audit_challenge_coordinator: None,
                 peer_commitments: None,
                 close_group_size: 7,
+                disk_retention: None,
             },
             shutdown.clone(),
         ));
@@ -2828,6 +2887,7 @@ mod tests {
             audit_challenge_coordinator: None,
             peer_commitments: None,
             close_group_size: 7,
+            disk_retention: None,
         };
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -2861,6 +2921,7 @@ mod tests {
             audit_challenge_coordinator: None,
             peer_commitments: None,
             close_group_size: 7,
+            disk_retention: None,
         };
 
         let keys = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
@@ -2875,6 +2936,52 @@ mod tests {
                 "and none of them may be given up"
             );
         }
+    }
+
+    #[test]
+    fn a_node_gives_nothing_up_while_its_disk_has_room() {
+        use crate::replication::retention::{DiskRetention, DiskSpace};
+
+        let context = |disk_retention: Option<Arc<DiskRetention>>| MigrationContext {
+            p2p: None,
+            self_id: None,
+            self_xor: None,
+            commitment: None,
+            replication: None,
+            sync_state: None,
+            audit_challenge_coordinator: None,
+            peer_commitments: None,
+            close_group_size: 7,
+            disk_retention,
+        };
+        let free = |available: u64| {
+            Some(DiskSpace {
+                available,
+                total: 100,
+            })
+        };
+        assert!(
+            !context(None).under_disk_pressure(),
+            "without a measurement there is no pressure"
+        );
+
+        let state = Arc::new(DiskRetention::new(PathBuf::from(".")));
+        let node = context(Some(Arc::clone(&state)));
+        state.set_space_for_test(free(50));
+        assert!(!node.under_disk_pressure());
+        state.set_space_for_test(free(12));
+        assert!(!node.under_disk_pressure(), "12% free is room");
+        state.set_space_for_test(free(9));
+        assert!(node.under_disk_pressure(), "below 10% free it may shed");
+        state.set_space_for_test(free(12));
+        assert!(node.under_disk_pressure(), "and goes on until 15% is free");
+        state.set_space_for_test(free(15));
+        assert!(!node.under_disk_pressure());
+        state.set_space_for_test(None);
+        assert!(
+            !node.under_disk_pressure(),
+            "a failed measurement is no pressure"
+        );
     }
 
     #[test]
@@ -3135,6 +3242,7 @@ mod tests {
             audit_challenge_coordinator: None,
             peer_commitments: None,
             close_group_size: 7,
+            disk_retention: None,
         };
         assert!(!context.neighbours_know_the_commitment().await);
     }

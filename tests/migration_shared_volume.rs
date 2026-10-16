@@ -117,6 +117,7 @@ fn offline_context() -> migration::MigrationContext {
         audit_challenge_coordinator: None,
         peer_commitments: None,
         close_group_size: 7,
+        disk_retention: None,
     }
 }
 

@@ -349,6 +349,14 @@ impl PaidList {
         self.record_out_of_range.read().get(key).copied()
     }
 
+    /// Put back a `RecordOutOfRangeFirstSeen` timestamp a removal cleared.
+    ///
+    /// For the prune pass, which removes a paid entry while the node still
+    /// holds the record: the record's wait goes on from when it began.
+    pub fn restore_record_out_of_range(&self, key: &XorName, since: Instant) {
+        self.record_out_of_range.write().insert(*key, since);
+    }
+
     /// Starting offset for the next paid-list prune scan.
     ///
     /// LMDB iteration order is stable, so a bounded prune pass must rotate its

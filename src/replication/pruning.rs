@@ -1,13 +1,16 @@
 //! Post-cycle responsibility pruning (Section 11).
 //!
-//! On `NeighborSyncCycleComplete`: prune stored records and `PaidForList`
+//! On `NeighborSyncCycleComplete`: track stored records and `PaidForList`
 //! entries that have been continuously out of range for at least
-//! `PRUNE_HYSTERESIS_DURATION`.
+//! `PRUNE_HYSTERESIS_DURATION`, erase stored records only when the disk needs
+//! the room (see [`super::retention`]), and prune paid entries.
 //!
 //! # Stored-record prune lifecycle
 //!
-//! Each stored record is classified per pass against the current local
-//! routing table:
+//! A node keeps every record it holds while its disk has room, including
+//! records it is no longer responsible for: they stay stored, are served, and
+//! are offered to their close group by neighbour sync. Each stored record is
+//! classified per pass against the current local routing table:
 //!
 //! - `InRange`: self is within the storage-retention width
 //!   (`close_group_size + STORAGE_ADMISSION_MARGIN`, 9 at production
@@ -20,19 +23,32 @@
 //! - `Candidate`: continuously outside the retention width for the full
 //!   hysteresis. Candidacy is unconditional: it never depends on repair-hint
 //!   proofs, bootstrap state, audit budget, or prior neighbor-sync contact.
+//!   A candidate is kept and served like any other record; candidacy only
+//!   makes it erasable under disk pressure.
 //! - `HeldByCommitment` / `BootstrapDeferred` / `Unauditable`: candidate
 //!   deferrals. They defer deletion, but never remove candidacy or restart
 //!   the hysteresis clock. The request/candidate budget is a separate, later
 //!   deferral applied after classification (not a disposition variant) so
 //!   whole proof sets are either scheduled or deferred as a unit.
-//! - `FastDelete`: after hysteresis, a complete self-inclusive width-20
-//!   lookup that excludes self permits deletion without a remote audit.
+//! - Eligible for erasure: only while the node is under disk pressure (free
+//!   space below 10% of the partition, until it is back to 15%), and only
+//!   candidates strictly beyond the erase floor (10 times the distance from
+//!   the node to its own 7th-nearest peer). Eligible candidates are audited
+//!   and erased farthest from the node first; one whose audit failed earlier
+//!   in the same spell of pressure waits behind those not audited yet.
 //! - `AuditFailed`: an audited candidate whose current strict close group
 //!   returned fewer than the required positive possession proofs
 //!   (`prune_proofs_needed`, 6 of 7 at production parameters). The record
 //!   and its first-seen timestamp are retained and retried on later passes.
-//! - `Pruned`: deleted after immediately re-passing the applicable checks
-//!   against the then-current routing table.
+//! - `Pruned`: erased after immediately re-passing the applicable checks
+//!   (still out of range, past the wait, not held by a retained commitment,
+//!   still beyond the floor, the proofs from the current close group) and
+//!   after free space was measured again. Erasing stops for the pass as soon
+//!   as the disk pressure is over.
+//!
+//! Every erasure needs the possession proofs: there is no deletion path that
+//! skips them, however far the node is from the key. Without disk pressure
+//! nothing is erased, so no prune-confirmation audit is sent either.
 //!
 //! Prune-confirmation audits challenge the CURRENT strict closest
 //! `close_group_size` peers to the key, taken directly from the local
@@ -40,7 +56,11 @@
 //! neighbor-sync hints. The repair-proof maturity gate remains a
 //! prerequisite for the responsible-chunk storage audit (see
 //! `audit_tick_with_repair_proofs`), which is a different mechanism with a
-//! different threat model.
+//! different threat model. Their batches are sized from the records the node
+//! is in range for, which are comparable across a close group, not from all
+//! it keeps. A failed proof for a key beyond the erase floor is logged but
+//! does not penalise the peer: the node's routing table may not know which
+//! nodes are nearest a key that far away.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -60,8 +80,8 @@ use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
-    MAX_FAST_PRUNE_DELETIONS_PER_PASS, MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS,
-    MAX_PRUNE_AUDIT_REQUESTS_PER_PASS, REPLICATION_PROTOCOL_ID,
+    MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS, MAX_PRUNE_AUDIT_REQUESTS_PER_PASS,
+    REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -69,6 +89,7 @@ use crate::replication::protocol::{
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
 };
 use crate::replication::quorum::{self, VerificationTargets};
+use crate::replication::retention::{self, DiskRetention};
 use crate::replication::types::{
     BootstrapClaimObservation, KeyVerificationEvidence, NeighborSyncState, PaidListEvidence,
     RepairProofs,
@@ -123,6 +144,11 @@ pub struct PruneResult {
     pub records_audits_attempted: usize,
     /// Audited candidates confirmed below the proof threshold (retained).
     pub records_audit_below_threshold: usize,
+    /// Whether the node was under disk pressure for this pass, the only
+    /// state in which it erases records.
+    pub disk_pressure: bool,
+    /// Candidates strictly beyond the erase floor this pass.
+    pub records_beyond_floor: usize,
     /// Number of `PaidForList` entries removed.
     pub paid_entries_pruned: usize,
     /// Number of `PaidForList` entries with out-of-range timestamp newly set.
@@ -143,13 +169,14 @@ pub struct PrunePassContext<'a> {
     pub p2p_node: &'a Arc<P2PNode>,
     /// Replication configuration.
     pub config: &'a ReplicationConfig,
-    /// Neighbor-sync state, including prune cursor and bootstrap claims.
+    /// Neighbor-sync state, including bootstrap claims.
     pub sync_state: &'a Arc<RwLock<NeighborSyncState>>,
     /// Repair-proof table, consulted ONLY to drop a deleted record's proof
     /// entries. Prune candidacy and prune-audit target selection never read it.
     pub repair_proofs: &'a Arc<RwLock<RepairProofs>>,
     /// Whether bootstrap has drained enough to permit pruning this pass.
-    /// This gates both remote confirmation audits and the local fast path.
+    /// This gates the remote confirmation audits, without which nothing is
+    /// erased.
     pub allow_remote_prune_audits: bool,
     /// Responder commitment state, used to veto deleting a chunk still held
     /// under a recently-gossiped commitment (so the storage-commitment audit's
@@ -158,6 +185,9 @@ pub struct PrunePassContext<'a> {
     pub commitment_state: Option<&'a Arc<ResponderCommitmentState>>,
     /// Shared outbound limiter for digest `AuditChallenge`s.
     pub audit_challenge_coordinator: &'a Arc<AuditChallengeCoordinator>,
+    /// The node's disk-pressure state, shared with the pointer pass, and its
+    /// erase floor. Nothing is erased without disk pressure.
+    pub disk_retention: &'a DiskRetention,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,12 +217,11 @@ struct RecordPruneStats {
     held_by_commitment: usize,
     bootstrap_deferred: usize,
     budget_deferred: usize,
-    fast_delete_candidates: usize,
-    fast_delete_budget_deferred: usize,
-    fast_pruned: usize,
     audits_attempted: usize,
     audit_requests: usize,
     audit_below_threshold: usize,
+    disk_pressure: bool,
+    beyond_floor: usize,
     pruned: usize,
 }
 
@@ -247,19 +276,8 @@ struct RecordPruneCandidate {
     target_peers: Vec<PeerId>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FastPruneCandidate {
-    key: XorName,
-}
-
-enum ScheduledPruneCandidate {
-    Fast(FastPruneCandidate),
-    Auditable(RecordPruneCandidate),
-}
-
 struct RecordPruneLookupGroups {
     retention: Vec<PeerId>,
-    widest: Vec<PeerId>,
     strict: Vec<PeerId>,
 }
 
@@ -295,17 +313,17 @@ enum PruneCandidateDisposition {
     /// Remote prune-confirmation audits are not allowed yet (bootstrap has
     /// not drained).
     BootstrapDeferred,
-    /// A complete self-inclusive width-20 lookup excludes self, so no remote
-    /// confirmation is required.
-    FastDelete(FastPruneCandidate),
     /// The current close group has no remote peers to audit; retain
     /// conservatively.
     Unauditable,
-    /// Audit the current strict close group this pass.
+    /// May be audited against the current strict close group, and erased
+    /// if it proves possession, should the disk need the room. However far
+    /// the node is from the key, there is no other way to erase it.
     Auditable(RecordPruneCandidate),
 }
 
 /// Outcome of revalidating one candidate immediately before deletion.
+#[derive(Debug, PartialEq, Eq)]
 enum PruneRevalidationOutcome {
     /// Every check re-passed against the current routing table: delete.
     Delete,
@@ -316,6 +334,11 @@ enum PruneRevalidationOutcome {
     HysteresisPending,
     /// (Re-)committed under a retained commitment; deletion vetoed.
     HeldByCommitment,
+    /// The disk pressure is over (or free space cannot be measured); the
+    /// record is kept.
+    NoDiskPressure,
+    /// No longer strictly beyond the erase floor; the record is kept.
+    WithinFloor,
     /// Fewer than the required positive proofs from the CURRENT strict close
     /// group — including when the group's membership changed after the audit
     /// round, which invalidates stale positive reports. Record kept, retried
@@ -337,6 +360,27 @@ enum PaidPruneKeyState {
 struct PruneAuditReportState {
     audit_failures: RwLock<HashSet<PeerId>>,
     bootstrap_abuse: RwLock<HashSet<PeerId>>,
+    /// The node's own address and erase floor, when the audited keys are
+    /// erase candidates: a failed proof for a key beyond the floor is logged
+    /// but not penalised, because the node's routing table may not know which
+    /// nodes are nearest a key that far away. `None`: every failure penalises.
+    erase_floor: Option<(XorName, XorName)>,
+}
+
+impl PruneAuditReportState {
+    fn new(erase_floor: Option<(XorName, XorName)>) -> Self {
+        Self {
+            erase_floor,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a failed proof for `key` penalises the peer.
+    fn penalises(&self, key: &XorName) -> bool {
+        !self
+            .erase_floor
+            .is_some_and(|(node, floor)| retention::is_beyond_floor(&node, key, Some(&floor)))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -360,6 +404,7 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
     let (paid_count, paid_stats) = prune_paid_entries(
         ctx.self_id,
         ctx.paid_list,
+        ctx.storage,
         ctx.p2p_node,
         ctx.config,
         now,
@@ -380,6 +425,8 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
         records_budget_deferred: record_stats.budget_deferred,
         records_audits_attempted: record_stats.audits_attempted,
         records_audit_below_threshold: record_stats.audit_below_threshold,
+        disk_pressure: record_stats.disk_pressure,
+        records_beyond_floor: record_stats.beyond_floor,
         paid_entries_pruned: paid_stats.pruned,
         paid_entries_marked: paid_stats.marked,
         paid_entries_cleared: paid_stats.cleared,
@@ -387,10 +434,23 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
 
     // One aggregate line per pass: the full lifecycle census (never per-chunk).
     info!(
+        "{}",
+        prune_pass_line(&result, record_stats.audit_requests, paid_count)
+    );
+
+    result
+}
+
+/// The one line each prune pass logs, in the shape the server watchdog
+/// parses. The `pruned=` before `; paid` counts records erased, the one after
+/// it paid-list entries removed.
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+fn prune_pass_line(result: &PruneResult, audit_requests: usize, paid_total: usize) -> String {
+    format!(
         "Prune pass complete: records total={} in_range={} newly_marked={} cleared={} \
          hysteresis_pending={} candidates={} held_by_commitment={} bootstrap_deferred={} \
          budget_deferred={} audits_attempted={} audit_requests={} audit_below_threshold={} \
-         fast_delete_candidates={} fast_delete_budget_deferred={} fast_pruned={} pruned={}; \
+         disk_pressure={} beyond_floor={} pruned={}; \
          paid total={} marked={} cleared={} pruned={}",
         result.records_total,
         result.records_in_range,
@@ -402,34 +462,38 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
         result.records_bootstrap_deferred,
         result.records_budget_deferred,
         result.records_audits_attempted,
-        record_stats.audit_requests,
+        audit_requests,
         result.records_audit_below_threshold,
-        record_stats.fast_delete_candidates,
-        record_stats.fast_delete_budget_deferred,
-        record_stats.fast_pruned,
+        u8::from(result.disk_pressure),
+        result.records_beyond_floor,
         result.records_pruned,
-        paid_count,
+        paid_total,
         result.paid_entries_marked,
         result.paid_entries_cleared,
         result.paid_entries_pruned,
-    );
-
-    result
+    )
 }
 
 #[allow(clippy::too_many_lines)]
 async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPruneStats) {
+    let mut stats = RecordPruneStats {
+        disk_pressure: ctx.disk_retention.refresh(),
+        ..RecordPruneStats::default()
+    };
     let stored_keys = match ctx.storage.all_keys().await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read stored keys for pruning: {e}");
-            return (0, RecordPruneStats::default());
+            return (0, stats);
         }
     };
 
     let now = Instant::now();
-    let mut stats = RecordPruneStats::default();
-    let mut fast_candidates = Vec::new();
+    let self_xor = *ctx.self_id.as_bytes();
+    let floor = ctx
+        .disk_retention
+        .floor_from_routing_table(ctx.p2p_node, ctx.self_id, ctx.config.close_group_size)
+        .await;
     let mut audit_candidates = Vec::new();
     let deps = RecordPruneKeyDeps {
         self_id: ctx.self_id,
@@ -438,45 +502,41 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         allow_remote_prune_audits: ctx.allow_remote_prune_audits,
         commitment_state: ctx.commitment_state,
     };
-    let scan_start = prune_scan_start(ctx.sync_state, stored_keys.len()).await;
 
-    for offset in 0..stored_keys.len() {
-        let key = &stored_keys[(scan_start + offset) % stored_keys.len()];
+    for key in &stored_keys {
         let groups = record_prune_lookup_groups(key, ctx.p2p_node, ctx.config).await;
-
-        let outcome = evaluate_record_prune_key(
-            &deps,
-            key,
-            &groups.retention,
-            &groups.widest,
-            &groups.strict,
-            now,
-        );
-        match tally_record_prune_outcome(&mut stats, outcome, key) {
-            Some(ScheduledPruneCandidate::Fast(candidate)) => {
-                fast_candidates.push((offset, candidate));
+        let outcome = evaluate_record_prune_key(&deps, key, &groups.retention, &groups.strict, now);
+        let beyond_floor = matches!(outcome.state, RecordPruneKeyState::Candidate(_))
+            && retention::is_beyond_floor(&self_xor, key, floor.as_ref());
+        if beyond_floor {
+            stats.beyond_floor += 1;
+        }
+        // Without disk pressure nothing may be erased, so nothing is audited:
+        // a prune-confirmation audit exists only to make an erasure safe.
+        // Only the candidates this pass could erase are kept.
+        if let Some(candidate) = tally_record_prune_outcome(&mut stats, outcome, key) {
+            if stats.disk_pressure && beyond_floor {
+                audit_candidates.push(candidate);
             }
-            Some(ScheduledPruneCandidate::Auditable(candidate)) => {
-                audit_candidates.push((offset, candidate));
-            }
-            None => {}
         }
     }
 
-    let selected_fast_count = fast_candidates.len().min(MAX_FAST_PRUNE_DELETIONS_PER_PASS);
-    stats.fast_delete_budget_deferred = fast_candidates.len() - selected_fast_count;
-    let selected_fast: Vec<FastPruneCandidate> = fast_candidates
-        .iter()
-        .take(selected_fast_count)
-        .map(|(_, candidate)| *candidate)
-        .collect();
-    let last_fast_offset = fast_candidates
-        .get(selected_fast_count.saturating_sub(1))
-        .map(|(offset, _)| *offset);
-
-    let max_keys_per_challenge = ReplicationConfig::responsible_audit_key_limit(stored_keys.len());
+    let failures = ctx.disk_retention.failed_chunk_checks();
+    let erasable = erasable_in_order(
+        ctx.storage,
+        stats.disk_pressure,
+        &self_xor,
+        floor.as_ref(),
+        failures,
+        audit_candidates,
+    );
+    // Sized from the records this node is in range for, which are comparable
+    // across a close group, not from everything it keeps: a node holding many
+    // out-of-range records would otherwise send batches its peers refuse.
+    let audit_key_count = stats.in_range.max(1);
+    let max_keys_per_challenge = ReplicationConfig::responsible_audit_key_limit(audit_key_count);
     let audit_selection = select_record_prune_audits(
-        &audit_candidates,
+        &erasable,
         max_keys_per_challenge,
         MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS,
         MAX_PRUNE_AUDIT_REQUESTS_PER_PASS,
@@ -484,63 +544,92 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     stats.budget_deferred = audit_selection.deferred;
     stats.audits_attempted = audit_selection.candidates.len();
     stats.audit_requests = audit_selection.request_count;
-    let last_selected_offset = match (last_fast_offset, audit_selection.last_selected_offset) {
-        (Some(fast), Some(audit)) => Some(fast.max(audit)),
-        (fast, audit) => fast.or(audit),
-    };
-
-    advance_prune_cursor(
-        ctx.sync_state,
-        stored_keys.len(),
-        scan_start,
-        last_selected_offset,
-    )
-    .await;
-
-    let (fast_keys_to_delete, fast_cleared) =
-        revalidated_fast_prune_keys(&selected_fast, ctx).await;
-    stats.cleared += fast_cleared;
-    stats.fast_pruned = delete_stored_records(
-        &fast_keys_to_delete,
-        ctx.storage,
-        ctx.paid_list,
-        ctx.repair_proofs,
-    )
-    .await;
+    if audit_selection.candidates.is_empty() {
+        return (stored_keys.len(), stats);
+    }
 
     let present_by_key = collect_record_prune_proofs(
         &audit_selection.candidates,
-        stored_keys.len(),
+        audit_key_count,
         ctx.storage,
         ctx.p2p_node,
         ctx.config,
         ctx.sync_state,
         ctx.audit_challenge_coordinator,
+        floor.map(|floor| (self_xor, floor)),
     )
     .await;
-    let (keys_to_delete, revalidated_cleared, audit_below_threshold) =
-        revalidated_record_prune_keys(&audit_selection.candidates, &present_by_key, ctx).await;
-    stats.cleared += revalidated_cleared;
-    stats.audit_below_threshold = audit_below_threshold;
-    let audited_pruned = delete_stored_records(
-        &keys_to_delete,
-        ctx.storage,
-        ctx.paid_list,
-        ctx.repair_proofs,
+    let present_by_key = &present_by_key;
+    let outcomes = retention::erase_while_under_pressure(
+        ctx.disk_retention,
+        audit_selection.candidates,
+        |candidate| async move {
+            let outcome = erase_if_still_eligible(&candidate, present_by_key, ctx).await;
+            (candidate.key, outcome)
+        },
     )
     .await;
-    stats.pruned = stats.fast_pruned + audited_pruned;
+    for (key, (verdict, erased)) in outcomes {
+        if erased {
+            stats.pruned += 1;
+            failures.forget(&key);
+        }
+        match verdict {
+            Some(PruneRevalidationOutcome::ClearedBackInRange) => {
+                stats.cleared += 1;
+                failures.forget(&key);
+            }
+            Some(PruneRevalidationOutcome::AuditFailed) => {
+                stats.audit_below_threshold += 1;
+                failures.record(&key);
+            }
+            _ => {}
+        }
+    }
 
     (stored_keys.len(), stats)
 }
 
+/// The audited candidates this pass may erase, in the order it tries them:
+/// none without disk pressure, only those strictly beyond the erase floor,
+/// farthest from the node first, with those whose audit failed earlier in
+/// this spell of pressure behind the rest (see [`retention::erase_order`]).
+/// Records only the legacy store holds are left out: erasing one returns no
+/// disk space, because the legacy store keeps its freed pages.
+fn erasable_in_order(
+    storage: &ChunkStore,
+    under_disk_pressure: bool,
+    self_xor: &XorName,
+    floor: Option<&XorName>,
+    failures: &retention::FailedChecks,
+    candidates: Vec<RecordPruneCandidate>,
+) -> Vec<RecordPruneCandidate> {
+    let candidates = if under_disk_pressure && !candidates.is_empty() && storage.has_legacy() {
+        let legacy_only: HashSet<XorName> = storage.legacy_only_keys().into_iter().collect();
+        candidates
+            .into_iter()
+            .filter(|candidate| !legacy_only.contains(&candidate.key))
+            .collect()
+    } else {
+        candidates
+    };
+    retention::erase_order(
+        under_disk_pressure,
+        self_xor,
+        floor,
+        failures,
+        candidates,
+        |c| c.key,
+    )
+}
+
 /// Fold one record's per-pass classification into the pass stats. Returns the
-/// auditable candidate when the record was scheduled for a prune audit.
+/// auditable candidate when the record may be audited for erasure.
 fn tally_record_prune_outcome(
     stats: &mut RecordPruneStats,
     outcome: RecordPruneKeyOutcome,
     key: &XorName,
-) -> Option<ScheduledPruneCandidate> {
+) -> Option<RecordPruneCandidate> {
     if outcome.marked {
         stats.marked += 1;
     }
@@ -567,10 +656,6 @@ fn tally_record_prune_outcome(
                     stats.bootstrap_deferred += 1;
                     None
                 }
-                PruneCandidateDisposition::FastDelete(candidate) => {
-                    stats.fast_delete_candidates += 1;
-                    Some(ScheduledPruneCandidate::Fast(candidate))
-                }
                 PruneCandidateDisposition::Unauditable => {
                     debug!(
                         "Cannot prune-audit {}: current close group has no remote peers",
@@ -578,9 +663,7 @@ fn tally_record_prune_outcome(
                     );
                     None
                 }
-                PruneCandidateDisposition::Auditable(candidate) => {
-                    Some(ScheduledPruneCandidate::Auditable(candidate))
-                }
+                PruneCandidateDisposition::Auditable(candidate) => Some(candidate),
             }
         }
     }
@@ -600,15 +683,8 @@ async fn record_prune_lookup_groups(
     let strict_close_group: Vec<DHTNode> = dht
         .find_closest_nodes_local_with_self(key, config.close_group_size)
         .await;
-    let wide_admission_group: Vec<DHTNode> = dht
-        .find_closest_nodes_local_with_self(key, config.paid_list_close_group_size)
-        .await;
     RecordPruneLookupGroups {
         retention: storage_admission_group
-            .iter()
-            .map(|node| node.peer_id)
-            .collect(),
-        widest: wide_admission_group
             .iter()
             .map(|node| node.peer_id)
             .collect(),
@@ -638,7 +714,6 @@ fn evaluate_record_prune_key(
     deps: &RecordPruneKeyDeps<'_>,
     key: &XorName,
     storage_admission_peers: &[PeerId],
-    wide_admission_peers: &[PeerId],
     strict_close_peers: &[PeerId],
     now: Instant,
 ) -> RecordPruneKeyOutcome {
@@ -682,7 +757,6 @@ fn evaluate_record_prune_key(
         state: RecordPruneKeyState::Candidate(schedule_prune_candidate(
             deps,
             key,
-            wide_admission_peers,
             strict_close_peers,
         )),
     }
@@ -696,10 +770,12 @@ fn evaluate_record_prune_key(
 /// contact: prune confirmation concerns the peers now closest to the KEY,
 /// while neighbor sync contacts the peers closest to SELF, and nothing
 /// guarantees those sets overlap for an out-of-range key.
+///
+/// How far the node is from the key changes nothing here: a candidate far
+/// outside every group goes through the same possession audit as any other.
 fn schedule_prune_candidate(
     deps: &RecordPruneKeyDeps<'_>,
     key: &XorName,
-    wide_admission_peers: &[PeerId],
     strict_close_peers: &[PeerId],
 ) -> PruneCandidateDisposition {
     if let Some(cs) = deps.commitment_state {
@@ -710,14 +786,6 @@ fn schedule_prune_candidate(
 
     if !deps.allow_remote_prune_audits {
         return PruneCandidateDisposition::BootstrapDeferred;
-    }
-
-    if complete_group_excludes_self(
-        wide_admission_peers,
-        deps.self_id,
-        deps.config.paid_list_close_group_size,
-    ) {
-        return PruneCandidateDisposition::FastDelete(FastPruneCandidate { key: *key });
     }
 
     let target_peers = remote_close_group_peers(strict_close_peers, deps.self_id);
@@ -731,24 +799,20 @@ fn schedule_prune_candidate(
     })
 }
 
-fn complete_group_excludes_self(peers: &[PeerId], self_id: &PeerId, expected_width: usize) -> bool {
-    peers.len() == expected_width && !peers.contains(self_id)
-}
-
 struct RecordPruneAuditSelection {
     candidates: Vec<RecordPruneCandidate>,
     deferred: usize,
     request_count: usize,
-    last_selected_offset: Option<usize>,
 }
 
-/// Select whole candidates while bounding actual batched network requests.
+/// Select whole candidates, in the order given, while bounding actual
+/// batched network requests.
 ///
 /// Adding a candidate consumes another request for a peer only when that
 /// peer's current batch is full. This avoids the old accounting where every
 /// candidate-to-peer edge consumed one unit despite sharing a request.
 fn select_record_prune_audits(
-    candidates: &[(usize, RecordPruneCandidate)],
+    candidates: &[RecordPruneCandidate],
     max_keys_per_challenge: usize,
     max_candidates: usize,
     max_requests: usize,
@@ -758,9 +822,8 @@ fn select_record_prune_audits(
     let mut keys_by_peer = HashMap::<PeerId, usize>::new();
     let mut request_count = 0usize;
     let mut deferred = 0usize;
-    let mut last_selected_offset = None;
 
-    for (offset, candidate) in candidates {
+    for candidate in candidates {
         if selected.len() >= max_candidates {
             deferred += 1;
             continue;
@@ -782,7 +845,6 @@ fn select_record_prune_audits(
             *keys_by_peer.entry(peer).or_default() += 1;
         }
         request_count += additional_requests;
-        last_selected_offset = Some(*offset);
         selected.push(candidate.clone());
     }
 
@@ -794,13 +856,13 @@ fn select_record_prune_audits(
         candidates: selected,
         deferred,
         request_count,
-        last_selected_offset,
     }
 }
 
 async fn prune_paid_entries(
     self_id: &PeerId,
     paid_list: &Arc<PaidList>,
+    storage: &ChunkStore,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     now: Instant,
@@ -896,7 +958,7 @@ async fn prune_paid_entries(
     )
     .await;
     stats.cleared += revalidated_cleared;
-    stats.pruned = delete_paid_entries(&paid_keys_to_delete, paid_list).await;
+    stats.pruned = delete_paid_entries(&paid_keys_to_delete, paid_list, storage).await;
 
     (paid_keys.len(), stats)
 }
@@ -933,13 +995,34 @@ fn select_paid_prune_candidate(
     PaidPruneKeyState::Candidate(target_peers)
 }
 
-async fn delete_paid_entries(keys_to_delete: &[XorName], paid_list: &Arc<PaidList>) -> usize {
+/// Remove paid-list entries. A record the node still holds keeps its
+/// out-of-range clock, which removing its entry would otherwise clear: the
+/// record pass owns that clock, and a kept record whose entry goes would
+/// restart its wait and be counted as newly out of range again.
+async fn delete_paid_entries(
+    keys_to_delete: &[XorName],
+    paid_list: &Arc<PaidList>,
+    storage: &ChunkStore,
+) -> usize {
     if keys_to_delete.is_empty() {
         return 0;
     }
 
+    let record_clocks: Vec<(XorName, Instant)> = keys_to_delete
+        .iter()
+        .filter_map(|key| {
+            paid_list
+                .record_out_of_range_since(key)
+                .map(|since| (*key, since))
+        })
+        .collect();
     match paid_list.remove_batch(keys_to_delete).await {
         Ok(count) => {
+            for (key, since) in &record_clocks {
+                if storage.exists(key).unwrap_or(true) {
+                    paid_list.restore_record_out_of_range(key, *since);
+                }
+            }
             debug!("Pruned {count} out-of-range PaidForList entries");
             count
         }
@@ -955,7 +1038,7 @@ async fn delete_paid_entries(keys_to_delete: &[XorName], paid_list: &Arc<PaidLis
 ///
 /// The network round in [`collect_paid_prune_confirmations`] takes time;
 /// the paid close group may have changed underneath it, including self
-/// moving back into range. Mirrors [`revalidated_record_prune_keys`]:
+/// moving back into range. Mirrors [`revalidate_record_prune_candidate`]:
 /// confirmations only count from peers still in the current paid close
 /// group, against a threshold computed from that current group.
 async fn revalidated_paid_prune_keys(
@@ -1141,67 +1224,47 @@ fn paid_confirmations_by_key(
     confirmed_by_key
 }
 
-async fn prune_scan_start(
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    stored_key_count: usize,
-) -> usize {
-    if stored_key_count == 0 {
-        return 0;
-    }
-    sync_state.read().await.prune_cursor % stored_key_count
-}
-
-async fn advance_prune_cursor(
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    stored_key_count: usize,
-    scan_start: usize,
-    last_selected_offset: Option<usize>,
-) {
-    if stored_key_count == 0 {
-        sync_state.write().await.prune_cursor = 0;
-        return;
-    }
-
-    let advance_by = last_selected_offset.map_or(1, |offset| offset.saturating_add(1));
-    sync_state.write().await.prune_cursor = (scan_start + advance_by) % stored_key_count;
-}
-
-async fn delete_stored_records(
-    keys_to_delete: &[XorName],
-    storage: &Arc<ChunkStore>,
-    paid_list: &Arc<PaidList>,
-    repair_proofs: &Arc<RwLock<RepairProofs>>,
-) -> usize {
-    let mut pruned = 0;
-
-    for key in keys_to_delete {
-        if let Err(e) = storage.delete(key).await {
-            warn!("Failed to prune record {}: {e}", hex::encode(key));
-        } else {
-            pruned += 1;
-            paid_list.clear_record_out_of_range(key);
-            repair_proofs.write().await.remove_key(key);
+/// Erase one stored record that passed every check, and drop what the node
+/// kept about it. The only place the pruner removes a stored record; returns
+/// whether it was still there to remove.
+async fn erase_stored_record(key: &XorName, ctx: &PrunePassContext<'_>) -> bool {
+    match ctx.storage.delete(key).await {
+        Ok(existed) => {
+            ctx.paid_list.clear_record_out_of_range(key);
+            ctx.repair_proofs.write().await.remove_key(key);
             // Seed the PaidForList out-of-range timer so the second pass can
             // prune the entry sooner, closing the re-admission window between
             // the storage delete and the PaidForList prune pass.
-            paid_list.set_paid_out_of_range(key);
-            debug!("Pruned out-of-range record {}", hex::encode(key));
+            ctx.paid_list.set_paid_out_of_range(key);
+            if existed {
+                debug!(
+                    "Erased out-of-range record {} under disk pressure",
+                    hex::encode(key)
+                );
+            }
+            existed
+        }
+        Err(e) => {
+            warn!("Failed to prune record {}: {e}", hex::encode(key));
+            false
         }
     }
-
-    pruned
 }
 
 /// Collect positive presence reports for prune candidates.
 ///
-/// A key is deleted once all but one of the current close group prove
+/// A key may be erased once all but one of the current close group prove
 /// possession ([`prune_proofs_needed`]). Requiring unanimous proofs left
 /// out-of-range records undeletable whenever a single close-group peer
 /// lagged, while the all-but-one threshold still demands more copies than
 /// the storage quorum used elsewhere. Keys below the proof threshold stay
 /// local, and the retained record continues to participate in normal
 /// neighbor-sync repair because replica hint construction walks all locally
-/// stored keys, including out-of-range keys retained by hysteresis.
+/// stored keys, including out-of-range keys.
+///
+/// `erase_floor` is the node's own address and erase floor when the keys are
+/// erase candidates: failed proofs for keys beyond it are not penalised.
+#[allow(clippy::too_many_arguments)]
 async fn collect_record_prune_proofs(
     candidates: &[RecordPruneCandidate],
     local_stored_key_count: usize,
@@ -1210,6 +1273,7 @@ async fn collect_record_prune_proofs(
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
+    erase_floor: Option<(XorName, XorName)>,
 ) -> HashMap<XorName, HashSet<PeerId>> {
     if candidates.is_empty() {
         return HashMap::new();
@@ -1218,7 +1282,7 @@ async fn collect_record_prune_proofs(
     let max_keys_per_challenge =
         ReplicationConfig::responsible_audit_key_limit(local_stored_key_count);
     let challenges = build_peer_audit_challenges(candidates, max_keys_per_challenge);
-    let report_state = PruneAuditReportState::default();
+    let report_state = PruneAuditReportState::new(erase_floor);
     let audit_context = PruneAuditContext {
         storage,
         p2p_node,
@@ -1284,56 +1348,9 @@ pub(crate) async fn prove_peers_hold_records(
         config,
         sync_state,
         audit_challenge_coordinator,
+        None,
     )
     .await
-}
-
-async fn revalidated_fast_prune_keys(
-    candidates: &[FastPruneCandidate],
-    ctx: &PrunePassContext<'_>,
-) -> (Vec<XorName>, usize) {
-    let mut keys_to_delete = Vec::new();
-    let mut cleared = 0;
-    let now = Instant::now();
-
-    for candidate in candidates {
-        if !ctx.allow_remote_prune_audits
-            || !stored_record_still_exists(&candidate.key, ctx.storage).await
-        {
-            continue;
-        }
-
-        let groups = record_prune_lookup_groups(&candidate.key, ctx.p2p_node, ctx.config).await;
-        if groups.retention.contains(ctx.self_id) {
-            ctx.paid_list.clear_record_out_of_range(&candidate.key);
-            cleared += 1;
-            continue;
-        }
-        if ctx
-            .commitment_state
-            .is_some_and(|cs| cs.is_held(&candidate.key))
-        {
-            continue;
-        }
-        let Some(first_seen) = ctx.paid_list.record_out_of_range_since(&candidate.key) else {
-            continue;
-        };
-        let elapsed = now
-            .checked_duration_since(first_seen)
-            .unwrap_or(Duration::ZERO);
-        if elapsed < ctx.config.prune_hysteresis_duration {
-            continue;
-        }
-        if complete_group_excludes_self(
-            &groups.widest,
-            ctx.self_id,
-            ctx.config.paid_list_close_group_size,
-        ) {
-            keys_to_delete.push(candidate.key);
-        }
-    }
-
-    (keys_to_delete, cleared)
 }
 
 async fn stored_record_still_exists(key: &XorName, storage: &Arc<ChunkStore>) -> bool {
@@ -1350,72 +1367,76 @@ async fn stored_record_still_exists(key: &XorName, storage: &Arc<ChunkStore>) ->
     }
 }
 
-/// Re-check every audited candidate against current local state immediately
-/// before deletion, returning the keys to delete, the number of out-of-range
-/// timestamps cleared (self back in range), and the number of candidates
-/// confirmed below the proof threshold.
+/// Re-check one audited candidate against current local state immediately
+/// before deletion, and erase it if every check still passes. Returns the
+/// re-check's verdict (`None` when the record has already gone) and whether
+/// this call erased the record.
 ///
 /// The audit round takes time; the routing table may have changed underneath
 /// it, including self moving back into range or the strict close group
 /// changing membership. Positive reports only count from peers still in the
 /// CURRENT strict close group, against a threshold computed from that
-/// current group.
-async fn revalidated_record_prune_keys(
-    candidates: &[RecordPruneCandidate],
+/// current group. The erase floor is read again, and free space measured
+/// again, too.
+async fn erase_if_still_eligible(
+    candidate: &RecordPruneCandidate,
     present_by_key: &HashMap<XorName, HashSet<PeerId>>,
     ctx: &PrunePassContext<'_>,
-) -> (Vec<XorName>, usize, usize) {
-    let mut keys_to_delete = Vec::new();
-    let mut cleared = 0;
-    let mut audit_below_threshold = 0;
-    let now = Instant::now();
-
-    for candidate in candidates {
-        if !stored_record_still_exists(&candidate.key, ctx.storage).await {
-            continue;
-        }
-        let groups = record_prune_lookup_groups(&candidate.key, ctx.p2p_node, ctx.config).await;
-        let held_by_commitment = ctx
-            .commitment_state
-            .is_some_and(|cs| cs.is_held(&candidate.key));
-        let inputs = PruneRevalidationInputs {
-            self_id: ctx.self_id,
-            first_seen: ctx.paid_list.record_out_of_range_since(&candidate.key),
-            prune_hysteresis_duration: ctx.config.prune_hysteresis_duration,
-            held_by_commitment,
-            storage_admission_peers: &groups.retention,
-            wide_admission_peers: &groups.widest,
-            wide_admission_width: ctx.config.paid_list_close_group_size,
-            strict_close_peers: &groups.strict,
-            now,
-        };
-
-        match revalidate_record_prune_candidate(candidate, present_by_key, &inputs) {
-            PruneRevalidationOutcome::Delete => keys_to_delete.push(candidate.key),
-            PruneRevalidationOutcome::ClearedBackInRange => {
-                ctx.paid_list.clear_record_out_of_range(&candidate.key);
-                cleared += 1;
-            }
-            PruneRevalidationOutcome::AuditFailed => {
-                audit_below_threshold += 1;
-                debug!(
-                    "Deferring prune for {} until all but one of the current close group \
-                     report it",
-                    hex::encode(candidate.key)
-                );
-            }
-            PruneRevalidationOutcome::HysteresisPending
-            | PruneRevalidationOutcome::HeldByCommitment => {}
-            PruneRevalidationOutcome::Unauditable => {
-                debug!(
-                    "Cannot prune {}: current close group has no remote peers",
-                    hex::encode(candidate.key)
-                );
-            }
-        }
+) -> (Option<PruneRevalidationOutcome>, bool) {
+    if !stored_record_still_exists(&candidate.key, ctx.storage).await {
+        return (None, false);
     }
+    let groups = record_prune_lookup_groups(&candidate.key, ctx.p2p_node, ctx.config).await;
+    let floor = ctx
+        .disk_retention
+        .floor_from_routing_table(ctx.p2p_node, ctx.self_id, ctx.config.close_group_size)
+        .await;
+    let held_by_commitment = ctx
+        .commitment_state
+        .is_some_and(|cs| cs.is_held(&candidate.key));
+    let inputs = PruneRevalidationInputs {
+        self_id: ctx.self_id,
+        first_seen: ctx.paid_list.record_out_of_range_since(&candidate.key),
+        prune_hysteresis_duration: ctx.config.prune_hysteresis_duration,
+        held_by_commitment,
+        under_disk_pressure: ctx.disk_retention.refresh(),
+        beyond_floor: retention::is_beyond_floor(
+            ctx.self_id.as_bytes(),
+            &candidate.key,
+            floor.as_ref(),
+        ),
+        storage_admission_peers: &groups.retention,
+        strict_close_peers: &groups.strict,
+        now: Instant::now(),
+    };
 
-    (keys_to_delete, cleared, audit_below_threshold)
+    let verdict = revalidate_record_prune_candidate(candidate, present_by_key, &inputs);
+    let erased = match verdict {
+        PruneRevalidationOutcome::Delete => erase_stored_record(&candidate.key, ctx).await,
+        PruneRevalidationOutcome::ClearedBackInRange => {
+            ctx.paid_list.clear_record_out_of_range(&candidate.key);
+            false
+        }
+        PruneRevalidationOutcome::AuditFailed => {
+            debug!(
+                "Keeping {} until all but one of the current close group prove they hold it",
+                hex::encode(candidate.key)
+            );
+            false
+        }
+        PruneRevalidationOutcome::Unauditable => {
+            debug!(
+                "Cannot prune {}: current close group has no remote peers",
+                hex::encode(candidate.key)
+            );
+            false
+        }
+        PruneRevalidationOutcome::HysteresisPending
+        | PruneRevalidationOutcome::HeldByCommitment
+        | PruneRevalidationOutcome::NoDiskPressure
+        | PruneRevalidationOutcome::WithinFloor => false,
+    };
+    (Some(verdict), erased)
 }
 
 /// Inputs for revalidating one audited candidate immediately before deletion.
@@ -1427,23 +1448,25 @@ struct PruneRevalidationInputs<'a> {
     /// Whether a retained commitment holds the key NOW (TOCTOU re-check: a
     /// rotation/gossip may have re-committed it since candidate selection).
     held_by_commitment: bool,
+    /// Whether the node is under disk pressure NOW.
+    under_disk_pressure: bool,
+    /// Whether the key is strictly beyond the erase floor NOW.
+    beyond_floor: bool,
     /// Current self-inclusive storage-retention group for the key.
     storage_admission_peers: &'a [PeerId],
-    /// Current widest self-inclusive admission group for the key.
-    wide_admission_peers: &'a [PeerId],
-    wide_admission_width: usize,
     /// Current strict close group for the key.
     strict_close_peers: &'a [PeerId],
     now: Instant,
 }
 
 /// Pure deletion decision for one audited candidate (see
-/// [`revalidated_record_prune_keys`]). Deletion requires that, against the
-/// CURRENT routing table: self is still outside the storage-retention width,
-/// the hysteresis still holds, no retained commitment holds the key, and at
+/// [`erase_if_still_eligible`]). Deletion requires that, against the CURRENT
+/// routing table: self is still outside the storage-retention width, the
+/// hysteresis still holds, no retained commitment holds the key, the node is
+/// under disk pressure, the key is strictly beyond the erase floor, and at
 /// least [`prune_proofs_needed`] of the current strict close group supplied
 /// positive possession proofs. Stale positive reports from peers no longer in
-/// the current close group never count.
+/// the current close group never count, and nothing stands in for the proofs.
 fn revalidate_record_prune_candidate(
     candidate: &RecordPruneCandidate,
     present_by_key: &HashMap<XorName, HashSet<PeerId>>,
@@ -1468,12 +1491,12 @@ fn revalidate_record_prune_candidate(
         return PruneRevalidationOutcome::HysteresisPending;
     }
 
-    if complete_group_excludes_self(
-        inputs.wide_admission_peers,
-        inputs.self_id,
-        inputs.wide_admission_width,
-    ) {
-        return PruneRevalidationOutcome::Delete;
+    if !inputs.under_disk_pressure {
+        return PruneRevalidationOutcome::NoDiskPressure;
+    }
+
+    if !inputs.beyond_floor {
+        return PruneRevalidationOutcome::WithinFloor;
     }
 
     let current_target_peers = remote_close_group_peers(inputs.strict_close_peers, inputs.self_id);
@@ -2027,6 +2050,14 @@ async fn report_prune_audit_failure_once(
         "Prune audit failure: peer={peer}, audit_failure_class={audit_failure_class}, key={}",
         hex::encode(key)
     );
+    if !report_state.penalises(key) {
+        debug!(
+            "Not penalising {peer} for {}: the key is beyond the erase floor, where this \
+             node's routing table may not know which nodes are nearest it",
+            hex::encode(key)
+        );
+        return true;
+    }
     crate::replication::config::penalise_unheld_close_group_chunk(
         p2p_node,
         peer,
@@ -2484,26 +2515,167 @@ mod tests {
         ));
     }
 
+    /// The per-pass audit budget goes to the eligible candidates farthest
+    /// from the node; nearer ones wait for a later pass.
     #[tokio::test]
-    async fn prune_cursor_advances_past_selected_budget_window() {
-        let state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
-        state.write().await.prune_cursor = 2;
+    async fn audit_budget_goes_to_the_farthest_eligible_candidates() {
+        let (storage, _dir) = test_chunk_store().await;
+        let node = [0u8; 32];
+        let floor = [0u8; 32];
+        let peers = peer_ids(2);
+        let candidates: Vec<RecordPruneCandidate> = [0x10u8, 0x80, 0x40, 0xF0, 0x20]
+            .iter()
+            .map(|b| candidate(key_from_byte(*b), peers.clone()))
+            .collect();
 
-        let start = prune_scan_start(&state, 10).await;
-        advance_prune_cursor(&state, 10, start, Some(3)).await;
+        let failures = retention::FailedChecks::default();
+        let ordered = erasable_in_order(&storage, true, &node, Some(&floor), &failures, candidates);
+        let selected = select_record_prune_audits(&ordered, 100, 3, 100);
 
-        assert_eq!(state.read().await.prune_cursor, 6);
+        let selected_keys: Vec<XorName> = selected.candidates.iter().map(|c| c.key).collect();
+        assert_eq!(
+            selected_keys,
+            vec![
+                key_from_byte(0xF0),
+                key_from_byte(0x80),
+                key_from_byte(0x40)
+            ]
+        );
+        assert_eq!(selected.deferred, 2);
     }
 
+    /// Candidates whose audit failed earlier in the same spell of pressure
+    /// wait behind the ones not audited yet, so a budget the failing ones
+    /// would fill still reaches the rest.
     #[tokio::test]
-    async fn prune_cursor_advances_even_when_no_candidate_selected() {
-        let state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
-        state.write().await.prune_cursor = 9;
+    async fn the_budget_reaches_candidates_behind_those_whose_audit_failed() {
+        let (storage, _dir) = test_chunk_store().await;
+        let node = [0u8; 32];
+        let floor = [0u8; 32];
+        let peers = peer_ids(2);
+        let candidates = || -> Vec<RecordPruneCandidate> {
+            [0x10u8, 0x80, 0x40, 0xF0, 0x20]
+                .iter()
+                .map(|b| candidate(key_from_byte(*b), peers.clone()))
+                .collect()
+        };
+        let failures = retention::FailedChecks::default();
+        let selected = |candidates: Vec<RecordPruneCandidate>| -> Vec<XorName> {
+            let ordered =
+                erasable_in_order(&storage, true, &node, Some(&floor), &failures, candidates);
+            select_record_prune_audits(&ordered, 100, 3, 100)
+                .candidates
+                .iter()
+                .map(|c| c.key)
+                .collect()
+        };
 
-        let start = prune_scan_start(&state, 10).await;
-        advance_prune_cursor(&state, 10, start, None).await;
+        failures.record(&key_from_byte(0xF0));
+        failures.record(&key_from_byte(0x80));
+        assert_eq!(
+            selected(candidates()),
+            vec![
+                key_from_byte(0x40),
+                key_from_byte(0x20),
+                key_from_byte(0x10)
+            ]
+        );
 
-        assert_eq!(state.read().await.prune_cursor, 0);
+        failures.record(&key_from_byte(0x40));
+        failures.record(&key_from_byte(0x20));
+        failures.record(&key_from_byte(0x10));
+        assert_eq!(
+            selected(candidates()),
+            vec![
+                key_from_byte(0xF0),
+                key_from_byte(0x80),
+                key_from_byte(0x40)
+            ],
+            "once every candidate has failed, the one that failed longest ago goes first"
+        );
+    }
+
+    /// A failed prune-confirmation proof for a key beyond the erase floor is
+    /// not penalised; one for a key within it, or outside a prune pass, is.
+    #[test]
+    fn failed_proofs_beyond_the_erase_floor_are_not_penalised() {
+        let node = [0u8; 32];
+        let floor = key_from_byte(0x30);
+        let pass = PruneAuditReportState::new(Some((node, floor)));
+        assert!(!pass.penalises(&key_from_byte(0x31)));
+        assert!(pass.penalises(&key_from_byte(0x30)));
+        assert!(pass.penalises(&key_from_byte(0x01)));
+
+        let migration = PruneAuditReportState::new(None);
+        assert!(migration.penalises(&key_from_byte(0xFF)));
+    }
+
+    /// The prune pass logs one line in the shape the server watchdog parses.
+    #[test]
+    fn the_prune_pass_line_keeps_the_shape_the_watchdog_parses() {
+        let result = PruneResult {
+            records_total: 1,
+            records_in_range: 2,
+            records_marked_out_of_range: 3,
+            records_cleared: 4,
+            records_hysteresis_pending: 5,
+            records_candidates: 6,
+            records_held_by_commitment: 7,
+            records_bootstrap_deferred: 8,
+            records_budget_deferred: 9,
+            records_audits_attempted: 10,
+            records_audit_below_threshold: 12,
+            disk_pressure: true,
+            records_beyond_floor: 13,
+            records_pruned: 14,
+            paid_entries_marked: 16,
+            paid_entries_cleared: 17,
+            paid_entries_pruned: 18,
+        };
+        assert_eq!(
+            prune_pass_line(&result, 11, 15),
+            "Prune pass complete: records total=1 in_range=2 newly_marked=3 cleared=4 \
+             hysteresis_pending=5 candidates=6 held_by_commitment=7 bootstrap_deferred=8 \
+             budget_deferred=9 audits_attempted=10 audit_requests=11 audit_below_threshold=12 \
+             disk_pressure=1 beyond_floor=13 pruned=14; paid total=15 marked=16 cleared=17 \
+             pruned=18"
+        );
+        let roomy = PruneResult {
+            disk_pressure: false,
+            ..PruneResult::default()
+        };
+        assert!(prune_pass_line(&roomy, 0, 0).contains(" disk_pressure=0 beyond_floor=0 pruned=0;"));
+    }
+
+    /// Removing a paid-list entry keeps the out-of-range clock of a record
+    /// the node still holds, and drops the clock of one it no longer does.
+    #[tokio::test]
+    async fn removing_a_paid_entry_keeps_a_held_records_out_of_range_clock() {
+        let (paid_list, _paid_dir) = test_paid_list().await;
+        let (storage, _store_dir) = test_chunk_store().await;
+        let held = b"a record the node keeps".to_vec();
+        let held_key = crate::client::compute_address(&held);
+        storage.put(&held_key, &held).await.expect("put");
+        let gone_key = crate::client::compute_address(b"a record the node no longer has");
+        for key in [held_key, gone_key] {
+            paid_list.insert(&key).await.expect("insert");
+            paid_list.set_record_out_of_range(&key);
+        }
+        let since = paid_list
+            .record_out_of_range_since(&held_key)
+            .expect("clock");
+
+        assert_eq!(
+            delete_paid_entries(&[held_key, gone_key], &paid_list, &storage).await,
+            2
+        );
+        assert!(!paid_list.contains(&held_key).expect("contains"));
+        assert_eq!(
+            paid_list.record_out_of_range_since(&held_key),
+            Some(since),
+            "the record's wait must not restart"
+        );
+        assert_eq!(paid_list.record_out_of_range_since(&gone_key), None);
     }
 
     #[tokio::test]
@@ -2580,8 +2752,6 @@ mod tests {
     const PROD_CLOSE_GROUP: usize = 7;
     /// Production storage-retention width (`close_group_size + margin`).
     const PROD_RETENTION_WIDTH: usize = 9;
-    /// An incomplete width-20 view, which must retain the audited path.
-    const INCOMPLETE_WIDE_WIDTH: usize = 19;
     /// A self id outside every `peer_ids(..)` helper group.
     const SELF_BYTE: u8 = 99;
 
@@ -2589,6 +2759,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paid_list = Arc::new(PaidList::new(dir.path()).await.expect("paid list"));
         (paid_list, dir)
+    }
+
+    async fn test_chunk_store() -> (ChunkStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            ..crate::storage::ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        (storage, dir)
     }
 
     fn record_deps<'a>(
@@ -2643,7 +2824,6 @@ mod tests {
         let key = key_from_byte(0xA0);
         let commitment = held_commitment_state(key, b"held bytes");
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, Some(&commitment));
 
@@ -2651,7 +2831,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             Instant::now(),
         );
@@ -2679,7 +2858,6 @@ mod tests {
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xA1);
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, None);
 
@@ -2688,7 +2866,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             Instant::now(),
         );
@@ -2710,7 +2887,6 @@ mod tests {
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xA2);
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, None);
 
@@ -2722,7 +2898,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             instant_after(first_seen, config.prune_hysteresis_duration),
         );
@@ -2740,14 +2915,16 @@ mod tests {
         );
     }
 
+    /// A mature out-of-range record is audited against its strict close
+    /// group, and is kept without the proofs, and without disk pressure even
+    /// with every proof.
     #[tokio::test]
-    async fn mature_record_outside_complete_width_twenty_uses_fast_path() {
+    async fn a_mature_candidate_is_audited_against_its_strict_group_and_kept_without_proofs() {
         let (paid_list, _dir) = test_paid_list().await;
         let config = ReplicationConfig::default();
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xA8);
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(config.paid_list_close_group_size);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, None);
 
@@ -2755,21 +2932,39 @@ mod tests {
         let first_seen = paid_list
             .record_out_of_range_since(&key)
             .expect("first seen");
-        let outcome = evaluate_record_prune_key(
-            &deps,
-            &key,
+        let now = instant_after(first_seen, config.prune_hysteresis_duration);
+        let outcome =
+            evaluate_record_prune_key(&deps, &key, &admission_peers, &strict_close_peers, now);
+
+        let RecordPruneKeyState::Candidate(PruneCandidateDisposition::Auditable(candidate)) =
+            outcome.state
+        else {
+            panic!("a mature out-of-range record must be an auditable candidate");
+        };
+        assert_eq!(candidate.target_peers, strict_close_peers);
+
+        let mut inputs = revalidation_inputs(
+            &self_id,
+            Some(first_seen),
+            false,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
-            instant_after(first_seen, config.prune_hysteresis_duration),
+            now,
+        );
+        assert_eq!(
+            revalidate_record_prune_candidate(&candidate, &HashMap::new(), &inputs),
+            PruneRevalidationOutcome::AuditFailed,
+            "under disk pressure and beyond the floor, no proofs still means no erasure"
         );
 
-        assert!(matches!(
-            outcome.state,
-            RecordPruneKeyState::Candidate(PruneCandidateDisposition::FastDelete(
-                FastPruneCandidate { key: candidate_key }
-            )) if candidate_key == key
-        ));
+        let mut every_proof = HashMap::new();
+        every_proof.insert(key, strict_close_peers.iter().copied().collect());
+        inputs.under_disk_pressure = false;
+        assert_eq!(
+            revalidate_record_prune_candidate(&candidate, &every_proof, &inputs),
+            PruneRevalidationOutcome::NoDiskPressure,
+            "without disk pressure, every proof still means no erasure"
+        );
     }
 
     /// #5: a retained commitment vetoes deletion after candidacy without
@@ -2782,7 +2977,6 @@ mod tests {
         let key = key_from_byte(0xA3);
         let commitment = held_commitment_state(key, b"still committed");
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, Some(&commitment));
 
@@ -2794,7 +2988,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             instant_after(first_seen, config.prune_hysteresis_duration),
         );
@@ -2819,7 +3012,6 @@ mod tests {
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xA4);
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, false, None);
 
@@ -2831,7 +3023,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             instant_after(first_seen, config.prune_hysteresis_duration),
         );
@@ -2853,9 +3044,9 @@ mod tests {
     fn audit_selection_batches_keys_and_defers_whole_candidates() {
         let peers = peer_ids(2);
         let candidates = vec![
-            (0, candidate(key_from_byte(0xA5), peers.clone())),
-            (1, candidate(key_from_byte(0xA6), peers.clone())),
-            (2, candidate(key_from_byte(0xA7), peers)),
+            candidate(key_from_byte(0xA5), peers.clone()),
+            candidate(key_from_byte(0xA6), peers.clone()),
+            candidate(key_from_byte(0xA7), peers),
         ];
 
         let selected = select_record_prune_audits(&candidates, 2, 10, 2);
@@ -2863,7 +3054,11 @@ mod tests {
         assert_eq!(selected.candidates.len(), 2);
         assert_eq!(selected.request_count, 2);
         assert_eq!(selected.deferred, 1);
-        assert_eq!(selected.last_selected_offset, Some(1));
+        assert_eq!(
+            selected.candidates.last().map(|c| c.key),
+            Some(key_from_byte(0xA6)),
+            "candidates are taken in the order given"
+        );
     }
 
     /// #12 (part): moving back inside the retention width clears the
@@ -2876,7 +3071,6 @@ mod tests {
         let key = key_from_byte(0xA6);
         let mut admission_peers = peer_ids(PROD_RETENTION_WIDTH - 1);
         admission_peers.push(self_id);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, None);
 
@@ -2885,7 +3079,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             Instant::now(),
         );
@@ -2915,9 +3108,11 @@ mod tests {
             first_seen,
             prune_hysteresis_duration: ReplicationConfig::default().prune_hysteresis_duration,
             held_by_commitment,
+            // Under disk pressure and beyond the floor unless a test says
+            // otherwise, so the other checks decide.
+            under_disk_pressure: true,
+            beyond_floor: true,
             storage_admission_peers,
-            wide_admission_peers: storage_admission_peers,
-            wide_admission_width: ReplicationConfig::default().paid_list_close_group_size,
             strict_close_peers,
             now,
         }
@@ -2974,15 +3169,17 @@ mod tests {
         }
     }
 
+    /// Without disk pressure nothing is erased, whatever else holds: every
+    /// proof, far beyond the floor, out of range past the wait.
     #[test]
-    fn audited_candidate_that_moves_outside_complete_width_twenty_deletes_without_proofs() {
+    fn revalidation_never_erases_without_disk_pressure() {
         let self_id = peer_id_from_byte(SELF_BYTE);
-        let key = key_from_byte(0xB5);
+        let key = key_from_byte(0xB6);
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers =
-            peer_ids(ReplicationConfig::default().paid_list_close_group_size);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let candidate = candidate(key, strict_close_peers.clone());
+        let mut present_by_key = HashMap::new();
+        present_by_key.insert(key, strict_close_peers.iter().copied().collect());
         let first_seen = Instant::now();
         let mut inputs = revalidation_inputs(
             &self_id,
@@ -2992,11 +3189,170 @@ mod tests {
             &strict_close_peers,
             matured(first_seen),
         );
-        inputs.wide_admission_peers = &wide_admission_peers;
+        assert_eq!(
+            revalidate_record_prune_candidate(&candidate, &present_by_key, &inputs),
+            PruneRevalidationOutcome::Delete,
+            "test setup: every other check passes"
+        );
 
-        let outcome = revalidate_record_prune_candidate(&candidate, &HashMap::new(), &inputs);
+        inputs.under_disk_pressure = false;
+        assert_eq!(
+            revalidate_record_prune_candidate(&candidate, &present_by_key, &inputs),
+            PruneRevalidationOutcome::NoDiskPressure
+        );
+    }
 
-        assert!(matches!(outcome, PruneRevalidationOutcome::Delete));
+    /// Under disk pressure, a record within the erase floor is kept even
+    /// with every proof.
+    #[test]
+    fn revalidation_never_erases_within_the_floor() {
+        let self_id = peer_id_from_byte(SELF_BYTE);
+        let key = key_from_byte(0xB7);
+        let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
+        let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
+        let candidate = candidate(key, strict_close_peers.clone());
+        let mut present_by_key = HashMap::new();
+        present_by_key.insert(key, strict_close_peers.iter().copied().collect());
+        let first_seen = Instant::now();
+        let mut inputs = revalidation_inputs(
+            &self_id,
+            Some(first_seen),
+            false,
+            &admission_peers,
+            &strict_close_peers,
+            matured(first_seen),
+        );
+        inputs.beyond_floor = false;
+
+        assert_eq!(
+            revalidate_record_prune_candidate(&candidate, &present_by_key, &inputs),
+            PruneRevalidationOutcome::WithinFloor
+        );
+    }
+
+    /// Under disk pressure and beyond the floor, fewer proofs than
+    /// [`prune_proofs_needed`] keep the record, down to none at all.
+    #[test]
+    fn revalidation_never_erases_under_pressure_without_enough_proofs() {
+        let self_id = peer_id_from_byte(SELF_BYTE);
+        let key = key_from_byte(0xB8);
+        let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
+        let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
+        let candidate = candidate(key, strict_close_peers.clone());
+        let first_seen = Instant::now();
+        let inputs = revalidation_inputs(
+            &self_id,
+            Some(first_seen),
+            false,
+            &admission_peers,
+            &strict_close_peers,
+            matured(first_seen),
+        );
+
+        for proofs in 0..prune_proofs_needed(PROD_CLOSE_GROUP) {
+            let mut present_by_key = HashMap::new();
+            present_by_key.insert(
+                key,
+                strict_close_peers[..proofs]
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>(),
+            );
+            assert_eq!(
+                revalidate_record_prune_candidate(&candidate, &present_by_key, &inputs),
+                PruneRevalidationOutcome::AuditFailed,
+                "{proofs} proofs must keep the record"
+            );
+        }
+    }
+
+    /// Nothing is audited, so nothing can be erased, without disk pressure or
+    /// within the floor; under pressure only candidates beyond the floor are,
+    /// farthest first.
+    #[tokio::test]
+    async fn only_candidates_beyond_the_floor_are_audited_and_only_under_pressure() {
+        let (storage, _dir) = test_chunk_store().await;
+        let node = [0u8; 32];
+        let peers = peer_ids(PROD_CLOSE_GROUP);
+        let candidates = || -> Vec<RecordPruneCandidate> {
+            [0x01u8, 0x90, 0x30, 0xC0]
+                .iter()
+                .map(|b| candidate(key_from_byte(*b), peers.clone()))
+                .collect()
+        };
+        let floor = key_from_byte(0x30);
+        let failures = retention::FailedChecks::default();
+        let erasable = |under_pressure: bool, floor: Option<&XorName>| -> Vec<XorName> {
+            erasable_in_order(
+                &storage,
+                under_pressure,
+                &node,
+                floor,
+                &failures,
+                candidates(),
+            )
+            .iter()
+            .map(|c| c.key)
+            .collect()
+        };
+
+        let nothing: Vec<XorName> = Vec::new();
+        assert_eq!(erasable(false, Some(&floor)), nothing);
+        assert_eq!(erasable(true, None), nothing);
+        assert_eq!(erasable(true, Some(&[u8::MAX; 32])), nothing);
+        assert_eq!(
+            erasable(true, Some(&floor)),
+            vec![key_from_byte(0xC0), key_from_byte(0x90)]
+        );
+    }
+
+    /// Under disk pressure, a record only the legacy store holds is not
+    /// erased: the legacy store keeps its freed pages, so erasing it would
+    /// return no disk.
+    #[tokio::test]
+    async fn records_only_the_legacy_store_holds_are_not_erased() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy_content = b"legacy only".to_vec();
+        let legacy_key = crate::client::compute_address(&legacy_content);
+        {
+            let lmdb = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
+                root_dir: dir.path().to_path_buf(),
+                verify_on_read: true,
+                max_map_size: 0,
+                disk_reserve: 0,
+            })
+            .await
+            .expect("legacy store");
+            lmdb.put(&legacy_key, &legacy_content).await.expect("put");
+            lmdb.wait_idle().await;
+        }
+        let storage = ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            ..crate::storage::ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        let file_content = b"in a file".to_vec();
+        let file_key = crate::client::compute_address(&file_content);
+        storage.put(&file_key, &file_content).await.expect("put");
+        assert!(storage.has_legacy());
+
+        let peers = peer_ids(PROD_CLOSE_GROUP);
+        let erasable: Vec<XorName> = erasable_in_order(
+            &storage,
+            true,
+            &[0u8; 32],
+            Some(&[0u8; 32]),
+            &retention::FailedChecks::default(),
+            vec![
+                candidate(legacy_key, peers.clone()),
+                candidate(file_key, peers),
+            ],
+        )
+        .iter()
+        .map(|c| c.key)
+        .collect();
+        assert_eq!(erasable, vec![file_key]);
     }
 
     /// #12: self moving back inside the retention width between the audit and

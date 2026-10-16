@@ -600,3 +600,24 @@ which is why it is a release and not an expiry constant compiled into the first 
 ## Notes for AI-assisted work
 
 Drafted with AI assistance. Not to be marked Accepted without human review.
+
+---
+
+## Note (2026-10-16): shedding and the pruner's disk-pressure rule
+
+Gate 1 above compares shedding with "the width the pruner treats as strictly
+in-range". Since ADR-0005 Amendment 1 the pruner is stricter: it erases only under
+disk pressure (below 10% free, until 15%) and only records farther than ten times the
+distance to the node's 7th-nearest peer. The shed now waits for the same disk
+pressure, read from the state the prune passes share: a node whose copier has run
+out of room but whose disk is 10% free or more gives nothing up and serves from both
+stores, and the pressure is measured again before the verification pass and just
+before `chunks.mdb` is removed. Its other gates stay (the copier out of room, the
+rank rule, the shed hold, and six of seven possession proofs from the current close
+group). The pruner's floor and order do not apply to it: they would leave a node that
+is short of space unable ever to retire `chunks.mdb`, which returns no disk until it
+is removed whole, and per-key deletes from it free nothing, so erasing farthest first
+until 15% is free cannot work there.
+
+The pruning cursor mentioned under the file store's consequences is gone too: the
+prune pass orders its candidates by distance from the node instead.
