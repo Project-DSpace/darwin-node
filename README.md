@@ -51,7 +51,7 @@ means Autonomi's earlier network, which Darwin never ran.
   request while it stayed connected and looked healthy. This one logs a
   warning, skips the events it missed and carries on, as the replication
   engine already did; only a closed stream ends it.
-- **Nodes keep data while the disk has room.** A node keeps the records and
+- **Nodes keep data while the disk has room** (from ds.11). A node keeps the records and
   pointers it holds after it stops being responsible for them, and goes on
   serving them and offering them to their close group. Its prune passes erase
   only when free space on the disk holding its data falls below 10%, and then
