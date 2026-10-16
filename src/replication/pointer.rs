@@ -24,7 +24,8 @@
 //!   and farther from the node than the erase floor may be erased, farthest
 //!   first, each only once all but one of the current close group prove they
 //!   hold that state or a newer one by returning a valid record, however far
-//!   the node is from the group.
+//!   the node is from the group, and only while the node still holds the
+//!   state they proved.
 //! - **Possession.** Some minutes after offering a fresh state, the node asks
 //!   each close-group member for the record. A member that is still responsible
 //!   and cannot produce that state or a newer one is penalised.
@@ -171,6 +172,58 @@ pub(crate) fn pointer_may_be_erased(check: &PointerEraseCheck) -> bool {
         && check
             .out_of_range_for
             .is_some_and(|waited| waited >= check.hysteresis)
+}
+
+/// The candidates a prune pass asks the close group about, in the order it
+/// asks: none unless erasing is possible (`may_erase`: under disk pressure,
+/// with bootstrap allowing anyone to be asked), only those beyond the erase
+/// floor, farthest first with those whose check failed earlier in this spell
+/// of pressure behind the rest (see [`retention::erase_order`]), and at most
+/// [`MAX_PRUNE_CANDIDATES_PER_PASS`] of them.
+fn pointer_erase_candidates(
+    may_erase: bool,
+    self_xor: &XorName,
+    floor: Option<&XorName>,
+    failures: &retention::FailedChecks,
+    candidates: Vec<PointerState>,
+) -> Vec<PointerState> {
+    retention::erase_order(may_erase, self_xor, floor, failures, candidates, |state| {
+        state.address
+    })
+    .into_iter()
+    .take(MAX_PRUNE_CANDIDATES_PER_PASS)
+    .collect()
+}
+
+/// The one line each pointer prune pass logs.
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+fn pointer_prune_pass_line(result: &PointerPruneResult) -> String {
+    format!(
+        "Pointer prune pass complete: total={} in_range={} newly_marked={} \
+         hysteresis_pending={} candidates={} held_by_commitment={} disk_pressure={} \
+         beyond_floor={} pruned={}",
+        result.total,
+        result.in_range,
+        result.newly_marked,
+        result.hysteresis_pending,
+        result.candidates,
+        result.held_by_commitment,
+        u8::from(result.disk_pressure),
+        result.beyond_floor,
+        result.pruned,
+    )
+}
+
+/// What became of one candidate the pass asked the close group about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerErasure {
+    /// Erased.
+    Erased,
+    /// Kept: the close group did not prove it holds the record.
+    Unproven,
+    /// Kept: a check just before deleting failed, or the node no longer holds
+    /// the state the close group proved.
+    Kept,
 }
 
 /// A pointer state this node accepted from a paying client, to be offered to
@@ -1121,27 +1174,26 @@ impl PointerReplication {
         &self,
         allow_remote: bool,
         commitment_state: Option<&ResponderCommitmentState>,
-        retention: &DiskRetention,
+        disk_retention: &DiskRetention,
     ) -> PointerPruneResult {
         let committed = |address: &XorName| commitment_state.is_some_and(|cs| cs.is_held(address));
         let self_id = *self.p2p.peer_id();
         let self_xor = *self_id.as_bytes();
-        let retention_width = storage_admission_width(self.config.close_group_size);
+        let retention = storage_admission_width(self.config.close_group_size);
         let now = Instant::now();
         let held = self.store.held_states();
         let mut result = PointerPruneResult {
             total: held.len(),
-            disk_pressure: retention.refresh(),
+            disk_pressure: disk_retention.refresh(),
             ..PointerPruneResult::default()
         };
-        let floor = retention
+        let floor = disk_retention
             .floor_from_routing_table(&self.p2p, &self_id, self.config.close_group_size)
             .await;
 
         let mut candidates = Vec::new();
         for state in &held {
-            if admission::is_responsible(&self_id, &state.address, &self.p2p, retention_width).await
-            {
+            if admission::is_responsible(&self_id, &state.address, &self.p2p, retention).await {
                 self.out_of_range.lock().remove(&state.address);
                 result.in_range += 1;
                 continue;
@@ -1181,63 +1233,60 @@ impl PointerReplication {
         // follow: under disk pressure, beyond the floor, once bootstrap allows
         // asking anyone.
         let may_ask = allow_remote && !*self.is_bootstrapping.read().await;
-        let ordered: Vec<PointerState> = if may_ask {
-            retention::erase_order(
-                result.disk_pressure,
-                &self_xor,
-                floor.as_ref(),
-                candidates,
-                |state| state.address,
-            )
-            .into_iter()
-            .take(MAX_PRUNE_CANDIDATES_PER_PASS)
-            .collect()
-        } else {
-            Vec::new()
-        };
-        let erased = retention::erase_while_under_pressure(retention, ordered, move |state| {
-            self.erase_if_proven(state, commitment_state, retention)
-        })
-        .await;
-        result.pruned = erased.into_iter().filter(|erased| *erased).count();
-
-        info!(
-            "Pointer prune pass complete: total={} in_range={} newly_marked={} \
-             hysteresis_pending={} candidates={} held_by_commitment={} disk_pressure={} \
-             beyond_floor={} pruned={}",
-            result.total,
-            result.in_range,
-            result.newly_marked,
-            result.hysteresis_pending,
-            result.candidates,
-            result.held_by_commitment,
-            u8::from(result.disk_pressure),
-            result.beyond_floor,
-            result.pruned,
+        let failures = disk_retention.failed_pointer_checks();
+        let ordered = pointer_erase_candidates(
+            may_ask && result.disk_pressure,
+            &self_xor,
+            floor.as_ref(),
+            failures,
+            candidates,
         );
+        let outcomes = retention::erase_while_under_pressure(
+            disk_retention,
+            ordered,
+            move |state| async move {
+                let erasure = self
+                    .erase_if_proven(state, commitment_state, disk_retention)
+                    .await;
+                (state.address, erasure)
+            },
+        )
+        .await;
+        for (address, erasure) in outcomes {
+            match erasure {
+                PointerErasure::Erased => {
+                    result.pruned += 1;
+                    failures.forget(&address);
+                }
+                PointerErasure::Unproven => failures.record(&address),
+                PointerErasure::Kept => {}
+            }
+        }
+
+        info!("{}", pointer_prune_pass_line(&result));
         result
     }
 
     /// Erase one candidate if all but one of its close group prove they hold
-    /// it and every check still passes just before deleting. Returns whether
-    /// it was erased.
+    /// it and every check still passes just before deleting.
     async fn erase_if_proven(
         &self,
         state: PointerState,
         commitment_state: Option<&ResponderCommitmentState>,
-        retention: &DiskRetention,
-    ) -> bool {
+        disk_retention: &DiskRetention,
+    ) -> PointerErasure {
         if self.shutdown.is_cancelled() {
-            return false;
+            return PointerErasure::Kept;
         }
         let others_hold = self.others_hold(&state).await;
         if !others_hold {
-            return false;
+            return PointerErasure::Unproven;
         }
         // Re-check just before deleting: the group may have moved back, a
-        // commitment may hold the record again, or the floor may have moved.
+        // commitment may hold the record again, the floor may have moved, or
+        // the disk may have room again after the time the proof took.
         let self_id = *self.p2p.peer_id();
-        let floor = retention
+        let floor = disk_retention
             .floor_from_routing_table(&self.p2p, &self_id, self.config.close_group_size)
             .await;
         let responsible = admission::is_responsible(
@@ -1248,7 +1297,7 @@ impl PointerReplication {
         )
         .await;
         let check = PointerEraseCheck {
-            under_disk_pressure: retention.under_pressure(),
+            under_disk_pressure: disk_retention.refresh(),
             beyond_floor: retention::is_beyond_floor(
                 self_id.as_bytes(),
                 &state.address,
@@ -1264,7 +1313,11 @@ impl PointerReplication {
                 .map(Instant::elapsed),
             hysteresis: self.config.prune_hysteresis_duration,
         };
-        pointer_may_be_erased(&check) && self.delete(&state.address).await
+        if pointer_may_be_erased(&check) && self.delete(&state).await {
+            PointerErasure::Erased
+        } else {
+            PointerErasure::Kept
+        }
     }
 
     /// Whether all but one of the current close group prove they hold `ours`
@@ -1301,16 +1354,22 @@ impl PointerReplication {
         false
     }
 
-    async fn delete(&self, address: &XorName) -> bool {
-        self.out_of_range.lock().remove(address);
-        match self.store.delete(address).await {
+    /// Erase the record at `state.address`, but only while the node still
+    /// holds exactly `state`, the one its close group proved: a newer state
+    /// that arrived since is not covered by that proof and stays.
+    async fn delete(&self, state: &PointerState) -> bool {
+        match self.store.delete_held(state).await {
             Ok(true) => {
+                self.out_of_range.lock().remove(&state.address);
                 self.chunks.release(POINTER_WIRE_LEN as u64);
                 true
             }
             Ok(false) => false,
             Err(e) => {
-                warn!("Could not prune pointer {}: {e}", hex::encode(address));
+                warn!(
+                    "Could not prune pointer {}: {e}",
+                    hex::encode(state.address)
+                );
                 false
             }
         }
@@ -1542,32 +1601,94 @@ mod tests {
     }
 
     #[test]
-    fn pointers_are_considered_farthest_first_and_only_beyond_the_floor() {
+    fn pointer_candidates_are_asked_about_farthest_first_and_only_beyond_the_floor() {
         let node = [0u8; 32];
         let floor = [0x20u8; 32];
+        let failures = retention::FailedChecks::default();
         let candidates = vec![
             at([0x10; 32]),
             at([0xF0; 32]),
             at([0x40; 32]),
             at([0x80; 32]),
         ];
-
-        let ordered: Vec<XorName> =
-            retention::erase_order(true, &node, Some(&floor), candidates.clone(), |s| s.address)
+        let asked = |may_erase: bool, floor: Option<&XorName>| -> Vec<XorName> {
+            pointer_erase_candidates(may_erase, &node, floor, &failures, candidates.clone())
                 .iter()
                 .map(|s| s.address)
-                .collect();
-        assert_eq!(ordered, vec![[0xF0; 32], [0x80; 32], [0x40; 32]]);
+                .collect()
+        };
 
-        assert!(
-            retention::erase_order(false, &node, Some(&floor), candidates.clone(), |s| s
-                .address)
-            .is_empty(),
-            "nothing is considered without disk pressure"
+        assert_eq!(
+            asked(true, Some(&floor)),
+            vec![[0xF0; 32], [0x80; 32], [0x40; 32]]
         );
         assert!(
-            retention::erase_order(true, &node, None, candidates, |s| s.address).is_empty(),
-            "nothing is considered without a floor"
+            asked(false, Some(&floor)).is_empty(),
+            "nothing is asked about without disk pressure, or while bootstrapping"
         );
+        assert!(
+            asked(true, None).is_empty(),
+            "nothing is asked about without a floor"
+        );
+
+        failures.record(&[0xF0; 32]);
+        assert_eq!(
+            asked(true, Some(&floor)),
+            vec![[0x80; 32], [0x40; 32], [0xF0; 32]],
+            "one whose check failed waits behind the rest"
+        );
+    }
+
+    #[test]
+    fn a_pass_asks_about_the_farthest_candidates_up_to_its_budget() {
+        let node = [0u8; 32];
+        let count = u16::try_from(MAX_PRUNE_CANDIDATES_PER_PASS + 44).expect("fits");
+        // Addresses in ascending order, so the farthest come last.
+        let candidates: Vec<PointerState> = (1..=count)
+            .map(|i| {
+                let mut address = [0u8; 32];
+                address[..2].copy_from_slice(&i.to_be_bytes());
+                at(address)
+            })
+            .collect();
+
+        let asked = pointer_erase_candidates(
+            true,
+            &node,
+            Some(&[0u8; 32]),
+            &retention::FailedChecks::default(),
+            candidates,
+        );
+
+        assert_eq!(asked.len(), MAX_PRUNE_CANDIDATES_PER_PASS);
+        let firsts: Vec<u16> = asked
+            .iter()
+            .map(|s| u16::from_be_bytes([s.address[0], s.address[1]]))
+            .collect();
+        let expected: Vec<u16> = (45..=count).rev().collect();
+        assert_eq!(firsts, expected, "the farthest, farthest first");
+    }
+
+    #[test]
+    fn the_pointer_prune_pass_line_keeps_its_shape() {
+        let result = PointerPruneResult {
+            total: 1,
+            in_range: 2,
+            newly_marked: 3,
+            hysteresis_pending: 4,
+            candidates: 5,
+            held_by_commitment: 6,
+            disk_pressure: true,
+            beyond_floor: 7,
+            pruned: 8,
+        };
+        assert_eq!(
+            pointer_prune_pass_line(&result),
+            "Pointer prune pass complete: total=1 in_range=2 newly_marked=3 \
+             hysteresis_pending=4 candidates=5 held_by_commitment=6 disk_pressure=1 \
+             beyond_floor=7 pruned=8"
+        );
+        assert!(pointer_prune_pass_line(&PointerPruneResult::default())
+            .contains(" disk_pressure=0 beyond_floor=0 pruned=0"));
     }
 }

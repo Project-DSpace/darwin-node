@@ -7758,7 +7758,7 @@ async fn run_neighbor_sync_round(
             allow_remote_prune_audits,
             commitment_state: Some(commitment_state),
             audit_challenge_coordinator,
-            retention: disk_retention,
+            disk_retention,
         })
         .await;
         if let Some(pointers) = pointers {
@@ -10356,10 +10356,10 @@ async fn rebuild_and_rotate_commitment(
     // ages past GOSSIP_ANSWERABILITY_TTL it falls out of the in-window retained
     // set, `ResponderCommitmentState::is_held` goes false,
     // and the pruner (which until then vetoes its deletion) may erase it once
-    // the disk needs the room. Without
-    // this filter the pruner's reprieve would keep re-committing stale keys
-    // forever (the rebuild reads all_keys, so a retained-on-disk key would be
-    // re-committed and re-gossiped every rotation — a permanent pin).
+    // the disk needs the room. Without this filter the pruner's reprieve would
+    // keep re-committing stale keys forever (the rebuild reads all_keys, so a
+    // retained-on-disk key would be re-committed and re-gossiped every
+    // rotation — a permanent pin).
     let self_id = *p2p.peer_id();
     let mut keys = Vec::with_capacity(stored_keys.len());
     for k in stored_keys {
@@ -10409,9 +10409,9 @@ async fn rebuild_and_rotate_commitment(
         // The retired slot then ages out by its gossip-answerability TTL while
         // remaining answerable for in-flight pins until then. Once it ages out,
         // `is_held` flips false and the pruner may erase the now-uncommitted,
-        // out-of-range chunks under disk pressure. (Calling `age_out` alone would leave `current()`
-        // pointing at the stale root, which the gossip loop would keep
-        // re-stamping — pinning its keys forever.)
+        // out-of-range chunks under disk pressure. (Calling `age_out` alone
+        // would leave `current()` pointing at the stale root, which the gossip
+        // loop would keep re-stamping — pinning its keys forever.)
         debug!(
             "Commitment rotation: no responsible keys to commit to; retiring current commitment \
              (stays answerable until its gossip TTL lapses, bytes still on disk)"

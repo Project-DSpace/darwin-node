@@ -16,16 +16,20 @@
 //! Counted, in production code:
 //!
 //! - every mention of a primitive that removes stored data ([`PRIMITIVES`]:
-//!   file and directory removal, store and table deletes), except its own
-//!   definition, so that an import under another name is counted too;
+//!   file and directory removal, the system calls behind them, store and
+//!   table deletes), except its own definition, so that an import under
+//!   another name is counted too;
 //! - every call of a function of this crate that removes stored records
 //!   under another name ([`ERASERS`]);
 //! - `clear` called with an argument: a table cleared inside a transaction
 //!   (clearing an in-memory collection takes none);
 //! - `truncate(true)`: a file opened so that its old contents are dropped.
 //!
-//! Renames and plain writes are not counted: they publish a file written under
-//! a temporary name, or move one aside.
+//! Not counted: renames, plain writes and `File::create`, which publish a file
+//! written under a temporary name or move one aside, and a temporary directory
+//! dropped at the end of its scope. Nor can a count tell which receiver a
+//! listed call is on, so a listed call turned into another of the same name
+//! at the same site passes; the review of the change has to catch that.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -36,17 +40,22 @@ const PRIMITIVES: &[&str] = &[
     "delete",
     "delete_range",
     "del_current",
+    "ftruncate",
     "remove_batch",
     "remove_dir",
     "remove_dir_all",
     "remove_file",
+    "rmdir",
     "set_len",
+    "unlink",
+    "unlinkat",
 ];
 
 /// Functions of this crate that remove stored records under another name,
 /// counted where they are called.
 const ERASERS: &[&str] = &[
     "delete_blocking",
+    "delete_held",
     "delete_in_txn",
     "delete_retired_directory",
     "delete_unobserved",
@@ -58,6 +67,12 @@ const ERASERS: &[&str] = &[
     "retire_legacy",
     "try_delete",
 ];
+
+/// Calls that build a node's disk-pressure state. The prune passes and the
+/// storage migration must share one, so that the pressure lasts until 15% is
+/// free for all of them: one built afresh would end it at 10%.
+const DISK_PRESSURE_STATE_BUILDERS: &[(Option<&str>, &str)] =
+    &[(None, "for_store"), (Some("DiskRetention"), "new")];
 
 /// A reviewed site where stored data may be removed, and why that is safe.
 struct EraseSite {
@@ -173,8 +188,16 @@ const ERASE_SITES: &[EraseSite] = &[
         "PointerStore::delete",
         "delete_blocking",
         1,
-        "Removes a pointer record; its only production caller is \
-         PointerReplication::delete.",
+        "Removes a pointer record whatever state it holds; no production code calls it \
+         (the pruner uses PointerStore::delete_held).",
+    ),
+    site(
+        "src/pointer/store.rs",
+        "PointerStore::delete_held",
+        "delete_blocking",
+        1,
+        "Removes a pointer record only while it still holds the state its close group \
+         proved; its only production caller is PointerReplication::delete.",
     ),
     site(
         "src/pointer/store.rs",
@@ -208,9 +231,10 @@ const ERASE_SITES: &[EraseSite] = &[
     site(
         "src/replication/pointer.rs",
         "PointerReplication::delete",
-        "delete",
+        "delete_held",
         1,
-        "Erases a pointer record PointerReplication::erase_if_proven has cleared.",
+        "Erases a pointer record PointerReplication::erase_if_proven has cleared, only \
+         while the node still holds the state its close group proved.",
     ),
     site(
         "src/replication/pointer.rs",
@@ -897,8 +921,19 @@ const ITEM_KEYWORDS: &[&str] = &[
     "use",
 ];
 
+/// What a walk counts.
+#[derive(Debug, Clone, Copy)]
+enum Counting {
+    /// Calls that can remove stored data (see the module documentation).
+    Erasures,
+    /// Calls of these functions, by name and, where given, the path segment
+    /// before it (`Type::name`).
+    Calls(&'static [(Option<&'static str>, &'static str)]),
+}
+
 struct Walker<'a> {
     tokens: &'a [Token],
+    counting: Counting,
     stack: Vec<Frame>,
     /// A label for the next `{` opened at this stack depth.
     pending: Option<(Frame, usize)>,
@@ -906,9 +941,10 @@ struct Walker<'a> {
 }
 
 impl<'a> Walker<'a> {
-    fn new(tokens: &'a [Token]) -> Self {
+    fn new(tokens: &'a [Token], counting: Counting) -> Self {
         Self {
             tokens,
+            counting,
             stack: Vec::new(),
             pending: None,
             scan: FileScan::default(),
@@ -1070,6 +1106,37 @@ impl<'a> Walker<'a> {
         let called = matches!(next, Some(Tok::Punct('(')))
             || (matches!(next, Some(Tok::Joint("::")))
                 && matches!(self.tok(pos + 2), Some(Tok::Punct('<'))));
+        match self.counting {
+            Counting::Erasures => self.count_erasure(pos, name, called, line),
+            Counting::Calls(functions) if called => {
+                let owner = if matches!(previous, Some(Tok::Joint("::"))) {
+                    pos.checked_sub(2)
+                        .and_then(|at| self.ident(at))
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                let label = functions
+                    .iter()
+                    .find(|(wanted, function)| {
+                        *function == name
+                            && wanted.is_none_or(|wanted| owner.as_deref() == Some(wanted))
+                    })
+                    .map(|(wanted, function)| {
+                        wanted
+                            .map_or_else(|| (*function).to_string(), |w| format!("{w}::{function}"))
+                    });
+                if let Some(label) = label {
+                    self.count(&label, line);
+                }
+            }
+            Counting::Calls(_) => {}
+        }
+        pos + 1
+    }
+
+    /// Count `name` at `pos` if it is a call that can remove stored data.
+    fn count_erasure(&mut self, pos: usize, name: &str, called: bool, line: usize) {
         if PRIMITIVES.contains(&name) || (ERASERS.contains(&name) && called) {
             self.count(name, line);
         } else if name == "clear" && called && !matches!(self.tok(pos + 2), Some(Tok::Punct(')'))) {
@@ -1081,7 +1148,6 @@ impl<'a> Walker<'a> {
         {
             self.count("truncate", line);
         }
-        pos + 1
     }
 
     /// The type an `impl` header starting at `pos` names: after `for` if there
@@ -1234,10 +1300,15 @@ impl<'a> Walker<'a> {
     }
 }
 
-/// Scan one file's source.
+/// Scan one file's source for calls that can remove stored data.
 fn scan_source(source: &str) -> FileScan {
+    scan_counting(source, Counting::Erasures)
+}
+
+/// Scan one file's source for what `counting` counts.
+fn scan_counting(source: &str, counting: Counting) -> FileScan {
     let tokens = tokenize(source);
-    Walker::new(&tokens).walk()
+    Walker::new(&tokens, counting).walk()
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,13 +1360,22 @@ fn declared_file(file: &str, decl: &ModDecl, files: &BTreeSet<String>) -> Option
 /// Counted calls in the production code of the crate at `root`, by
 /// `(file, site, call)`, with the lines they are on.
 fn census(root: &Path) -> BTreeMap<(String, String, String), Vec<usize>> {
+    census_counting(root, Counting::Erasures)
+}
+
+/// What `counting` counts in the production code of the crate at `root`, by
+/// `(file, site, call)`, with the lines they are on.
+fn census_counting(
+    root: &Path,
+    counting: Counting,
+) -> BTreeMap<(String, String, String), Vec<usize>> {
     let mut files = Vec::new();
     rust_files(root, &root.join("src"), &mut files);
     let scans: BTreeMap<String, FileScan> = files
         .iter()
         .map(|(relative, path)| {
             let source = std::fs::read_to_string(path).unwrap_or_default();
-            (relative.clone(), scan_source(&source))
+            (relative.clone(), scan_counting(&source, counting))
         })
         .collect();
     let names: BTreeSet<String> = scans.keys().cloned().collect();
@@ -1433,11 +1513,40 @@ fn every_call_that_can_remove_stored_data_is_reviewed() {
          listed, with the reason it is there, in ERASE_SITES in \
          src/replication/retention/census.rs.\n\n\
          To review a new call: decide whether it can remove the only local copy of a valid \
-         record or pointer. If it can, route it through the prune passes' rule instead. If it \
-         cannot (temporary files, metadata, data proven wrong), add an entry to ERASE_SITES \
-         with the file, the site and call exactly as shown above, the count, and a one-line \
-         reason, and have it reviewed. For a listed call that has gone, remove or lower its \
-         entry.\n"
+         record or pointer. If it can, route it through the prune passes' rule instead, or \
+         at least through their disk-pressure state, as the storage migration's shed does. \
+         If it cannot (temporary files, metadata, data proven wrong), add an entry to \
+         ERASE_SITES with the file, the site and call exactly as shown above, the count, and \
+         a one-line reason, and have it reviewed. For a listed call that has gone, remove or \
+         lower its entry.\n"
+    );
+}
+
+/// The prune passes and the storage migration share one disk-pressure state
+/// per node, built in one place in production code. One built anywhere else
+/// would start without the pressure the others are under, and end it at 10%
+/// free instead of 15%.
+#[test]
+fn the_disk_pressure_state_is_built_once_per_node() {
+    let found = census_counting(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Counting::Calls(DISK_PRESSURE_STATE_BUILDERS),
+    );
+    let sites: Vec<(String, String, String, usize)> = found
+        .into_iter()
+        .map(|((file, site, call), lines)| (file, site, call, lines.len()))
+        .collect();
+    assert_eq!(
+        sites,
+        vec![(
+            "src/replication/mod.rs".to_string(),
+            "ReplicationEngine::new".to_string(),
+            "for_store".to_string(),
+            1
+        )],
+        "\nA node's disk-pressure state (DiskRetention) is built once, in \
+         ReplicationEngine::new, and shared. Pass the engine's \
+         (ReplicationEngine::disk_retention) instead of building another.\n"
     );
 }
 
@@ -1600,6 +1709,58 @@ mod tests {
         assert_eq!(
             calls(source),
             vec![one("f", "clear"), one("f", "set_len"), one("f", "truncate")]
+        );
+    }
+
+    #[test]
+    fn named_calls_are_counted_with_their_owner_and_definitions_are_not() {
+        let source = r"
+            impl DiskRetention {
+                pub fn for_store(s: &Store) -> Self { Self::new(s.dir()) }
+                pub fn new(dir: PathBuf) -> Self { Self { dir } }
+            }
+            fn engine(s: &Store) {
+                let a = retention::DiskRetention::for_store(&s);
+                let b = DiskRetention :: new ( dir );
+                let c = Other::new(dir);
+                let d = Vec::new();
+            }
+        ";
+        let found: Vec<(String, String, usize)> =
+            scan_counting(source, Counting::Calls(DISK_PRESSURE_STATE_BUILDERS))
+                .calls
+                .into_iter()
+                .map(|((site, call), lines)| (site, call, lines.len()))
+                .collect();
+        assert_eq!(
+            found,
+            vec![
+                one("engine", "DiskRetention::new"),
+                one("engine", "for_store")
+            ]
+        );
+    }
+
+    #[test]
+    fn the_system_calls_behind_removal_are_counted() {
+        let source = r"
+            fn f(p: &CStr, fd: i32) {
+                unsafe {
+                    libc::unlink(p.as_ptr());
+                    libc::unlinkat(fd, p.as_ptr(), 0);
+                    libc::rmdir(p.as_ptr());
+                    libc::ftruncate(fd, 0);
+                }
+            }
+        ";
+        assert_eq!(
+            calls(source),
+            vec![
+                one("f", "ftruncate"),
+                one("f", "rmdir"),
+                one("f", "unlink"),
+                one("f", "unlinkat"),
+            ]
         );
     }
 

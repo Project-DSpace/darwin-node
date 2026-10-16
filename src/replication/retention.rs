@@ -12,8 +12,9 @@
 //!   [`DISK_PRESSURE_END_PERCENT`] (15%). Free space is measured as the chunk
 //!   store's capacity guard measures it: the space available on the partition
 //!   holding the chunk directory. A measurement that fails counts as no
-//!   pressure. The state lives in memory, is shared by both passes, and starts
-//!   without pressure when the node starts.
+//!   pressure. The state lives in memory, is shared by both passes and the
+//!   storage migration's shed, and starts without pressure when the node
+//!   starts.
 //! - **The erase floor.** Only records farther from the node than
 //!   [`ERASE_FLOOR_MULTIPLE`] (10) times the XOR distance from the node to its
 //!   own `close_group_size`-th nearest peer (the 7th at production parameters,
@@ -21,7 +22,10 @@
 //!   With fewer peers known, nothing may. "Farther" is strict, and the multiple
 //!   is computed without overflow: past the end of the key space nothing is
 //!   farther.
-//! - **Order.** Eligible records go farthest from the node first. Each is
+//! - **Order.** Eligible records go farthest from the node first, chunks and
+//!   pointers each in their own pass. A record whose possession check failed
+//!   earlier in the same spell of pressure is tried after those not tried yet,
+//!   so the per-pass budgets reach every eligible record in turn. Each is
 //!   erased only after the nodes now nearest to it prove they hold it and the
 //!   pass's re-check just before deleting passes. Free space is measured again
 //!   before each record, and erasing stops once it is back to 15%.
@@ -29,8 +33,13 @@
 //! Everything else about pruning stays as it was: the out-of-range wait, the
 //! retained-commitment veto, the bootstrap deferral and the audit budgets.
 
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use saorsa_core::identity::PeerId;
@@ -74,6 +83,7 @@ impl DiskSpace {
 
     /// Free space as a percentage of the partition, for logs.
     #[allow(clippy::cast_precision_loss)]
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
     fn free_percent(self) -> f64 {
         if self.total == 0 {
             0.0
@@ -153,33 +163,80 @@ pub fn is_beyond_floor(self_id: &XorName, key: &XorName, floor: Option<&XorName>
     floor.is_some_and(|floor| xor_distance(self_id, key) > *floor)
 }
 
-/// The candidates a pass may try to erase, farthest from the node first.
+/// The records of one kind whose possession check failed during the current
+/// spell of disk pressure, and when.
 ///
-/// None without disk pressure, and only those strictly beyond the floor.
+/// Process-local, like the out-of-range clocks. [`erase_order`] keeps only the
+/// records that are still eligible, so it forgets them all once the pressure
+/// is over.
+#[derive(Debug, Default)]
+pub struct FailedChecks {
+    failed_at: Mutex<HashMap<XorName, Instant>>,
+}
+
+impl FailedChecks {
+    /// Note that the possession check for `key` failed just now.
+    pub fn record(&self, key: &XorName) {
+        self.failed_at.lock().insert(*key, Instant::now());
+    }
+
+    /// Forget `key`: it was erased, or is no longer a candidate.
+    pub fn forget(&self, key: &XorName) {
+        self.failed_at.lock().remove(key);
+    }
+
+    /// When the possession check for `key` last failed, if it has during
+    /// this spell of pressure.
+    #[must_use]
+    pub fn last_failed(&self, key: &XorName) -> Option<Instant> {
+        self.failed_at.lock().get(key).copied()
+    }
+}
+
+/// The candidates a pass may try to erase, in the order it tries them.
+///
+/// None without disk pressure, and only those strictly beyond the floor,
+/// farthest from the node first. Those whose possession check already failed
+/// during this spell of pressure come after the ones not tried yet, the one
+/// that failed longest ago first. `failures` forgets every record that is not
+/// eligible now.
 pub fn erase_order<T>(
     under_disk_pressure: bool,
     self_id: &XorName,
     floor: Option<&XorName>,
+    failures: &FailedChecks,
     candidates: Vec<T>,
     key_of: impl Fn(&T) -> XorName,
 ) -> Vec<T> {
-    if !under_disk_pressure {
-        return Vec::new();
-    }
-    let Some(floor) = floor else {
+    let Some(floor) = floor.filter(|_| under_disk_pressure) else {
+        failures.failed_at.lock().clear();
         return Vec::new();
     };
-    let mut eligible: Vec<(XorName, T)> = candidates
+    let eligible: Vec<(XorName, XorName, T)> = candidates
         .into_iter()
         .filter_map(|candidate| {
-            let distance = xor_distance(self_id, &key_of(&candidate));
-            (distance > *floor).then_some((distance, candidate))
+            let key = key_of(&candidate);
+            let distance = xor_distance(self_id, &key);
+            (distance > *floor).then_some((key, distance, candidate))
         })
         .collect();
-    eligible.sort_by_key(|(distance, _)| std::cmp::Reverse(*distance));
-    eligible
+
+    let mut failed_at = failures.failed_at.lock();
+    let eligible_keys: HashSet<XorName> = eligible.iter().map(|(key, _, _)| *key).collect();
+    failed_at.retain(|key, _| eligible_keys.contains(key));
+    let mut ordered: Vec<(Option<Instant>, Reverse<XorName>, T)> = eligible
         .into_iter()
-        .map(|(_, candidate)| candidate)
+        .map(|(key, distance, candidate)| {
+            (failed_at.get(&key).copied(), Reverse(distance), candidate)
+        })
+        .collect();
+    drop(failed_at);
+
+    // Not tried yet (`None`) before failed, then farthest first.
+    ordered.sort_by_key(|(failed, distance, _)| (*failed, *distance));
+    ordered
+        .into_iter()
+        .map(|(_, _, candidate)| candidate)
         .collect()
 }
 
@@ -208,25 +265,37 @@ where
     outcomes
 }
 
-/// The disk-pressure state of one node, shared by its chunk and pointer prune
-/// passes so they never disagree about whether the node is erasing, and the
-/// measurements behind it.
+/// The disk-pressure state of one node, and the measurements behind it.
+///
+/// Shared by the chunk and pointer prune passes and the storage migration, so
+/// they never disagree about whether the node is erasing. It also holds the
+/// records whose possession check failed during the current spell of
+/// pressure.
 pub struct DiskRetention {
     /// A directory on the partition holding the record store: the chunk
     /// store's own, which its capacity guard measures.
     dir: PathBuf,
     /// Whether the node is under disk pressure.
     under_pressure: Mutex<bool>,
+    /// Chunks whose possession check failed during this spell of pressure.
+    failed_chunk_checks: FailedChecks,
+    /// Pointers whose possession check failed during this spell of pressure.
+    failed_pointer_checks: FailedChecks,
     /// Inputs a test fixed instead of reading the disk and the routing table.
     #[cfg(any(test, feature = "test-utils"))]
     fixed: Mutex<FixedInputs>,
 }
 
+/// A measurement a test supplies in place of the disk's.
+#[cfg(any(test, feature = "test-utils"))]
+type SpaceSource = Arc<dyn Fn() -> Option<DiskSpace> + Send + Sync>;
+
 /// Inputs a test fixed.
 #[cfg(any(test, feature = "test-utils"))]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default)]
 struct FixedInputs {
-    space: Fixed<Option<DiskSpace>>,
+    /// Measured instead of the disk, at every measurement.
+    space: Option<SpaceSource>,
     floor: Fixed<Option<XorName>>,
 }
 
@@ -256,21 +325,31 @@ impl DiskRetention {
         Self {
             dir,
             under_pressure: Mutex::new(false),
+            failed_chunk_checks: FailedChecks::default(),
+            failed_pointer_checks: FailedChecks::default(),
             #[cfg(any(test, feature = "test-utils"))]
             fixed: Mutex::new(FixedInputs::default()),
         }
-    }
-
-    /// The directory whose partition is measured.
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 
     /// Whether the node was under disk pressure at the last measurement.
     #[must_use]
     pub fn under_pressure(&self) -> bool {
         *self.under_pressure.lock()
+    }
+
+    /// The chunks whose possession check failed during this spell of
+    /// pressure.
+    #[must_use]
+    pub fn failed_chunk_checks(&self) -> &FailedChecks {
+        &self.failed_chunk_checks
+    }
+
+    /// The pointers whose possession check failed during this spell of
+    /// pressure.
+    #[must_use]
+    pub fn failed_pointer_checks(&self) -> &FailedChecks {
+        &self.failed_pointer_checks
     }
 
     /// Measure free space again and update the pressure state. Returns
@@ -282,11 +361,11 @@ impl DiskRetention {
         let now = next_disk_pressure(was, space);
         *under_pressure = now;
         drop(under_pressure);
-        match (was, now, space) {
+        match (was, now, space.filter(|space| space.total > 0)) {
             (false, true, Some(space)) => info!(
                 "Disk pressure: {:.1}% of the record store's partition is free, below \
-                 {DISK_PRESSURE_START_PERCENT}%; erasing records far from this node, farthest \
-                 first, until {DISK_PRESSURE_END_PERCENT}% is free",
+                 {DISK_PRESSURE_START_PERCENT}%; records far from this node may now be erased, \
+                 farthest first, until {DISK_PRESSURE_END_PERCENT}% is free",
                 space.free_percent()
             ),
             (true, false, Some(space)) => info!(
@@ -308,9 +387,9 @@ impl DiskRetention {
     fn measure(&self) -> Option<DiskSpace> {
         #[cfg(any(test, feature = "test-utils"))]
         {
-            let fixed = self.fixed.lock().space;
-            if let Fixed::To(space) = fixed {
-                return space;
+            let source = self.fixed.lock().space.clone();
+            if let Some(source) = source {
+                return source();
             }
         }
         match fs2::statvfs(&self.dir) {
@@ -359,7 +438,16 @@ impl DiskRetention {
     /// From now on, measure `space` instead of the disk (`None`: the
     /// measurement fails). Tests only.
     pub fn set_space_for_test(&self, space: Option<DiskSpace>) {
-        self.fixed.lock().space = Fixed::To(space);
+        self.set_space_source_for_test(move || space);
+    }
+
+    /// From now on, call `source` at every measurement instead of reading the
+    /// disk, so a test can model the space each erasure returns. Tests only.
+    pub fn set_space_source_for_test(
+        &self,
+        source: impl Fn() -> Option<DiskSpace> + Send + Sync + 'static,
+    ) {
+        self.fixed.lock().space = Some(Arc::new(source));
     }
 
     /// From now on, use `floor` instead of the routing table's (`None`:
@@ -398,6 +486,23 @@ mod tests {
     }
 
     const NODE: XorName = [0u8; 32];
+
+    /// [`erase_order`] with no failed checks to account for.
+    fn order<T>(
+        under_disk_pressure: bool,
+        floor: Option<&XorName>,
+        candidates: Vec<T>,
+        key_of: impl Fn(&T) -> XorName,
+    ) -> Vec<T> {
+        erase_order(
+            under_disk_pressure,
+            &NODE,
+            floor,
+            &FailedChecks::default(),
+            candidates,
+            key_of,
+        )
+    }
 
     // -- Disk pressure -------------------------------------------------------
 
@@ -489,6 +594,18 @@ mod tests {
     }
 
     #[test]
+    fn a_measurement_source_is_asked_at_every_measurement() {
+        let retention = DiskRetention::new(PathBuf::from("."));
+        let available = Arc::new(Mutex::new(90u64));
+        let source = Arc::clone(&available);
+        retention.set_space_source_for_test(move || space(*source.lock()));
+
+        assert!(retention.refresh());
+        *available.lock() = 150;
+        assert!(!retention.refresh(), "the second measurement reads 15%");
+    }
+
+    #[test]
     fn the_real_partition_can_be_measured() {
         let dir = tempfile::tempdir().expect("tempdir");
         let retention = DiskRetention::new(dir.path().to_path_buf());
@@ -543,7 +660,7 @@ mod tests {
         let far = [u8::MAX; 32];
         assert!(!is_beyond_floor(&NODE, &far, floor.as_ref()));
         assert_eq!(
-            erase_order(true, &NODE, floor.as_ref(), vec![far], |k| *k),
+            order(true, floor.as_ref(), vec![far], |k| *k),
             Vec::<XorName>::new()
         );
         assert_eq!(erase_floor(&NODE, &peers, 0), None);
@@ -573,7 +690,7 @@ mod tests {
         assert_eq!(floor, Some([u8::MAX; 32]));
         assert!(!is_beyond_floor(&NODE, &[u8::MAX; 32], floor.as_ref()));
         assert_eq!(
-            erase_order(true, &NODE, floor.as_ref(), vec![[u8::MAX; 32]], |k| *k),
+            order(true, floor.as_ref(), vec![[u8::MAX; 32]], |k| *k),
             Vec::<XorName>::new()
         );
 
@@ -624,7 +741,7 @@ mod tests {
             distance(0, 10),
             distance(0, 2),
         ];
-        let ordered = erase_order(true, &NODE, floor.as_ref(), candidates, |k| *k);
+        let ordered = order(true, floor.as_ref(), candidates, |k| *k);
         assert_eq!(
             ordered,
             vec![
@@ -642,8 +759,73 @@ mod tests {
         let floor = Some([0u8; 32]);
         let candidates = vec![[u8::MAX; 32], distance(0, 1)];
         assert_eq!(
-            erase_order(false, &NODE, floor.as_ref(), candidates, |k| *k),
+            order(false, floor.as_ref(), candidates, |k| *k),
             Vec::<XorName>::new()
+        );
+    }
+
+    #[test]
+    fn records_whose_check_failed_are_tried_after_those_not_tried_yet() {
+        let floor = Some(distance(0, 10));
+        let failures = FailedChecks::default();
+        let candidates = || {
+            vec![
+                distance(0, 50),
+                distance(0, 200),
+                distance(3, 0),
+                distance(0, 11),
+            ]
+        };
+        let ordered = |candidates: Vec<XorName>| {
+            erase_order(true, &NODE, floor.as_ref(), &failures, candidates, |k| *k)
+        };
+
+        assert_eq!(
+            ordered(candidates()),
+            vec![
+                distance(3, 0),
+                distance(0, 200),
+                distance(0, 50),
+                distance(0, 11)
+            ]
+        );
+
+        // The two farthest failed, the farther one first.
+        failures.record(&distance(3, 0));
+        failures.record(&distance(0, 200));
+        assert_eq!(
+            ordered(candidates()),
+            vec![
+                distance(0, 50),
+                distance(0, 11),
+                distance(3, 0),
+                distance(0, 200)
+            ],
+            "the ones not tried yet first, farthest first, then the one that failed longest ago"
+        );
+
+        // A record that is no longer eligible is forgotten.
+        assert_eq!(
+            ordered(vec![distance(0, 200), distance(0, 50)]),
+            vec![distance(0, 50), distance(0, 200)]
+        );
+        assert_eq!(failures.last_failed(&distance(3, 0)), None);
+        assert!(failures.last_failed(&distance(0, 200)).is_some());
+
+        // Erased, or the pressure is over: forgotten too.
+        failures.forget(&distance(0, 200));
+        assert_eq!(failures.last_failed(&distance(0, 200)), None);
+        failures.record(&distance(0, 50));
+        assert_eq!(
+            erase_order(false, &NODE, floor.as_ref(), &failures, candidates(), |k| {
+                *k
+            }),
+            Vec::<XorName>::new()
+        );
+        assert_eq!(
+            failures.last_failed(&distance(0, 50)),
+            None,
+            "a spell of pressure that ends forgets every failure"
         );
     }
 

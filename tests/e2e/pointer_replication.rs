@@ -19,6 +19,7 @@ use ant_node::replication::commitment::pointer_leaf_hash;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::pointer::{PointerFreshWrite, PointerReplication};
 use ant_node::replication::retention::{DiskRetention, DiskSpace};
+use ant_node::storage::XorName;
 use ant_node::ReplicationConfig;
 use ant_protocol::pointer::{Pointer, PointerState, PointerTarget, PointerTargetKind};
 use bytes::Bytes;
@@ -472,18 +473,36 @@ fn prune_network(paid_width: usize) -> TestNetworkConfig {
 
 /// Disk-pressure state for an explicit prune pass, fixed so the test does not
 /// depend on the host's disk: under pressure (5% free) or not (50% free), with
-/// every out-of-range address beyond the erase floor. The harness is too small
-/// for a real floor: ten times the distance to a node's 7th-nearest peer is
-/// past the end of the key space.
+/// every out-of-range address beyond the erase floor. The floor is fixed
+/// because in a harness this small ten times the distance to a node's
+/// `close_group_size`-th nearest peer is usually past the end of the key
+/// space, which would leave nothing eligible.
 fn disk_state(under_pressure: bool) -> DiskRetention {
+    disk_state_with_floor(under_pressure, Some([0u8; 32]))
+}
+
+/// As [`disk_state`], with the erase floor at `floor`.
+fn disk_state_with_floor(under_pressure: bool, floor: Option<XorName>) -> DiskRetention {
     let retention = DiskRetention::new(std::env::temp_dir());
     let available = if under_pressure { 5 } else { 50 };
     retention.set_space_for_test(Some(DiskSpace {
         available,
         total: 100,
     }));
-    retention.set_floor_for_test(Some([0u8; 32]));
+    retention.set_floor_for_test(floor);
     retention
+}
+
+/// One less than `distance`, which is not zero.
+fn one_less(mut distance: XorName) -> XorName {
+    for byte in distance.iter_mut().rev() {
+        if *byte > 0 {
+            *byte -= 1;
+            break;
+        }
+        *byte = u8::MAX;
+    }
+    distance
 }
 
 /// The node, out of five, that is outside the retention width for `record`.
@@ -561,15 +580,126 @@ async fn pruning_deletes_only_once_the_close_group_proves_it_holds_the_record() 
         "a node with room erased a record it keeps"
     );
 
-    // Under disk pressure, the close group proves it and the pruner drops it.
-    let erased = pruning
-        .prune_pass(true, Some(commitments(pruner_node)), &pressured)
+    // While bootstrapping it asks no one, so under disk pressure too it keeps
+    // the record.
+    let bootstrapping = pruning
+        .prune_pass(false, Some(commitments(pruner_node)), &pressured)
         .await;
+    assert!(bootstrapping.disk_pressure);
+    assert_eq!(bootstrapping.pruned, 0);
+    assert!(holds(harness.test_node(pruner).expect("node"), &record));
+
+    // Under disk pressure it keeps the record with no floor, and at exactly
+    // the floor: only records strictly farther may go.
+    let distance = ant_node::xor_distance(peer(pruner_node).as_bytes(), &record.address());
+    for floor in [None, Some(distance)] {
+        let floored = pruning
+            .prune_pass(
+                true,
+                Some(commitments(pruner_node)),
+                &disk_state_with_floor(true, floor),
+            )
+            .await;
+        assert_eq!(floored.beyond_floor, 0, "floor {floor:?}");
+        assert_eq!(floored.pruned, 0, "floor {floor:?}");
+        assert!(holds(harness.test_node(pruner).expect("node"), &record));
+    }
+
+    // Beyond the floor and under disk pressure, the close group proves it and
+    // the pruner drops it.
+    let erased = pruning
+        .prune_pass(
+            true,
+            Some(commitments(pruner_node)),
+            &disk_state_with_floor(true, Some(one_less(distance))),
+        )
+        .await;
+    assert_eq!(erased.beyond_floor, 1);
     assert_eq!(erased.pruned, 1);
     assert!(
         held(harness.test_node(pruner).expect("node"), &record).is_none(),
         "the record was not pruned though the close group holds it"
     );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Under disk pressure the pointer pass erases the eligible record farthest
+/// from the node first, measures free space again before the next one, and
+/// stops once 15% is free, keeping the rest though their close groups hold
+/// them.
+#[tokio::test]
+#[serial]
+async fn pointer_erasure_goes_farthest_first_and_stops_once_fifteen_percent_is_free() {
+    let harness = TestHarness::setup_with_config(prune_network(20))
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    // Two records the same node is out of range of.
+    let (pk, sk) = owner();
+    let first = signed(&pk, &sk, 1, 1);
+    let pruner = out_of_range_node(&harness, &first).await;
+    let mut second = None;
+    for _ in 0..500 {
+        let (pk, sk) = owner();
+        let candidate = signed(&pk, &sk, 1, 1);
+        if out_of_range_node(&harness, &candidate).await == pruner {
+            second = Some(candidate);
+            break;
+        }
+    }
+    let second = second.expect("a second record the same node is out of range of");
+    for i in 0..harness.node_count() {
+        for record in [&first, &second] {
+            store(harness.test_node(i).expect("node"))
+                .put_bytes(&record.to_bytes())
+                .await
+                .expect("put");
+        }
+    }
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[pruner]).await;
+
+    let pruner_node = harness.test_node(pruner).expect("node");
+    let distance =
+        |record: &Pointer| ant_node::xor_distance(peer(pruner_node).as_bytes(), &record.address());
+    let (farther, nearer) = if distance(&first) > distance(&second) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    // 9% free while the farther record is held; erasing it frees 6%.
+    let disk = DiskRetention::new(std::env::temp_dir());
+    disk.set_floor_for_test(Some([0u8; 32]));
+    let pruner_store = store(pruner_node);
+    let farther_address = farther.address();
+    disk.set_space_source_for_test(move || {
+        let available = if pruner_store.state(&farther_address).is_some() {
+            9
+        } else {
+            15
+        };
+        Some(DiskSpace {
+            available,
+            total: 100,
+        })
+    });
+
+    let result = replication(pruner_node)
+        .prune_pass(true, Some(commitments(pruner_node)), &disk)
+        .await;
+    assert!(result.disk_pressure);
+    assert_eq!(result.candidates, 2);
+    assert_eq!(result.beyond_floor, 2);
+    assert_eq!(result.pruned, 1, "erasing must stop at 15% free");
+    assert!(
+        held(pruner_node, &farther).is_none(),
+        "the farther record goes first"
+    );
+    assert!(holds(pruner_node, &nearer), "the nearer one is kept");
+    assert!(!disk.under_pressure());
 
     harness.teardown().await.expect("teardown");
 }

@@ -657,7 +657,33 @@ impl PointerStore {
     pub async fn delete(&self, address: &XorName) -> Result<bool> {
         let inner = Arc::clone(&self.inner);
         let address = *address;
-        let removed = spawn_blocking(move || inner.delete_blocking(&address))
+        let removed = spawn_blocking(move || inner.delete_blocking(&address, None))
+            .await
+            .map_err(|e| Error::Storage(format!("pointer delete panicked: {e}")))??;
+        if removed {
+            self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(removed)
+    }
+
+    /// Remove the record at `state.address` as [`Self::delete`] does, but
+    /// only while the index still holds exactly `state`.
+    ///
+    /// For the pruner, which erases a record only once its close group has
+    /// proved it holds that state or a newer one: a newer state that arrived
+    /// since is not covered by the proof and stays. The state is compared
+    /// under the same lock the removal takes, so no commit can land between
+    /// the two. Returns whether a file was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the file exists and cannot be removed; the
+    /// record is then still held and still indexed.
+    pub async fn delete_held(&self, state: &PointerState) -> Result<bool> {
+        let inner = Arc::clone(&self.inner);
+        let address = state.address;
+        let state_id = state.state_id;
+        let removed = spawn_blocking(move || inner.delete_blocking(&address, Some(&state_id)))
             .await
             .map_err(|e| Error::Storage(format!("pointer delete panicked: {e}")))??;
         if removed {
@@ -758,12 +784,18 @@ impl Inner {
     }
 
     /// Remove the file and the index entry for `address` under one lock, so a
-    /// commit can never land between the two and be forgotten on disk.
-    fn delete_blocking(&self, address: &XorName) -> Result<bool> {
+    /// commit can never land between the two and be forgotten on disk. With
+    /// `held`, only while the index still records that state at `address`.
+    fn delete_blocking(&self, address: &XorName, held: Option<&XorName>) -> Result<bool> {
         let shard = shard_dir(&self.dir, address);
         let path = record_path(&self.dir, address);
         let removed = {
             let mut index = self.index.lock();
+            if let Some(held) = held {
+                if index.get(address).map(|entry| entry.state.state_id) != Some(*held) {
+                    return Ok(false);
+                }
+            }
             let removed = match std::fs::remove_file(&path) {
                 Ok(()) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -1990,6 +2022,26 @@ mod tests {
         drop(store);
         let reopened = PointerStore::new(&dir).await.expect("reopen");
         assert!(!reopened.contains(&record.address()));
+    }
+
+    #[tokio::test]
+    async fn delete_held_removes_only_the_state_it_names() {
+        let (store, _dir) = store().await;
+        let proved = signed(6, 1, 1);
+        let newer = signed(6, 2, 1);
+        store.put_bytes(&newer.to_bytes()).await.expect("put");
+
+        assert!(
+            !store.delete_held(&proved.state()).await.expect("delete"),
+            "a newer state than the one named stays"
+        );
+        assert_eq!(store.state_id(&newer.address()), Some(newer.state_id()));
+        assert!(store.file_for(&newer.address()).exists());
+
+        assert!(store.delete_held(&newer.state()).await.expect("delete"));
+        assert!(!store.contains(&newer.address()));
+        assert!(!store.file_for(&newer.address()).exists());
+        assert_eq!(store.stats().deleted, 1);
     }
 
     #[tokio::test]

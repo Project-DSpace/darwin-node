@@ -34,7 +34,8 @@
 //!   space below 10% of the partition, until it is back to 15%), and only
 //!   candidates strictly beyond the erase floor (10 times the distance from
 //!   the node to its own 7th-nearest peer). Eligible candidates are audited
-//!   and erased farthest from the node first.
+//!   and erased farthest from the node first; one whose audit failed earlier
+//!   in the same spell of pressure waits behind those not audited yet.
 //! - `AuditFailed`: an audited candidate whose current strict close group
 //!   returned fewer than the required positive possession proofs
 //!   (`prune_proofs_needed`, 6 of 7 at production parameters). The record
@@ -55,7 +56,11 @@
 //! neighbor-sync hints. The repair-proof maturity gate remains a
 //! prerequisite for the responsible-chunk storage audit (see
 //! `audit_tick_with_repair_proofs`), which is a different mechanism with a
-//! different threat model.
+//! different threat model. Their batches are sized from the records the node
+//! is in range for, which are comparable across a close group, not from all
+//! it keeps. A failed proof for a key beyond the erase floor is logged but
+//! does not penalise the peer: the node's routing table may not know which
+//! nodes are nearest a key that far away.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -182,7 +187,7 @@ pub struct PrunePassContext<'a> {
     pub audit_challenge_coordinator: &'a Arc<AuditChallengeCoordinator>,
     /// The node's disk-pressure state, shared with the pointer pass, and its
     /// erase floor. Nothing is erased without disk pressure.
-    pub retention: &'a DiskRetention,
+    pub disk_retention: &'a DiskRetention,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +360,27 @@ enum PaidPruneKeyState {
 struct PruneAuditReportState {
     audit_failures: RwLock<HashSet<PeerId>>,
     bootstrap_abuse: RwLock<HashSet<PeerId>>,
+    /// The node's own address and erase floor, when the audited keys are
+    /// erase candidates: a failed proof for a key beyond the floor is logged
+    /// but not penalised, because the node's routing table may not know which
+    /// nodes are nearest a key that far away. `None`: every failure penalises.
+    erase_floor: Option<(XorName, XorName)>,
+}
+
+impl PruneAuditReportState {
+    fn new(erase_floor: Option<(XorName, XorName)>) -> Self {
+        Self {
+            erase_floor,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a failed proof for `key` penalises the peer.
+    fn penalises(&self, key: &XorName) -> bool {
+        !self
+            .erase_floor
+            .is_some_and(|(node, floor)| retention::is_beyond_floor(&node, key, Some(&floor)))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -378,6 +404,7 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
     let (paid_count, paid_stats) = prune_paid_entries(
         ctx.self_id,
         ctx.paid_list,
+        ctx.storage,
         ctx.p2p_node,
         ctx.config,
         now,
@@ -407,6 +434,19 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
 
     // One aggregate line per pass: the full lifecycle census (never per-chunk).
     info!(
+        "{}",
+        prune_pass_line(&result, record_stats.audit_requests, paid_count)
+    );
+
+    result
+}
+
+/// The one line each prune pass logs, in the shape the server watchdog
+/// parses. The `pruned=` before `; paid` counts records erased, the one after
+/// it paid-list entries removed.
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+fn prune_pass_line(result: &PruneResult, audit_requests: usize, paid_total: usize) -> String {
+    format!(
         "Prune pass complete: records total={} in_range={} newly_marked={} cleared={} \
          hysteresis_pending={} candidates={} held_by_commitment={} bootstrap_deferred={} \
          budget_deferred={} audits_attempted={} audit_requests={} audit_below_threshold={} \
@@ -422,37 +462,36 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
         result.records_bootstrap_deferred,
         result.records_budget_deferred,
         result.records_audits_attempted,
-        record_stats.audit_requests,
+        audit_requests,
         result.records_audit_below_threshold,
         u8::from(result.disk_pressure),
         result.records_beyond_floor,
         result.records_pruned,
-        paid_count,
+        paid_total,
         result.paid_entries_marked,
         result.paid_entries_cleared,
         result.paid_entries_pruned,
-    );
-
-    result
+    )
 }
 
+#[allow(clippy::too_many_lines)]
 async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPruneStats) {
+    let mut stats = RecordPruneStats {
+        disk_pressure: ctx.disk_retention.refresh(),
+        ..RecordPruneStats::default()
+    };
     let stored_keys = match ctx.storage.all_keys().await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read stored keys for pruning: {e}");
-            return (0, RecordPruneStats::default());
+            return (0, stats);
         }
     };
 
     let now = Instant::now();
-    let mut stats = RecordPruneStats {
-        disk_pressure: ctx.retention.refresh(),
-        ..RecordPruneStats::default()
-    };
     let self_xor = *ctx.self_id.as_bytes();
     let floor = ctx
-        .retention
+        .disk_retention
         .floor_from_routing_table(ctx.p2p_node, ctx.self_id, ctx.config.close_group_size)
         .await;
     let mut audit_candidates = Vec::new();
@@ -467,26 +506,35 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     for key in &stored_keys {
         let groups = record_prune_lookup_groups(key, ctx.p2p_node, ctx.config).await;
         let outcome = evaluate_record_prune_key(&deps, key, &groups.retention, &groups.strict, now);
-        if matches!(outcome.state, RecordPruneKeyState::Candidate(_))
-            && retention::is_beyond_floor(&self_xor, key, floor.as_ref())
-        {
+        let beyond_floor = matches!(outcome.state, RecordPruneKeyState::Candidate(_))
+            && retention::is_beyond_floor(&self_xor, key, floor.as_ref());
+        if beyond_floor {
             stats.beyond_floor += 1;
         }
+        // Without disk pressure nothing may be erased, so nothing is audited:
+        // a prune-confirmation audit exists only to make an erasure safe.
+        // Only the candidates this pass could erase are kept.
         if let Some(candidate) = tally_record_prune_outcome(&mut stats, outcome, key) {
-            audit_candidates.push(candidate);
+            if stats.disk_pressure && beyond_floor {
+                audit_candidates.push(candidate);
+            }
         }
     }
 
-    // Without disk pressure nothing may be erased, so nothing is audited: a
-    // prune-confirmation audit exists only to make an erasure safe.
+    let failures = ctx.disk_retention.failed_chunk_checks();
     let erasable = erasable_in_order(
         ctx.storage,
         stats.disk_pressure,
         &self_xor,
         floor.as_ref(),
+        failures,
         audit_candidates,
     );
-    let max_keys_per_challenge = ReplicationConfig::responsible_audit_key_limit(stored_keys.len());
+    // Sized from the records this node is in range for, which are comparable
+    // across a close group, not from everything it keeps: a node holding many
+    // out-of-range records would otherwise send batches its peers refuse.
+    let audit_key_count = stats.in_range.max(1);
+    let max_keys_per_challenge = ReplicationConfig::responsible_audit_key_limit(audit_key_count);
     let audit_selection = select_record_prune_audits(
         &erasable,
         max_keys_per_challenge,
@@ -502,28 +550,39 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
 
     let present_by_key = collect_record_prune_proofs(
         &audit_selection.candidates,
-        stored_keys.len(),
+        audit_key_count,
         ctx.storage,
         ctx.p2p_node,
         ctx.config,
         ctx.sync_state,
         ctx.audit_challenge_coordinator,
+        floor.map(|floor| (self_xor, floor)),
     )
     .await;
     let present_by_key = &present_by_key;
     let outcomes = retention::erase_while_under_pressure(
-        ctx.retention,
+        ctx.disk_retention,
         audit_selection.candidates,
-        |candidate| async move { erase_if_still_eligible(&candidate, present_by_key, ctx).await },
+        |candidate| async move {
+            let outcome = erase_if_still_eligible(&candidate, present_by_key, ctx).await;
+            (candidate.key, outcome)
+        },
     )
     .await;
-    for (verdict, erased) in outcomes {
+    for (key, (verdict, erased)) in outcomes {
         if erased {
             stats.pruned += 1;
+            failures.forget(&key);
         }
         match verdict {
-            Some(PruneRevalidationOutcome::ClearedBackInRange) => stats.cleared += 1,
-            Some(PruneRevalidationOutcome::AuditFailed) => stats.audit_below_threshold += 1,
+            Some(PruneRevalidationOutcome::ClearedBackInRange) => {
+                stats.cleared += 1;
+                failures.forget(&key);
+            }
+            Some(PruneRevalidationOutcome::AuditFailed) => {
+                stats.audit_below_threshold += 1;
+                failures.record(&key);
+            }
             _ => {}
         }
     }
@@ -531,27 +590,37 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     (stored_keys.len(), stats)
 }
 
-/// The audited candidates this pass may erase, farthest from the node first:
-/// none without disk pressure, and only those strictly beyond the erase
-/// floor. Records only the legacy store holds are left out: erasing one
-/// returns no disk space, because the legacy store keeps its freed pages.
+/// The audited candidates this pass may erase, in the order it tries them:
+/// none without disk pressure, only those strictly beyond the erase floor,
+/// farthest from the node first, with those whose audit failed earlier in
+/// this spell of pressure behind the rest (see [`retention::erase_order`]).
+/// Records only the legacy store holds are left out: erasing one returns no
+/// disk space, because the legacy store keeps its freed pages.
 fn erasable_in_order(
     storage: &ChunkStore,
     under_disk_pressure: bool,
     self_xor: &XorName,
     floor: Option<&XorName>,
+    failures: &retention::FailedChecks,
     candidates: Vec<RecordPruneCandidate>,
 ) -> Vec<RecordPruneCandidate> {
-    let ordered =
-        retention::erase_order(under_disk_pressure, self_xor, floor, candidates, |c| c.key);
-    if ordered.is_empty() || !storage.has_legacy() {
-        return ordered;
-    }
-    let legacy_only: HashSet<XorName> = storage.legacy_only_keys().into_iter().collect();
-    ordered
-        .into_iter()
-        .filter(|candidate| !legacy_only.contains(&candidate.key))
-        .collect()
+    let candidates = if under_disk_pressure && !candidates.is_empty() && storage.has_legacy() {
+        let legacy_only: HashSet<XorName> = storage.legacy_only_keys().into_iter().collect();
+        candidates
+            .into_iter()
+            .filter(|candidate| !legacy_only.contains(&candidate.key))
+            .collect()
+    } else {
+        candidates
+    };
+    retention::erase_order(
+        under_disk_pressure,
+        self_xor,
+        floor,
+        failures,
+        candidates,
+        |c| c.key,
+    )
 }
 
 /// Fold one record's per-pass classification into the pass stats. Returns the
@@ -793,6 +862,7 @@ fn select_record_prune_audits(
 async fn prune_paid_entries(
     self_id: &PeerId,
     paid_list: &Arc<PaidList>,
+    storage: &ChunkStore,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     now: Instant,
@@ -888,7 +958,7 @@ async fn prune_paid_entries(
     )
     .await;
     stats.cleared += revalidated_cleared;
-    stats.pruned = delete_paid_entries(&paid_keys_to_delete, paid_list).await;
+    stats.pruned = delete_paid_entries(&paid_keys_to_delete, paid_list, storage).await;
 
     (paid_keys.len(), stats)
 }
@@ -925,13 +995,34 @@ fn select_paid_prune_candidate(
     PaidPruneKeyState::Candidate(target_peers)
 }
 
-async fn delete_paid_entries(keys_to_delete: &[XorName], paid_list: &Arc<PaidList>) -> usize {
+/// Remove paid-list entries. A record the node still holds keeps its
+/// out-of-range clock, which removing its entry would otherwise clear: the
+/// record pass owns that clock, and a kept record whose entry goes would
+/// restart its wait and be counted as newly out of range again.
+async fn delete_paid_entries(
+    keys_to_delete: &[XorName],
+    paid_list: &Arc<PaidList>,
+    storage: &ChunkStore,
+) -> usize {
     if keys_to_delete.is_empty() {
         return 0;
     }
 
+    let record_clocks: Vec<(XorName, Instant)> = keys_to_delete
+        .iter()
+        .filter_map(|key| {
+            paid_list
+                .record_out_of_range_since(key)
+                .map(|since| (*key, since))
+        })
+        .collect();
     match paid_list.remove_batch(keys_to_delete).await {
         Ok(count) => {
+            for (key, since) in &record_clocks {
+                if storage.exists(key).unwrap_or(true) {
+                    paid_list.restore_record_out_of_range(key, *since);
+                }
+            }
             debug!("Pruned {count} out-of-range PaidForList entries");
             count
         }
@@ -947,7 +1038,7 @@ async fn delete_paid_entries(keys_to_delete: &[XorName], paid_list: &Arc<PaidLis
 ///
 /// The network round in [`collect_paid_prune_confirmations`] takes time;
 /// the paid close group may have changed underneath it, including self
-/// moving back into range. Mirrors [`revalidated_record_prune_keys`]:
+/// moving back into range. Mirrors [`revalidate_record_prune_candidate`]:
 /// confirmations only count from peers still in the current paid close
 /// group, against a threshold computed from that current group.
 async fn revalidated_paid_prune_keys(
@@ -1170,6 +1261,10 @@ async fn erase_stored_record(key: &XorName, ctx: &PrunePassContext<'_>) -> bool 
 /// local, and the retained record continues to participate in normal
 /// neighbor-sync repair because replica hint construction walks all locally
 /// stored keys, including out-of-range keys.
+///
+/// `erase_floor` is the node's own address and erase floor when the keys are
+/// erase candidates: failed proofs for keys beyond it are not penalised.
+#[allow(clippy::too_many_arguments)]
 async fn collect_record_prune_proofs(
     candidates: &[RecordPruneCandidate],
     local_stored_key_count: usize,
@@ -1178,6 +1273,7 @@ async fn collect_record_prune_proofs(
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
+    erase_floor: Option<(XorName, XorName)>,
 ) -> HashMap<XorName, HashSet<PeerId>> {
     if candidates.is_empty() {
         return HashMap::new();
@@ -1186,7 +1282,7 @@ async fn collect_record_prune_proofs(
     let max_keys_per_challenge =
         ReplicationConfig::responsible_audit_key_limit(local_stored_key_count);
     let challenges = build_peer_audit_challenges(candidates, max_keys_per_challenge);
-    let report_state = PruneAuditReportState::default();
+    let report_state = PruneAuditReportState::new(erase_floor);
     let audit_context = PruneAuditContext {
         storage,
         p2p_node,
@@ -1252,6 +1348,7 @@ pub(crate) async fn prove_peers_hold_records(
         config,
         sync_state,
         audit_challenge_coordinator,
+        None,
     )
     .await
 }
@@ -1279,7 +1376,8 @@ async fn stored_record_still_exists(key: &XorName, storage: &Arc<ChunkStore>) ->
 /// it, including self moving back into range or the strict close group
 /// changing membership. Positive reports only count from peers still in the
 /// CURRENT strict close group, against a threshold computed from that
-/// current group. The erase floor is read again too.
+/// current group. The erase floor is read again, and free space measured
+/// again, too.
 async fn erase_if_still_eligible(
     candidate: &RecordPruneCandidate,
     present_by_key: &HashMap<XorName, HashSet<PeerId>>,
@@ -1290,7 +1388,7 @@ async fn erase_if_still_eligible(
     }
     let groups = record_prune_lookup_groups(&candidate.key, ctx.p2p_node, ctx.config).await;
     let floor = ctx
-        .retention
+        .disk_retention
         .floor_from_routing_table(ctx.p2p_node, ctx.self_id, ctx.config.close_group_size)
         .await;
     let held_by_commitment = ctx
@@ -1301,7 +1399,7 @@ async fn erase_if_still_eligible(
         first_seen: ctx.paid_list.record_out_of_range_since(&candidate.key),
         prune_hysteresis_duration: ctx.config.prune_hysteresis_duration,
         held_by_commitment,
-        under_disk_pressure: ctx.retention.under_pressure(),
+        under_disk_pressure: ctx.disk_retention.refresh(),
         beyond_floor: retention::is_beyond_floor(
             ctx.self_id.as_bytes(),
             &candidate.key,
@@ -1952,6 +2050,14 @@ async fn report_prune_audit_failure_once(
         "Prune audit failure: peer={peer}, audit_failure_class={audit_failure_class}, key={}",
         hex::encode(key)
     );
+    if !report_state.penalises(key) {
+        debug!(
+            "Not penalising {peer} for {}: the key is beyond the erase floor, where this \
+             node's routing table may not know which nodes are nearest it",
+            hex::encode(key)
+        );
+        return true;
+    }
     crate::replication::config::penalise_unheld_close_group_chunk(
         p2p_node,
         peer,
@@ -2422,7 +2528,8 @@ mod tests {
             .map(|b| candidate(key_from_byte(*b), peers.clone()))
             .collect();
 
-        let ordered = erasable_in_order(&storage, true, &node, Some(&floor), candidates);
+        let failures = retention::FailedChecks::default();
+        let ordered = erasable_in_order(&storage, true, &node, Some(&floor), &failures, candidates);
         let selected = select_record_prune_audits(&ordered, 100, 3, 100);
 
         let selected_keys: Vec<XorName> = selected.candidates.iter().map(|c| c.key).collect();
@@ -2435,6 +2542,140 @@ mod tests {
             ]
         );
         assert_eq!(selected.deferred, 2);
+    }
+
+    /// Candidates whose audit failed earlier in the same spell of pressure
+    /// wait behind the ones not audited yet, so a budget the failing ones
+    /// would fill still reaches the rest.
+    #[tokio::test]
+    async fn the_budget_reaches_candidates_behind_those_whose_audit_failed() {
+        let (storage, _dir) = test_chunk_store().await;
+        let node = [0u8; 32];
+        let floor = [0u8; 32];
+        let peers = peer_ids(2);
+        let candidates = || -> Vec<RecordPruneCandidate> {
+            [0x10u8, 0x80, 0x40, 0xF0, 0x20]
+                .iter()
+                .map(|b| candidate(key_from_byte(*b), peers.clone()))
+                .collect()
+        };
+        let failures = retention::FailedChecks::default();
+        let selected = |candidates: Vec<RecordPruneCandidate>| -> Vec<XorName> {
+            let ordered =
+                erasable_in_order(&storage, true, &node, Some(&floor), &failures, candidates);
+            select_record_prune_audits(&ordered, 100, 3, 100)
+                .candidates
+                .iter()
+                .map(|c| c.key)
+                .collect()
+        };
+
+        failures.record(&key_from_byte(0xF0));
+        failures.record(&key_from_byte(0x80));
+        assert_eq!(
+            selected(candidates()),
+            vec![
+                key_from_byte(0x40),
+                key_from_byte(0x20),
+                key_from_byte(0x10)
+            ]
+        );
+
+        failures.record(&key_from_byte(0x40));
+        failures.record(&key_from_byte(0x20));
+        failures.record(&key_from_byte(0x10));
+        assert_eq!(
+            selected(candidates()),
+            vec![
+                key_from_byte(0xF0),
+                key_from_byte(0x80),
+                key_from_byte(0x40)
+            ],
+            "once every candidate has failed, the one that failed longest ago goes first"
+        );
+    }
+
+    /// A failed prune-confirmation proof for a key beyond the erase floor is
+    /// not penalised; one for a key within it, or outside a prune pass, is.
+    #[test]
+    fn failed_proofs_beyond_the_erase_floor_are_not_penalised() {
+        let node = [0u8; 32];
+        let floor = key_from_byte(0x30);
+        let pass = PruneAuditReportState::new(Some((node, floor)));
+        assert!(!pass.penalises(&key_from_byte(0x31)));
+        assert!(pass.penalises(&key_from_byte(0x30)));
+        assert!(pass.penalises(&key_from_byte(0x01)));
+
+        let migration = PruneAuditReportState::new(None);
+        assert!(migration.penalises(&key_from_byte(0xFF)));
+    }
+
+    /// The prune pass logs one line in the shape the server watchdog parses.
+    #[test]
+    fn the_prune_pass_line_keeps_the_shape_the_watchdog_parses() {
+        let result = PruneResult {
+            records_total: 1,
+            records_in_range: 2,
+            records_marked_out_of_range: 3,
+            records_cleared: 4,
+            records_hysteresis_pending: 5,
+            records_candidates: 6,
+            records_held_by_commitment: 7,
+            records_bootstrap_deferred: 8,
+            records_budget_deferred: 9,
+            records_audits_attempted: 10,
+            records_audit_below_threshold: 12,
+            disk_pressure: true,
+            records_beyond_floor: 13,
+            records_pruned: 14,
+            paid_entries_marked: 16,
+            paid_entries_cleared: 17,
+            paid_entries_pruned: 18,
+        };
+        assert_eq!(
+            prune_pass_line(&result, 11, 15),
+            "Prune pass complete: records total=1 in_range=2 newly_marked=3 cleared=4 \
+             hysteresis_pending=5 candidates=6 held_by_commitment=7 bootstrap_deferred=8 \
+             budget_deferred=9 audits_attempted=10 audit_requests=11 audit_below_threshold=12 \
+             disk_pressure=1 beyond_floor=13 pruned=14; paid total=15 marked=16 cleared=17 \
+             pruned=18"
+        );
+        let roomy = PruneResult {
+            disk_pressure: false,
+            ..PruneResult::default()
+        };
+        assert!(prune_pass_line(&roomy, 0, 0).contains(" disk_pressure=0 beyond_floor=0 pruned=0;"));
+    }
+
+    /// Removing a paid-list entry keeps the out-of-range clock of a record
+    /// the node still holds, and drops the clock of one it no longer does.
+    #[tokio::test]
+    async fn removing_a_paid_entry_keeps_a_held_records_out_of_range_clock() {
+        let (paid_list, _paid_dir) = test_paid_list().await;
+        let (storage, _store_dir) = test_chunk_store().await;
+        let held = b"a record the node keeps".to_vec();
+        let held_key = crate::client::compute_address(&held);
+        storage.put(&held_key, &held).await.expect("put");
+        let gone_key = crate::client::compute_address(b"a record the node no longer has");
+        for key in [held_key, gone_key] {
+            paid_list.insert(&key).await.expect("insert");
+            paid_list.set_record_out_of_range(&key);
+        }
+        let since = paid_list
+            .record_out_of_range_since(&held_key)
+            .expect("clock");
+
+        assert_eq!(
+            delete_paid_entries(&[held_key, gone_key], &paid_list, &storage).await,
+            2
+        );
+        assert!(!paid_list.contains(&held_key).expect("contains"));
+        assert_eq!(
+            paid_list.record_out_of_range_since(&held_key),
+            Some(since),
+            "the record's wait must not restart"
+        );
+        assert_eq!(paid_list.record_out_of_range_since(&gone_key), None);
     }
 
     #[tokio::test]
@@ -2674,22 +2915,17 @@ mod tests {
         );
     }
 
-    /// A mature record whose widest group (a complete width-20 view) excludes
-    /// the node is audited against its strict close group like any other
-    /// candidate, and is never erased on its distance alone: not without
-    /// proofs, and not without disk pressure even with every proof.
+    /// A mature out-of-range record is audited against its strict close
+    /// group, and is kept without the proofs, and without disk pressure even
+    /// with every proof.
     #[tokio::test]
-    async fn mature_record_outside_complete_width_twenty_is_audited_like_any_other() {
+    async fn a_mature_candidate_is_audited_against_its_strict_group_and_kept_without_proofs() {
         let (paid_list, _dir) = test_paid_list().await;
         let config = ReplicationConfig::default();
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xA8);
-        // The twenty peers nearest the key, self not among them; the
-        // retention and strict groups are their nearest nine and seven.
-        let widest_group = peer_ids(config.paid_list_close_group_size);
-        assert!(!widest_group.contains(&self_id));
-        let admission_peers = widest_group[..PROD_RETENTION_WIDTH].to_vec();
-        let strict_close_peers = widest_group[..PROD_CLOSE_GROUP].to_vec();
+        let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
+        let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, None);
 
         paid_list.set_record_out_of_range(&key);
@@ -2703,7 +2939,7 @@ mod tests {
         let RecordPruneKeyState::Candidate(PruneCandidateDisposition::Auditable(candidate)) =
             outcome.state
         else {
-            panic!("a far mature record must be an auditable candidate");
+            panic!("a mature out-of-range record must be an auditable candidate");
         };
         assert_eq!(candidate.target_peers, strict_close_peers);
 
@@ -2933,32 +3169,6 @@ mod tests {
         }
     }
 
-    /// An audited candidate that has meanwhile moved outside a complete
-    /// width-20 group is still kept without the proofs: no distance stands in
-    /// for them.
-    #[test]
-    fn audited_candidate_that_moves_outside_complete_width_twenty_is_kept_without_proofs() {
-        let self_id = peer_id_from_byte(SELF_BYTE);
-        let key = key_from_byte(0xB5);
-        let widest_group = peer_ids(ReplicationConfig::default().paid_list_close_group_size);
-        let admission_peers = widest_group[..PROD_RETENTION_WIDTH].to_vec();
-        let strict_close_peers = widest_group[..PROD_CLOSE_GROUP].to_vec();
-        let candidate = candidate(key, strict_close_peers.clone());
-        let first_seen = Instant::now();
-        let inputs = revalidation_inputs(
-            &self_id,
-            Some(first_seen),
-            false,
-            &admission_peers,
-            &strict_close_peers,
-            matured(first_seen),
-        );
-
-        let outcome = revalidate_record_prune_candidate(&candidate, &HashMap::new(), &inputs);
-
-        assert_eq!(outcome, PruneRevalidationOutcome::AuditFailed);
-    }
-
     /// Without disk pressure nothing is erased, whatever else holds: every
     /// proof, far beyond the floor, out of range past the wait.
     #[test]
@@ -3071,19 +3281,29 @@ mod tests {
                 .collect()
         };
         let floor = key_from_byte(0x30);
+        let failures = retention::FailedChecks::default();
+        let erasable = |under_pressure: bool, floor: Option<&XorName>| -> Vec<XorName> {
+            erasable_in_order(
+                &storage,
+                under_pressure,
+                &node,
+                floor,
+                &failures,
+                candidates(),
+            )
+            .iter()
+            .map(|c| c.key)
+            .collect()
+        };
 
-        assert!(erasable_in_order(&storage, false, &node, Some(&floor), candidates()).is_empty());
-        assert!(erasable_in_order(&storage, true, &node, None, candidates()).is_empty());
-        assert!(
-            erasable_in_order(&storage, true, &node, Some(&[u8::MAX; 32]), candidates()).is_empty()
+        let nothing: Vec<XorName> = Vec::new();
+        assert_eq!(erasable(false, Some(&floor)), nothing);
+        assert_eq!(erasable(true, None), nothing);
+        assert_eq!(erasable(true, Some(&[u8::MAX; 32])), nothing);
+        assert_eq!(
+            erasable(true, Some(&floor)),
+            vec![key_from_byte(0xC0), key_from_byte(0x90)]
         );
-
-        let ordered: Vec<XorName> =
-            erasable_in_order(&storage, true, &node, Some(&floor), candidates())
-                .iter()
-                .map(|c| c.key)
-                .collect();
-        assert_eq!(ordered, vec![key_from_byte(0xC0), key_from_byte(0x90)]);
     }
 
     /// Under disk pressure, a record only the legacy store holds is not
@@ -3123,6 +3343,7 @@ mod tests {
             true,
             &[0u8; 32],
             Some(&[0u8; 32]),
+            &retention::FailedChecks::default(),
             vec![
                 candidate(legacy_key, peers.clone()),
                 candidate(file_key, peers),
