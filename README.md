@@ -51,6 +51,17 @@ means Autonomi's earlier network, which Darwin never ran.
   request while it stayed connected and looked healthy. This one logs a
   warning, skips the events it missed and carries on, as the replication
   engine already did; only a closed stream ends it.
+- **Nodes keep data while the disk has room.** A node keeps the records and
+  pointers it holds after it stops being responsible for them, and goes on
+  serving them and offering them to their close group. It erases only when
+  free space on the disk holding its data falls below 10%, and then only
+  records far from it (more than 10 times the distance to its 7th-nearest
+  peer), farthest first, each after the nodes now nearest to the record prove
+  they hold it, until 15% is free again. Upstream deletes such records once
+  they have been out of range for three days, whether or not the disk needs
+  the room. A test (`src/replication/retention/census.rs`) lists every
+  call in the code that can remove stored data, with the reason it is there,
+  so a change that adds one fails the test suite until it is reviewed.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself.
@@ -1171,7 +1182,11 @@ RUST_LOG=debug ./ant-node --enable-logging
 
 At `info`, the log shows rate-limited connections (as warnings), each change
 to the 20 peers nearest the node (`K-closest peer swap completed`) and each
-relay session the node serves.
+relay session the node serves. It also shows one line per prune pass, about
+every neighbour-sync cycle: `Prune pass complete: …` for chunks and `Pointer
+prune pass complete: …` for pointers, with `disk_pressure=1` while the node
+is erasing and `pruned=` the records erased in that pass. `Disk pressure:`
+and `Disk pressure over:` mark when erasing starts and stops.
 
 ---
 

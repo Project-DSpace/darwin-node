@@ -258,3 +258,17 @@ How we will know this decision remains correct:
 AI tools may help draft this ADR, but **must not mark it Accepted without human
 review**. Accepted ADRs are immutable: create a new superseding ADR rather than
 editing this one.
+
+---
+
+## Amendment 1 (2026-10-16): over-coverage is kept while the disk has room
+
+"Retention stays narrow" above described the pruner reclaiming transient
+over-coverage. Since ADR-0005 Amendment 1, a node keeps records outside the
+retention width while its disk has room, and erases them only under disk pressure
+(below 10% free, until 15%), beyond ten times the distance to its 7th-nearest peer,
+farthest first, each after its current close group proves possession. Responsibility
+is still evaluated at `storage_admission_width`, so the replicas the network counts on
+are unchanged; what changes is that extra copies are no longer removed while there is
+room for them. Out-of-range records are never committed, so they do not change a
+node's quoted price.

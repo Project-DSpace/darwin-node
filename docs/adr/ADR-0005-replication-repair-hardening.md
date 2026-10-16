@@ -1036,3 +1036,50 @@ review**. Accepted ADRs are immutable: create a new superseding ADR rather than
 editing this one. Several decisions here (the responsibility widths, the trust /
 eviction path, the delayed possession check) are shared with ADR-0002 and ADR-0003
 — changes to those knobs must be reconciled across all three records.
+
+---
+
+## Amendment 1 (2026-10-16): out-of-range records are kept while the disk has room
+
+Decision 11's width-20 fast path is withdrawn, together with every other way the
+prune pass could delete a record without a possession check. A node now keeps every
+record it holds while its disk has room, including records it is no longer
+responsible for: they stay stored, are served, and are offered to their close group
+by neighbour sync. Classification is unchanged (width-9 retention, the three-day
+hysteresis, the retained-commitment veto, the bootstrap deferral, the per-pass
+candidate and request budgets), but a candidate is erased only when all of the
+following hold:
+
+- **Disk pressure.** Free space on the partition holding the record store is below
+  10% of the partition's size; once started, the pressure lasts until free space is
+  back to at least 15%. Free space is measured as the chunk store's capacity guard
+  measures it (`fs2::statvfs` on the chunk directory), and a failed measurement
+  counts as no pressure. The state is shared by the chunk and pointer passes, lives
+  in memory, and starts without pressure whenever the node starts.
+- **The erase floor.** The key is strictly farther from the node than ten times the
+  XOR distance from the node to its own 7th-nearest peer (`close_group_size`-th,
+  from the local routing table, the node itself not counted). With fewer peers
+  known, nothing is eligible. The multiple is computed without overflow: past the
+  end of the key space it saturates, and then nothing is farther.
+- **Possession.** All but one of the key's current strict close group prove
+  possession through the existing nonce-bound prune-confirmation audit (6 of 7), and
+  the existing re-check just before deleting passes: still outside width 9, past
+  the hysteresis, not held by a retained commitment, and now also still beyond the
+  floor.
+
+Eligible candidates are audited and erased farthest from the node first, within the
+existing budgets. Free space is measured again before each erasure, and erasing
+stops as soon as it is back to 15%. Records only the legacy LMDB store holds are not
+erased, since erasing one returns no disk. Without disk pressure no
+prune-confirmation audit is sent at all, because none could lead to a deletion.
+
+`MAX_FAST_PRUNE_DELETIONS_PER_PASS`, the fast-delete statistics and the rotating
+prune cursor are removed, and stored records no longer need a width-20 lookup. The
+pass still logs one line, now ending `audit_below_threshold=… disk_pressure=0|1
+beyond_floor=… pruned=…; paid total=… marked=… cleared=… pruned=…`. Paid-list entry
+pruning is unchanged. The accepted far-copy deletion risk, the fast-path validation
+items and the fast-path re-open trigger above no longer apply.
+
+A census test (`src/replication/retention/census.rs`) reads the crate's `src/` tree
+and lists every call that can remove stored data with the reason it is there; a
+change that adds one fails the test suite until it is reviewed and listed.

@@ -383,3 +383,23 @@ receipt is paid again on retry.
   taken. Nodes that missed updates take the next one and the group converges.
   A fork at one counter across the group reads as its merge winner, and one
   update at the next counter heals it on every node.
+
+---
+
+## Amendment 1 (2026-10-16): pointers out of range are kept while the disk has room
+
+The pruning rule above changes for pointers as it does for chunks (ADR-0005
+Amendment 1). A pointer the node is out of range of is kept, served and hinted while
+the disk has room. Only under disk pressure (free space below 10% of the partition,
+until it is back to 15%) and only for addresses strictly farther from the node than
+ten times the distance to its 7th-nearest peer is a pointer erased, farthest first,
+and each only once all but one of the current close group prove they hold that
+state or a newer one. There is no longer a path that drops a pointer without that
+proof, however far the node is from the group. Free space is measured again before
+each erasure; the chunk and pointer passes share one disk-pressure state. The pass
+logs one line every pass: `Pointer prune pass complete: total=… in_range=…
+newly_marked=… hysteresis_pending=… candidates=… held_by_commitment=…
+disk_pressure=0|1 beyond_floor=… pruned=…`. The validation item "a node far outside
+the group prunes without asking" is replaced by: a node far outside the group keeps
+the record until the close group proves it holds it, and a node with room keeps it
+regardless.

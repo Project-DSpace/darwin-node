@@ -13,7 +13,10 @@ You'll need:
   starting with `0x`, for example from MetaMask.
 - **Access to your router**, to forward some UDP ports.
 - **Spare disk space**: at least 20 GB per node (about 35 GB recommended), plus
-  for each node some memory, CPU and part of your internet connection.
+  for each node some memory, CPU and part of your internet connection. The
+  nodes keep the data they hold while the disk has room, so over time they
+  use most of its free space (see [When the disk gets
+  full](#day-to-day)).
   As a guide, a node computer should have a 4-core CPU, 8 GB of RAM and 8 Mbps
   up and down.
 
@@ -116,7 +119,14 @@ Run these in the folder with `docker-compose.yml`.
 - **Different ports**: change `PORT_START` or `BROWSER_PORT_START` and run
   `docker compose up -d`. The nodes move to the new ports and keep their
   identities; change your router's port forwarding to match.
-- **When the disk gets full**: the node manager checks the free space where
+- **When the disk gets full**: each node keeps every record it holds,
+  including ones the network no longer needs from it, while the disk has
+  room. When free space on the disk with the data folder falls below 10%,
+  each node erases records far from it, farthest first, each only after the
+  nodes now nearest to the record prove they hold it, until 15% is free again.
+  Its log shows `Disk pressure:` when it starts and `Disk pressure over:` when
+  it stops, and each prune pass logs `disk_pressure=1` and how many records
+  it erased (`pruned=`). Separately, the node manager checks the free space where
   the data folder is every 30 seconds. At 1 GiB (1,024 MiB) free or less,
   `docker exec storage-node nodes status` shows a warning naming the node that
   would be removed next, as does the manager's `GET /api/v1/health` on
