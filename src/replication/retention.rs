@@ -42,6 +42,9 @@ use crate::logging::{debug, info, warn};
 use crate::storage::file_store::CHUNKS_DIR_NAME;
 use crate::storage::ChunkStore;
 
+#[cfg(test)]
+mod census;
+
 /// Disk pressure starts when free space falls below this share of the
 /// partition holding the record store, in percent.
 pub const DISK_PRESSURE_START_PERCENT: u64 = 10;
