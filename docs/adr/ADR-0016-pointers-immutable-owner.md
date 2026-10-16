@@ -395,11 +395,17 @@ until it is back to 15%) and only for addresses strictly farther from the node t
 ten times the distance to its 7th-nearest peer is a pointer erased, farthest first,
 and each only once all but one of the current close group prove they hold that
 state or a newer one. There is no longer a path that drops a pointer without that
-proof, however far the node is from the group. Free space is measured again before
-each erasure; the chunk and pointer passes share one disk-pressure state. The pass
+proof, however far the node is from the group, and a pointer is erased only while the
+node still holds exactly the state the group proved: a newer one that arrived during
+the check stays. A pointer whose check failed earlier in the same spell of pressure is
+asked about after those not asked yet. Free space is measured again before each
+erasure and once more after the proof, just before deleting; the chunk and pointer
+passes share one disk-pressure state, and each orders only its own records. The pass
 logs one line every pass: `Pointer prune pass complete: total=… in_range=…
 newly_marked=… hysteresis_pending=… candidates=… held_by_commitment=…
 disk_pressure=0|1 beyond_floor=… pruned=…`. The validation item "a node far outside
 the group prunes without asking" is replaced by: a node far outside the group keeps
 the record until the close group proves it holds it, and a node with room keeps it
-regardless.
+regardless. The item "Pruning keeps a pointer a retained commitment holds, and drops
+it once none does" now holds under disk pressure, once the close group proves it
+holds the record.

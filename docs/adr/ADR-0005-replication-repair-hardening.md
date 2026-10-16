@@ -1068,10 +1068,26 @@ following hold:
   floor.
 
 Eligible candidates are audited and erased farthest from the node first, within the
-existing budgets. Free space is measured again before each erasure, and erasing
-stops as soon as it is back to 15%. Records only the legacy LMDB store holds are not
-erased, since erasing one returns no disk. Without disk pressure no
-prune-confirmation audit is sent at all, because none could lead to a deletion.
+existing budgets. A candidate whose audit fell below the threshold earlier in the same
+spell of pressure is audited after those not audited yet, so the budgets reach every
+eligible candidate in turn instead of retrying the same farthest ones every pass; the
+node forgets those failures once the pressure is over. Free space is measured again
+before each erasure, and erasing stops as soon as it is back to 15%. On a file system
+that returns space late (ZFS, btrfs, snapshots) a pass may erase more than it needed
+to before the measurement shows it; every record it erases has passed the possession
+check. The order is per pass: chunks first, then pointers. Records only the legacy
+LMDB store holds are not erased, since erasing one returns no disk. Without disk
+pressure no prune-confirmation audit is sent at all, because none could lead to a
+deletion.
+
+Prune-confirmation batches are now split at the square root of the records the node
+is in range for, not of all it stores: in-range counts are comparable across a close
+group, while a node that keeps many out-of-range records would otherwise send batches
+larger than its peers accept. A failed proof for a key beyond the erase floor is
+logged but no longer penalises the peer, since the node's routing table may not know
+which nodes are nearest a key that far away; such keys were never audited before this
+amendment. Removing a paid-list entry no longer restarts the out-of-range wait of a
+record the node still holds.
 
 `MAX_FAST_PRUNE_DELETIONS_PER_PASS`, the fast-delete statistics and the rotating
 prune cursor are removed, and stored records no longer need a width-20 lookup. The
@@ -1080,6 +1096,12 @@ beyond_floor=… pruned=…; paid total=… marked=… cleared=… pruned=…`. 
 pruning is unchanged. The accepted far-copy deletion risk, the fast-path validation
 items and the fast-path re-open trigger above no longer apply.
 
+The storage migration's shed (ADR-0014) follows the same disk-pressure rule: a node
+gives up the chunks it could not copy only under disk pressure, measured again just
+before the legacy store is removed, and the chunk and pointer passes and the shed
+share one disk-pressure state per node.
+
 A census test (`src/replication/retention/census.rs`) reads the crate's `src/` tree
-and lists every call that can remove stored data with the reason it is there; a
-change that adds one fails the test suite until it is reviewed and listed.
+and lists the calls that delete files, directories or table entries, with the reason
+each is there; a change that adds one fails the test suite until it is reviewed and
+listed. A second test checks that the disk-pressure state is built in one place only.
