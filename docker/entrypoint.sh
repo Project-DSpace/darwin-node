@@ -60,21 +60,20 @@ fi
 if [[ -n "${STORAGE_LIMIT_GB:-}" && "${STORAGE_LIMIT_GB:-0}" != 0 ]]; then
     echo "STORAGE_LIMIT_GB is no longer used: nodes use the free space where /data lives."
 fi
-# An operator's own RPC_URL replaces the image's RPC_URLS. One of only spaces,
-# as an Unraid field can hold, counts as unset.
+# An operator's own RPC_URL replaces the image's RPC_URLS. One of only spaces
+# counts as unset.
 read -ra rpc_urls <<<"${RPC_URL:-}"
 (( ${#rpc_urls[@]} > 0 )) || read -ra rpc_urls <<<"${RPC_URLS:-}"
 (( ${#rpc_urls[@]} > 0 )) || fail "Set RPC_URL or RPC_URLS"
-# The default before 2026-10-06, which older compose files and Unraid
-# templates still set.
+# The default before 2026-10-06, which older compose files still set.
 if [[ "${RPC_URL:-}" == *robinhood-rpc.publicnode.com* ]]; then
     echo "RPC_URL is PublicNode, the old default, which refuses some of the chain reads nodes make:" \
         "delete RPC_URL to use the image's RPCs."
 fi
 read -ra bootstrap <<<"$BOOTSTRAP_PEERS"
 # ANT_RELAY_SERVING reaches every node as it is: false turns relay serving
-# off, true or unset leaves the node's default (on). Empty or only spaces,
-# as an Unraid field can be, counts as unset, since nodes refuse it.
+# off, true or unset leaves the node's default (on). Empty or only spaces
+# counts as unset, since nodes refuse it.
 relay_serving=${ANT_RELAY_SERVING:-}
 if [[ -z "${relay_serving//[[:space:]]/}" ]]; then
     unset ANT_RELAY_SERVING

@@ -36,8 +36,8 @@ RUN chmod 755 /opt/ant/ant-node /entrypoint.sh /usr/local/bin/nodes
 # REWARDS_ADDRESS, NODE_COUNT and usually BROWSER_PORT_START; servers also set
 # PUBLIC_IP. RPC_URL, if set, replaces RPC_URLS with one provider of the
 # operator's choice. The token, vault and bootstrap peers change only with a
-# new image. Browser access is off unless BROWSER_PORT_START is set (the Unraid
-# template sets 11000), so older installs don't advertise ports they never
+# new image. Browser access is off unless BROWSER_PORT_START is set (the compose
+# file sets 11000), so older installs don't advertise ports they never
 # forwarded. The XDG paths keep the node manager's state on the /data volume
 # and let `docker exec ... nodes` find it.
 ENV ANT_NETWORK_MODE=production \

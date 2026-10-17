@@ -1,6 +1,6 @@
-# Runs storage nodes with Docker Compose on any Linux server; the same setup as
-# unraid-storage-node.xml. Put your wallet address in REWARDS_ADDRESS below,
-# change any other settings you want, then:
+# Runs storage nodes with Docker Compose on a Linux server, or in WSL 2 on
+# Windows. Put your wallet address in REWARDS_ADDRESS below, change any other
+# settings you want, then:
 #
 #   docker compose up -d
 #   docker exec storage-node nodes status

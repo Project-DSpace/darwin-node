@@ -1,255 +1,190 @@
 # Running storage nodes with Docker
 
-This sets up storage nodes for Darwin, our storage network, in a Docker
-container on a Linux server, using Docker Compose. Inside the container, a node
-manager runs and looks after the nodes. It takes about 15 minutes. On Unraid, use
-the template instead: see [On Unraid](#on-unraid).
-You'll need:
+This runs storage nodes for Darwin, our storage network, in one Docker
+container. They earn storage fees in DARWIN, paid to your wallet.
 
-- A **Linux server** with Docker and its Compose plugin (`docker compose
-  version` should print a version). Docker Desktop on Mac or Windows won't do:
-  the nodes need the server's own network, which only Linux gives a container.
-- A **wallet address** for your storage fees: any Ethereum-style address
-  starting with `0x`, for example from MetaMask.
-- **Access to your router**, to forward some UDP ports.
-- **Spare disk space**: at least 20 GB per node (about 35 GB recommended), plus
-  for each node some memory, CPU and part of your internet connection. The
-  nodes keep the data they hold while the disk has room, so over time they
-  can grow to use most of it (see [When the disk gets full](#day-to-day)).
-  As a guide, a node computer should have a 4-core CPU, 8 GB of RAM and 8 Mbps
-  up and down.
+## Requirements
 
-Fees are paid in DARWIN, the network's token, to the rewards address you set.
+- An x86-64 machine running Linux with
+  [Docker Engine](https://docs.docker.com/engine/install/) and its Compose
+  plugin, or Windows 11 with WSL 2 ([On Windows](#on-windows-wsl-2)). The image
+  is x86-64 only; Macs and Docker Desktop aren't supported.
+- A wallet address (`0x…`, any Ethereum-style address).
+- Access to your router, to forward UDP ports.
+- At least 20 GB of disk per node (about 35 GB recommended). As a guide: a
+  4-core CPU, 8 GB of RAM and 8 Mbps up and down.
 
-The image comes set up for the network as our servers run it: production mode,
-IPv4 only, the 3 bootstrap servers (142.93.32.90, 165.22.193.90 and
-142.93.96.232, UDP port 10000) and Robinhood Chain RPCs. You don't need to set
-any of these.
+## 1. Forward the ports
 
-Running nodes from before 2026-10-06? See [Rejoining after the 2026-10-06
-reset](#rejoining-after-the-2026-10-06-reset).
+Each node uses two UDP ports: one for storage, one for web browsers. For 2
+nodes:
 
-## 1. Forward the ports on your router
+- **Browser ports 11000–11001:** forward them by hand to the server's local IP
+  (`hostname -I`), same numbers outside and inside. If you can't, set
+  `BROWSER_PORT_START: 0`; the nodes still store and earn.
+- **Storage ports 10000–10001:** the nodes map them by UPnP if your router has
+  it on; otherwise forward them by hand. Never both: a manual rule makes the
+  router give UPnP random ports.
+- **Firewall:** open all four (`sudo ufw allow 10000:10001/udp` and
+  `sudo ufw allow 11000:11001/udp`). A server with its own public IP needs
+  only this, plus any cloud firewall.
 
-Each node uses two UDP ports: one for the storage network and one for web
-browsers fetching files. Run 2 nodes and forward **UDP 10000–10001** and
-**UDP 11000–11001** to your server's local IP address. The exact menu depends
-on your router; it is usually called "Port forwarding" or "Virtual servers".
-Use the same port numbers outside and inside.
+## 2. Set up and start
 
-Use either manual forwarding or your router's automatic forwarding (UPnP) for
-the storage ports, not both: the nodes ask UPnP-capable routers for those
-ports themselves, and a manual rule on the same ports makes the router hand
-them random ones instead. If your router has UPnP on, forward only the browser
-ports by hand.
+```sh
+mkdir ~/storage-node && cd ~/storage-node
+curl -fsSLO https://raw.githubusercontent.com/Project-DSpace/darwin-node/main/docker/docker-compose.yml
+```
 
-If you can't forward the browser ports, set `BROWSER_PORT_START` to `0` (step
-2): the nodes then store and earn as usual, but don't serve web browsers.
+Edit `docker-compose.yml`:
 
-If the server runs a firewall (such as `ufw`), open the same UDP ports there too.
+- `REWARDS_ADDRESS`: your wallet address, in place of `0xYOUR_WALLET_ADDRESS`.
+- `NODE_COUNT`: 2, or 1 on a small machine. Each node's routing table takes at
+  most 2 nodes from one IP in each bucket and among its 20 nearest, so more
+  add load for less storage.
+- Data folder: `./data`; the nodes can fill its disk
+  ([When the disk fills](#when-the-disk-fills)). For another disk, change the
+  `volumes` line, for example to `/mnt/storage/storage-node:/data`. Not on a
+  `noexec` mount: the nodes run their program from it.
+- Leave the rest. Change `PUID`/`PGID` only before the first start.
 
-## 2. Set up and start the container
+Run `docker compose up -d` (with `sudo` unless you're in the `docker` group).
 
-1. Make a folder for the nodes and download `docker-compose.yml` into it:
+## 3. Check it works
 
-   ```
-   mkdir ~/storage-node && cd ~/storage-node
-   curl -fsSLO https://raw.githubusercontent.com/Project-DSpace/darwin-node/main/docker/docker-compose.yml
-   ```
-
-2. Open `docker-compose.yml` and fill in:
-   - **`REWARDS_ADDRESS`**: your `0x…` address, in place of
-     `0xYOUR_WALLET_ADDRESS`.
-   - **`NODE_COUNT`**: 2 (or 1 if your disk, memory or connection is
-     short). Each node's routing table takes at most 2 nodes from one IP
-     address in each bucket and among the 20 nodes nearest it, so more than 2
-     nodes add load for less storage, and the container warns about it. Each
-     node needs at least 20 GB of free disk space.
-   - **The data folder**: node data goes in `data` next to the file. To use
-     another disk, change `./data` in the `volumes` line to a folder on that
-     disk, such as `/mnt/storage/storage-node:/data`. The nodes measure free
-     space on whichever disk that folder is on.
-3. In that folder, run:
-
-   ```
-   docker compose up -d
-   ```
-
-   Docker downloads the image and starts the nodes.
-
-The other settings in the file are explained in its comments; the defaults suit
-most servers.
-
-## 3. Check it's working
-
-In the same folder, run `docker compose logs -f` (Ctrl+C to stop watching).
-Within a minute you should see:
+`docker compose logs -f` shows, on a first start (among `[manager]` lines):
 
 ```
 Added node on UDP port 10000
 Added node on UDP port 10001
 Running 2 node(s) on UDP ports 10000-10001; browser access: UDP 11000-11001; storage fees go to 0x…
-[node-1] … Successfully connected to 3 bootstrap peers
+  ● Fleet health: Healthy
 ```
 
-If it stops with `REWARDS_ADDRESS is not a wallet address`, put your wallet
-address in `docker-compose.yml` and run `docker compose up -d` again.
+then each node as `● Running`, then the node logs, including
+`[node-1] … Successfully connected to 3 bootstrap peers` (or fewer).
 
+- With UPnP, each node logs `upnp: gateway mapping active`. If you left the
+  storage ports to UPnP and none does, forward them by hand.
+- A start-up error, such as `REWARDS_ADDRESS is not a wallet address`, repeats
+  until you fix the file and rerun `docker compose up -d`.
 
+## On Windows (WSL 2)
+
+Use Docker Engine inside WSL 2, not Docker Desktop (quit it and stop it
+starting at sign-in). Not yet tested by us. Needs Windows 11 22H2+ and WSL
+2.5.4+ (check with `wsl --version`, update with `wsl --update`). Without WSL,
+run `wsl --install --no-distribution` in PowerShell as administrator, then
+restart.
+
+1. In PowerShell, run `notepad $env:USERPROFILE\.wslconfig`, add these lines
+   (into existing sections, if any), save, then run `wsl --shutdown`:
+
+   ```ini
+   [wsl2]
+   networkingMode=mirrored
+
+   [general]
+   instanceIdleTimeout=-1
+   ```
+
+2. Install Ubuntu on a fixed-size disk, so the disk checks see real free space:
+   about 35 GB per node plus room for Ubuntu (80GB fits 2 nodes). It takes
+   that space at once; add `--location D:\WSL\storage-node` for another drive.
+
+   ```powershell
+   wsl --install Ubuntu-24.04 --name storage-node --fixed-vhd --vhd-size 80GB
+   ```
+
+3. In Ubuntu (`wsl -d storage-node`), check that `wslinfo --networking-mode`
+   prints `mirrored` (if not, redo step 1). Install
+   [Docker Engine](https://docs.docker.com/engine/install/ubuntu/), run
+   `sudo usermod -aG docker $USER`, `exit`, then
+   `wsl --terminate storage-node`.
+4. Open the Hyper-V and Windows firewalls (as administrator):
+
+   ```powershell
+   New-NetFirewallHyperVRule -Name StorageNodes -DisplayName "Storage nodes" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol UDP -LocalPorts 10000-10001,11000-11001 -Action Allow
+   New-NetFirewallRule -Name StorageNodes -DisplayName "Storage nodes" -Direction Inbound -Protocol UDP -LocalPort 10000-10001,11000-11001 -Action Allow
+   ```
+
+5. [Forward the ports](#1-forward-the-ports) to the PC's IPv4 address
+   (`ipconfig`), with the same UPnP rule. Skip `ufw`.
+6. [Set up and start](#2-set-up-and-start) in your Ubuntu home folder, with
+   the data folder off `/mnt/` (the Windows drives).
+7. Stop sleep and hibernation (keep a laptop plugged in, lid set to Do
+   nothing):
+
+   ```powershell
+   powercfg /change standby-timeout-ac 0
+   powercfg /change hibernate-timeout-ac 0
+   ```
+
+8. Start the nodes at sign-in, and within 15 minutes whenever WSL stops (such
+   as after a WSL update):
+
+   ```powershell
+   $a = New-ScheduledTaskAction -Execute "C:\Program Files\WSL\wslg.exe" -Argument "-d storage-node --shell-type none -- /bin/true"
+   $t = @(
+     New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+     New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 15)
+   )
+   $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries
+   Register-ScheduledTask -TaskName "storage-node" -Action $a -Trigger $t -Settings $s
+   ```
+
+   After a reboot, the nodes wait for you to sign in. Lock the PC rather than
+   signing out.
+
+Run the [Day to day](#day-to-day) commands in Ubuntu.
 
 ## Day to day
 
-Run these in the folder with `docker-compose.yml`.
+In the folder with `docker-compose.yml`:
 
-- **Updates**: `docker compose pull`, then `docker compose up -d`. The
-  image's `:latest`, which the Compose file and the Unraid template use,
-  moves to each new release when it is published.
-- **Keep it running**: nodes that are offline for long get dropped by the
-  network and stop earning. Restarts and reboots are fine: the container
-  starts again with Docker.
-- **Stopping**: `docker compose down`. Your node data stays in the data folder;
-  `docker compose up -d` starts the nodes again.
-- **Status**: `docker exec storage-node nodes status` lists your nodes.
-- **More or fewer nodes**: change `NODE_COUNT` in `docker-compose.yml` and run
-  `docker compose up -d`. Fewer nodes removes any the disk-full check removed
-  first (see below), then the ones on the highest ports. Removed nodes' data is
-  kept in `retired/` inside the data folder for 3 days, in case you change your
-  mind, then deleted.
-- **Different ports**: change `PORT_START` or `BROWSER_PORT_START` and run
-  `docker compose up -d`. The nodes move to the new ports and keep their
-  identities; change your router's port forwarding to match.
-- **When the disk gets full**: each node keeps every record it holds,
-  including ones the network no longer needs from it, while the disk has
-  room. When free space on the disk with the data folder falls below 10%,
-  each node may erase records it has been out of range of for three days
-  (counted from when it last started) and that are far from it (more than ten
-  times the distance to its 7th-nearest node), farthest first, each only after
-  the nodes now nearest to the record prove they hold it, until 15% is free or
-  nothing else qualifies. While the network is small (under about 70 nodes) no
-  record is that far, so nothing is erased (`beyond_floor=0` in the prune line
-  shows it), and the disk keeps filling until the node manager's limits below
-  apply. On a file system that returns space late (ZFS, btrfs, or one with
-  snapshots), a node may erase more in one pass than it needed to; every
-  record it erases is still held by the nodes that proved it. Its log shows
-  `Disk pressure:` when erasing may start, `Disk pressure over:` when it stops,
-  and `could not be measured` if it stopped because the disk could not be
-  read. Each prune pass logs `disk_pressure=1` while erasing is allowed,
-  `beyond_floor=` how many records are far enough to be erased, and how many
-  it erased: the `pruned=` before `; paid`, since the one after it counts
-  payment bookkeeping entries, which go whatever the disk. A node still moving
-  off the older LMDB store gives up the chunks it could not copy only under
-  the same disk pressure. At startup the container warns if free space under
-  `/data`, counting what the nodes already hold, is below 20 GB per node.
-  Separately, the node manager checks the free space where
-  the data folder is every 30 seconds. At 1 GiB (1,024 MiB) free or less,
-  `docker exec storage-node nodes status` shows a warning naming the node that
-  would be removed next, as does the manager's `GET /api/v1/health` on
-  `127.0.0.1:MANAGER_PORT`; nothing is written to the log. At 500 MiB free or
-  less, it removes the node holding the least data (never the last one),
-  deletes that node's data so the others have room, and logs `Evicted node`
-  with how much it freed. Removed nodes stay
-  removed: free up space, run `docker exec storage-node nodes clear-evicted`,
-  then `docker compose restart` to replace them, or lower `NODE_COUNT`.
-- **IPv4 only**: the network runs on IPv4. Leave `IPV4_ONLY` at `"true"`.
-- **Relaying for other nodes**: each node also runs a relay, on which anyone
-  on the network can open a session and have your node send UDP for them, to
-  any address, from your IP address. Replies come back to a port the relay picks
-  at random for each session, so behind a router or firewall that doesn't let
-  them in, only the sending works. To turn relaying off, add
-  `ANT_RELAY_SERVING: "false"` under `environment:` in `docker-compose.yml`
-  and run `docker compose up -d` (on Unraid, add a variable
-  `ANT_RELAY_SERVING` with the value `false`). Each node then logs `Relay
-  serving is off` when it starts; storing and earning don't change. Leave it
-  out, or set `"true"`, to keep relaying on.
+- **Status:** `docker exec storage-node nodes status`, or
+  `http://127.0.0.1:12600/console` on the server (from elsewhere:
+  `ssh -L 12600:127.0.0.1:12600 you@server`).
+- **Updates:** the nodes install signed releases themselves (hourly checks,
+  then up to 24 hours' delay). For a new image: `docker compose pull`, then
+  `docker compose up -d`.
+- **Stop:** `docker compose down` (data stays); `docker compose up -d` starts
+  again. Otherwise keep it running: nodes offline for long are dropped and
+  stop earning. Docker restarts it after a reboot.
+- **Change settings:** edit the file, run `docker compose up -d`.
+  - More nodes take the next ports: forward and open those too.
+  - Fewer nodes: any [evicted](#when-the-disk-fills) go first, then the
+    highest ports. Their data moves to `retired/` and is deleted at a
+    container start 4 or more days later.
+  - New `PORT_START` or `BROWSER_PORT_START`: nodes keep their data; update
+    your router and firewall.
+  - A new `REWARDS_ADDRESS` applies to every node.
 
-## Rejoining after the 2026-10-06 reset
+## When the disk fills
 
-On 2026-10-06 the network restarted in production mode, paying in DARWIN, and
-the old network's data was wiped. Nodes from before then hold data and
-settings for the old network (testnet mode, up to 6 nodes, IPv6 on), so start
-them fresh. With Docker Compose, in the folder with `docker-compose.yml`:
+- **Nodes keep every record while the disk has room.** Below 10% free, a node
+  may erase records far from it that nearer nodes hold, until 15% is free;
+  while the network is small none are that far, so the disk keeps filling.
+- **At 1 GiB free or less**, `docker exec storage-node nodes status` warns,
+  naming the node that would go next. Nothing is logged.
+- **At 500 MiB or less**, the node manager evicts the node holding the least
+  data (never the last one): it deletes its data and logs `Evicted node`.
+- **Evicted nodes stay removed.** Free up space, run
+  `docker exec storage-node nodes clear-evicted`, then
+  `docker compose restart`. Or lower `NODE_COUNT`.
 
-1. Stop the container: `docker compose down`.
-2. Wipe the data folder: `sudo rm -rf ./data/*` (or the folder in your
-   `volumes` line).
-3. Replace `docker-compose.yml` with the current one (step 2 above) and put
-   your `REWARDS_ADDRESS` back in. If you keep your old file instead, set
-   `NODE_COUNT` to 2 and `IPV4_ONLY` to `"true"`, and delete the `RPC_URL`
-   line.
-4. Pull the new image and recreate the container: `docker compose pull`, then
-   `docker compose up -d`.
+## Relaying
 
-On Unraid: stop the container, then wipe its data folder in the Unraid
-terminal (for the default folder, `rm -rf /mnt/user/appdata/storage-node/*`).
-Edit the container: set **Number of nodes** to 2, **IPv4 only** to `true` and
-clear **Blockchain RPC** (both under "Show more settings"), remove any
-**Storage limit** variable, and set **Extra Parameters** as in [Add the
-container](#add-the-container). Click **Apply**: Unraid downloads the current
-image and recreates the container.
-
-The nodes start with new identities; your rewards address stays the same.
-
-## On Unraid
-
-Unraid runs containers from templates rather than Compose files. Follow step 1
-above, then:
-
-### Add the container
-
-1. In the Unraid web interface, open the terminal (the `>_` icon, top right)
-   and download the template:
-
-   ```
-   curl -fsSL -o /boot/config/plugins/dockerMan/templates-user/my-storage-node.xml \
-     https://raw.githubusercontent.com/Project-DSpace/darwin-node/main/docker/unraid-storage-node.xml
-   ```
-
-2. In Unraid, go to **Docker → Add Container**, and choose **storage-node** from
-   the Template list.
-3. Fill in:
-   - **Rewards wallet**: your `0x…` address.
-   - **Number of nodes**: as in step 2 above.
-   - **Data folder**: the default `/mnt/user/appdata/storage-node` is fine if
-     your `appdata` share can spill over to the array (**Shares → appdata**,
-     Secondary storage set to Array). If `appdata` lives only on a cache drive,
-     pick a folder on the disk you want the nodes to use instead: the nodes
-     measure free space where the folder is, and on `/mnt/user` that's the
-     whole array's free space, so they keep data until the whole array is
-     below 10% free.
-4. Click **Apply**. Unraid downloads the image and starts the nodes.
-
-Without the template file, fill in Add Container by hand instead: Repository
-`ghcr.io/project-dspace/storage-node:latest`, Network Type **Host**, a path
-`/data` → `/mnt/user/appdata/storage-node`, and variables `REWARDS_ADDRESS`
-(your wallet), `NODE_COUNT` (2) and `BROWSER_PORT_START` (11000). Under
-**Advanced view → Extra Parameters**, add
-`--ulimit nofile=65536:65536 --stop-timeout 120 --log-opt max-size=100m --log-opt max-file=3`
-(stopping the nodes cleanly can take a minute or two, and the log options keep
-the container's log from filling the disk).
-
-### Check it's working
-
-On the Docker tab, click the container's icon and choose **Logs**, and look for
-the lines shown in step 3. The container's network should show as **host**, with
-the IP and port columns blank. If it says **bridge**, edit the container and set
-Network Type to **Host**: in bridge mode nothing from the internet can reach
-the nodes.
-
-### Day to day on Unraid
-
-Everything under [Day to day](#day-to-day) applies, but instead of editing
-`docker-compose.yml`, edit the container and change the matching setting
-(**Number of nodes**, **First UDP port**, **First browser UDP port**, **IPv4
-only** under "Show more settings"), then click **Apply**. For updates, click
-**Check for Updates** on the Docker tab, then **Apply Update**. Run the
-`docker exec` commands in the Unraid terminal, using your container's name if
-it isn't `storage-node`, and restart the container from the Docker tab.
+Each node runs a relay: anyone on the network can have your node send UDP, to
+any address, from your IP (with UPnP, each relay session also opens a port on
+your router). To turn it off, add `ANT_RELAY_SERVING: "false"` under
+`environment:` and run `docker compose up -d`; each node then logs
+`Relay serving is off`. Storing and earning don't change.
 
 ## Licences
 
-The licences and notices of the software in the image are in
-`/usr/share/doc/storage-node/` inside it (`docker exec storage-node ls
+In `/usr/share/doc/storage-node/` in the image (`docker exec storage-node ls
 /usr/share/doc/storage-node` lists them). `NOTICE` says what each program is
-and where its source is. `THIRD-PARTY-NOTICES.txt` has the licences of the
-code built into the node, including self_encryption, which the node links
-under GPL-3.0 with a linking exception.
+and where its source is. `THIRD-PARTY-NOTICES.txt` has the licences of the code
+built into the node, including self_encryption, which the node links under
+GPL-3.0 with a linking exception.
