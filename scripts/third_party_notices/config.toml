@@ -111,7 +111,7 @@ version = "0.2.0"
 note = "an unchanged copy of Project-DSpace/darwin-listings v0.2.0 (commit e3cf6bbfbd64, without its .github folder), kept in vendor/ant-listings of the repository this release is built from; its Source above is that copy (see vendor/ant-listings/VENDORED.md)."
 
 [remark.ant-protocol]
-version = "3.1.0"
+version = "5.0.0"
 note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this release is built from; its Source above is that copy. The one change is PRICE_MULTIPLIER in src/payment/pricing.rs (see vendor/ant-protocol/VENDORED.md)."
 
 [remark.webrtc]
