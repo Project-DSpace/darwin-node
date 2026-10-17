@@ -85,7 +85,7 @@ pub use pointer::{
     Pointer, PointerState, PointerStore, PointerTarget, PointerTargetKind, PutOutcome,
 };
 pub use replication::{config::ReplicationConfig, ReplicationEngine};
-pub use storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
+pub use storage::{AntProtocol, ChunkStore, ChunkStoreConfig, LmdbStorage, LmdbStorageConfig};
 
 /// Re-exports from `saorsa-core` so downstream crates (e.g. `ant-client`)
 /// can depend on `ant-node` alone without a direct `saorsa-core` dependency.
