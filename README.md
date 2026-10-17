@@ -109,9 +109,11 @@ never ran.
   library's `RUST-STD-COPYRIGHT.html`. The Docker image has them in
   `/usr/share/doc/storage-node/`, with a `NOTICE` for the `ant` node manager
   it bundles.
-- **Rate limits**: only browser (WebRTC Direct) sessions and requests are
-  limited. New connections over saorsa-core's rate per IP are only logged,
-  and unpaid storage and quote requests aren't limited; see [Rate
+- **Rate limits**: browser (WebRTC Direct) sessions and requests are
+  limited, and so are the replication requests nodes send each other: a
+  node accepts only so many of each kind at once and turns the rest away.
+  New connections over saorsa-core's rate per IP are only logged, and
+  unpaid storage and quote requests aren't limited; see [Rate
   Limiting](#rate-limiting).
 
 ---
@@ -184,7 +186,7 @@ Even though self-encrypted data on the legacy network is secure, the legacy netw
 | **Geographic Routing** | None | 7-region distribution (no entity holds multiple copies) |
 | **Eclipse Protection** | Limited | Diversity scoring, ASN limits, detection algorithms |
 | **Auto-Upgrade** | Manual | Staged rollout of signed releases (this fork: Linux x86_64 only) |
-| **Rate Limiting** | Basic | Browser sessions and requests; new connections per IP are only logged (see [Rate Limiting](#rate-limiting)) |
+| **Rate Limiting** | Basic | Browser sessions and requests, and replication requests between nodes; new connections per IP are only logged (see [Rate Limiting](#rate-limiting)) |
 | **Node Identity** | Ed25519 pubkey (unused, never signs data) | ML-DSA-65 pubkey (actively signs all operations) |
 | **Legacy Data** | N/A | Full support for classical encrypted data |
 
@@ -1149,6 +1151,8 @@ What is limited:
 |-------|-------|-------|
 | Browser (WebRTC Direct) sessions and requests | `WebRtcDirectConfig` in `src/config.rs` | per IP, per session and in total |
 | Storage and listings requests handled at once | `start_protocol_routing` in `src/node.rs` | 64 per node, from all peers together |
+| Replication requests from other nodes: chunk fetches, verification, neighbour sync, paid notifications, fresh offers and audits | `src/replication/mod.rs`, and `src/replication/config.rs` for audits | for each kind, in all and per peer; any more are turned away |
+| Pointer requests from other nodes | `src/replication/pointer.rs` | fetch and state requests: 128 admitted in all and 16 from one peer, 32 of them served at once, any more dropped; fresh offers: 16 verified at once, any more dropped |
 
 Logged only: saorsa-core's transport counts new connections, per IP and in
 total, against 1,000 per 60 s with bursts of 100. A connection over the
