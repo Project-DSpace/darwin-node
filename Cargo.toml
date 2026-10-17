@@ -35,13 +35,13 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-ant-protocol = "3.1.0"
+ant-protocol = "5.0.0"
 # Listed files: envelope format, listings, payment checks, the listings protocol.
-# Vendored while darwin-listings is private (vendor/ant-listings/VENDORED.md).
+# A copy of darwin-listings v0.2.1 (vendor/ant-listings/VENDORED.md).
 ant-listings = { path = "vendor/ant-listings" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.28.0"
+saorsa-core = "0.29.1"
 saorsa-pqc = "0.5.2"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -118,7 +118,7 @@ bao = "0.13.1"
 
 # Shared portable browser profile. The native listener is enabled separately
 # by the `webrtc-direct` feature.
-saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
+saorsa-transport = { version = "0.38.1", default-features = false, features = ["webrtc"] }
 # Only the test-utils devnet helper that seeds public files for browser tests
 # uses it directly. Upstream's release builds do not link it, but ours do:
 # vendor/ant-listings decodes envelopes with its DataMap.
@@ -242,18 +242,6 @@ ant-protocol = { path = "vendor/ant-protocol" }
 # Closing a browser session cancels a DTLS handshake still in progress
 # (vendor/webrtc/VENDORED.md).
 webrtc = { path = "vendor/webrtc" }
-# Copy-free sends (ADR-0017): saorsa-core's `send_message` takes
-# `impl Into<Bytes>`, and saorsa-transport writes owned buffers to QUIC
-# streams without copying. Upstream merged both into main on 2026-10-06
-# (saorsa-core #166, saorsa-transport #171), but no crates.io release has
-# them yet (saorsa-core 0.28.0, saorsa-transport 0.37.0): drop both pins once
-# releases include them. Fetched from our mirrors of upstream's repos.
-saorsa-core = { git = "https://github.com/Project-DSpace/saorsa-core", rev = "c0022b871961c7f373f2ccde815385816962de98" }
-saorsa-transport = { git = "https://github.com/Project-DSpace/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
-
-# saorsa-core names saorsa-transport by upstream's git URL: the same mirror.
-[patch."https://github.com/WithAutonomi/saorsa-transport"]
-saorsa-transport = { git = "https://github.com/Project-DSpace/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
 
 [profile.release]
 lto = true
