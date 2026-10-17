@@ -827,6 +827,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-listings"
+version = "0.2.1"
+dependencies = [
+ "ant-protocol",
+ "postcard",
+ "rmp-serde",
+ "self_encryption",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "ant-merkle"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -837,9 +849,10 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.23.0"
+version = "0.21.0+ds.11"
 dependencies = [
  "alloy",
+ "ant-listings",
  "ant-protocol",
  "bao",
  "blake3",
@@ -895,8 +908,6 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ad739acc497fb0f9bb49691e5874ecd68584569e730cc32f8a26d70f4b6725"
 dependencies = [
  "blake3",
  "bytes",
@@ -6903,8 +6914,6 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08fd686c0920ac08f3a57eacc48e31f0e4ca1ffefba4478784606f78c14e83ad"
 dependencies = [
  "arc-swap",
  "async-trait",
