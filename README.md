@@ -4,9 +4,10 @@
 
 darwin-node is the node software for Darwin, our storage network. It is a fork
 of [Autonomi's ant-node](https://github.com/WithAutonomi/ant-node)
-(MIT/Apache-2.0) and keeps upstream's crate and binary name, `ant-node`. Most
-of this README is upstream's. Where it talks about the "legacy" network, it
-means Autonomi's earlier network, which Darwin never ran.
+(MIT/Apache-2.0), built on upstream's v0.23.0, and keeps upstream's crate and
+binary name, `ant-node`. Most of this README is upstream's. Where it talks
+about the "legacy" network, it means Autonomi's earlier network, which Darwin
+never ran.
 
 ## What differs in this fork
 
@@ -65,6 +66,15 @@ means Autonomi's earlier network, which Darwin never ran.
   test (`src/replication/retention/census.rs`) lists the calls in `src/` that
   delete files, directories or table entries, with the reason each is there,
   so a change that adds one fails the test suite until it is reviewed.
+- **The LMDB chunk store and the move off it stay.** Upstream's v0.23.0
+  removes them (#218): the legacy LMDB store, the migration that copies it
+  into one file per chunk, the migration state each node announces in its
+  user agent, and the record of commitment deliveries the migration reads.
+  It also penalises peers again for close-group chunks they don't hold.
+  This fork reverts #218, so a node that still has a `chunks.mdb` goes on
+  migrating, and that penalty stays suspended
+  (`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY` in
+  `src/replication/config.rs`), until every node has finished migrating.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself.
@@ -80,6 +90,15 @@ means Autonomi's earlier network, which Darwin never ran.
   only when a release is published (from ds.10): release.yml then points it
   at the image the Build workflow made from the release's commit. A push to
   main publishes the image as `:<commit>` only.
+- **Three crates are vendored**, each with a `VENDORED.md` saying what it
+  is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
+  its only change; `vendor/webrtc` is webrtc 0.14.0, whose
+  `RTCDtlsTransport::stop()` cancels a DTLS handshake still in progress;
+  and `vendor/ant-listings` is darwin-listings v0.2.1, unchanged: the
+  envelope format, listings, their payment checks and the listings
+  protocol. `[patch.crates-io]` puts the first two in place of the
+  crates.io releases. saorsa-core and saorsa-transport are their crates.io
+  releases, as upstream's are.
 - **Release builds link self_encryption** (GPL-3.0 with MaidSafe's linking
   exception), which upstream's don't: `vendor/ant-listings` reads the data
   maps in file envelopes with it. The exception lets the binary be
@@ -463,7 +482,7 @@ For connections, ant-node implements Happy Eyeballs:
 ## Migration from Legacy ant-node
 
 > **Not in this code.** This section is upstream's design for moving data
-> from Autonomi's legacy network. Neither upstream v0.21.0 nor this fork has
+> from Autonomi's legacy network. Neither upstream v0.23.0 nor this fork has
 > the migration tool: there is no `--migrate-ant-data` flag, no `[migration]`
 > config section and no legacy-network payment check. It does not apply to
 > Darwin, which has no legacy network.
