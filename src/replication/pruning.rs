@@ -2200,7 +2200,8 @@ mod tests {
     /// A prune audit judges holders against this node's own copy. A copy that
     /// no longer hashes to its key would fail every honest holder and hold the
     /// prune back forever, so it is not used as a reference: the read takes it
-    /// out of service instead, and an intact copy is used as before.
+    /// out of service instead, leaving the file for replication to repair, and an
+    /// intact copy is used as before.
     #[tokio::test]
     async fn a_rotted_local_copy_is_not_used_to_judge_holders() {
         let dir = TempDir::new().expect("temp dir");
@@ -2225,10 +2226,29 @@ mod tests {
             .join(hex::encode(bad));
         std::fs::write(&path, b"rotted").expect("corrupt the file");
 
-        assert_eq!(local_record_bytes(&good, &storage).await, Some(good_bytes));
+        assert_eq!(
+            local_record_bytes(&good, &storage).await,
+            Some(good_bytes.clone())
+        );
         assert_eq!(local_record_bytes(&bad, &storage).await, None);
+        // No digest, so no holder is judged against the rotted copy.
+        let holder = peer_id_from_byte(9);
+        assert_eq!(
+            local_record_digest(&holder, &bad, &[0x5A; 32], &storage).await,
+            None
+        );
         assert!(!storage.exists(&bad).expect("exists"));
-        assert!(!path.exists(), "the rotted local copy is removed");
+        assert!(!storage.all_keys().await.expect("keys").contains(&bad));
+        assert_eq!(
+            std::fs::read(&path).expect("the rotted local copy stays on disk"),
+            b"rotted"
+        );
+
+        // Replication's repair, an ordinary store of the right bytes, makes it a
+        // reference again.
+        assert!(storage.put(&bad, &bad_bytes).await.expect("repair"));
+        assert_eq!(local_record_bytes(&bad, &storage).await, Some(bad_bytes));
+        assert_eq!(local_record_bytes(&good, &storage).await, Some(good_bytes));
     }
 
     #[test]

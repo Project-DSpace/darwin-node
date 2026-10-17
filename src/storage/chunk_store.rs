@@ -734,18 +734,61 @@ impl ChunkStore {
 
     /// Retrieve a chunk, verifying it against its address when configured to.
     ///
+    /// Never removes a file. A chunk file whose bytes do not hash to its name stays
+    /// where it is, and the node stops claiming the chunk until the next good copy
+    /// replaces it (see [`FileStore::get`]). An intact copy in the legacy environment
+    /// is served instead, if there is one. Reads that hand a chunk on use
+    /// [`Self::get_or_quarantine`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Storage`] on an I/O failure, or when verification fails and no
     /// intact copy is available.
     pub async fn get(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        // Held for the whole read, for the reason given on `get_or_quarantine`: a file
+        // found gone is put back in the legacy-only set, and the environment this read
+        // may fall back on must not be retired under it.
+        let _reading = self.retirement.read().await;
+        let fallback = self.legacy();
+        let from_files = self.files.get(address).await;
+        self.with_legacy_fallback(address, fallback, from_files)
+            .await
+    }
+
+    /// Retrieve a chunk as [`Self::get`] does, removing a chunk file whose bytes do not
+    /// hash to its name.
+    ///
+    /// For reads that hand a chunk on. The file is read again under its write lane and
+    /// removed only if it is still wrong (see [`FileStore::get_or_quarantine`]); an
+    /// intact legacy copy is then served, and the key goes back on the copier's list.
+    /// Every call is listed in the erasure census
+    /// (`src/replication/retention/census.rs`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] on an I/O failure, or when verification fails and no
+    /// intact copy is available.
+    pub async fn get_or_quarantine(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
         // Held for the whole read. A verifying read that finds rotted bytes throws the
         // file away, and until this key is back in the legacy-only set there is a moment
         // when it appears to live in neither store. Retirement waits behind this rather
         // than deleting the copy the read is about to fall back on.
         let _reading = self.retirement.read().await;
         let fallback = self.legacy();
-        match self.files.get(address).await {
+        let from_files = self.files.get_or_quarantine(address).await;
+        self.with_legacy_fallback(address, fallback, from_files)
+            .await
+    }
+
+    /// Finish a verifying read: the file store's answer, or the legacy environment's
+    /// when the file store could not serve the chunk.
+    async fn with_legacy_fallback(
+        &self,
+        address: &XorName,
+        fallback: Option<Legacy>,
+        from_files: Result<Option<Vec<u8>>>,
+    ) -> Result<Option<Vec<u8>>> {
+        match from_files {
             Ok(Some(content)) => Ok(Some(content)),
             Ok(None) => {
                 // The file store missed. If the legacy store answers, the key has to go
@@ -757,24 +800,27 @@ impl ChunkStore {
             Err(e) => {
                 // Whatever went wrong with the file, the legacy environment may still
                 // have the bytes, and while it is there it is the point of the bridge to
-                // use them. A verification failure means the file was thrown away; every
-                // other error (a full descriptor table, an I/O fault, an oversized file)
-                // leaves the file in place and unreadable. Both are unservable from the
-                // file store, and both are worth asking the other store about.
+                // use them. A verification failure in `get_or_quarantine` means the file
+                // was thrown away; in `get` it means the file is still there, out of
+                // service. Every other error (a full descriptor table, an I/O fault, an
+                // oversized file) leaves the file in place and unreadable. All of them
+                // are unservable from the file store, and all are worth asking the other
+                // store about.
                 let verification_failed = format!("{e}").contains("verification failed");
                 warn!(
                     "Chunk {} could not be served from the file store ({e}); looking for a \
                      copy in the legacy environment",
                     hex::encode(address)
                 );
+                // `serve_from_legacy` puts the key back on the copier's list only when
+                // the file really went. A rotted or unreadable file that is still there
+                // is not legacy-only, and calling it so is how a key ends up claimed
+                // through one view and servable through neither.
                 let from_legacy = self.serve_from_legacy(address, fallback).await;
                 match from_legacy {
                     Ok(Some(content)) => Ok(Some(content)),
                     // Nothing anywhere. Report the original failure rather than a plain
-                    // miss, so the caller can tell the difference. The key is only
-                    // re-queued for copying when the file really went: an unreadable file
-                    // that is still there is not legacy-only, and calling it so is how a
-                    // key ends up claimed through one view and servable through neither.
+                    // miss, so the caller can tell the difference.
                     Ok(None) => Err(e),
                     Err(legacy_error) => {
                         if verification_failed {
@@ -880,10 +926,10 @@ impl ChunkStore {
     /// wrong reports the key here.
     ///
     /// Never waits. Rechecking here instead would let every audit that reads a rotted
-    /// chunk start a recheck of its own, outside every responder limit, and while a
-    /// quarantine waits on its shard's write lane each of those would hold a blocking
-    /// thread. A key already queued or being rechecked is not queued again, and one that
-    /// does not fit under [`MAX_CORRUPT_REPORTS`] is dropped.
+    /// chunk start a recheck of its own, outside every responder limit, and while a read
+    /// waits on a slow disk each of those would hold a blocking thread. A key already
+    /// queued or being rechecked is not queued again, and one that does not fit under
+    /// [`MAX_CORRUPT_REPORTS`] is dropped.
     pub(crate) fn report_corrupt(&self, keys: &[XorName]) {
         let (added, dropped) = self.corrupt.lock().add(keys);
         if added > 0 {
@@ -902,12 +948,12 @@ impl ChunkStore {
     /// oldest first, until `stop` is cancelled.
     ///
     /// The node runs exactly one of these, on the replication engine, so however many
-    /// audits report rot, and however long a quarantine waits for its shard's write lane,
-    /// the rechecks hold at most one blocking thread between them. `stop` is raced only
-    /// against waiting for work, never against a recheck, which may be reading the legacy
-    /// environment and must not be dropped part-way. Keys still queued when it stops are
-    /// left there: each is still on disk and still committed, so after a restart the next
-    /// audit that reads it reports it again.
+    /// audits report rot, and however long a recheck waits on a slow disk or on its
+    /// shard's write lane, the rechecks hold at most one blocking thread between them.
+    /// `stop` is raced only against waiting for work, never against a recheck, which may
+    /// be reading the legacy environment and must not be dropped part-way. Keys still
+    /// queued when it stops are left there: each is still on disk and still committed, so
+    /// after a restart the next audit that reads it reports it again.
     pub(crate) async fn run_corrupt_rechecks(&self, stop: &CancellationToken) {
         // A worker stopped part-way through a recheck leaves that key marked as queued
         // with nothing left to finish it; clear it so the key can be reported again.
@@ -935,10 +981,12 @@ impl ChunkStore {
 
     /// Take a key out of service if its bytes really do not hash to it.
     ///
-    /// The verifying read does this exactly as it does for a fetch: it re-reads the file
-    /// under the write lane, removes it only if it is still wrong, stops the node claiming
-    /// the key so its next commitment leaves it out and replication brings a good copy
-    /// back, and re-queues a legacy copy if there is one.
+    /// The verifying read does this as it does for an audit's reference copy: it reads
+    /// the file and, if the bytes are wrong, stops the node claiming the key, so its next
+    /// commitment leaves it out and replication brings a good copy back, which replaces
+    /// the file in place. The file itself is never removed here. An intact legacy copy is
+    /// served instead, if there is one, and the key stays off the copier's list while its
+    /// file is still indexed.
     ///
     /// Follows the node's `verify_on_read` setting, like every other verifying read.
     async fn recheck_corrupt(&self, address: &XorName) {
@@ -4920,8 +4968,8 @@ mod tests {
         };
         std::fs::remove_file(file(&gone)).expect("remove");
         std::fs::write(file(&rotted), b"not what it was").expect("rot");
-        assert_eq!(store.get(&gone).await.expect("get"), None);
-        assert!(store.get(&rotted).await.is_err());
+        assert_eq!(store.get_or_quarantine(&gone).await.expect("get"), None);
+        assert!(store.get_or_quarantine(&rotted).await.is_err());
         assert_eq!(*removed.lock(), vec![bad, gone, rotted]);
     }
 
@@ -4998,7 +5046,11 @@ mod tests {
             .await
             .expect("retire");
         assert_eq!(
-            store.get(&victim).await.expect("get").expect("present"),
+            store
+                .get_or_quarantine(&victim)
+                .await
+                .expect("get")
+                .expect("present"),
             addressed("w1").1
         );
     }
@@ -5029,13 +5081,117 @@ mod tests {
         // The file store removes the bad file and stops advertising it; the facade must
         // still find the intact copy rather than reporting a failure.
         assert_eq!(
-            store.get(&victim).await.expect("get").expect("present"),
+            store
+                .get_or_quarantine(&victim)
+                .await
+                .expect("get")
+                .expect("present"),
             addressed("s1").1
         );
         assert!(
             store.legacy_only_keys().contains(&victim),
             "the key must go back on the copier's list"
         );
+    }
+
+    /// A plain verifying read never removes a file. A chunk whose bytes don't match its
+    /// name leaves service and its file stays, however often it is read, until the next
+    /// good copy replaces it in place; the removed-chunk observer hears nothing, because
+    /// nothing was removed.
+    #[tokio::test]
+    async fn get_never_removes_a_file() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = open(&dir).await;
+        let removed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&removed);
+        store.set_removed_observer(Box::new(move |address| heard.lock().push(*address)));
+        let (addr, content) = addressed("rotted-and-kept");
+        store.put(&addr, &content).await.expect("put");
+        let path = store.test_chunk_path(&addr);
+        std::fs::write(&path, b"rotted").expect("rot the file");
+
+        for read in 1..=3 {
+            let err = store.get(&addr).await.expect_err("verification must fail");
+            assert!(format!("{err}").contains("verification failed"), "{err}");
+            assert_eq!(
+                std::fs::read(&path).expect("the file stays"),
+                b"rotted",
+                "read {read} changed the file"
+            );
+        }
+        assert!(
+            !store.exists(&addr).expect("exists"),
+            "the node stops claiming a chunk proven wrong"
+        );
+        assert!(!store.all_keys().await.expect("keys").contains(&addr));
+        assert!(!store
+            .committable_keys()
+            .await
+            .expect("keys")
+            .contains(&addr));
+        assert_eq!(
+            store.current_chunks().expect("count"),
+            1,
+            "the file is still on this disk"
+        );
+        assert!(removed.lock().is_empty(), "nothing was removed");
+
+        // The next good copy offered replaces the bytes in place.
+        assert!(
+            store.put(&addr, &content).await.expect("repair"),
+            "a good copy over rotted bytes is a repair, not a duplicate"
+        );
+        assert_eq!(
+            store.get(&addr).await.expect("get").expect("present"),
+            content
+        );
+        assert!(store.exists(&addr).expect("exists"));
+        assert!(store.all_keys().await.expect("keys").contains(&addr));
+    }
+
+    /// A plain verifying read of a rotted file whose intact copy is still in the legacy
+    /// environment serves that copy and leaves the rotted file where it is. The key does
+    /// not go back on the copier's list: its file is still indexed, and a key in both
+    /// views stays answerable through one and blocks retirement. The node stops claiming
+    /// it until the next good copy repairs the file.
+    #[tokio::test]
+    async fn get_serves_the_legacy_copy_of_a_rotted_file_and_leaves_the_file() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["rotted-with-a-legacy-copy"]).await;
+        let (_, intact) = addressed("rotted-with-a-legacy-copy");
+        let store = open(&dir).await;
+        store
+            .copy_batch(&keys, 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        assert!(store.legacy_only_keys().is_empty());
+
+        let victim = keys.first().copied().expect("a key");
+        let path = store.test_chunk_path(&victim);
+        std::fs::write(&path, b"rotted").expect("corrupt the file");
+
+        assert_eq!(
+            store.get(&victim).await.expect("get").expect("present"),
+            intact,
+            "the intact legacy copy is served"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the rotted file stays"),
+            b"rotted"
+        );
+        assert!(
+            store.legacy_only_keys().is_empty(),
+            "a key whose file is still indexed must not go back on the copier's list"
+        );
+        assert!(
+            !store.exists(&victim).expect("exists"),
+            "out of service until the file is repaired"
+        );
+
+        // The next good copy offered repairs the file in place.
+        assert!(store.put(&victim, &intact).await.expect("repair"));
+        assert!(store.exists(&victim).expect("exists"));
+        assert_eq!(std::fs::read(&path).expect("the repaired file"), intact);
     }
 
     #[tokio::test]
@@ -5069,19 +5225,29 @@ mod tests {
             !keys.contains(&bad),
             "a rotted chunk must leave the view the next commitment is built from"
         );
-        assert!(!path.exists(), "the rotted file is removed");
         assert!(!store.exists(&bad).expect("exists"));
+        assert_eq!(
+            std::fs::read(&path).expect("the rotted file stays"),
+            b"rotted",
+            "a recheck takes the chunk out of service and leaves its file"
+        );
         assert_eq!(
             store.get(&good).await.expect("get").expect("present"),
             good_bytes
         );
 
-        // Replication's repair is an ordinary store of the right bytes.
-        store.put(&bad, &bad_bytes).await.expect("repair");
+        // Replication's repair is an ordinary store of the right bytes, which replaces
+        // the rotted ones in place.
+        assert!(
+            store.put(&bad, &bad_bytes).await.expect("repair"),
+            "a good copy over rotted bytes is a repair, not a duplicate"
+        );
         assert_eq!(
             store.get(&bad).await.expect("get").expect("present"),
             bad_bytes
         );
+        assert!(store.exists(&bad).expect("exists"));
+        assert!(store.all_keys().await.expect("keys").contains(&bad));
     }
 
     /// Poll `done` until it holds, failing with `what` if it has not within 30 seconds.
@@ -5093,8 +5259,8 @@ mod tests {
         }
     }
 
-    /// Hold the write lane `address` is quarantined under until the returned sender is used
-    /// or dropped, stalling that shard the way a hung disk would. Held from a thread of its
+    /// Hold the write lane of `address`'s shard until the returned sender is used or
+    /// dropped, stalling that shard the way a hung disk would. Held from a thread of its
     /// own, so nothing holds a blocking guard across an await.
     fn stall_write_lane(store: &ChunkStore, address: &XorName) -> (Sender<()>, JoinHandle<()>) {
         let (lanes, lane) = store.files.test_write_lane(address);
@@ -5109,17 +5275,19 @@ mod tests {
         (release_tx, holder)
     }
 
-    /// A quarantine stalled on its shard's write lane holds one blocking thread, however
-    /// many audits report rot meanwhile, and what they reported is worked through once the
-    /// lane frees.
+    /// A recheck stalled on its shard's write lane holds one blocking thread, however many
+    /// audits report rot meanwhile, and what they reported is worked through once the lane
+    /// frees. A rotted chunk leaves service without waiting for the lane at all, because
+    /// its file is only read, and its file stays.
     ///
-    /// This is the hazard as it arises: a retained commitment keeps the rotted key in
-    /// every subtree an auditor selects over it, the raw read that answers audits keeps
-    /// reading the file, and identities are cheap, so reports keep coming while the
-    /// quarantine waits. A recheck run by each report would park a blocking thread per
-    /// report, outside every responder limit.
+    /// This is the hazard as it arises: a retained commitment keeps a rotted key in every
+    /// subtree an auditor selects over it, the raw read that answers audits keeps reading
+    /// the file, and identities are cheap, so reports keep coming while a recheck waits.
+    /// A recheck run by each report would park a blocking thread per report, outside
+    /// every responder limit. The recheck that waits on the lane here is one whose file
+    /// has gone, which is dropped from the index under that lane.
     #[tokio::test]
-    async fn a_stalled_quarantine_holds_one_blocking_thread_however_many_reports_arrive() {
+    async fn a_stalled_recheck_holds_one_blocking_thread_however_many_reports_arrive() {
         let dir = TempDir::new().expect("temp dir");
         let store = Arc::new(open(&dir).await);
         let chunk_path = |key: &XorName| {
@@ -5128,19 +5296,22 @@ mod tests {
                 .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
                 .join(hex::encode(key))
         };
-        let (bad, bad_bytes) = addressed("stalled");
-        let (other, other_bytes) = addressed("queued-behind-the-stall");
+        let (bad, bad_bytes) = addressed("rotted-in-a-stalled-shard");
+        // In the same shard, so the lane held below is the one both rechecks would take.
+        let (gone, gone_bytes) = (0..4096u32)
+            .map(|i| addressed(&format!("gone-from-a-stalled-shard-{i}")))
+            .find(|(key, _)| key.last() == bad.last())
+            .expect("a chunk in the same shard");
         let (later, later_bytes) = addressed("rotted-after-the-stall");
         for (key, bytes) in [
             (&bad, &bad_bytes),
-            (&other, &other_bytes),
+            (&gone, &gone_bytes),
             (&later, &later_bytes),
         ] {
             store.put(key, bytes).await.expect("put");
         }
-        for key in [&bad, &other] {
-            std::fs::write(chunk_path(key), b"rotted").expect("rot the file");
-        }
+        std::fs::write(chunk_path(&bad), b"rotted").expect("rot the file");
+        std::fs::remove_file(chunk_path(&gone)).expect("lose the file");
 
         let (release, holder) = stall_write_lane(&store, &bad);
 
@@ -5151,20 +5322,32 @@ mod tests {
             tokio::spawn(async move { store.run_corrupt_rechecks(&stop).await })
         };
 
-        // The first report: the worker reads the file, proves it wrong, stops claiming it
-        // and parks in the quarantine behind the held lane. Waited for rather than slept
-        // at, so the reports below really do arrive while the quarantine is stalled.
+        // A rotted chunk: read, proven wrong and taken out of service while its shard's
+        // lane is still held, with its file left where it is.
         store.report_corrupt(&[bad]);
-        wait_until("the recheck never reached the stalled quarantine", || {
-            !store.exists(&bad).expect("exists") && store.files.tasks_in_flight() > 0
+        wait_until("a rotted chunk waited on its shard's write lane", || {
+            !store.exists(&bad).expect("exists") && store.corrupt.lock().queued.is_empty()
+        })
+        .await;
+        assert_eq!(
+            std::fs::read(chunk_path(&bad)).expect("the rotted file stays"),
+            b"rotted"
+        );
+
+        // A chunk whose file has gone: the worker parks behind the held lane to drop it
+        // from the index. Waited for rather than slept at, so the reports below really do
+        // arrive while the recheck is stalled.
+        store.report_corrupt(&[gone]);
+        wait_until("the recheck never reached the stalled lane", || {
+            store.corrupt.lock().waiting.is_empty() && store.files.tasks_in_flight() > 0
         })
         .await;
 
-        // Audits keep reporting it, and another rotted chunk, while the quarantine waits.
+        // Audits keep reporting both while the recheck waits.
         let reporters: Vec<_> = (0..32)
             .map(|_| {
                 let store = Arc::clone(&store);
-                tokio::spawn(async move { store.report_corrupt(&[bad, other]) })
+                tokio::spawn(async move { store.report_corrupt(&[gone, bad]) })
             })
             .collect();
         let mut most_in_flight = 0;
@@ -5190,28 +5373,37 @@ mod tests {
             let reports = store.corrupt.lock();
             assert_eq!(
                 reports.waiting,
-                VecDeque::from([other]),
+                VecDeque::from([bad]),
                 "the key being rechecked must not be queued again, and the other waits its turn"
             );
             assert_eq!(reports.queued.len(), 2, "one being rechecked, one waiting");
         }
+        assert!(
+            store.files.is_indexed(&gone),
+            "the recheck was still waiting on the lane while the reports arrived"
+        );
 
-        // The lane frees: both rotted chunks leave service in turn.
+        // The lane frees: the queue is worked through. The chunk whose file went leaves
+        // the index; the rotted one stays out of service, its file still there.
         release.send(()).ok();
         holder.join().expect("lane holder");
         wait_until(
             "the queue was not worked through after the lane freed",
-            || {
-                !chunk_path(&bad).exists()
-                    && !chunk_path(&other).exists()
-                    && store.corrupt.lock().queued.is_empty()
-            },
+            || store.corrupt.lock().queued.is_empty(),
         )
         .await;
+        assert!(
+            !store.files.is_indexed(&gone),
+            "a lost file leaves the index"
+        );
+        assert_eq!(
+            std::fs::read(chunk_path(&bad)).expect("the rotted file stays"),
+            b"rotted"
+        );
         let keys = store.all_keys().await.expect("keys");
         assert!(
-            !keys.contains(&bad) && !keys.contains(&other),
-            "both rotted chunks must leave the view the next commitment is built from"
+            !keys.contains(&bad) && !keys.contains(&gone),
+            "both must leave the view the next commitment is built from"
         );
         assert!(keys.contains(&later), "an intact chunk stays in service");
 
@@ -5219,9 +5411,19 @@ mod tests {
         std::fs::write(chunk_path(&later), b"rotted").expect("rot the file");
         store.report_corrupt(&[later]);
         wait_until("a report after the stall was never rechecked", || {
-            !chunk_path(&later).exists()
+            !store.exists(&later).expect("exists")
         })
         .await;
+        assert!(chunk_path(&later).exists(), "the rotted file stays");
+
+        // Replication's repair, an ordinary store of the right bytes, puts both back.
+        for (key, bytes) in [(&bad, &bad_bytes), (&later, &later_bytes)] {
+            assert!(store.put(key, bytes).await.expect("repair"));
+            assert_eq!(
+                store.get(key).await.expect("get").as_deref(),
+                Some(bytes.as_slice())
+            );
+        }
 
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(10), worker)

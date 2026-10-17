@@ -20,7 +20,10 @@
 //!   table deletes), except its own definition, so that an import under
 //!   another name is counted too;
 //! - every call of a function of this crate that removes stored records
-//!   under another name ([`ERASERS`]);
+//!   under another name ([`ERASERS`]). Verifying reads are counted there
+//!   too: `get_or_quarantine` removes a chunk file whose bytes don't hash to
+//!   its name, so each read that can remove one is listed. The plain
+//!   verifying read, `get`, never removes a file and is not counted;
 //! - `clear` called with an argument: a table cleared inside a transaction
 //!   (clearing an in-memory collection takes none);
 //! - `truncate(true)`: a file opened so that its old contents are dropped.
@@ -61,6 +64,7 @@ const ERASERS: &[&str] = &[
     "delete_unobserved",
     "delete_with_slack",
     "erase_stored_record",
+    "get_or_quarantine",
     "quarantine_corrupt",
     "remove_legacy_dir",
     "remove_marked_directory",
@@ -124,6 +128,24 @@ const ERASE_SITES: &[EraseSite] = &[
         1,
         "The local devnet tool removes its own temporary data directory at shutdown; \
          never a running node's store.",
+    ),
+    site(
+        "src/listings/service.rs",
+        "ListingService::ensure_listing",
+        "get_or_quarantine",
+        1,
+        "Reads an envelope chunk to check its listing with its close group; a copy whose \
+         bytes, read again under the write lane, don't hash to its name is removed, as in \
+         v0.21.0+ds.11.",
+    ),
+    site(
+        "src/listings/service.rs",
+        "ListingService::held",
+        "get_or_quarantine",
+        1,
+        "Reads an envelope chunk the store has stopped claiming, to tell a listing whose \
+         chunk is gone from one whose chunk can't be read; a copy whose bytes, read again \
+         under the write lane, don't hash to its name is removed, as in v0.21.0+ds.11.",
     ),
     site(
         "src/listings/store.rs",
@@ -215,6 +237,24 @@ const ERASE_SITES: &[EraseSite] = &[
     ),
     site("src/pointer/store.rs", "stage", "remove_file", 1, TEMP_FILE),
     site(
+        "src/replication/mod.rs",
+        "ReplicationEngine::start_fresh_offer_dispatcher",
+        "get_or_quarantine",
+        1,
+        "Reads a newly stored chunk back to offer it to its close group; a copy whose \
+         bytes, read again under the write lane, don't hash to its name is removed, as in \
+         v0.21.0+ds.11.",
+    ),
+    site(
+        "src/replication/mod.rs",
+        "handle_fetch_request",
+        "get_or_quarantine",
+        1,
+        "Hands a chunk to a peer that fetches it for replication; a copy whose bytes, read \
+         again under the write lane, don't hash to its name is removed, as in \
+         v0.21.0+ds.11.",
+    ),
+    site(
         "src/replication/paid_list.rs",
         "PaidList::remove",
         "delete",
@@ -295,6 +335,14 @@ const ERASE_SITES: &[EraseSite] = &[
     ),
     site(
         "src/storage/chunk_store.rs",
+        "ChunkStore::get_or_quarantine",
+        "get_or_quarantine",
+        1,
+        "The chunk store's read that can remove a chunk file whose bytes don't hash to \
+         its name, through the file store's; its callers are each listed here.",
+    ),
+    site(
+        "src/storage/chunk_store.rs",
         "ChunkStore::remove_legacy_dir",
         "delete_retired_directory",
         1,
@@ -365,11 +413,11 @@ const ERASE_SITES: &[EraseSite] = &[
     ),
     site(
         "src/storage/file_store.rs",
-        "FileStore::get",
+        "FileStore::get_or_quarantine",
         "quarantine_corrupt",
         1,
         "Removes a chunk file whose bytes, read again, do not hash to its name: never a \
-         valid record.",
+         valid record. Reached only through ChunkStore::get_or_quarantine.",
     ),
     site(
         "src/storage/file_store.rs",
@@ -433,6 +481,23 @@ const ERASE_SITES: &[EraseSite] = &[
         "remove_file",
         2,
         TEMP_FILE,
+    ),
+    site(
+        "src/storage/handler.rs",
+        "AntProtocol::get_local",
+        "get_or_quarantine",
+        1,
+        "Hands a locally stored chunk to the library's caller; a copy whose bytes, read \
+         again under the write lane, don't hash to its name is removed, as in \
+         v0.21.0+ds.11.",
+    ),
+    site(
+        "src/storage/handler.rs",
+        "AntProtocol::handle_get_inner",
+        "get_or_quarantine",
+        1,
+        "Hands a chunk to a client's GET; a copy whose bytes, read again under the write \
+         lane, don't hash to its name is removed, as in v0.21.0+ds.11.",
     ),
     site(
         "src/storage/lmdb.rs",
@@ -508,6 +573,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "remove_file",
         1,
         "Release cache file; no record data.",
+    ),
+    site(
+        "src/web_rtc.rs",
+        "process_get_chunk",
+        "get_or_quarantine",
+        1,
+        "Hands a chunk to a browser's GET; a copy whose bytes, read again under the write \
+         lane, don't hash to its name is removed, as in v0.21.0+ds.11.",
     ),
     site(
         "src/web_rtc.rs",
@@ -1695,6 +1768,31 @@ mod tests {
             fn f(config: &Config) { if config.retire_legacy { } }
         ";
         assert!(calls(source).is_empty(), "{:?}", calls(source));
+    }
+
+    /// A verifying read that can remove a chunk file is counted where it is called,
+    /// like any other eraser; the plain verifying read, which never removes one, is not.
+    #[test]
+    fn a_read_that_can_remove_a_file_is_counted_and_a_plain_read_is_not() {
+        let source = r"
+            impl ChunkStore {
+                pub async fn get(&self, key: &K) -> R { self.files.get(key).await }
+                pub async fn get_or_quarantine(&self, key: &K) -> R {
+                    self.files.get_or_quarantine(key).await
+                }
+            }
+            async fn serve(store: &ChunkStore, key: &K) -> R {
+                store.get_or_quarantine(key).await
+            }
+            async fn audit(store: &ChunkStore, key: &K) -> R { store.get(key).await }
+        ";
+        assert_eq!(
+            calls(source),
+            vec![
+                one("ChunkStore::get_or_quarantine", "get_or_quarantine"),
+                one("serve", "get_or_quarantine"),
+            ]
+        );
     }
 
     #[test]

@@ -499,7 +499,7 @@ impl ListingService {
         match self.chunks.exists(address) {
             // When in doubt, keep the listing: the next request asks again.
             Ok(true) | Err(_) => Held::Yes,
-            Ok(false) => match self.chunks.get(address).await {
+            Ok(false) => match self.chunks.get_or_quarantine(address).await {
                 Ok(Some(_)) => Held::Yes,
                 Ok(None) => Held::Gone,
                 Err(_) => Held::Unreadable,
@@ -749,7 +749,7 @@ impl ListingService {
         } else {
             None
         };
-        let Some(content) = self.chunks.get(address).await? else {
+        let Some(content) = self.chunks.get_or_quarantine(address).await? else {
             // Gone: so is any listing it had.
             self.forget(address).await;
             return Ok(Checked::Done);

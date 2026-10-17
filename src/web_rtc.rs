@@ -1976,7 +1976,11 @@ async fn process_get_chunk(
     // largest permitted chunk before awaiting it. This closes the interval in
     // which many concurrent GETs could materialize unaccounted full chunks.
     let mut content_reservation = resources.try_reserve_bytes(MAX_CHUNK_SIZE)?;
-    let response = match ant_protocol.storage().get(&address_bytes).await {
+    let response = match ant_protocol
+        .storage()
+        .get_or_quarantine(&address_bytes)
+        .await
+    {
         Ok(Some(content)) if content.len() <= MAX_CHUNK_SIZE => {
             let content_length = content.len();
             content_reservation.resize(content_length)?;

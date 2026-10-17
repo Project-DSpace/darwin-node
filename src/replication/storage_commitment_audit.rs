@@ -3631,7 +3631,7 @@ mod pointer_audit_tests {
     /// but the responder reports it, and the chunk store's recheck worker then
     /// stops the node claiming it, so its next commitment leaves the chunk out
     /// and replication can repair it rather than the node failing every audit
-    /// that lands on that key.
+    /// that lands on that key. The file stays until that repair replaces it.
     #[tokio::test]
     async fn round_one_takes_a_rotted_committed_chunk_out_of_service() {
         let responder = Responder::new(24, 0).await;
@@ -3639,6 +3639,10 @@ mod pointer_audit_tests {
         let nonce = [7u8; 32];
         let plan = subtree_plan(committed.tree(), &nonce).expect("plan");
         let victim = plan.leaf_keys.first().copied().expect("a selected chunk");
+        let victim_bytes = (0..24u8)
+            .map(chunk)
+            .find(|content| ChunkStore::compute_address(content) == victim)
+            .expect("the victim is one of the stored chunks");
         let path = responder.chunk_file(&victim);
         std::fs::write(&path, b"rotted").expect("corrupt the file");
 
@@ -3670,21 +3674,38 @@ mod pointer_audit_tests {
         // stops, so once it returns the chunk has been dealt with.
         responder.storage.report_corrupt(&work.corrupt_keys);
         let stop = CancellationToken::new();
-        let removed = async {
+        let unclaimed = async {
             let deadline = Instant::now() + Duration::from_secs(30);
-            while path.exists() && Instant::now() < deadline {
+            while responder.storage.exists(&victim).unwrap_or(true) && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             stop.cancel();
         };
-        tokio::join!(responder.storage.run_corrupt_rechecks(&stop), removed);
+        tokio::join!(responder.storage.run_corrupt_rechecks(&stop), unclaimed);
         let keys = responder.storage.all_keys().await.expect("keys");
         assert!(
             !keys.contains(&victim),
             "the rotted chunk leaves the view the next commitment is built from"
         );
-        assert!(!path.exists(), "the rotted file is removed");
+        assert!(!responder.storage.exists(&victim).expect("exists"));
+        assert_eq!(
+            std::fs::read(&path).expect("the rotted file stays"),
+            b"rotted"
+        );
         assert_eq!(keys.len(), 23, "every intact chunk stays in service");
+
+        // Replication's repair, an ordinary store of the right bytes, replaces the
+        // rotted ones in place and puts the chunk back in service.
+        assert!(responder
+            .storage
+            .put(&victim, &victim_bytes)
+            .await
+            .expect("repair"));
+        assert_eq!(
+            responder.storage.get(&victim).await.expect("get"),
+            Some(victim_bytes)
+        );
+        assert_eq!(responder.storage.all_keys().await.expect("keys").len(), 24);
     }
 
     /// An honest round 1 over intact chunks takes nothing out of service.

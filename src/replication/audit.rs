@@ -1379,7 +1379,8 @@ mod tests {
 
     /// The auditor's own copy is the reference a peer is judged against. A local
     /// copy that has rotted must not fail an honest peer, must not count as a
-    /// verification either, and is taken out of service so replication repairs it.
+    /// verification either, and is taken out of service, its file left in place,
+    /// so replication repairs it.
     #[tokio::test]
     async fn a_rotted_local_copy_neither_fails_nor_passes_the_peer() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -1391,14 +1392,18 @@ mod tests {
         .expect("storage");
         let nonce = [0x42; 32];
         let peer = PeerId::from_bytes([0x24; 32]);
-        let rot = |key: &XorName| {
-            let path = temp_dir
+        let chunk_path = |key: &XorName| {
+            temp_dir
                 .path()
                 .join(CHUNKS_DIR_NAME)
                 .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
-                .join(hex::encode(key));
-            std::fs::write(path, b"rotted").expect("corrupt the file");
+                .join(hex::encode(key))
         };
+        let rot = |key: &XorName| {
+            std::fs::write(chunk_path(key), b"rotted").expect("corrupt the file");
+        };
+        let still_rotted =
+            |key: &XorName| std::fs::read(chunk_path(key)).is_ok_and(|bytes| bytes == b"rotted");
 
         let mut stored = Vec::new();
         for content in [
@@ -1442,6 +1447,11 @@ mod tests {
             !storage.exists(lone).expect("exists"),
             "the rotted local copy is taken out of service"
         );
+        assert!(
+            !storage.all_keys().await.expect("keys").contains(lone),
+            "and leaves the view the next commitment is built from"
+        );
+        assert!(still_rotted(lone), "the rotted file stays on disk");
 
         // A good and a rotted reference: the peer passes on what was checked.
         let partial = compare_with_local_copies(
@@ -1466,12 +1476,35 @@ mod tests {
             }
         ));
 
+        assert!(!storage.exists(paired).expect("exists"));
+        assert!(still_rotted(paired), "the rotted file stays on disk");
+
         // A wrong digest against a good reference still fails, as before.
         let wrong =
             compare_with_local_copies(&storage, &nonce, peer.as_bytes(), &[*good], &[[0xAB; 32]])
                 .await;
         assert_eq!(wrong.failed_keys.len(), 1);
         assert_eq!(wrong.verified, 0);
+
+        // Replication's repair, an ordinary store of the right bytes, replaces both in
+        // place, and they are references again.
+        for (key, bytes) in [(lone, lone_bytes), (paired, paired_bytes)] {
+            assert!(storage.put(key, bytes).await.expect("repair"));
+            assert_eq!(
+                storage.get(key).await.expect("get").as_deref(),
+                Some(bytes.as_slice())
+            );
+        }
+        let repaired = compare_with_local_copies(
+            &storage,
+            &nonce,
+            peer.as_bytes(),
+            &[*lone, *paired],
+            &[honest(lone, lone_bytes), honest(paired, paired_bytes)],
+        )
+        .await;
+        assert!(repaired.failed_keys.is_empty());
+        assert_eq!(repaired.verified, 2);
     }
 
     // -- Scenario 55: Empty failure set means no evidence -------------------------

@@ -2675,7 +2675,7 @@ impl ReplicationEngine {
                 // charges the sender for an offer that does not hash to its
                 // key. A chunk that fails verification is quarantined by this
                 // read, so its retry finds it gone and skips it.
-                let data = match storage.get(&event.key).await {
+                let data = match storage.get_or_quarantine(&event.key).await {
                     Ok(Some(data)) => data,
                     Ok(None) => {
                         debug!("Chunk {key_hex} no longer stored, skipping fresh replication");
@@ -7545,7 +7545,7 @@ async fn handle_fetch_request(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    let response = fetch_response_for(request.key, storage.get(&request.key).await);
+    let response = fetch_response_for(request.key, storage.get_or_quarantine(&request.key).await);
 
     send_replication_response(
         source,

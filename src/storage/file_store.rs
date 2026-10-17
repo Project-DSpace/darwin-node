@@ -512,6 +512,26 @@ enum StoredBytes {
     Unreadable,
 }
 
+/// What a verifying read found. See [`FileStore::get`].
+enum CheckedRead {
+    /// The chunk's bytes, or `None` when nothing is stored under the name. They hash to
+    /// the name whenever the store verifies on read.
+    Read(Option<Vec<u8>>),
+    /// The bytes do not hash to the name. Already counted, logged and marked
+    /// known-wrong, so the node has stopped answering for the chunk.
+    Wrong,
+}
+
+/// The error a verifying read returns for bytes that do not hash to their name.
+///
+/// [`crate::storage::ChunkStore`] tells it from other read failures by its text.
+fn verification_failed(address: &XorName) -> Error {
+    Error::Storage(format!(
+        "Chunk verification failed for {}",
+        hex::encode(address)
+    ))
+}
+
 /// Convert a byte count to GiB for human-readable log messages.
 #[allow(clippy::cast_precision_loss)] // display only — sub-byte precision is irrelevant
 fn bytes_to_gib(bytes: u64) -> f64 {
@@ -1192,16 +1212,54 @@ impl FileStore {
 
     /// Retrieve a chunk, verifying it against its address when configured to.
     ///
+    /// Never removes a file. A chunk whose bytes do not hash to its name is marked
+    /// known-wrong and the read fails: the chunk leaves `exists()` and `all_keys()`, so
+    /// the node stops claiming it, and the file stays where it is until the next good
+    /// copy offered replaces it in place ([`Self::put`] reads what is under an indexed
+    /// name and repairs it). The mark is held in memory only, so after a restart the
+    /// node claims the chunk again until a verifying read finds it wrong again.
+    ///
+    /// Reads that hand a chunk on use [`Self::get_or_quarantine`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] on an I/O failure, or when verification fails.
+    pub async fn get(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        match self.read_checked(address).await? {
+            CheckedRead::Read(content) => Ok(content),
+            CheckedRead::Wrong => Err(verification_failed(address)),
+        }
+    }
+
+    /// Retrieve a chunk as [`Self::get`] does, and remove the file if its bytes do not
+    /// hash to its name.
+    ///
+    /// For reads that hand a chunk on. The file is read again under its write lane and
+    /// removed only if it is still wrong, so a copy repaired in the meantime stays. Every
+    /// call is listed in the erasure census (`src/replication/retention/census.rs`).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Storage`] on an I/O failure, or when verification fails. A
     /// chunk whose bytes do not hash to its name is removed and dropped from the index
     /// before the error is returned, so it leaves `all_keys()` and ordinary replication
     /// repairs it.
-    pub async fn get(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+    pub async fn get_or_quarantine(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        match self.read_checked(address).await? {
+            CheckedRead::Read(content) => Ok(content),
+            CheckedRead::Wrong => {
+                self.quarantine_corrupt(address).await;
+                Err(verification_failed(address))
+            }
+        }
+    }
+
+    /// The verifying read behind [`Self::get`] and [`Self::get_or_quarantine`]. It
+    /// removes no file.
+    async fn read_checked(&self, address: &XorName) -> Result<CheckedRead> {
         let Some(content) = self.read_file(address).await? else {
             trace!("Chunk {} not found", hex::encode(address));
-            return Ok(None);
+            return Ok(CheckedRead::Read(None));
         };
 
         if self.config.verify_on_read {
@@ -1221,15 +1279,8 @@ impl FileStore {
                 // keeps committing to and, worse, one a cached pre-retirement pass still
                 // covers: the legacy copy that would repair it gets deleted.
                 self.mark_known_wrong(address);
-                self.quarantine_corrupt(address).await;
-                return Err(Error::Storage(format!(
-                    "Chunk verification failed for {}",
-                    hex::encode(address)
-                )));
+                return Ok(CheckedRead::Wrong);
             }
-        }
-
-        if self.config.verify_on_read {
             // The bytes hashed to their name. Whatever this store thought was wrong with
             // them is not wrong with them, and a mark that outlives the fault it
             // describes means the node can serve a chunk it will not claim, commit or
@@ -1244,7 +1295,7 @@ impl FileStore {
             stats.bytes_retrieved = stats.bytes_retrieved.saturating_add(len);
         }
         debug!("Retrieved chunk {} ({len} bytes)", hex::encode(address));
-        Ok(Some(content))
+        Ok(CheckedRead::Read(Some(content)))
     }
 
     /// Retrieve raw chunk bytes without content-address verification.
@@ -3400,7 +3451,10 @@ mod tests {
         store.put(&addr, &content).await.expect("put");
         std::fs::write(store.chunk_path(&addr), b"tampered").expect("tamper");
 
-        let err = store.get(&addr).await.expect_err("verification must fail");
+        let err = store
+            .get_or_quarantine(&addr)
+            .await
+            .expect_err("verification must fail");
         assert!(format!("{err}").contains("verification failed"), "{err}");
 
         assert!(!store.chunk_path(&addr).exists(), "corrupt file must go");
@@ -3410,6 +3464,59 @@ mod tests {
             "a corrupt chunk must stop being advertised"
         );
         assert_eq!(store.stats().verification_failures, 1);
+    }
+
+    /// A plain verifying read takes a chunk whose bytes don't match its name out of
+    /// service and leaves the file where it is: the node stops claiming the chunk, and
+    /// the next good copy offered repairs it in place.
+    #[tokio::test]
+    async fn get_never_removes_a_file() {
+        let (store, _dir) = test_store().await;
+        let dropped = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&dropped);
+        store.set_dropped_hook(Box::new(move |address| heard.lock().push(*address)));
+        let (addr, content) = addressed("rotted-and-kept");
+        store.put(&addr, &content).await.expect("put");
+        let path = store.chunk_path(&addr);
+        std::fs::write(&path, b"tampered").expect("tamper");
+
+        // However often it is read, each read fails and the file stays.
+        for reads in 1..=3u64 {
+            let err = store.get(&addr).await.expect_err("verification must fail");
+            assert!(format!("{err}").contains("verification failed"), "{err}");
+            assert_eq!(
+                std::fs::read(&path).expect("the file stays"),
+                b"tampered",
+                "read {reads} changed the file"
+            );
+            assert_eq!(store.stats().verification_failures, reads);
+        }
+        assert!(
+            !store.exists(&addr).expect("exists"),
+            "the node stops claiming a chunk proven wrong"
+        );
+        assert!(
+            !store.all_keys().await.expect("all_keys").contains(&addr),
+            "a chunk proven wrong must stop being advertised"
+        );
+        assert!(store.is_indexed(&addr), "the file is still in the index");
+        assert_eq!(store.current_chunks().expect("count"), 1);
+        assert!(
+            dropped.lock().is_empty(),
+            "nothing may be dropped from the index"
+        );
+
+        // The next good copy offered replaces the bytes in place.
+        assert!(
+            store.put(&addr, &content).await.expect("repair"),
+            "a good copy over wrong bytes is a repair, not a duplicate"
+        );
+        assert_eq!(
+            store.get(&addr).await.expect("get").expect("present"),
+            content
+        );
+        assert!(store.exists(&addr).expect("exists"));
+        assert!(store.all_keys().await.expect("all_keys").contains(&addr));
     }
 
     #[tokio::test]

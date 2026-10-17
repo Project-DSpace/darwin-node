@@ -186,13 +186,14 @@ async fn data_deleting_node_fails_subtree_audit() {
 /// SELF-REPAIR: a node whose committed chunk files rotted on disk still fails the
 /// audit over them, and then starts taking the rotted chunks its proof read out of
 /// service, so its next commitment leaves them out and replication can bring good
-/// copies back.
+/// copies back. The rotted files stay until a good copy replaces them.
 ///
 /// Drives the shipped path end to end: the round-1 responder reports the rotted
-/// leaves and the engine's recheck worker removes them. Requires at least one to
-/// go, and every one gone to be unclaimed. Nothing else removes a rotted file this
-/// quickly, so a responder that stopped reporting, or an engine that never started
-/// the worker, leaves every file in place and fails this.
+/// leaves and the engine's recheck worker stops the node claiming them. Requires at
+/// least one to leave service, its file still on disk, while the honest auditor keeps
+/// every copy it holds. Nothing else reads a rotted chunk through a verifying read
+/// this quickly, so a responder that stopped reporting, or an engine that never
+/// started the worker, leaves every chunk claimed and fails this.
 #[tokio::test]
 #[serial]
 async fn a_node_whose_chunks_rotted_takes_them_out_of_service_after_an_audit() {
@@ -230,27 +231,65 @@ async fn a_node_whose_chunks_rotted_takes_them_out_of_service_after_an_audit() {
     );
 
     let start = std::time::Instant::now();
-    let removed = loop {
-        let removed: Vec<_> = addrs
+    let unclaimed = loop {
+        let unclaimed: Vec<(usize, [u8; 32])> = addrs
             .iter()
-            .filter(|addr| !chunk_path(addr).exists())
+            .copied()
+            .enumerate()
+            .filter(|(_, addr)| !a_store.exists(addr).unwrap_or(true))
             .collect();
-        if !removed.is_empty() || start.elapsed() >= Duration::from_secs(30) {
-            break removed;
+        if !unclaimed.is_empty() || start.elapsed() >= Duration::from_secs(30) {
+            break unclaimed;
         }
         sleep(Duration::from_millis(100)).await;
     };
     assert!(
-        !removed.is_empty(),
+        !unclaimed.is_empty(),
         "no rotted chunk the audit read was taken out of service"
     );
     let claimed = a_store.all_keys().await.expect("a keys");
-    for addr in &removed {
+    for (_, addr) in &unclaimed {
         assert!(
-            !claimed.contains(*addr),
-            "{} lost its file but is still claimed",
+            !claimed.contains(addr),
+            "{} is out of service but still claimed",
             hex::encode(addr)
         );
+        assert_eq!(
+            std::fs::read(chunk_path(addr)).expect("the rotted file stays"),
+            b"rotted",
+            "{} was taken out of service by removing its file",
+            hex::encode(addr)
+        );
+    }
+
+    // The honest auditor is unaffected: it still holds and claims every chunk.
+    let b_store = harness
+        .test_node(b_idx)
+        .expect("b")
+        .ant_protocol
+        .as_ref()
+        .expect("b protocol")
+        .storage();
+    for addr in &addrs {
+        assert!(
+            b_store.exists(addr).expect("b exists"),
+            "the honest node lost {}",
+            hex::encode(addr)
+        );
+    }
+
+    // Replication's repair is an ordinary store of the right bytes: it replaces the
+    // rotted ones in place and puts the chunk back in service.
+    for (i, addr) in &unclaimed {
+        let content = format!("subtree-audit-testnet-chunk-{i}").into_bytes();
+        a_store.put(addr, &content).await.expect("repair on a");
+        assert_eq!(
+            a_store.get(addr).await.expect("get on a"),
+            Some(content),
+            "{} was not repaired",
+            hex::encode(addr)
+        );
+        assert!(a_store.exists(addr).expect("a exists"));
     }
 
     harness.teardown().await.expect("teardown");

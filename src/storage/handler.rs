@@ -963,7 +963,7 @@ impl AntProtocol {
         let addr_hex = hex::encode(address);
         debug!("Handling GET request for {addr_hex}");
 
-        match self.storage.get(&address).await {
+        match self.storage.get_or_quarantine(&address).await {
             Ok(Some(content)) => {
                 let content_len = content.len();
                 debug!("Retrieved chunk {addr_hex} ({content_len} bytes)");
@@ -1267,7 +1267,7 @@ impl AntProtocol {
     ///
     /// Returns an error if storage access fails.
     pub async fn get_local(&self, address: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        self.storage.get(address).await
+        self.storage.get_or_quarantine(address).await
     }
 
     /// Store a chunk directly to local storage (bypasses payment verification).
