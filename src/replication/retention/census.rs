@@ -1899,6 +1899,9 @@ fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
             "rpc_url",
             1,
         ),
+        // The line a node logs at start, which names the RPC's host alone and
+        // reads nothing through it.
+        ("src/node.rs", "payment_settings", "rpc_url", 1),
         // The payment check's list: the node's RPC, then the chain's other public ones.
         (
             "src/payment/verifier.rs",

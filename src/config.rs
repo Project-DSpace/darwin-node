@@ -354,7 +354,11 @@ pub struct UpgradeConfig {
 /// instance with the ANT token + payment vault contracts deployed,
 /// every node points at the Anvil RPC and the deployed addresses
 /// instead of one of the public Arbitrum networks.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// Its `Debug` output, which the node logs with its config at start, gives a
+/// custom RPC as its host alone: an RPC URL can carry an API key in its user
+/// info, path or query, and is never logged.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum EvmNetworkConfig {
     /// Arbitrum One mainnet.
@@ -372,6 +376,33 @@ pub enum EvmNetworkConfig {
         /// Deployed payment vault contract address.
         payment_vault_address: String,
     },
+}
+
+impl std::fmt::Debug for EvmNetworkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArbitrumOne => f.write_str("ArbitrumOne"),
+            Self::ArbitrumSepolia => f.write_str("ArbitrumSepolia"),
+            Self::Custom {
+                rpc_url,
+                payment_token_address,
+                payment_vault_address,
+            } => f
+                .debug_struct("Custom")
+                .field("rpc_host", &rpc_host(rpc_url))
+                .field("payment_token_address", payment_token_address)
+                .field("payment_vault_address", payment_vault_address)
+                .finish(),
+        }
+    }
+}
+
+/// The host of an RPC URL, without its scheme, user info, port, path or
+/// query, which is all of it the node logs. `None` if it doesn't parse.
+fn rpc_host(rpc_url: &str) -> Option<String> {
+    reqwest::Url::parse(rpc_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
 }
 
 impl EvmNetworkConfig {
@@ -838,6 +869,62 @@ mod tests {
         use crate::payment::EvmVerifierConfig;
         let _config = EvmVerifierConfig::default();
         // EVM verification is always on — no enabled field
+    }
+
+    /// The config a node logs at start names a custom RPC by its host alone:
+    /// an RPC URL can carry an API key, and is never logged.
+    #[test]
+    fn a_custom_rpc_is_logged_by_its_host_alone() {
+        let config = NodeConfig {
+            payment: PaymentConfig {
+                evm_network: EvmNetworkConfig::Custom {
+                    rpc_url: "https://key-user:key-password@rpc.example.org:8545/v2/key-in-path?apikey=key-in-query"
+                        .to_string(),
+                    payment_token_address: "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3".to_string(),
+                    payment_vault_address: "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B".to_string(),
+                },
+                ..PaymentConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        let logged = format!("{config:?}");
+        assert!(
+            logged.contains(
+                "Custom { rpc_host: Some(\"rpc.example.org\"), \
+                 payment_token_address: \"0x511f76a3de41f000ec11ea4fd212fb3587c6cef3\", \
+                 payment_vault_address: \"0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B\" }"
+            ),
+            "{logged}"
+        );
+        for secret in [
+            "key-user",
+            "key-password",
+            ":8545",
+            "key-in-path",
+            "key-in-query",
+        ] {
+            assert!(
+                !logged.contains(secret),
+                "the logged config shows {secret:?}: {logged}"
+            );
+        }
+
+        let unparsed = EvmNetworkConfig::Custom {
+            rpc_url: "not a url, key-in-text".to_string(),
+            payment_token_address: String::new(),
+            payment_vault_address: String::new(),
+        };
+        let logged = format!("{unparsed:?}");
+        assert!(logged.contains("rpc_host: None"), "{logged}");
+        assert!(!logged.contains("key-in-text"), "{logged}");
+        assert_eq!(
+            format!("{:?}", EvmNetworkConfig::ArbitrumOne),
+            "ArbitrumOne"
+        );
+        assert_eq!(
+            format!("{:?}", EvmNetworkConfig::ArbitrumSepolia),
+            "ArbitrumSepolia"
+        );
     }
 
     #[test]

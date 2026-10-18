@@ -586,6 +586,7 @@ impl NodeBuilder {
 
         // Create payment verifier
         let evm_network = config.payment.evm_network.clone().into_evm_network();
+        info!("{}", payment_settings(&evm_network));
         // Listings check payments on the same chain, through the same vault.
         let listings_rpc_url = evm_network.rpc_url().to_string();
         let mut listings_vault = [0u8; 20];
@@ -651,6 +652,20 @@ impl NodeBuilder {
 
         Ok(protocol)
     }
+}
+
+/// The line a node logs at start about where it is paid: the payment token,
+/// the vault and the RPC's host. Only the host: an RPC URL can carry an
+/// operator's API key, in its user info, path or query, and is never logged.
+/// The image's smoke test checks that every node names DARWIN's token and
+/// vault.
+fn payment_settings(network: &evmlib::Network) -> String {
+    format!(
+        "Payments: token {}, vault {}, RPC host {}",
+        network.payment_token_address(),
+        network.payment_vault_address(),
+        network.rpc_url().host_str().unwrap_or("(none)")
+    )
 }
 
 /// A running Ant node.
@@ -1593,6 +1608,41 @@ mod tests {
     }
     use super::*;
     use crate::config::NODES_SUBDIR;
+
+    /// What a node logs at start about where it is paid: the token, the vault
+    /// and the RPC's host, never the rest of the URL.
+    #[test]
+    fn the_payment_line_names_the_token_vault_and_rpc_host_alone() {
+        let darwin = crate::config::EvmNetworkConfig::Custom {
+            rpc_url: "https://rpc.mainnet.chain.robinhood.com".to_string(),
+            payment_token_address: "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3".to_string(),
+            payment_vault_address: "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B".to_string(),
+        }
+        .into_evm_network();
+        assert_eq!(
+            payment_settings(&darwin),
+            "Payments: token 0x511f76A3De41F000EC11EA4fD212fb3587c6cef3, \
+             vault 0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B, \
+             RPC host rpc.mainnet.chain.robinhood.com"
+        );
+
+        let keyed = evmlib::Network::new_custom(
+            "https://key-user:key-password@rpc.example.org:8545/v2/key-in-path?apikey=key-in-query",
+            "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3",
+            "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B",
+        );
+        let line = payment_settings(&keyed);
+        assert!(line.ends_with(", RPC host rpc.example.org"), "{line}");
+        for secret in [
+            "key-user",
+            "key-password",
+            "8545",
+            "key-in-path",
+            "key-in-query",
+        ] {
+            assert!(!line.contains(secret), "the line shows {secret:?}: {line}");
+        }
+    }
 
     #[test]
     fn test_build_upgrade_monitor_staged_rollout_enabled() {
