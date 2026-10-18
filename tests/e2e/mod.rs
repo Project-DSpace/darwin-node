@@ -48,6 +48,10 @@ mod integration_tests;
 #[cfg(test)]
 mod live_testnet;
 
+// Listings across real nodes: a paid envelope served by its close group.
+#[cfg(test)]
+mod listings;
+
 #[cfg(test)]
 mod payment_flow;
 

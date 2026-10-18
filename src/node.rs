@@ -1567,6 +1567,15 @@ mod tests {
             "a node holding a legacy chunk store came up with nothing migrating it, so \
              its disk would never be reclaimed"
         );
+        // What it tells every peer, in the user agent saorsa-core sends with each
+        // signed message: the count of nodes still migrating reads it.
+        let agent = node.p2p_node.config().user_agent();
+        assert_eq!(
+            agent,
+            format!("node/{} migration/legacy", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(agent, user_agent(MigrationSignal::Legacy));
+        assert_eq!(peer_state(&agent), PeerMigrationState::Legacy);
 
         node.shutdown.cancel();
         if let Some(handle) = node.migration_task {
@@ -1604,10 +1613,78 @@ mod tests {
         };
 
         assert!(node.migration_task.is_none());
+        // And it tells its peers so.
+        let agent = node.p2p_node.config().user_agent();
+        assert_eq!(
+            agent,
+            format!("node/{} migration/files", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(agent, user_agent(MigrationSignal::Files));
+        assert_eq!(peer_state(&agent), PeerMigrationState::Files);
+        node.shutdown.cancel();
+    }
+
+    /// Build a node on a random port of the test range, retrying a bind failure.
+    async fn build_on_a_free_port(root: &std::path::Path) -> RunningNode {
+        let mut last_err = String::new();
+        for _ in 0..BIND_ATTEMPTS {
+            let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+            match NodeBuilder::new(local_node_config(root, port))
+                .build()
+                .await
+            {
+                Ok(node) => return node,
+                Err(e) => {
+                    last_err = e.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        panic!("could not build a node after {BIND_ATTEMPTS} attempts: {last_err}");
+    }
+
+    /// A built node records listings in one service: the chunk handler records
+    /// them from PUTs, the replication engine from fresh offers, and the service
+    /// watches the node's chunk store for envelopes stored and chunks removed.
+    /// A node assembled by hand can leave any of these out with every other
+    /// test still passing.
+    #[tokio::test]
+    async fn a_built_node_keeps_listings() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let node = build_on_a_free_port(&root).await;
+
+        let protocol = node
+            .ant_protocol
+            .as_ref()
+            .expect("a node with storage has a chunk handler");
+        let recorded = protocol
+            .listing_service()
+            .expect("the chunk handler records listings from PUTs");
+        let engine = node
+            .replication_engine
+            .as_ref()
+            .expect("a built node has a replication engine");
+        let offered = engine
+            .listings()
+            .expect("the replication engine records listings from fresh offers");
+        assert!(
+            Arc::ptr_eq(recorded, offered),
+            "the chunk handler and the replication engine must share one listing service"
+        );
+        assert_eq!(
+            protocol.storage().observers_set(),
+            (true, true),
+            "the listing service must watch the node's chunk store for stored and removed chunks"
+        );
         node.shutdown.cancel();
     }
     use super::*;
     use crate::config::NODES_SUBDIR;
+    use crate::storage::migration_signal::{
+        peer_state, user_agent, MigrationSignal, PeerMigrationState,
+    };
 
     /// What a node logs at start about where it is paid: the token, the vault
     /// and the RPC's host, never the rest of the URL.

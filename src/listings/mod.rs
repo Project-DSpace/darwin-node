@@ -16,6 +16,9 @@ mod chain;
 // Envelopes and a record exactly as the client writes them.
 #[cfg(test)]
 mod golden;
+// The chunk handler's listings hook.
+#[cfg(test)]
+mod hooks_tests;
 mod service;
 mod store;
 

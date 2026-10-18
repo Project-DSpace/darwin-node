@@ -1167,10 +1167,13 @@ impl TestNetwork {
         // Otherwise default to ArbitrumSepoliaTest for test nodes.
         let rewards_address = RewardsAddress::new(TEST_REWARDS_ADDRESS);
         let replication_config = ReplicationConfig::default();
+        let network = evm_network.unwrap_or(EvmNetwork::ArbitrumSepoliaTest);
+        // Listings check payments on the same chain, through the same vault.
+        let listings_rpc_url = network.rpc_url().to_string();
+        let mut listings_vault = [0u8; 20];
+        listings_vault.copy_from_slice(network.payment_vault_address().as_slice());
         let payment_config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                network: evm_network.unwrap_or(EvmNetwork::ArbitrumSepoliaTest),
-            },
+            evm: EvmVerifierConfig { network },
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
             close_group_size: replication_config.close_group_size,
             local_rewards_address: rewards_address,
@@ -1215,9 +1218,24 @@ impl TestNetwork {
             .with_chunk_store(Arc::clone(&storage))
             .with_payments(Arc::clone(&payment_verifier));
 
+        // Listings for envelope chunks, kept beside the chunks, as a node
+        // keeps them (src/node.rs): the handler records them from PUTs, the
+        // replication engine from fresh offers (`start_node`), and the
+        // protocol loop serves them on the listings topic.
+        let listings = ant_node::listings::ListingService::new(
+            data_dir,
+            disk_reserve,
+            Arc::clone(&storage),
+            listings_rpc_url,
+            listings_vault,
+        )
+        .await
+        .map_err(|e| TestnetError::Core(format!("Failed to open listing store: {e}")))?;
+
         Ok(
             AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
-                .with_pointer_service(pointers),
+                .with_pointer_service(pointers)
+                .with_listing_service(listings),
         )
     }
 
@@ -1319,6 +1337,34 @@ impl TestNetwork {
                         ..
                     } = event
                     {
+                        // Listings requests and answers, as the node's own
+                        // protocol loop routes them (src/node.rs).
+                        if topic == ant_listings::TOPIC {
+                            if let Some(listings) = protocol_clone.listing_service().cloned() {
+                                let p2p = Arc::clone(&p2p_clone);
+                                tokio::spawn(async move {
+                                    if listings.handle_response(&source, &data) {
+                                        return;
+                                    }
+                                    if let Some(response) = listings.handle_message(&data).await {
+                                        if let Err(e) = p2p
+                                            .send_message(
+                                                &source,
+                                                ant_listings::TOPIC,
+                                                response,
+                                                &[],
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                "Node {node_index} failed to send listings response to {source}: {e}"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                            continue;
+                        }
                         if topic == CHUNK_PROTOCOL_ID {
                             debug!(
                                 "Node {node_index} received chunk protocol message from {source}"
@@ -1393,6 +1439,11 @@ impl TestNetwork {
                     // (ADR-0018).
                     if let Some(service) = protocol.pointer_service() {
                         engine.with_pointer_service(service);
+                    }
+                    // Fresh offers carry the upload's payment proof: listings
+                    // are recorded from them as from client PUTs.
+                    if let Some(listings) = protocol.listing_service() {
+                        engine.with_listings(Arc::clone(listings));
                     }
                     let dht_events = p2p.dht_manager().subscribe_events();
                     engine.start(dht_events);

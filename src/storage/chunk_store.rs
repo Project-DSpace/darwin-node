@@ -606,6 +606,15 @@ impl ChunkStore {
         }
     }
 
+    /// Whether the stored-chunk and the removed-chunk observers are set.
+    #[cfg(test)]
+    pub(crate) fn observers_set(&self) -> (bool, bool) {
+        (
+            self.stored_observer.get().is_some(),
+            self.removed_observer.get().is_some(),
+        )
+    }
+
     fn notify_removed(&self, address: &XorName) {
         if let Some(observer) = self.removed_observer.get() {
             observer(address);

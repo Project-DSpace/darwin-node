@@ -1213,9 +1213,10 @@ fn route_response(waiting: &Waiting, source: &PeerId, request_id: u64, listing: 
     }
 }
 
+/// Tests, and the helpers `hooks_tests` shares.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(super) mod tests {
     use super::super::chain::tests::{chain_with, vault_log, MockChain, VAULT};
     use super::super::store::tests::{signed_quote, signed_quote_at};
     use super::*;
@@ -1232,9 +1233,14 @@ mod tests {
     const BLOCK_TIME: u64 = 1_790_000_000;
 
     /// A chain endpoint nothing answers at.
-    const DEAD_CHAIN: &str = "http://127.0.0.1:0";
+    pub const DEAD_CHAIN: &str = "http://127.0.0.1:0";
 
-    async fn service_on(dir: &TempDir, rpc_url: &str) -> (Arc<ListingService>, Arc<ChunkStore>) {
+    /// A listing service over a new chunk store in `dir`, reading payments
+    /// through `rpc_url`.
+    pub async fn service_on(
+        dir: &TempDir,
+        rpc_url: &str,
+    ) -> (Arc<ListingService>, Arc<ChunkStore>) {
         let chunks = Arc::new(
             ChunkStore::new(ChunkStoreConfig {
                 root_dir: dir.path().to_path_buf(),
@@ -1275,7 +1281,8 @@ mod tests {
         }
     }
 
-    fn envelope_with(seed: u8, shown: ShownFields, in_index: bool) -> Envelope {
+    /// A readable envelope of `data_map(seed)`, showing `shown`.
+    pub fn envelope_with(seed: u8, shown: ShownFields, in_index: bool) -> Envelope {
         Envelope::readable(&data_map(seed), metadata(), shown, in_index).unwrap()
     }
 
@@ -1330,7 +1337,9 @@ mod tests {
         response.body
     }
 
-    async fn get(listings: &ListingService, address: XorName) -> Option<Listing> {
+    /// The listing `listings` serves for `address`, asked on the listings
+    /// topic.
+    pub async fn get(listings: &ListingService, address: XorName) -> Option<Listing> {
         let ListingsBody::GetResponse { listing } =
             ask(listings, ListingsBody::GetRequest { address }).await
         else {
@@ -1339,7 +1348,12 @@ mod tests {
         listing
     }
 
-    async fn list(listings: &ListingService, from: ListingKey, limit: u32) -> (Vec<Listing>, bool) {
+    /// A page of the index `listings` serves, asked on the listings topic.
+    pub async fn list(
+        listings: &ListingService,
+        from: ListingKey,
+        limit: u32,
+    ) -> (Vec<Listing>, bool) {
         let ListingsBody::ListResponse { listings, more } =
             ask(listings, ListingsBody::ListRequest { from, limit }).await
         else {
@@ -1522,7 +1536,7 @@ mod tests {
     }
 
     /// A single-node proof paying `quote` in `tx_hash`, among other quotes.
-    fn single_node_proof(quote: &PaymentQuote, tx_hash: [u8; 32]) -> Vec<u8> {
+    pub fn single_node_proof(quote: &PaymentQuote, tx_hash: [u8; 32]) -> Vec<u8> {
         proof_naming(quote, &[tx_hash])
     }
 

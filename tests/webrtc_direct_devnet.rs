@@ -555,6 +555,160 @@ async fn invalid_chain_identity_fails_without_exposing_provider_response(
     Ok(())
 }
 
+/// A devnet node keeps listings as a node does, which
+/// `scripts/test_e2e_listings.sh` relies on: its chunk handler refuses an
+/// envelope whose payment it can't find from a proof, and its protocol loop
+/// answers requests on the listings topic.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[allow(clippy::too_many_lines)]
+async fn devnet_nodes_keep_and_serve_listings() -> Result<(), Box<dyn Error>> {
+    use ant_listings::self_encryption::{ChunkInfo, DataMap as FileMap, XorName};
+    use ant_listings::{
+        Envelope, ListingKey, ListingsBody, ListingsMessage, Metadata, ShownFields, TOPIC,
+    };
+    use saorsa_core::{NodeConfig as CoreNodeConfig, NodeMode, P2PEvent, P2PNode};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    let rpc =
+        MockChainRpc::new(json!({"jsonrpc":"2.0", "id":1, "result":"0x7a69"}).to_string()).await?;
+    let temp = tempfile::tempdir()?;
+    let mut config = DevnetConfig::minimal();
+    config.node_count = 2;
+    config.bootstrap_count = 1;
+    config.base_port = 0;
+    config.webrtc_direct = true;
+    config.data_dir = temp.path().join("listings-devnet");
+    config.spawn_delay = Duration::from_millis(20);
+    config.evm_network = Some(rpc.network());
+    let mut devnet = Devnet::new(config).await?;
+    devnet.start().await?;
+    let result: Result<(), Box<dyn Error>> = async {
+        let (protocol, _) = devnet.test_browser_node(0).ok_or("missing devnet node")?;
+        if protocol.listing_service().is_none() {
+            return Err("a devnet node keeps no listings".into());
+        }
+
+        // The chunk handler's hook: an envelope whose storage is paid for, PUT
+        // without the proof its listing is found from, is refused and not
+        // stored.
+        let infos = (0..3u8)
+            .map(|index| ChunkInfo {
+                index: usize::from(index),
+                dst_hash: XorName([0x70 + index; 32]),
+                src_hash: XorName([0x75 + index; 32]),
+                src_size: 100,
+            })
+            .collect();
+        let envelope = Envelope::readable(
+            &FileMap::new(infos),
+            Metadata::default(),
+            ShownFields::ALL,
+            true,
+        )?;
+        let address = envelope.address();
+        protocol.payment_verifier_arc().cache_insert(address);
+        let request = ant_protocol::ChunkMessage {
+            request_id: 1,
+            body: ant_protocol::ChunkMessageBody::PutRequest(ant_protocol::ChunkPutRequest::new(
+                address,
+                Bytes::from(envelope.to_bytes()),
+            )),
+        }
+        .encode()?;
+        let response = protocol
+            .try_handle_request(&request)
+            .await?
+            .ok_or("no PUT response")?;
+        match ant_protocol::ChunkMessage::decode(&response)?.body {
+            ant_protocol::ChunkMessageBody::PutResponse(ant_protocol::ChunkPutResponse::Error(
+                ant_protocol::ProtocolError::PaymentFailed(message),
+            )) if message.contains("needs its payment proof") => {}
+            other => {
+                return Err(
+                    format!("an envelope without its proof was not refused: {other:?}").into(),
+                )
+            }
+        }
+        if protocol.storage().exists(&address)? {
+            return Err("the refused envelope was stored".into());
+        }
+
+        // The protocol loop: a client asks a node for a page of its index on
+        // the listings topic and is answered, with nothing listed yet.
+        let mut core = CoreNodeConfig::builder()
+            .port(0)
+            .ipv6(false)
+            .local(true)
+            .mode(NodeMode::Client)
+            .build()?;
+        core.bootstrap_peers = devnet.bootstrap_addrs();
+        let client = P2PNode::new(core).await?;
+        client.start().await?;
+        let asked: Result<(), Box<dyn Error>> = async {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let peers = loop {
+                let peers = client.connected_peers().await;
+                if !peers.is_empty() {
+                    break peers;
+                }
+                if Instant::now() >= deadline {
+                    return Err("the client connected to no devnet node".into());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            };
+            let mut events = client.subscribe_events();
+            for (request_id, peer) in (77..).zip(&peers) {
+                let request = ListingsMessage {
+                    request_id,
+                    body: ListingsBody::ListRequest {
+                        from: ListingKey::MIN,
+                        limit: 16,
+                    },
+                }
+                .encode()?;
+                client.send_message(peer, TOPIC, request, &[]).await?;
+                let answer = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        match events.recv().await {
+                            Ok(P2PEvent::Message {
+                                topic,
+                                source: Some(source),
+                                data,
+                                ..
+                            }) if topic == TOPIC && source == *peer => {
+                                if let Ok(answer) = ListingsMessage::decode(&data) {
+                                    if answer.request_id == request_id {
+                                        return Some(answer.body);
+                                    }
+                                }
+                            }
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| format!("{peer} didn't answer on the listings topic"))?;
+                match answer {
+                    Some(ListingsBody::ListResponse { listings, more })
+                        if listings.is_empty() && !more => {}
+                    other => return Err(format!("{peer} answered {other:?}").into()),
+                }
+            }
+            Ok(())
+        }
+        .await;
+        client.shutdown().await?;
+        asked
+    }
+    .await;
+    devnet.shutdown().await?;
+    result
+}
+
 #[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a five-node local network"]

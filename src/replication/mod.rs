@@ -2301,6 +2301,12 @@ impl ReplicationEngine {
         self.listings = Some(listings);
     }
 
+    /// The service fresh offers' listings are recorded in, if any.
+    #[cfg(test)]
+    pub(crate) const fn listings(&self) -> Option<&Arc<crate::listings::ListingService>> {
+        self.listings.as_ref()
+    }
+
     /// Replicate the pointers `service` stores (ADR-0016), and wire the
     /// service to this engine both ways: it hands each newly stored paid
     /// state here to be offered on, and asks here before it takes a final
