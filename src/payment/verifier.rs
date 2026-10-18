@@ -4143,6 +4143,154 @@ mod tests {
         assert_eq!(answer, Err(format!("failure {}", 3 * rounds)));
     }
 
+    /// One request a stub RPC received: its method, its parameters and when.
+    type StubRequest = (String, serde_json::Value, Instant);
+
+    /// One HTTP request's body, or `None` once the connection closes.
+    async fn read_http_body(socket: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_lowercase();
+        let length: usize = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |value| value.trim().parse().expect("a content length"));
+        while buffer.len() < header_end + length {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        Some(buffer[header_end..header_end + length].to_vec())
+    }
+
+    /// A JSON-RPC provider on 127.0.0.1 that answers its first request with
+    /// `-32005 the network is busy`, as a busy public RPC does, and every
+    /// later one with `result`. Returns its URL and the requests it gets.
+    async fn busy_then_answering_rpc(result: String) -> (String, Arc<Mutex<Vec<StubRequest>>>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        let requests: Arc<Mutex<Vec<StubRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                let result = result.clone();
+                tokio::spawn(async move {
+                    while let Some(body) = read_http_body(&mut socket).await {
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&body).expect("a JSON-RPC request");
+                        let first = {
+                            let mut seen = seen.lock();
+                            seen.push((
+                                request["method"].as_str().unwrap_or_default().to_string(),
+                                request["params"].clone(),
+                                Instant::now(),
+                            ));
+                            seen.len() == 1
+                        };
+                        let response = if first {
+                            serde_json::json!({ "jsonrpc": "2.0", "id": request["id"],
+                                "error": { "code": -32005, "message": "the network is busy" } })
+                        } else {
+                            serde_json::json!({ "jsonrpc": "2.0", "id": request["id"],
+                                "result": result })
+                        };
+                        let body = response.to_string();
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if socket.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    /// The node's only RPC is busy at first: the read's next round, half a
+    /// second later, gets the record. Upstream reads once, so a busy answer
+    /// made the node refuse a chunk that was paid for.
+    #[tokio::test]
+    async fn a_settlement_read_survives_a_busy_rpc() {
+        assert_eq!(PAYMENT_READ_ROUNDS, 2);
+        assert_eq!(PAYMENT_READ_BACKOFF, std::time::Duration::from_millis(500));
+
+        // completedPayments(bytes32) returns (bytes16 rewardsAddress, uint128 amount).
+        let rewards_prefix = [0x5a_u8; 16];
+        let amount: u128 = 1_234_567_890_123;
+        let mut words = [0u8; 64];
+        words[..16].copy_from_slice(&rewards_prefix);
+        words[48..].copy_from_slice(&amount.to_be_bytes());
+        let (url, requests) = busy_then_answering_rpc(format!("0x{}", hex::encode(words))).await;
+
+        let verifier = verifier_reading_through(&url);
+        assert_eq!(
+            verifier.payment_rpc_urls().len(),
+            1,
+            "the stub is the node's only RPC"
+        );
+        let quote_hash = QuoteHash::from([0x42_u8; 32]);
+        let settlement = verifier
+            .completed_payment_settlement(quote_hash)
+            .await
+            .expect("the second round reads the record");
+        assert_eq!(settlement, (Amount::from(amount), Some(rewards_prefix)));
+
+        let requests = requests.lock().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one busy answer, then the record: {requests:?}"
+        );
+        let vault = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B";
+        for (method, params, _) in &requests {
+            assert_eq!(method, "eth_call");
+            let call = &params[0];
+            assert!(
+                call["to"]
+                    .as_str()
+                    .is_some_and(|to| to.eq_ignore_ascii_case(vault)),
+                "{params}"
+            );
+            let data = call["input"].as_str().or_else(|| call["data"].as_str());
+            assert!(
+                data.is_some_and(|data| data.contains(&hex::encode(quote_hash))),
+                "{params}"
+            );
+        }
+        let (_, _, first) = requests[0];
+        let (_, _, second) = requests[1];
+        assert!(
+            second.duration_since(first) >= PAYMENT_READ_BACKOFF,
+            "the second round waits {PAYMENT_READ_BACKOFF:?}"
+        );
+    }
+
     #[test]
     fn paid_quote_issuer_closeness_width_uses_k() {
         let issuer_closeness_width = PAID_QUOTE_ISSUER_CLOSENESS_WIDTH;

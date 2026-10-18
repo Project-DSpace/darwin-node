@@ -903,3 +903,7 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+/// The downgrade guard with this fork's `+ds` builds (`apply/ds_ordering.rs`).
+#[cfg(test)]
+mod ds_ordering;

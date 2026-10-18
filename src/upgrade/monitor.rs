@@ -1358,3 +1358,7 @@ mod tests {
         assert_eq!(beta.version, Version::parse("0.17.0-beta.1").unwrap());
     }
 }
+
+/// How this fork's `+ds` builds are ordered (`monitor/ds_ordering.rs`).
+#[cfg(test)]
+mod ds_ordering;

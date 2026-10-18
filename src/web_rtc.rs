@@ -2369,6 +2369,35 @@ mod tests {
         assert_eq!(refused.as_deref(), Some(SOURCE_SESSION_RATE_ERROR));
         assert!(resources.try_admit_connection(other).is_ok());
     }
+
+    /// At the defaults a source opens 12 sessions at once, then one every ten
+    /// seconds (6 a minute).
+    #[test]
+    fn at_the_defaults_a_source_opens_12_sessions_then_6_a_minute() {
+        let config = WebRtcDirectConfig::default();
+        let start = Instant::now();
+        let mut bucket = SessionRateBucket::new(
+            config.new_sessions_burst_per_ip,
+            config.new_sessions_per_minute_per_ip,
+            start,
+        );
+        assert!((0..12).all(|_| bucket.try_take(start)));
+        assert!(!bucket.try_take(start));
+        assert!(!bucket.try_take(start + Duration::from_secs(9)));
+        assert!(bucket.try_take(start + Duration::from_secs(10)));
+        assert!(!bucket.try_take(start + Duration::from_secs(10)));
+
+        // Through the listener: each session is closed before the next opens,
+        // since the per-source cap on open sessions is checked first.
+        let resources = ListenerResources::new(&config);
+        let source: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        for session in 1..=12 {
+            let admitted = resources.try_admit_connection(source);
+            assert!(admitted.is_ok(), "session {session}: {:?}", admitted.err());
+        }
+        let thirteenth = resources.try_admit_connection(source).err();
+        assert_eq!(thirteenth.as_deref(), Some(SOURCE_SESSION_RATE_ERROR));
+    }
     use ant_protocol::chunk::{
         PointerGetRequest, PointerGetResponse, PointerPutRequest, PointerPutResponse,
     };
