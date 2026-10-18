@@ -1229,6 +1229,73 @@ mod tests {
         );
     }
 
+    /// A final state is paid for before the close group is asked about it: a
+    /// PUT with no proof, or with a merkle proof, is refused without a round
+    /// trip and stores nothing. Asking first would let every unpaid final state
+    /// cost the group a look.
+    #[tokio::test]
+    async fn a_final_state_is_paid_before_the_group_is_asked() {
+        use crate::payment::{PaymentVerifier, PaymentVerifierConfig, BATCH_PAYMENTS_REFUSED};
+        use ant_protocol::chunk::PROOF_TAG_MERKLE;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PointerStore::new(dir.path()).await.expect("store");
+        let verifier = Arc::new(PaymentVerifier::new(PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 16,
+            close_group_size: ant_protocol::chunk::CLOSE_GROUP_SIZE,
+            local_rewards_address: evmlib::common::Address::new([1u8; 20]),
+            price_floor: PriceFloorConfig::default(),
+        }));
+        let service = PointerService::new(store).with_payments(Arc::clone(&verifier));
+        let rival = final_state(10, 0xAA);
+        let transfer = final_state(10, 0x01);
+        let witness = StubWitness::answering(FinalityCheck::Conflict(rival.state()));
+        service.attach_final_state_witness(witness.clone());
+
+        match service.handle_put(put(&transfer)).await {
+            PointerPutResponse::PaymentRequired { message } => {
+                assert!(message.contains("must be paid for"), "got: {message}");
+            }
+            other => panic!("an unpaid final state must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            witness.asked(),
+            0,
+            "the group was asked about an unpaid state"
+        );
+        assert!(service.store().is_empty(), "an unpaid state was stored");
+
+        let mut merkle_proof = vec![PROOF_TAG_MERKLE];
+        merkle_proof.resize(64, 0);
+        let paid_with_merkle =
+            PointerPutRequest::with_payment(Bytes::from(transfer.to_bytes()), merkle_proof);
+        match service.handle_put(paid_with_merkle.clone()).await {
+            PointerPutResponse::PaymentRequired { message } => {
+                assert!(message.contains(BATCH_PAYMENTS_REFUSED), "got: {message}");
+            }
+            other => panic!("a merkle-paid final state must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            witness.asked(),
+            0,
+            "the group was asked about a merkle-paid state"
+        );
+        assert!(service.store().is_empty(), "a merkle-paid state was stored");
+
+        // Control: once the state counts as paid, the same PUT gets past the
+        // payment check and the group is asked, which proves the rival.
+        verifier.cache_insert_pointer(transfer.address(), transfer.state_id());
+        match service.handle_put(paid_with_merkle).await {
+            PointerPutResponse::Stale { state_id, .. } => {
+                assert_eq!(state_id, rival.state_id(), "the rival is named");
+            }
+            other => panic!("the group's proof must refuse the state, got {other:?}"),
+        }
+        assert_eq!(witness.asked(), 1);
+        assert!(service.store().is_empty(), "a proven loser was stored");
+    }
+
     #[tokio::test]
     async fn a_proven_conflict_is_refused_again_before_any_signature_check() {
         // Replaying a paid final state that already lost costs a node

@@ -3928,6 +3928,66 @@ mod tests {
         );
     }
 
+    /// A pointer's payment refuses every merkle proof the same way, through both
+    /// entry points and in every context: a client PUT, a fresh offer and paid
+    /// list admission. The refusal is this fork's, not upstream's
+    /// pointer-specific one, which only `verify_merkle_payment` gives, and
+    /// nothing is cached as paid.
+    #[tokio::test]
+    async fn merkle_proofs_are_refused_for_pointers_in_every_context() {
+        let verifier = create_test_verifier();
+        let (merkle_proof, _pool_hash, state_id, _timestamp) = make_valid_merkle_proof();
+        let tagged =
+            crate::payment::proof::serialize_merkle_proof(&merkle_proof).expect("serialize");
+        let routing: XorName = [0xA5; 32];
+        assert_ne!(
+            routing, state_id,
+            "the pointer is routed at an address apart from the state paid for"
+        );
+
+        let mut refusals = vec![(
+            "verify_pointer_payment".to_string(),
+            verifier
+                .verify_pointer_payment(&routing, &state_id, &tagged)
+                .await
+                .expect_err("a merkle proof must be refused"),
+        )];
+        for context in [
+            VerificationContext::ClientPut,
+            VerificationContext::FreshReplication,
+            VerificationContext::PaidListAdmission,
+        ] {
+            refusals.push((
+                format!("verify_pointer_payment_in({context:?})"),
+                verifier
+                    .verify_pointer_payment_in(&routing, &state_id, &tagged, context)
+                    .await
+                    .expect_err("a merkle proof must be refused"),
+            ));
+        }
+        for (entry, err) in refusals {
+            let message = err.to_string();
+            assert!(
+                message.contains(BATCH_PAYMENTS_REFUSED),
+                "{entry}: {message}"
+            );
+            assert!(
+                !message.contains("single-node proof"),
+                "{entry}: upstream's pointer refusal answered, not this fork's: {message}"
+            );
+        }
+
+        let paid = PaymentTarget::split(routing, state_id);
+        assert!(
+            !verifier.cache.contains_client_put_verified_key(&paid),
+            "a refused merkle proof must not be cached as a paid store"
+        );
+        assert!(
+            !verifier.cache.contains_paid_list_verified_key(&paid),
+            "nor as a paid-list admission"
+        );
+    }
+
     /// Create a verifier for unit tests. EVM is always on, but tests can
     /// pre-populate the cache to bypass on-chain verification.
     /// A chunk whose address equals a pointer's `state_id` must not be able to

@@ -11,9 +11,9 @@
 use super::testnet::{TestNetworkConfig, TestNode};
 use super::TestHarness;
 use ant_node::ant_protocol::chunk::{
-    ChunkMessage, ChunkMessageBody, PointerPutRequest, PointerPutResponse,
+    ChunkMessage, ChunkMessageBody, PointerPutRequest, PointerPutResponse, PROOF_TAG_MERKLE,
 };
-use ant_node::pointer::PointerStore;
+use ant_node::pointer::{FinalStateWitness, PointerStore};
 use ant_node::replication::audit::AuditTickResult;
 use ant_node::replication::commitment::pointer_leaf_hash;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
@@ -591,6 +591,92 @@ async fn a_node_that_missed_the_transfer_refuses_another_its_group_proves() {
         }
         other => panic!("the group's own transfer was refused: {other:?}"),
     }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A fresh offer of a final state is paid for before its receiver asks the
+/// close group about it, as a client's PUT is. An offer paid with a merkle
+/// proof, or not paid at all, is refused without a look: the receiver proves
+/// nothing about the rival its group holds. Paid, the same offer is looked
+/// for, and the rival is proven.
+#[tokio::test]
+#[serial]
+async fn a_final_state_offer_is_paid_for_before_the_group_is_asked() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let created = signed(&pk, &sk, 0, 1);
+    let handed_over = transfer(&pk, &sk, 0x77);
+    let second = transfer(&pk, &sk, 0x01);
+
+    // Everyone holds the create, and learns everyone else understands
+    // pointers while there is nothing newer to hint.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    for i in &everyone {
+        store(harness.test_node(*i).expect("node"))
+            .put_bytes(&created.to_bytes())
+            .await
+            .expect("put");
+    }
+    exchange_hints(&harness, &everyone, &everyone).await;
+
+    // The rival lands everywhere but one node, written straight into the
+    // stores so nothing replicates or hints it there.
+    let unaware = 4;
+    let source = 3;
+    for i in others(&harness, &[unaware]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&handed_over.to_bytes())
+            .await
+            .expect("put");
+    }
+    let offer = |payment_proof: Vec<u8>| PointerFreshWrite {
+        record: second.to_bytes(),
+        payment_proof,
+    };
+
+    let mut merkle_proof = vec![PROOF_TAG_MERKLE];
+    merkle_proof.resize(DUMMY_PROOF.len(), 0);
+    for proof in [merkle_proof, DUMMY_PROOF.to_vec()] {
+        replication(harness.test_node(source).expect("node"))
+            .replicate_fresh(offer(proof))
+            .await;
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let node = harness.test_node(unaware).expect("node");
+    assert!(
+        holds(node, &created),
+        "an offer paid with a merkle proof, or not paid, was stored"
+    );
+    assert_eq!(
+        replication(node).proven_conflict(&second.state()),
+        None,
+        "the group was asked about an offer before its payment was checked"
+    );
+
+    // Control: paid, the same offer gets as far as the look, which proves
+    // the rival and refuses it.
+    mark_paid(&harness, &second);
+    replication(harness.test_node(source).expect("node"))
+        .replicate_fresh(offer(DUMMY_PROOF.to_vec()))
+        .await;
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    let mut proven = None;
+    while tokio::time::Instant::now() < deadline {
+        proven = replication(node).proven_conflict(&second.state());
+        if proven.is_some() {
+            break;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    assert_eq!(
+        proven.map(|state| state.state_id),
+        Some(handed_over.state_id()),
+        "the paid offer never reached the look"
+    );
+    assert!(holds(node, &created), "the proven loser was stored");
 
     harness.teardown().await.expect("teardown");
 }
