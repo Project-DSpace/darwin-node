@@ -24,6 +24,10 @@ MIN_FREE_PER_NODE=$((20 * 1024 ** 3)) # Autonomi's recommended minimum disk per 
 fail() { echo "$*" >&2; exit 1; }
 as_user() { setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"; }
 manager() { as_user ant node "$@"; }
+# Move a folder into $RETIRED, dated now: mv keeps its modification time, which
+# the cleanup below reads, so a folder unchanged for days would otherwise be
+# deleted at the next start instead of kept 3 days from its retirement.
+retire() { mv "$1" "$2" && touch "$2"; }
 
 # ---------- settings ----------
 
@@ -187,8 +191,8 @@ for id in $(registered '.nodes | to_entries | sort_by(.value.eviction == null, -
     fi
     manager dismiss "$id" >/dev/null
     stamp=$(date -u +%Y%m%dT%H%M%S)
-    if [[ -d "$NODES/node-$id" ]]; then mv "$NODES/node-$id" "$RETIRED/$stamp-node-$id"; fi
-    if [[ -d "$LOGS/node-$id" ]]; then mv "$LOGS/node-$id" "$RETIRED/$stamp-node-$id-logs"; fi
+    if [[ -d "$NODES/node-$id" ]]; then retire "$NODES/node-$id" "$RETIRED/$stamp-node-$id"; fi
+    if [[ -d "$LOGS/node-$id" ]]; then retire "$LOGS/node-$id" "$RETIRED/$stamp-node-$id-logs"; fi
 done
 
 # Every node takes these settings. A running node whose port is outside
@@ -249,7 +253,7 @@ for dir in "$NODES"/node-*; do
     id=${dir##*/node-}
     if [[ "$(registered ".nodes | has(\"$id\")")" != true ]]; then
         echo "Retiring unused $(basename "$dir")"
-        mv "$dir" "$RETIRED/$(date -u +%Y%m%dT%H%M%S)-$(basename "$dir")"
+        retire "$dir" "$RETIRED/$(date -u +%Y%m%dT%H%M%S)-$(basename "$dir")"
     fi
 done
 

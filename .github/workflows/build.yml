@@ -134,6 +134,19 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin ant-node
 
+      # The image hands every node its payment settings in these variables
+      # (docker/Dockerfile, docker/entrypoint.sh), so the binary must read them.
+      - name: Check the payment variables
+        shell: bash
+        run: |
+          help=$(target/release/ant-node --help)
+          for name in ANT_EVM_RPC_URL ANT_EVM_PAYMENT_TOKEN ANT_EVM_PAYMENT_VAULT; do
+            if ! grep -qF "[env: $name=" <<<"$help"; then
+              echo "::error::ant-node --help doesn't name $name"
+              exit 1
+            fi
+          done
+
       # The binary and its bootstrap file, plus what the image ships in
       # /usr/share/doc/storage-node/ (docker/Dockerfile): the project's licence
       # files, the third-party notices and the Rust standard library's notices
@@ -193,9 +206,11 @@ jobs:
           load: true
           tags: ${{ env.IMAGE }}:${{ github.sha }}
 
-      # Runs the image on a small isolated network (never the live one):
-      # joining, browser addresses, restarts, taking over the previous image's
-      # layout, retiring nodes, clean stops and disk-pressure eviction.
+      # Runs the image on a small isolated network (never the live one): its
+      # network settings, joining, the token and vault every node names,
+      # browser addresses, restarts, taking over the previous image's layout,
+      # retiring nodes and keeping their data 3 days, clean stops, and
+      # disk-pressure eviction and clearing it.
       - name: Smoke test
         run: bash docker/smoke-test.sh "$IMAGE:${{ github.sha }}"
 

@@ -5,13 +5,20 @@
 #
 #   docker/smoke-test.sh <image>
 #
-# Checks: nodes start and join; browser addresses are published on the fixed
+# Checks: the image is set for the Darwin network (DARWIN's token and vault,
+# Robinhood Chain's RPC, the bootstrap servers, production mode, IPv4 only)
+# and its node's bootstrap file names no peers; nodes start and join, and
+# each names DARWIN's token and vault and only its RPC's host when it starts;
+# browser addresses are published on the fixed
 # ports; a restart keeps node identities and starts the nodes again; the
 # previous image's /data/node-<port> layout is taken over with identities
-# kept; lowering NODE_COUNT retires a node; changing PORT_START moves the
+# kept; lowering NODE_COUNT retires a node; retired data is deleted at a start
+# 4 or more days after its retirement, however long it sat unchanged before;
+# changing PORT_START moves the
 # nodes with identities kept; docker stop is clean and timely;
 # the node manager's disk-pressure eviction removes nodes (never the last)
-# when the disk is nearly full; a data folder mounted noexec is refused;
+# when the disk is nearly full, and `nodes clear-evicted` forgets them; a data
+# folder mounted noexec is refused;
 # production mode warns above 2 nodes; the old PublicNode RPC_URL is pointed
 # out; an RPC_URL of only spaces leaves the image's RPCs in place;
 # ANT_RELAY_SERVING=false reaches every node and switches its relay server
@@ -50,11 +57,40 @@ wait_for() { # container pattern [count] [seconds]
 peer_ids() { sudo sh -c "cat $1/nodes/node-*/webrtc-direct.multiaddr" 2>/dev/null | sed 's#.*/p2p/##' | sort | tr '\n' ' '; }
 registry() { sudo jq -r "$2" "$1/manager/ant/node_registry.json"; }
 
+# The Darwin network the image is built for (tests/darwin_network.rs checks
+# that docker/Dockerfile sets the same).
+TOKEN=0x511f76a3de41f000ec11ea4fd212fb3587c6cef3
+VAULT=0xe0f627986c0438de0e314b644f3c8aa21d3f4f6b
+SERVERS="142.93.32.90:10000 165.22.193.90:10000 142.93.96.232:10000"
+# The line each node logs as it starts: the token and vault it is paid
+# through, and its RPC's host alone, since an RPC URL can carry an API key.
+# Addresses are checksummed there, so compared ignoring case.
+PAYMENTS="\[node-[0-9]+\].*Payments: token $TOKEN, vault $VAULT, RPC host [a-z0-9.-]+([^a-z0-9.:/?@-]|\$)"
+logs_payments() { # container count
+    for _ in $(seq 1 30); do
+        (( $(docker logs "$1" 2>&1 | grep -ciE "$PAYMENTS" || true) >= $2 )) && return 0
+        sleep 2
+    done
+    return 1
+}
+
+echo "== the image's settings: the Darwin network, and no bootstrap peers in the node's file"
+image_env=$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$IMAGE")
+for setting in "ANT_EVM_PAYMENT_TOKEN=$TOKEN" "ANT_EVM_PAYMENT_VAULT=$VAULT" "BOOTSTRAP_PEERS=$SERVERS" \
+    ANT_NETWORK_MODE=production IPV4_ONLY=true; do
+    grep -qixF "$setting" <<<"$image_env" || fail "the image does not set $setting"
+done
+grep -qE '^RPC_URLS=(.* )?https://rpc\.mainnet\.chain\.robinhood\.com( |$)' <<<"$image_env" \
+    || fail "the image's RPC_URLS don't include Robinhood Chain's RPC"
+peers=$(docker run --rm --entrypoint cat "$IMAGE" /opt/ant/bootstrap_peers.toml | grep -vE '^[[:space:]]*(#|$)' || true)
+[[ "$peers" == "peers = []" ]] || fail "/opt/ant/bootstrap_peers.toml names peers: $peers"
+
 echo "== seed node (its only bootstrap peer is itself: starts an isolated network)"
 docker run -d --name seed "${COMMON[@]}" -e MANAGER_PORT=12601 -e NODE_COUNT=1 -e PORT_START=10900 \
     -e PUBLIC_IP=$IP -e BOOTSTRAP_PEERS="$IP:10900" -v "$WORK/seed:/data" "$IMAGE" >/dev/null
 wait_for seed 'Running 1 node' 1 60 || fail "seed did not start"
 [[ "$(registry "$WORK/seed" '.nodes["1"].bootstrap_peers | length')" == 0 ]] || fail "the seed lists itself as a bootstrap peer"
+logs_payments seed 1 || fail "the seed's node did not name DARWIN's token and vault and its RPC's host alone"
 
 echo "== three nodes joining the seed, browser ports 11910-11912, relay serving off"
 run_smoke() { # node_count [port_start]
@@ -65,6 +101,7 @@ run_smoke() { # node_count [port_start]
 run_smoke 3
 wait_for smoke 'Running 3 node' 1 60 || fail "smoke container did not start 3 nodes"
 wait_for smoke '\[node-[0-9]+\].*Successfully connected to [1-9]' 3 || fail "nodes did not join the seed"
+logs_payments smoke 3 || fail "not every node named DARWIN's token and vault and its RPC's host alone"
 # The node's own line, then saorsa-transport's from the relay server itself.
 wait_for smoke '\[node-[0-9]+\].*Relay serving is off' 3 || fail "ANT_RELAY_SERVING=false did not reach all 3 nodes"
 wait_for smoke '\[node-[0-9]+\].*Relay serving disabled' 3 || fail "the nodes' relay servers were not switched off"
@@ -91,12 +128,23 @@ wait_for smoke 'Running 3 node' 1 60 || fail "taken-over nodes did not start"
 [[ "$(peer_ids "$WORK/smoke")" == "$ids" ]] || fail "identities changed when taking over the old layout"
 [[ "$(registry "$WORK/smoke" '[.nodes[].node_port] | sort | join(",")')" == "10910,10911,10912" ]] || fail "ports changed"
 
-echo "== lowering NODE_COUNT retires the node on the highest port"
+echo "== lowering NODE_COUNT retires the node on the highest port; retired data is kept 3 days"
 docker stop -t 120 smoke >/dev/null && docker rm smoke >/dev/null
+# Retired folders from earlier starts: one retired 5 days ago goes at this
+# start, one retired 84 hours ago stays.
+sudo mkdir "$WORK/smoke/retired/old-node-8" "$WORK/smoke/retired/recent-node-9"
+sudo touch -d '5 days ago' "$WORK/smoke/retired/old-node-8"
+sudo touch -d '84 hours ago' "$WORK/smoke/retired/recent-node-9"
+# node-3's folder, unchanged for 5 days, keeps its 3 days once retired. Its
+# process file is gone first, so nothing before the move changes the folder.
+sudo rm -f "$WORK/smoke/nodes/node-3/node.pid"
+sudo touch -d '5 days ago' "$WORK/smoke/nodes/node-3"
 run_smoke 2
 wait_for smoke 'Retiring node-3 \(port 10912\)' 1 60 || fail "node-3 was not retired"
 wait_for smoke 'Running 2 node' 1 60 || fail "2 nodes did not start"
 sudo sh -c "ls -d $WORK/smoke/retired/*-node-3" >/dev/null || fail "node-3's data was not kept in /data/retired"
+sudo test ! -e "$WORK/smoke/retired/old-node-8" || fail "data retired 5 days ago was not deleted at start"
+sudo test -d "$WORK/smoke/retired/recent-node-9" || fail "data retired 84 hours ago was deleted at start"
 
 echo "== changing PORT_START moves the nodes, identities kept"
 docker stop -t 120 smoke >/dev/null && docker rm smoke >/dev/null
@@ -104,6 +152,10 @@ ids=$(peer_ids "$WORK/smoke")
 run_smoke 2 10920
 wait_for smoke 'Moving node-2 from UDP port 10911 to 10921' 1 60 || fail "nodes were not moved to the new ports"
 wait_for smoke 'Running 2 node' 1 60 || fail "moved nodes did not start"
+# The first start after node-3 was retired: its folder, unchanged for 5 days
+# before that, is still within its 3 days.
+sudo sh -c "ls -d $WORK/smoke/retired/*-node-3" >/dev/null \
+    || fail "node-3's data, retired at the last start, was deleted at this one"
 [[ "$(registry "$WORK/smoke" '[.nodes[].node_port] | sort | join(",")')" == "10920,10921" ]] || fail "ports not changed"
 [[ "$(peer_ids "$WORK/smoke")" == "$ids" ]] || fail "identities changed when moving ports"
 wait_for smoke '\[node-[0-9]+\].*Successfully connected to [1-9]' 2 || fail "moved nodes did not rejoin the seed"
@@ -131,6 +183,21 @@ done
 echo "evicted: $evicted of 3"
 (( evicted == 2 )) || fail "expected 2 of 3 nodes evicted (never the last), got $evicted"
 docker exec evict nodes status >/dev/null || fail "node manager not answering after evictions"
+
+echo "== nodes clear-evicted forgets the evicted nodes and keeps the last"
+# This container's /data is a tmpfs, so it is not restarted to see them replaced.
+cleared=$(docker exec evict nodes clear-evicted) || fail "nodes clear-evicted failed: $cleared"
+(( $(grep -c '^Cleared node-[0-9]*; restart the container to replace it$' <<<"$cleared" || true) == 2 )) \
+    || fail "nodes clear-evicted did not clear the 2 evicted nodes: $cleared"
+for _ in $(seq 1 10); do
+    remaining=$(docker exec evict jq '.nodes | length' /data/manager/ant/node_registry.json)
+    (( remaining == 1 )) && break
+    sleep 1
+done
+(( remaining == 1 )) || fail "the registry has $remaining nodes after nodes clear-evicted, expected 1"
+docker exec evict nodes status >/dev/null || fail "node manager not answering after nodes clear-evicted"
+[[ "$(docker exec evict nodes clear-evicted)" == "No removed nodes to clear" ]] \
+    || fail "a second nodes clear-evicted did not say there was nothing to clear"
 
 echo "== a data folder mounted noexec is refused; production mode warns above 2 nodes; the old RPC_URL is pointed out"
 # In production mode although COMMON sets testnet: of two -e for the same
