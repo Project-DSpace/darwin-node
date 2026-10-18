@@ -96,7 +96,7 @@ pub struct Cli {
     #[arg(long, env = "ANT_EVM_RPC_URL")]
     pub evm_rpc_url: Option<String>,
 
-    /// ANT token contract address on the custom EVM.
+    /// Payment token contract address on the custom EVM.
     /// Required iff --evm-rpc-url is set.
     #[arg(long, env = "ANT_EVM_PAYMENT_TOKEN")]
     pub evm_payment_token: Option<String>,
@@ -529,5 +529,88 @@ mod tests {
             "true"
         ])?);
         Ok(())
+    }
+
+    const DARWIN_RPC_URL: &str = "https://rpc.mainnet.chain.robinhood.com";
+    const DARWIN_TOKEN: &str = "0x511f76A3De41F000EC11EA4fD212fb3587c6cef3";
+    const DARWIN_VAULT: &str = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B";
+
+    /// The storage-node image hands every node its payment settings in these
+    /// variables (docker/Dockerfile, docker/entrypoint.sh). Read from the
+    /// command's definition: the other tests read the environment in parallel,
+    /// so this one leaves it alone.
+    #[test]
+    fn the_payment_settings_are_read_from_the_images_variables() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for (id, variable) in [
+            ("evm_rpc_url", "ANT_EVM_RPC_URL"),
+            ("evm_payment_token", "ANT_EVM_PAYMENT_TOKEN"),
+            ("evm_payment_vault", "ANT_EVM_PAYMENT_VAULT"),
+        ] {
+            let arg = command.get_arguments().find(|arg| arg.get_id() == id);
+            assert!(arg.is_some(), "no argument {id}");
+            assert_eq!(
+                arg.and_then(clap::Arg::get_env),
+                Some(std::ffi::OsStr::new(variable)),
+                "{id} must be read from {variable}"
+            );
+        }
+    }
+
+    /// The node manager in the image passes `--evm-network arbitrum-one` to
+    /// every node it starts. The three payment settings override it, so the
+    /// node checks payments in DARWIN through its vault.
+    #[test]
+    fn the_payment_settings_override_the_network_the_manager_passes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from([
+            "ant-node",
+            "--evm-network",
+            "arbitrum-one",
+            "--evm-rpc-url",
+            DARWIN_RPC_URL,
+            "--evm-payment-token",
+            DARWIN_TOKEN,
+            "--evm-payment-vault",
+            DARWIN_VAULT,
+        ])?;
+        let (config, _) = cli.into_config()?;
+        assert_eq!(
+            config.payment.evm_network,
+            super::EvmNetworkConfig::Custom {
+                rpc_url: DARWIN_RPC_URL.to_string(),
+                payment_token_address: DARWIN_TOKEN.to_string(),
+                payment_vault_address: DARWIN_VAULT.to_string(),
+            }
+        );
+        let network = config.payment.evm_network.into_evm_network();
+        assert_eq!(
+            network.payment_vault_address().to_string().to_lowercase(),
+            DARWIN_VAULT.to_lowercase()
+        );
+        assert_eq!(
+            network.payment_token_address().to_string().to_lowercase(),
+            DARWIN_TOKEN.to_lowercase()
+        );
+        assert_eq!(
+            network.rpc_url().as_str().trim_end_matches('/'),
+            DARWIN_RPC_URL
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_help_names_the_darwin_network() {
+        use clap::CommandFactory;
+
+        let short = Cli::command().render_help().to_string();
+        let long = Cli::command().render_long_help().to_string();
+        for help in [short, long] {
+            assert!(help.contains("Darwin"), "{help}");
+            assert!(!help.contains("Autonomi"), "{help}");
+            assert!(!help.contains("ANT token"), "{help}");
+        }
     }
 }
