@@ -14,6 +14,13 @@
 # existing tag. The signing key is the RELEASE_SIGNING_KEY_HEX secret of the
 # `release` environment, which only v*+ds.* tags can use.
 #
+# Nothing is published until the checks job has seen the tagged commit pass
+# both other workflows: its newest Test run (from the push to main, or one
+# run by hand) and the Build run from its push to main, waited for if they
+# are still going. The release environment's approval is asked for only
+# after that. scripts/check-workflows.sh, which the Build and Test workflows
+# run, fails if this file loses that order.
+#
 # Once the release is published, the latest job points the storage-node
 # image's :latest, which home operators run, at the image the Build workflow
 # made from the tagged commit when it was pushed to main. Nothing else moves
@@ -140,8 +147,63 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # The tagged commit must have passed the Test and Build workflows. Runs
+  # alongside the build job; publish needs both. Test cancels a run in
+  # progress when the same ref is pushed again, so a cancelled run fails this
+  # job: re-run it, then this job. The Build run found here is the one the
+  # latest job takes the image from.
+  checks:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    outputs:
+      build_run: ${{ steps.build_run.outputs.run }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # The newest run of the whole suite on this commit: from its push to
+      # main, or one run by hand (Test has no way to reuse another run).
+      - name: Wait for the Test workflow's run of this commit
+        run: |
+          run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/test.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f per_page=100 \
+            --jq '[.workflow_runs[] | select((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")] | max_by(.run_number) | .id // empty')
+          if [[ -z "$run" ]]; then
+            echo "::error::no Test run of $GITHUB_SHA from a push to main or by hand: run Test on it, then this job"
+            exit 1
+          fi
+          echo "Test run $run"
+          gh run watch "$run" --exit-status --interval 60 > /dev/null || true
+          conclusion=$(gh api "repos/$GH_REPO/actions/runs/$run" --jq '.conclusion // empty')
+          if [[ "$conclusion" != "success" ]]; then
+            echo "::error::Test run $run of $GITHUB_SHA ended '${conclusion:-unfinished}', not success: re-run it, then this job"
+            exit 1
+          fi
+
+      # Only a push run built the node binary from this commit itself; one
+      # run by hand may reuse another run's.
+      - name: Wait for the Build workflow's run of this commit
+        id: build_run
+        run: |
+          run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/build.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=push -f branch=main -f per_page=1 \
+            --jq '.workflow_runs[0].id // empty')
+          if [[ -z "$run" ]]; then
+            echo "::error::no Build run from a push of $GITHUB_SHA to main: tag a commit that Build ran for on main"
+            exit 1
+          fi
+          echo "Build run $run"
+          gh run watch "$run" --exit-status --interval 60 > /dev/null || true
+          conclusion=$(gh api "repos/$GH_REPO/actions/runs/$run" --jq '.conclusion // empty')
+          if [[ "$conclusion" != "success" ]]; then
+            echo "::error::Build run $run of $GITHUB_SHA ended '${conclusion:-unfinished}', not success: re-run it, then this job"
+            exit 1
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
   publish:
-    needs: build
+    needs: [build, checks]
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -203,9 +265,10 @@ jobs:
   # job of its own, after the approved publish, so it holds no signing key and
   # can be re-run alone. The image is the one that run smoke-tested and pushed
   # as :<commit>, found by the digest the run recorded, so a later run pushing
-  # the same commit tag can't change what :latest gets.
+  # the same commit tag can't change what :latest gets. The run is the one the
+  # checks job waited for: from the push of this commit to main, and green.
   latest:
-    needs: [build, publish]
+    needs: [build, checks, publish]
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -227,30 +290,10 @@ jobs:
             exit 1
           fi
 
-      # The run from the push of this commit to main, waited for if it is
-      # still going. Only a push run built the node binary from this commit
-      # itself; one run by hand may reuse another run's.
-      - name: Wait for the Build workflow's image of this commit
-        id: build_run
-        run: |
-          run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/build.yml/runs" \
-            -f head_sha="$GITHUB_SHA" -f event=push -f branch=main -f per_page=1 \
-            --jq '.workflow_runs[0].id // empty')
-          if [[ -z "$run" ]]; then
-            echo "::error::no Build run from a push of $GITHUB_SHA to main: tag a commit that Build ran for on main"
-            exit 1
-          fi
-          echo "Build run $run"
-          if ! gh run watch "$run" --exit-status --interval 30 > /dev/null; then
-            echo "::error::Build run $run did not succeed: re-run it, then this job"
-            exit 1
-          fi
-          echo "run=$run" >> "$GITHUB_OUTPUT"
-
       - name: Read the image's digest
         id: image
         env:
-          RUN: ${{ steps.build_run.outputs.run }}
+          RUN: ${{ needs.checks.outputs.build_run }}
         run: |
           if ! gh run download "$RUN" --name storage-node-digest --dir "$RUNNER_TEMP/digest"; then
             echo "::error::Build run $RUN has no storage-node-digest artifact (expired?): re-run it, then this job"
@@ -283,7 +326,7 @@ jobs:
       - name: Point latest at it
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
-          RUN: ${{ steps.build_run.outputs.run }}
+          RUN: ${{ needs.checks.outputs.build_run }}
         run: |
           docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
           now=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)

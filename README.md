@@ -153,7 +153,16 @@ never ran.
   that key. The storage-node image's `:latest` moves
   only when a release is published (from ds.10): release.yml then points it
   at the image the Build workflow made from the release's commit. A push to
-  main publishes the image as `:<commit>` only.
+  main publishes the image as `:<commit>` only. From ds.13 a release
+  publishes nothing until the tagged commit's newest Test run (from its push
+  to main, or one run by hand) and its Build run from the push to main have
+  succeeded: release.yml's `checks` job waits for both, and the release's
+  approval is asked for only after that. `scripts/check-workflows.sh`, which
+  the Build and Test workflows run, fails unless `.github/workflows` holds
+  only build.yml, release.yml and test.yml, every action is pinned to a
+  commit, and release.yml keeps its tag trigger, empty default permissions,
+  key check, release environment, that order of jobs and the only write of
+  `:latest`.
 - **Three crates are vendored**, each with a `VENDORED.md` saying what it
   is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
   its only change; `vendor/webrtc` is webrtc 0.14.0, whose

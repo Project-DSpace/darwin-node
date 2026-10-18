@@ -49,6 +49,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # The workflow files keep what releases rely on: only these three
+      # workflows, every action pinned to a commit, and release.yml's tags,
+      # permissions, key check and the checks its publish waits for (see the
+      # script).
+      - name: Check the workflows
+        shell: bash
+        run: bash scripts/check-workflows.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
         with:
