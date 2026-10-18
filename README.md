@@ -23,7 +23,12 @@ never ran.
   bootstrap servers and production mode, and that the binary reads every
   `ANT_*` variable the image sets; tests in `src/bin/ant-node/cli.rs` check
   the three names, and that they override the `--evm-network arbitrum-one`
-  the image's node manager passes.
+  the image's node manager passes. From ds.13 a node logs, as it starts, the
+  token, vault and RPC host it is paid through, and never the rest of the
+  RPC's URL, which can carry an API key, there or in the config it logs. The
+  image's smoke test checks its settings, that its bootstrap file names no
+  peers and that every node names DARWIN's token and vault, and the Build
+  workflow that the release binary reads the three variables.
 - **Batch payments are refused** (from ds.9). Nodes take per-chunk
   (single-node) payments only. A merkle candidate quote request, versioned
   or not, is answered `QuoteFailed("merkle (batch) payments are not
@@ -99,6 +104,24 @@ never ran.
   one fails the tests. A build with the switch turned off doesn't compile
   while the migration is here (an assertion in `src/storage/migration.rs`),
   and `tests/fork_pins.rs` checks that a started node withholds the penalty.
+  Tests of a built node (`src/node.rs`) check the migration state it
+  announces in its user agent, with and without a `chunks.mdb`.
+- **Nodes keep listings** (from ds.2) of the files stored with an
+  envelope: a node records the payment of each envelope chunk it stores,
+  found from the proof that comes with a PUT or a fresh replication offer,
+  keeping only the payment fields the envelope shows, and serves listings on
+  `listings.v2` (see `vendor/ant-listings`). Tests check the chunk handler's
+  hook (`src/listings/hooks_tests.rs`), that a built node's handler and
+  replication engine share one listing service (`src/node.rs`), and that a
+  paid envelope stored on one node is served by at least 4 of its close
+  group within 30 seconds (`tests/e2e/listings.rs`), and the local devnet's
+  nodes keep and serve listings (`tests/webrtc_direct_devnet.rs`).
+  `golden_envelopes_list_as_the_client_writes_them` reads envelopes and a
+  record exactly as darwin-client writes them, from constants
+  (`src/listings/golden.rs`) darwin-client pins too.
+  `scripts/test_e2e_listings.sh` runs darwin-client against a local devnet
+  of these nodes: weekly in the Test workflow, against its main branch, and
+  by hand.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself. From ds.13 the binary
@@ -111,7 +134,10 @@ never ran.
   takes at most 2 nodes from one IP address, and 5 from one /24 subnet, in
   each bucket and among the 20 nodes nearest that node. More nodes on one IP
   are turned away from some of those places and add load for less storage,
-  so run 2 nodes per IP.
+  so run 2 nodes per IP. From ds.13 the image dates each node folder it
+  retires, so the folder is kept 3 days from its retirement however long it
+  sat unchanged before; the smoke test checks that, and that
+  `nodes clear-evicted` forgets nodes the disk-pressure eviction removed.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
   releases without credentials, and orders `+ds.N` builds by their number,
@@ -131,7 +157,9 @@ never ran.
   and `vendor/ant-listings` is darwin-listings v0.2.1, unchanged: the
   envelope format, listings, their payment checks and the listings
   protocol. `[patch.crates-io]` puts the first two in place of the
-  crates.io releases. saorsa-core and saorsa-transport are their crates.io
+  crates.io releases. `vendor/ant-listings` is a workspace member, so its
+  own tests run under this repository's `Cargo.lock` in the Test workflow,
+  and the Build workflow checks its git objects against its `VENDORED.md`. saorsa-core and saorsa-transport are their crates.io
   releases, as upstream's are.
 - **Release builds link self_encryption** (GPL-3.0 with MaidSafe's linking
   exception), which upstream's don't: `vendor/ant-listings` reads the data
@@ -689,8 +717,10 @@ The goal is not to maintain classical crypto forever, but to provide a **clean m
 ### Test Coverage
 
 Run `cargo test --features test-utils` (the EVM tests need Foundry's
-`anvil`). The library alone has about 1,300 tests. CI runs the suite weekly
-and by hand, not on every push (`.github/workflows/test.yml`).
+`anvil`). The library alone has about 1,400 tests. CI runs the suite on
+every push to main, weekly and by hand (`.github/workflows/test.yml`), and
+weekly, or by hand when asked, `scripts/test_e2e_listings.sh` against
+darwin-client.
 
 ### Data Types Supported
 
