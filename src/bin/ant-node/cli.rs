@@ -234,7 +234,7 @@ impl Cli {
     ///
     /// 1. `--bootstrap` CLI argument (or `ANT_BOOTSTRAP` env var)
     /// 2. `bootstrap` field in a `--config` file
-    /// 3. Auto-discovered `bootstrap_peers.toml` from well-known paths
+    /// 3. A `bootstrap_peers.toml` at `$ANT_BOOTSTRAP_PEERS_PATH` or beside the binary
     /// 4. Empty list
     ///
     /// # Errors

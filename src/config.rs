@@ -695,10 +695,10 @@ impl BootstrapPeersConfig {
     /// Search order (first match wins):
     /// 1. `$ANT_BOOTSTRAP_PEERS_PATH` environment variable (path to file)
     /// 2. Same directory as the running executable
-    /// 3. Platform config directory (`~/.config/ant/` on Linux,
-    ///    `~/Library/Application Support/ant/` on macOS,
-    ///    `%APPDATA%\ant\` on Windows)
-    /// 4. System config: `/etc/ant/` (Unix only)
+    ///
+    /// The folders other `ant` programs share are not searched: the platform
+    /// config directory, where Autonomi's installer writes its own network's
+    /// bootstrap peers, and `/etc/ant/`.
     ///
     /// Returns `None` if no file is found in any location.
     #[must_use]
@@ -735,6 +735,13 @@ impl BootstrapPeersConfig {
     }
 
     /// Build the ordered list of candidate paths to search.
+    ///
+    /// Only the file `$ANT_BOOTSTRAP_PEERS_PATH` names and the one beside the
+    /// running executable. Upstream also searches the platform config
+    /// directory (`~/.config/ant/` on Linux) and `/etc/ant/`, which this fork
+    /// leaves out: Autonomi's installer writes its own network's bootstrap
+    /// peers to the first, so a node started without `--bootstrap` on such a
+    /// machine would join Autonomi's network instead of this one.
     fn search_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
 
@@ -748,17 +755,6 @@ impl BootstrapPeersConfig {
             if let Some(exe_dir) = exe.parent() {
                 paths.push(exe_dir.join(BOOTSTRAP_PEERS_FILENAME));
             }
-        }
-
-        // 3. Platform config directory.
-        if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "ant") {
-            paths.push(proj_dirs.config_dir().join(BOOTSTRAP_PEERS_FILENAME));
-        }
-
-        // 4. System config (Unix only).
-        #[cfg(unix)]
-        {
-            paths.push(PathBuf::from("/etc/ant").join(BOOTSTRAP_PEERS_FILENAME));
         }
 
         paths
@@ -947,5 +943,24 @@ mod tests {
                 .any(|p| p.file_name().is_some_and(|f| f == BOOTSTRAP_PEERS_FILENAME)),
             "search paths should include a candidate with the bootstrap peers filename"
         );
+    }
+
+    /// A bare node looks for a bootstrap peers file only beside itself, never
+    /// in the folders other `ant` programs share, where Autonomi's installer
+    /// leaves its own network's peers. Serial: it clears the override, which
+    /// the discovery test sets.
+    #[test]
+    #[serial]
+    fn bootstrap_peers_are_looked_for_only_beside_the_binary() {
+        let saved = std::env::var_os(BOOTSTRAP_PEERS_ENV);
+        std::env::remove_var(BOOTSTRAP_PEERS_ENV);
+        let paths = BootstrapPeersConfig::search_paths();
+        if let Some(saved) = saved {
+            std::env::set_var(BOOTSTRAP_PEERS_ENV, saved);
+        }
+
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let exe_dir = exe.parent().expect("the test binary's folder");
+        assert_eq!(paths, vec![exe_dir.join(BOOTSTRAP_PEERS_FILENAME)]);
     }
 }
