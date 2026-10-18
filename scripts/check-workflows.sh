@@ -16,8 +16,8 @@
 # - its publish job runs in the release environment and needs build and
 #   checks;
 # - its latest job needs checks and publish;
-# - neither publish nor latest has an if:, and nothing in release.yml
-#   continues on error, so neither job can run after a failed need;
+# - nothing in release.yml has an if: or continues on error, so no job can
+#   run after a failed need and no step can skip a check;
 # - nothing but release.yml's latest job names the image's :latest tag.
 #
 # A release runs release.yml as it is at the tagged commit, so this can't
@@ -142,14 +142,14 @@ else
         fi
     done
 
-    # Neither runs after a failed need: a condition on publish or latest
-    # (if: always(), say) would run it anyway, and so would a job or step
-    # that continues on error.
-    for name in publish latest; do
-        if grep -qE '^[[:space:]]+(-[[:space:]]+)?if:' <<<"$(job "${name}")"; then
-            problem "release.yml's ${name} job must have no if: (a condition can run it after a failed need)"
-        fi
-    done
+    # A job runs only once the jobs it needs succeeded, and a step only once
+    # the steps before it did. A condition would change that: if: always()
+    # on publish or latest runs it after a failed need, and if: false on a
+    # step of the checks or build job skips that check. So would a job or
+    # step that continues on error.
+    while IFS= read -r hit; do
+        problem "release.yml must have no if: (a condition can run a job after a failed need, or skip a check): ${hit}"
+    done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?if:' "${RELEASE}" || true)
     while IFS= read -r hit; do
         problem "release.yml must not continue on error: ${hit}"
     done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?continue-on-error:' "${RELEASE}" || true)
