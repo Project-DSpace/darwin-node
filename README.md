@@ -25,9 +25,14 @@ never ran.
   accepted; pay per chunk")` before anything is signed: a batch is paid
   on-chain before any PUT, so refusing the quote is what keeps a client from
   paying for storage it won't get. A merkle proof on a PUT or a fresh
-  replication offer is refused with the same message. Neighbour-sync repair
-  carries no proof, so chunks already stored keep being repaired. Upstream's
-  merkle code stays compiled, unused, so merges stay cheap.
+  replication offer, for a chunk or a pointer, is refused with the same
+  message, and a pointer's final state is paid for before its close group is
+  asked about it. Neighbour-sync repair carries no proof, so chunks already
+  stored keep being repaired. Upstream's merkle code stays compiled, unused,
+  so merges stay cheap. Tests in `src/replication/retention/census.rs` fail
+  if production code reaches it (`the_merkle_payment_code_is_not_reached`),
+  or if the vendored protocol gains a message or proof type nobody has
+  reviewed (`the_wire_messages_are_the_reviewed_ones`).
 - **Payment checks fall back across RPCs** (from ds.8). A node reads a
   storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a
@@ -35,7 +40,8 @@ never ran.
   was paid, settles the check. Upstream reads once, through one RPC, so a
   provider answering `-32005 the network is busy` made nodes refuse paid
   chunks. Reads of listings' payments have fallen back the same way since
-  ds.4.
+  ds.4. A census test fails if the vault is read, or the node's RPC address
+  taken, anywhere new.
 - **Relay serving can be turned off** (from ds.10). saorsa-core gives every
   node a MASQUE relay server, on which any peer can open a session and have
   the node send UDP for it to any address. `ANT_RELAY_SERVING=false` (or
@@ -51,7 +57,8 @@ never ran.
   when it fell further behind than that, and the node then answered no
   request while it stayed connected and looked healthy. This one logs a
   warning, skips the events it missed and carries on, as the replication
-  engine already did; only a closed stream ends it.
+  engine already did; only a closed stream ends it. A census test fails if
+  the loop stops reading through it.
 - **Nodes keep data while the disk has room** (from ds.11). A node keeps the records and
   pointers it holds after it stops being responsible for them, and goes on
   serving them and offering them to their close group. Its prune passes erase
@@ -80,7 +87,10 @@ never ran.
   This fork reverts #218, so a node that still has a `chunks.mdb` goes on
   migrating, and that penalty stays suspended
   (`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY` in
-  `src/replication/config.rs`), until every node has finished migrating.
+  `src/replication/config.rs`), until every node has finished migrating. A
+  census test lists the six places that can apply that penalty, each through
+  the one function that checks the switch, so a change that drops or adds
+  one fails the tests.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
   The image passes Darwin's bootstrap servers itself.
