@@ -18,7 +18,12 @@ never ran.
   image sets this with `ANT_EVM_RPC_URL`, `ANT_EVM_PAYMENT_TOKEN` and
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
   (Autonomi's contracts): run it on Darwin only with those three set (see
-  [Join the Network](#join-the-network)).
+  [Join the Network](#join-the-network)). `tests/darwin_network.rs` checks
+  that the image sets DARWIN's token and vault, Robinhood Chain's RPC, the
+  bootstrap servers and production mode, and that the binary reads every
+  `ANT_*` variable the image sets; tests in `src/bin/ant-node/cli.rs` check
+  the three names, and that they override the `--evm-network arbitrum-one`
+  the image's node manager passes.
 - **Batch payments are refused** (from ds.9). Nodes take per-chunk
   (single-node) payments only. A merkle candidate quote request, versioned
   or not, is answered `QuoteFailed("merkle (batch) payments are not
@@ -41,7 +46,8 @@ never ran.
   provider answering `-32005 the network is busy` made nodes refuse paid
   chunks. Reads of listings' payments have fallen back the same way since
   ds.4. A census test fails if the vault is read, or the node's RPC address
-  taken, anywhere new.
+  taken, anywhere new, and `a_settlement_read_survives_a_busy_rpc` reads a
+  payment through a stub RPC that answers busy first.
 - **Relay serving can be turned off** (from ds.10). saorsa-core gives every
   node a MASQUE relay server, on which any peer can open a session and have
   the node send UDP for it to any address. `ANT_RELAY_SERVING=false` (or
@@ -90,10 +96,16 @@ never ran.
   `src/replication/config.rs`), until every node has finished migrating. A
   census test lists the six places that can apply that penalty, each through
   the one function that checks the switch, so a change that drops or adds
-  one fails the tests.
+  one fails the tests. A build with the switch turned off doesn't compile
+  while the migration is here (an assertion in `src/storage/migration.rs`),
+  and `tests/fork_pins.rs` checks that a started node withholds the penalty.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
   is empty on purpose, so an unconfigured node can't join Autonomi's network.
-  The image passes Darwin's bootstrap servers itself.
+  The image passes Darwin's bootstrap servers itself. From ds.13 the binary
+  reads a bootstrap peers file only from `$ANT_BOOTSTRAP_PEERS_PATH` or beside
+  itself, not from the `ant` folders it shares with Autonomi's programs (see
+  [Bootstrap Peers File](#bootstrap-peers-file)). `tests/fork_pins.rs`
+  checks that the shipped file and every preset name no peers.
 - **Run nodes with the Docker image**: [docker/README.md](docker/README.md).
   The network runs in production mode, in which each node's routing table
   takes at most 2 nodes from one IP address, and 5 from one /24 subnet, in
@@ -102,7 +114,13 @@ never ran.
   so run 2 nodes per IP.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
-  releases without credentials. The storage-node image's `:latest` moves
+  releases without credentials, and orders `+ds.N` builds by their number,
+  so a node takes only a higher build or a newer upstream version (tests in
+  `src/upgrade/monitor/ds_ordering.rs` and
+  `src/upgrade/apply/ds_ordering.rs`). `tests/fork_pins.rs` pins the
+  repository and the SHA-256 of the release key, and the Build workflow, as
+  release.yml does for a tag, checks that the key compiled into the node is
+  that key. The storage-node image's `:latest` moves
   only when a release is published (from ds.10): release.yml then points it
   at the image the Build workflow made from the release's commit. A push to
   main publishes the image as `:<commit>` only.
@@ -128,6 +146,9 @@ never ran.
 - **Rate limits**: browser (WebRTC Direct) sessions and requests are
   limited, and so are the replication requests nodes send each other: a
   node accepts only so many of each kind at once and turns the rest away.
+  One IP address (or IPv6 /64) may open 12 new browser sessions at once,
+  then 6 a minute (from ds.5; pinned by `tests/fork_pins.rs` and a test in
+  `src/web_rtc.rs`).
   New connections over saorsa-core's rate per IP are only logged, and
   unpaid storage and quote requests aren't limited; see [Rate
   Limiting](#rate-limiting).
@@ -1099,10 +1120,13 @@ peers = [
 |----------|--------|------|
 | 1 | `$ANT_BOOTSTRAP_PEERS_PATH` env var | Explicit path to file |
 | 2 | Executable directory | `<exe_dir>/bootstrap_peers.toml` |
-| 3 | Platform config dir | Linux: `~/.config/ant/bootstrap_peers.toml` |
-|   |                      | macOS: `~/Library/Application Support/ant/bootstrap_peers.toml` |
-|   |                      | Windows: `%APPDATA%\ant\bootstrap_peers.toml` |
-| 4 | System config (Unix) | `/etc/ant/bootstrap_peers.toml` |
+
+Upstream also searches the platform config directory (`~/.config/ant/` on
+Linux, `~/Library/Application Support/ant/` on macOS, `%APPDATA%\ant\` on
+Windows) and `/etc/ant/`. This fork doesn't (from ds.13): those folders are
+shared with Autonomi's own programs, and Autonomi's installer writes its
+network's bootstrap peers to the first, so a node started there without
+`--bootstrap` would join Autonomi's network.
 
 **Bootstrap peer precedence** (highest wins):
 1. `--bootstrap` CLI argument or `ANT_BOOTSTRAP` env var
