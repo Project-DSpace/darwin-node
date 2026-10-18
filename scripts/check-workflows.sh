@@ -26,6 +26,8 @@
 # A release runs release.yml as it is at the tagged commit, so this can't
 # stop a tag on a commit that changed it; it makes that commit's Build and
 # Test runs fail, and the release waits for both.
+#
+# scripts/test_check_workflows.sh tests it, in the Test workflow.
 
 set -euo pipefail
 

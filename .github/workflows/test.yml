@@ -4,7 +4,8 @@
 # tagged commit's newest Test run (from its push to main, or one run by hand
 # without the listings cross-test) and its Build run from the push to main
 # have succeeded. Each run first checks that the workflows keep that order
-# (scripts/check-workflows.sh).
+# (scripts/check-workflows.sh), and tests that check
+# (scripts/test_check_workflows.sh).
 #
 # Upstream ran these on pull requests (their ci.yml, removed in 09d41b4).
 # It runs on every push to main, weekly and by hand. (While this repo was
@@ -68,6 +69,12 @@ jobs:
       - name: Check the workflows
         shell: bash
         run: bash scripts/check-workflows.sh
+
+      # That check fails on each change it guards against, and release.yml's
+      # checks job picks the Test run it should: see the script.
+      - name: Test the workflow check
+        shell: bash
+        run: bash scripts/test_check_workflows.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
