@@ -1,9 +1,10 @@
 # Runs the test suite: the library and binaries, then each integration test.
 # Kept apart from build.yml so a failing test doesn't stop the image from
 # being built. A release waits for both: release.yml publishes only once the
-# tagged commit's newest Test run (from its push to main, or one run by hand)
-# and its Build run from the push to main have succeeded. Each run first
-# checks that the workflows keep that order (scripts/check-workflows.sh).
+# tagged commit's newest Test run (from its push to main, or one run by hand
+# without the listings cross-test) and its Build run from the push to main
+# have succeeded. Each run first checks that the workflows keep that order
+# (scripts/check-workflows.sh).
 #
 # Upstream ran these on pull requests (their ci.yml, removed in 09d41b4).
 # It runs on every push to main, weekly and by hand. (While this repo was
@@ -16,6 +17,12 @@
 # a local devnet with listings and its own Anvil chain.
 
 name: Test
+
+# A run by hand is named for whether it runs the listings cross-test, which
+# also tests darwin-client. The release's checks job takes a run by hand only
+# without it, so a later cross-test run can't take the place of a green run
+# of the commit's suite. Other runs keep GitHub's names (an empty run-name).
+run-name: ${{ github.event_name == 'workflow_dispatch' && (inputs.listings_cross_test && 'Test by hand, with the listings cross-test' || 'Test by hand') || '' }}
 
 on:
   push:

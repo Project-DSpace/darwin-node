@@ -16,10 +16,11 @@
 #
 # Nothing is published until the checks job has seen the tagged commit pass
 # both other workflows: its newest Test run (from the push to main, or one
-# run by hand) and the Build run from its push to main, waited for if they
-# are still going. The release environment's approval is asked for only
-# after that. scripts/check-workflows.sh, which the Build and Test workflows
-# run, fails if this file loses that order.
+# run by hand without the listings cross-test) and the Build run from its
+# push to main, waited for if they are still going. The release
+# environment's approval is asked for only after that.
+# scripts/check-workflows.sh, which the Build and Test workflows run, fails
+# if this file loses that order.
 #
 # Once the release is published, the latest job points the storage-node
 # image's :latest, which home operators run, at the image the Build workflow
@@ -162,15 +163,18 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      # The newest run of the whole suite on this commit: from its push to
-      # main, or one run by hand (Test has no way to reuse another run).
+      # The newest run of this commit's suite alone: from its push to main,
+      # or one run by hand without the listings cross-test (Test has no way
+      # to reuse another run). test.yml names a run by hand for whether it
+      # runs the cross-test, which also tests darwin-client, so a later run
+      # with it can't take the place of a green run of the suite.
       - name: Wait for the Test workflow's run of this commit
         run: |
           run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/test.yml/runs" \
             -f head_sha="$GITHUB_SHA" -f per_page=100 \
-            --jq '[.workflow_runs[] | select((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")] | max_by(.run_number) | .id // empty')
+            --jq '[.workflow_runs[] | select((.event == "push" and .head_branch == "main") or (.event == "workflow_dispatch" and .display_title == "Test by hand"))] | max_by(.run_number) | .id // empty')
           if [[ -z "$run" ]]; then
-            echo "::error::no Test run of $GITHUB_SHA from a push to main or by hand: run Test on it, then this job"
+            echo "::error::no Test run of $GITHUB_SHA from a push to main, or by hand without the listings cross-test: run Test on it, then this job"
             exit 1
           fi
           echo "Test run $run"

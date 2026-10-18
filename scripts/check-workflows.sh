@@ -13,6 +13,9 @@
 #   with sign/release-signing-key.pub;
 # - its checks job waits for the tagged commit's Test and Build runs and
 #   fails unless both succeeded;
+# - the Test run it takes is from the push to main, or one run by hand that
+#   test.yml names "Test by hand": one without the listings cross-test,
+#   which runs only weekly or when a run by hand asks for it;
 # - its publish job runs in the release environment and needs build and
 #   checks;
 # - its latest job needs checks and publish;
@@ -29,6 +32,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 DIR=.github/workflows
 RELEASE="${DIR}/release.yml"
+TEST="${DIR}/test.yml"
 PROBLEMS=0
 
 problem() {
@@ -36,23 +40,23 @@ problem() {
     PROBLEMS=$((PROBLEMS + 1))
 }
 
-# A top-level section of release.yml: its key line and the lines under it,
-# leaving out comments and blank lines.
+# A top-level section of a workflow, release.yml unless another is given:
+# its key line and the lines under it, leaving out comments and blank lines.
 section() {
     awk -v key="$1" '
         /^[^ #]/ { inside = (index($0, key ":") == 1) }
         inside && !/^[ \t]*(#|$)/ { print }
-    ' "${RELEASE}"
+    ' "${2:-${RELEASE}}"
 }
 
-# A job of release.yml: its key line and the lines under it, leaving out
-# comments and blank lines.
+# A job of a workflow, release.yml unless another is given: its key line and
+# the lines under it, leaving out comments and blank lines.
 job() {
     awk -v name="$1" '
         /^[^ #]/ { in_jobs = ($0 ~ /^jobs:/); current = ""; next }
         in_jobs && /^  [A-Za-z0-9_-]+:/ { current = $1; sub(/:$/, "", current) }
         in_jobs && current == name && !/^[ \t]*(#|$)/ { print }
-    ' "${RELEASE}"
+    ' "${2:-${RELEASE}}"
 }
 
 # The jobs a job of release.yml needs, one a line, from `needs: x` or
@@ -123,6 +127,15 @@ else
         problem "release.yml's checks job must fail unless both runs succeeded"
     fi
 
+    # The Test run it takes is the newest from the push to main, or by hand
+    # under the name test.yml gives a run without the listings cross-test
+    # (below). A later run with the cross-test, which also tests
+    # darwin-client, can't take its place.
+    pick='--jq '\''[.workflow_runs[] | select((.event == "push" and .head_branch == "main") or (.event == "workflow_dispatch" and .display_title == "Test by hand"))] | max_by(.run_number) | .id // empty'\'''
+    if ! grep -qF -- "${pick}" <<<"${checks}"; then
+        problem "release.yml's checks job must take the Test run from the push to main, or one by hand without the listings cross-test (missing: ${pick})"
+    fi
+
     # Publishing waits for the build and the checks, in the release
     # environment, whose reviewers approve it.
     if ! grep -qx '    environment: release' <<<"$(job publish)"; then
@@ -155,6 +168,23 @@ else
     done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?continue-on-error:' "${RELEASE}" || true)
 fi
 
+if [[ ! -f "${TEST}" ]]; then
+    problem "${TEST} is missing"
+else
+    # A run by hand is named for whether it runs the listings cross-test, and
+    # the cross-test runs only weekly or when a run by hand asks for it. So a
+    # run named "Test by hand", which release.yml's checks job may take,
+    # tested this commit alone.
+    expected_name="run-name: \${{ github.event_name == 'workflow_dispatch' && (inputs.listings_cross_test && 'Test by hand, with the listings cross-test' || 'Test by hand') || '' }}"
+    if [[ "$(section run-name "${TEST}")" != "${expected_name}" ]]; then
+        problem "test.yml must name a run by hand for whether it runs the listings cross-test (${expected_name}); it has: $(section run-name "${TEST}" | tr '\n' ' ')"
+    fi
+    expected_if="    if: \${{ github.event_name == 'schedule' || inputs.listings_cross_test }}"
+    if [[ "$(job listings-cross-test "${TEST}" | grep -E '^    if:' || true)" != "${expected_if}" ]]; then
+        problem "test.yml's listings-cross-test job must run only weekly or when a run by hand asks for it (${expected_if#    })"
+    fi
+fi
+
 # Only release.yml's latest job names the image's :latest tag, outside
 # comments.
 while IFS= read -r hit; do
@@ -177,4 +207,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded; only its latest job moves :latest."
+echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; only its latest job moves :latest."
