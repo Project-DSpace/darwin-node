@@ -13,21 +13,32 @@
 #    from the chain, and every way to download it: by address (or the
 #    withheld message), with --datamap, and with --proof
 # 4. Uploads with a name and content type, on private files too
-# 5. Uploads a file of 64 or more chunks: merkle batches, then one per-chunk
-#    payment for the remainder and the envelope
-# 6. Checks `ant listings`: exactly the uploads in the index, in index order,
-#    hidden fields absent, the right check levels, `--since`
-# 7. Checks `ant listing <address>` for the uploads outside the index
-# 8. Writes proofs with `ant file prove` and downloads with them
-# 9. Stops the nodes (Anvil keeps running) and checks every proof with
-#    `ant file verify` from the chain alone; tampered proofs must fail
-# 10. Stops Anvil and reports results
+# 5. Checks that `--merkle` is refused before anything is paid, and uploads a
+#    file of 64 or more chunks, paid per chunk in transactions of up to 64,
+#    the envelope in the last
+# 6. Uploads two folders with `darwin manifest create`, with no flags and
+#    with `--public`: each file in an envelope showing every payment field,
+#    its record saved in <manifest>.records/ and checked with
+#    `darwin file verify`. `darwin manifest export --compact` of the
+#    `--public` one publishes nothing and the result downloads; of the
+#    private one it is refused
+# 7. Checks that `darwin chunk put` and `darwin node` are refused, and pay
+#    and write nothing
+# 8. Checks `darwin listings`: exactly the uploads in the index, in index
+#    order, hidden fields absent, the right check levels, `--since`
+# 9. Checks `darwin listing <address>` for the uploads outside the index,
+#    the manifests' files among them
+# 10. Writes proofs with `darwin file prove` and downloads with them
+# 11. Stops the nodes (Anvil keeps running) and checks every proof with
+#    `darwin file verify` from the chain alone; tampered proofs must fail
+# 12. Stops Anvil and reports results
 #
 # Exit 0 if ALL checks pass, non-zero otherwise.
 #
 # Needs cargo, Foundry (anvil and cast on PATH) and python3, on Linux, macOS
-# or WSL. ant-devnet and ant must be built against the same ant-listings
-# (version 2 envelopes, topic listings.v2).
+# or WSL. ant-devnet and darwin must be built against the same ant-listings
+# (version 2 envelopes, topic listings.v2). The Test workflow runs it weekly
+# and by hand against darwin-client's main branch, or a branch it is given.
 #
 # The devnet's nodes start dual-stack. On a host without IPv6 they fail to
 # start; add `.ipv6(false)` to the core config in `src/devnet.rs`
@@ -38,7 +49,7 @@
 #   ANT_TEST_SKIP_BUILD=1        don't build; use ANT_DEVNET and ANT_CLI
 #   ANT_DEVNET, ANT_CLI          binaries (default: the builds below)
 #   ANT_TEST_CARGO_PROFILE       cargo profile to build (default: release)
-#   ANT_TEST_DEVNET_NODES        node count (default: 25; merkle needs 16+)
+#   ANT_TEST_DEVNET_NODES        node count (default: 25)
 #   ANT_TEST_BOOTSTRAP_COUNT     bootstrap nodes (default: 3)
 #   ANT_TEST_DEVNET_LOG_LEVEL    devnet log level (default: warn)
 #   ANT_TEST_STABILIZE_SECS      wait after the devnet starts (default: 15)
@@ -192,8 +203,8 @@ py() {
     "${PY}" "${CHECK_PY}" "$@"
 }
 
-# Run the `ant` CLI against the devnet: `run_ant pay|free NAME ARGS...`.
-# stdout goes to $OUT_DIR/NAME.out and stderr to NAME.err; returns ant's
+# Run the `darwin` CLI against the devnet: `run_ant pay|free NAME ARGS...`.
+# stdout goes to $OUT_DIR/NAME.out and stderr to NAME.err; returns darwin's
 # exit status. `pay` hands it the devnet wallet's key. The client keeps its
 # state (peer cache, payment checkpoints, kept records) under the work
 # directory, away from the user's own.
@@ -254,7 +265,7 @@ fi
 
 # The checks on the CLI's JSON output and the chain, in Python.
 cat > "${CHECK_PY}" <<'PYEOF'
-"""Checks for test_e2e_listings.sh. Each command reads the `ant` CLI's JSON
+"""Checks for test_e2e_listings.sh. Each command reads the `darwin` CLI's JSON
 output (and the chain, through `cast`), prints values for the script as shell
 assignments, prints what doesn't match the upload's choices to stderr as
 `PROBLEM:` lines, and exits 1 if there is any."""
@@ -272,7 +283,7 @@ TEXT = {"tx-hash": "tx hash", "block": "block number", "timestamp": "block times
         "log-index": "log index", "quote": "quote"}
 GIVES = {"tx-hash": "the transaction", "block": "the block", "timestamp": "the time",
          "log-index": "the log index", "quote": "the quote"}
-# The key each shown field has in `ant listings --json`.
+# The key each shown field has in `darwin listings --json`.
 KEY = {"tx-hash": "tx_hash", "block": "block_number", "timestamp": "block_timestamp",
        "log-index": "log_index", "quote": "quote_hash"}
 TX_WITHOUT_QUOTE = ("tx hash shown without the quote: the wallet and time stay public, "
@@ -285,8 +296,7 @@ SHOWS_WALLET = ("the payment fields shown give away the paying wallet to anyone 
 INDEX_SHOWS_WALLET = ("a listing in the index shows roughly when it was paid, which can be "
                       "matched against the vault's payments to find the paying wallet")
 MAX_CHUNK_SIZE = 4_190_208       # self_encryption: a file under 3 of these is 3 chunks
-MERKLE_EXACT_MIN_BATCH = 32      # an upload's chunks left under this are paid per chunk
-MERKLE_THRESHOLD = 64            # from this many content chunks, Auto pays in batches
+PAYMENT_WAVE = 64                # chunks paid per chunk in one transaction, at most
 HOUR = 3600
 
 PROBLEMS = []
@@ -362,7 +372,7 @@ def given_away(hidden, by, extent):
 
 
 def warnings(readable, in_index, bits, has_metadata):
-    """The warnings `ant file upload` gives, in its order, written out here
+    """The warnings `darwin file upload` gives, in its order, written out here
     independently of the client's code."""
     if not needs_envelope(in_index, bits, has_metadata):
         return []
@@ -408,7 +418,7 @@ def expect(data, key, want, where=""):
 # ---------- an upload ----------
 
 def cmd_upload(path, readable, in_index, bits, file, name, content_type, min_content):
-    """`ant --json file upload`: the choices, the envelope, the saved files,
+    """`darwin --json file upload`: the choices, the envelope, the saved files,
     the warnings and the chunk count."""
     j = load(path)
     readable, in_index, bits = flag(readable), flag(in_index), int(bits)
@@ -504,9 +514,12 @@ def cast_json(cast, *args):
 
 
 def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
-    """The vault transactions in blocks first..last, read with cast: one
-    per-chunk payment for everything (`single`), or merkle batches and one
-    per-chunk payment for the remainder and the envelope (`large`)."""
+    """The vault transactions in blocks first..last, read with cast. Every
+    upload pays per chunk, in transactions of up to PAYMENT_WAVE chunks: one
+    for an upload under 64 chunks (`single`), as many as its chunks need for
+    a larger one, the envelope in the last (`waves`), and one for each file
+    of a manifest (`each:N`). Each chunk is paid once, and a merkle batch
+    payment is a problem in every mode."""
     vault, dpm_topic, mpm_topic = vault.lower(), dpm_topic.lower(), mpm_topic.lower()
     total = int(total)
     txs = []
@@ -532,33 +545,30 @@ def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
             problem(f"vault transaction {tx['hash']} failed")
         if not tx["payments"] and not tx["leaves"]:
             problem(f"vault transaction {tx['hash']} logged no payment")
-    per_chunk = [tx for tx in txs if tx["payments"]]
     batches = [tx for tx in txs if tx["leaves"]]
+    if batches:
+        problem(f"{len(batches)} merkle batch payment(s), for "
+                f"{sum(tx['leaves'] for tx in batches)} chunks: uploads pay per chunk")
+    per_chunk = [tx for tx in txs if tx["payments"]]
     if mode == "single":
-        if len(txs) != 1:
-            problem(f"{len(txs)} vault transactions, expected 1 for the whole upload")
-        if batches:
-            problem("a merkle batch payment for an upload under 64 chunks")
-        if len(per_chunk) == 1 and len(per_chunk[0]["payments"]) != total:
-            problem(f"the payment paid {len(per_chunk[0]['payments'])} chunks, expected all {total}")
+        expected = 1
+    elif mode == "waves":
+        expected = -(-total // PAYMENT_WAVE)
     else:
-        content = total - 1
-        if content < MERKLE_THRESHOLD:
-            problem(f"{content} content chunks: under {MERKLE_THRESHOLD}, no batch expected")
-        rest = content % MERKLE_EXACT_MIN_BATCH
-        if not batches:
-            problem("no merkle batch payment (did Auto fall back to per-chunk payments? "
-                    "a merkle batch needs 16 nodes answering)")
-        elif sum(tx["leaves"] for tx in batches) != content - rest:
-            problem(f"batches paid {sum(tx['leaves'] for tx in batches)} chunks, "
-                    f"expected {content - rest}")
-        if len(per_chunk) != 1:
-            problem(f"{len(per_chunk)} per-chunk payments, expected 1 for the remainder "
-                    "and the envelope")
-        elif len(per_chunk[0]["payments"]) != rest + 1:
-            problem(f"the per-chunk payment paid {len(per_chunk[0]['payments'])} chunks, "
-                    f"expected {rest} + the envelope")
-    pay = per_chunk[0] if len(per_chunk) == 1 else None
+        expected = int(mode.split(":", 1)[1])
+    if len(txs) != expected:
+        problem(f"{len(txs)} vault transactions, expected {expected} for {total} chunks "
+                f"({mode}), paid per chunk, up to {PAYMENT_WAVE} a transaction")
+    for tx in per_chunk:
+        if len(tx["payments"]) > PAYMENT_WAVE:
+            problem(f"vault transaction {tx['hash']} paid {len(tx['payments'])} chunks, "
+                    f"more than {PAYMENT_WAVE}")
+    paid = sum(len(tx["payments"]) for tx in per_chunk)
+    if paid != total:
+        problem(f"the payments paid {paid} chunks, expected all {total}")
+    # The envelope is paid in the last transaction: a record's payment is
+    # checked against it.
+    pay = per_chunk[-1] if per_chunk else None
     finish(PAY_TX=pay and pay["hash"], PAY_BLOCK=pay and pay["block"],
            PAY_TS=pay and pay["time"],
            PAY_LOGS=pay and ",".join(f"{index}:{quote}" for index, quote in pay["payments"]),
@@ -569,7 +579,7 @@ def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
 
 def cmd_verify(path, envelope, readable, in_index, bits, revealed, name, content_type, size,
                file_matches, pay_tx, pay_block, pay_ts, pay_logs):
-    """`ant --json file verify`: the proven envelope and payment, against the
+    """`darwin --json file verify`: the proven envelope and payment, against the
     choices and against the vault transaction read with cast."""
     j = load(path)
     expect(j, "valid", True)
@@ -600,7 +610,7 @@ def cmd_verify(path, envelope, readable, in_index, bits, revealed, name, content
 
 
 def cmd_prove(path, address, private, reveals):
-    """`ant --json file prove`."""
+    """`darwin --json file prove`."""
     j = load(path)
     expect(j, "address", address)
     expect(j, "private", flag(private))
@@ -689,8 +699,8 @@ def rows(tsv):
 
 
 def check_entry(entry, row, nearest, where):
-    """One listing from `ant listings` or `ant listing`, against the upload's
-    choices and its payment as `ant file verify` read it from the chain."""
+    """One listing from `darwin listings` or `darwin listing`, against the upload's
+    choices and its payment as `darwin file verify` read it from the chain."""
     address = row["address"]
 
     def bad(text):
@@ -763,14 +773,14 @@ def index_key(entry):
 
 
 def cmd_listings_ready(path, tsv):
-    """Exit 0 once `ant listings` serves exactly the uploads in the index."""
+    """Exit 0 once `darwin listings` serves exactly the uploads in the index."""
     want = {address for address, row in rows(tsv).items() if flag(row["index"])}
     got = {entry.get("address") for entry in load(path) if entry.get("valid")}
     sys.exit(0 if got == want else 1)
 
 
 def cmd_listings(path, tsv, nearest):
-    """`ant --json listings --all`: every upload in the index and nothing
+    """`darwin --json listings --all`: every upload in the index and nothing
     else, all valid, in index order, each as its choices say."""
     nearest = int(nearest)
     entries = load(path)
@@ -791,7 +801,7 @@ def cmd_listings(path, tsv, nearest):
         problem("listings are not in index order (time, block, log index, address)")
     for entry in entries:
         if entry.get("address") in expected:
-            check_entry(entry, expected[entry["address"]], nearest, "ant listings:")
+            check_entry(entry, expected[entry["address"]], nearest, "darwin listings:")
     finish(LISTED=len(entries))
 
 
@@ -803,7 +813,7 @@ def cmd_since_pick(path):
 
 
 def cmd_since(full_path, part_path, since):
-    """`ant listings --since S`: the listings from time S on, in order."""
+    """`darwin listings --since S`: the listings from time S on, in order."""
     since = int(since)
     want = [entry["address"] for entry in load(full_path)
             if entry.get("valid") and entry.get("time", 0) >= since]
@@ -815,14 +825,14 @@ def cmd_since(full_path, part_path, since):
 
 
 def cmd_listing(path, tsv, address, nearest):
-    """`ant --json listing <address>` for an upload with an envelope."""
+    """`darwin --json listing <address>` for an upload with an envelope."""
     j = load(path)
     row = rows(tsv)[address]
     listing = j.get("listing")
     if listing is None:
         problem(f"no valid listing; rejected: {[r.get('problem') for r in j.get('rejected', [])]}")
     else:
-        check_entry(listing, row, int(nearest), "ant listing:")
+        check_entry(listing, row, int(nearest), "darwin listing:")
     if j.get("rejected"):
         problem(f"rejected copies: {[r.get('problem') for r in j['rejected']]}")
     expect(j, "nearest", int(nearest))
@@ -830,10 +840,79 @@ def cmd_listing(path, tsv, address, nearest):
 
 
 def cmd_no_listing(path):
-    """`ant --json listing <address>` for an address with no envelope."""
+    """`darwin --json listing <address>` for an address with no envelope."""
     j = load(path)
     if j.get("listing") is not None:
         problem(f"a listing for an address with no envelope: {j['listing']}")
+    finish()
+
+
+# ---------- manifests ----------
+
+def cmd_manifest_create(path, readable, manifest_file, files_dir, rows):
+    """`darwin --json manifest create DIR`: every file of DIR uploaded in its
+    own envelope, as `darwin file upload` uploads it: readable only with
+    --public, outside the index, every payment field shown, with the same
+    warnings, its record saved in <manifest>.records/ and checked against the
+    chain. Writes `path, envelope address, record` for each file to `rows`."""
+    j = load(path)
+    readable = flag(readable)
+    names = sorted(os.listdir(files_dir))
+    expect(j, "manifest_file", manifest_file)
+    expect(j, "files_uploaded", len(names))
+    envelopes = j.get("envelopes") or []
+    paths = sorted(str(envelope.get("path")) for envelope in envelopes)
+    if paths != names:
+        problem(f"envelopes for {paths}, expected one for each of {names}")
+    records_dir = os.path.splitext(manifest_file)[0] + ".records"
+    with open(rows, "w") as out:
+        for envelope in envelopes:
+            entry = str(envelope.get("path"))
+            where = f"{entry}: "
+            expect(envelope, "readable", readable, where)
+            expect(envelope, "in_index", False, where)
+            expect(envelope, "hidden", [], where)
+            address = envelope.get("envelope_address") or ""
+            if len(address) != 64:
+                problem(f"{where}no envelope address")
+            record = envelope.get("record")
+            want = os.path.join(records_dir, entry + ".record")
+            if record != want:
+                problem(f"{where}record saved as {record!r}, expected {want}")
+            elif not os.path.isfile(record):
+                problem(f"{where}{record} is missing")
+            if envelope.get("record_checked") is not True:
+                problem(f"{where}the record was not checked against the chain")
+            if "record_problem" in envelope:
+                problem(f"{where}record problem: {envelope['record_problem']}")
+            out.write(f"{entry}\t{address}\t{record}\n")
+    got = j.get("warnings", [])
+    want = warnings(readable, False, 31, False)
+    if got != want:
+        problem(f"warnings {got}, expected {want}")
+    finish(CHUNKS_STORED=j.get("chunks_stored"), FILES_UPLOADED=j.get("files_uploaded"))
+
+
+def cmd_compacted(path, manifest_file, rows):
+    """`darwin --json manifest export M --compact`: nothing published, and
+    every file referenced by the address of the envelope it was uploaded in
+    (`rows`, from `manifest-create`)."""
+    j = load(path)
+    with open(rows) as f:
+        want = dict(line.rstrip("\n").split("\t")[:2] for line in f if line.strip())
+    expect(j, "manifest_file", manifest_file)
+    expect(j, "data_maps_published", 0)
+    expect(j, "embedded_entries", 0)
+    expect(j, "public_entries", len(want))
+    entries = j.get("entries") or []
+    if sorted(str(entry.get("path")) for entry in entries) != sorted(want):
+        problem(f"entries {[entry.get('path') for entry in entries]}, expected {sorted(want)}")
+    for entry in entries:
+        if entry.get("kind") != "public":
+            problem(f"{entry.get('path')} is {entry.get('kind')}, not public")
+        if entry.get("address") != want.get(entry.get("path")):
+            problem(f"{entry.get('path')} is at {entry.get('address')}, "
+                    f"not its envelope's {want.get(entry.get('path'))}")
     finish()
 
 
@@ -864,7 +943,8 @@ COMMANDS = {
     "prove": cmd_prove, "tamper": cmd_tamper, "listings-ready": cmd_listings_ready,
     "listings": cmd_listings, "since-pick": cmd_since_pick, "since": cmd_since,
     "listing": cmd_listing, "no-listing": cmd_no_listing, "manifest": cmd_manifest,
-    "chain-only": cmd_chain_only,
+    "chain-only": cmd_chain_only, "manifest-create": cmd_manifest_create,
+    "compacted": cmd_compacted,
 }
 
 if __name__ == "__main__":
@@ -872,7 +952,7 @@ if __name__ == "__main__":
 PYEOF
 
 # Step 1: Build
-echo "=== Step 1: Building ant-devnet and ant ==="
+echo "=== Step 1: Building ant-devnet and darwin ==="
 if [ "${ANT_TEST_SKIP_BUILD:-0}" = "1" ]; then
     echo "Skipping the build (ANT_TEST_SKIP_BUILD=1)"
 else
@@ -897,13 +977,13 @@ for binary in "${ANT_DEVNET}" "${ANT_CLI}"; do
     fi
 done
 echo "ant-devnet: ${ANT_DEVNET}"
-echo "ant:        ${ANT_CLI}"
+echo "darwin:     ${ANT_CLI}"
 echo ""
 
 # Step 2: Start devnet with EVM
 #
-# Merkle batch payments (Step 5) need 16 nodes answering for each pool, so
-# the default is well above that.
+# Every address then has a full close group of 7, which the listing checks
+# ask for a quorum.
 echo "=== Step 2: Starting devnet with EVM (${DEVNET_NODES} nodes, ${BOOTSTRAP_COUNT} bootstrap) ==="
 "${ANT_DEVNET}" \
     --nodes "${DEVNET_NODES}" \
@@ -1122,7 +1202,7 @@ upload_case() {
             fi
             eval "${vars}"
         else
-            fail "${label}: ant file verify (record)" "$(last_error "verify_${tag}")"
+            fail "${label}: darwin file verify (record)" "$(last_error "verify_${tag}")"
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "${tag}" "${ENVELOPE}" "${readable}" "${index}" "${bits}" "${name:--}" "${ctype:--}" \
@@ -1193,13 +1273,26 @@ upload_case 0 0 0 "dated-notes.txt" ""
 upload_case 1 0 0 "" "application/octet-stream"
 echo ""
 
-# Step 5: An upload of 64 chunks or more
+# Step 5: --merkle, and an upload of 64 chunks or more
 #
-# Auto mode pays its content in merkle batches of 256, 128, 64 and 32, then
-# one per-chunk payment for the chunks left and the envelope.
-echo "=== Step 5: An upload of 64 or more chunks ==="
+# Batch (merkle) payments are off: --merkle is refused before anything is
+# paid. Every upload pays per chunk, in transactions of up to 64 chunks, the
+# envelope in the last.
+echo "=== Step 5: --merkle is refused; an upload of 64 or more chunks, paid per chunk ==="
+MERKLE_FILE="${FILES_DIR}/merkle.bin"
+head -c 65536 /dev/urandom > "${MERKLE_FILE}"
+b0=$(block_number)
+if run_ant pay up_merkle --json file upload "${MERKLE_FILE}" --merkle; then
+    fail "file upload --merkle is refused" "it uploaded"
+elif ! grep -qF "Leave out --merkle" "${OUT_DIR}/up_merkle.out" "${OUT_DIR}/up_merkle.err"; then
+    fail "file upload --merkle is refused" "$(last_error up_merkle)"
+elif [ "$(block_number)" != "${b0}" ]; then
+    fail "file upload --merkle is refused" "a transaction was sent"
+else
+    pass "file upload --merkle is refused before anything is paid"
+fi
 if [ "${ANT_TEST_SKIP_LARGE:-0}" = "1" ]; then
-    echo "  Skipping (ANT_TEST_SKIP_LARGE=1)"
+    echo "  Skipping the large upload (ANT_TEST_SKIP_LARGE=1)"
 else
     LARGE_FILE="${FILES_DIR}/large.bin"
     LARGE_LABEL="large listed file (${LARGE_FILE_MB} MiB)"
@@ -1226,12 +1319,12 @@ else
         eval "${vars}"
         ok=0
         if vars=$(py vault "${CAST}" "${RPC_URL}" "${VAULT_ADDRESS}" "${DPM_TOPIC}" "${MPM_TOPIC}" \
-            "$((b0 + 1))" "${b1}" "${TOTAL_CHUNKS:-0}" large 2> "${LARGE_PROBLEMS}"); then
+            "$((b0 + 1))" "${b1}" "${TOTAL_CHUNKS:-0}" waves 2> "${LARGE_PROBLEMS}"); then
             ok=1
         fi
         eval "${vars}"
         if [ "${ok}" = 1 ]; then
-            pass "${LARGE_LABEL}: ${TOTAL_CHUNKS} chunks: merkle batches, then one payment for the rest and the envelope (${VAULT_TXS} vault transactions)"
+            pass "${LARGE_LABEL}: ${TOTAL_CHUNKS} chunks paid per chunk in ${VAULT_TXS} vault transactions, the envelope in the last"
         else
             fail_with "${LARGE_LABEL}: payments" "${LARGE_PROBLEMS}"
         fi
@@ -1239,7 +1332,7 @@ else
             if vars=$(py verify "${OUT_DIR}/verify_large.out" "${ENVELOPE}" 1 1 31 0 - - - - \
                 "${PAY_TX:--}" "${PAY_BLOCK:--}" "${PAY_TS:--}" "${PAY_LOGS:--}" \
                 2> "${LARGE_PROBLEMS}"); then
-                pass "${LARGE_LABEL}: record checks out against the per-chunk payment"
+                pass "${LARGE_LABEL}: record checks out against the last per-chunk payment"
             else
                 fail_with "${LARGE_LABEL}: record" "${LARGE_PROBLEMS}"
             fi
@@ -1249,7 +1342,7 @@ else
                 large "${ENVELOPE}" 1 1 31 - - - "${TX:--}" "${BLOCK:--}" "${TS:--}" "${LOG:--}" \
                 "${QUOTE:--}" "${t0}" "${t1}" "${LARGE_FILE}" "${RECORD}" - >> "${EXPECTED_TSV}"
         else
-            fail "${LARGE_LABEL}: ant file verify (record)" "$(last_error verify_large)"
+            fail "${LARGE_LABEL}: darwin file verify (record)" "$(last_error verify_large)"
         fi
         if [ -n "${ADDRESS}" ]; then
             check_download "${LARGE_LABEL}: download by address" dl_large "${LARGE_FILE}" "${ADDRESS}"
@@ -1260,8 +1353,177 @@ else
 fi
 echo ""
 
-# Step 6: The index
-echo "=== Step 6: ant listings ==="
+# Step 6: Uploads through a manifest
+#
+# `darwin manifest create` uploads each file as `darwin file upload` does:
+# private by default, readable by address with --public, each in an envelope
+# outside the index that shows every payment field, its record saved in
+# <manifest>.records/ next to the manifest. Their listings and records are
+# checked with the others' in Steps 9 to 11. Compacting the --public manifest
+# references each file by its envelope's address, publishing nothing, and the
+# result downloads; compacting the private one is refused, since compacting
+# publishes nothing.
+echo "=== Step 6: darwin manifest create ==="
+manifest_case() { # NAME READABLE FLAGS...
+    local name="$1" readable="$2"
+    shift 2
+    local dir="${FILES_DIR}/${name}" out="${WORK_DIR}/${name}.darwin"
+    local rows="${OUT_DIR}/${name}.rows" problems="${OUT_DIR}/${name}.problems"
+    local label="manifest create (${name})"
+    local b0 b1 t0 t1 vars entry address record file tag size
+    local CHUNKS_STORED="" FILES_UPLOADED=""
+    local PAY_TX="" PAY_BLOCK="" PAY_TS="" PAY_LOGS="" VAULT_TXS=""
+    local TX BLOCK TS LOG QUOTE
+    mkdir -p "${dir}"
+    for entry in a.bin b.bin; do
+        head -c $(( 4096 + RANDOM % 61440 )) /dev/urandom > "${dir}/${entry}"
+    done
+    echo ""
+    echo "--- ${label} ---"
+    b0=$(block_number)
+    t0=$(date +%s)
+    if ! run_ant pay "mc_${name}" --json manifest create "${dir}" -o "${out}" "$@"; then
+        fail "${label}" "$(last_error "mc_${name}")"
+        return 0
+    fi
+    t1=$(date +%s)
+    b1=$(block_number)
+    vars=""
+    if vars=$(py manifest-create "${OUT_DIR}/mc_${name}.out" "${readable}" "${out}" "${dir}" \
+        "${rows}" 2> "${problems}"); then
+        pass "${label}: each file in an envelope showing every payment field, its record in ${name}.records/"
+    else
+        fail_with "${label}" "${problems}"
+    fi
+    eval "${vars}"
+    if py vault "${CAST}" "${RPC_URL}" "${VAULT_ADDRESS}" "${DPM_TOPIC}" "${MPM_TOPIC}" \
+        "$((b0 + 1))" "${b1}" "${CHUNKS_STORED:-0}" "each:${FILES_UPLOADED:-0}" \
+        > /dev/null 2> "${problems}"; then
+        pass "${label}: paid per chunk, one vault transaction for each file"
+    else
+        fail_with "${label}: payments" "${problems}"
+    fi
+    # Each record, checked from the chain against its file. The payment it
+    # proves is what Step 9 expects the listing to show.
+    [ -f "${rows}" ] || return 0
+    while IFS=$'\t' read -r entry address record <&3; do
+        file="${dir}/${entry}"
+        tag="${name}_${entry%.bin}"
+        if [ "${readable}" = 1 ]; then size=$(wc -c < "${file}" | tr -d ' '); else size=-; fi
+        TX="-" BLOCK="-" TS="-" LOG="-" QUOTE="-"
+        if run_ant free "verify_${tag}" --json file verify "${record}" --file "${file}"; then
+            if vars=$(py verify "${OUT_DIR}/verify_${tag}.out" "${address}" "${readable}" 0 31 \
+                "$( [ "${readable}" = 1 ] && echo 0 || echo 1)" - - "${size}" true - - - - \
+                2> "${problems}"); then
+                pass "${label}: the record of ${entry} checks out from the chain"
+                eval "${vars}"
+            else
+                fail_with "${label}: the record of ${entry}" "${problems}"
+            fi
+        else
+            fail "${label}: darwin file verify (the record of ${entry})" "$(last_error "verify_${tag}")"
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${tag}" "${address}" "${readable}" 0 31 - - "${size}" "${TX:--}" "${BLOCK:--}" \
+            "${TS:--}" "${LOG:--}" "${QUOTE:--}" "${t0}" "${t1}" "${file}" "${record}" - \
+            >> "${EXPECTED_TSV}"
+    done 3< "${rows}"
+    return 0
+}
+manifest_case mc_private 0
+manifest_case mc_public 1 --public
+
+PUBLIC_MANIFEST="${WORK_DIR}/mc_public.darwin"
+COMPACT_MANIFEST="${WORK_DIR}/mc_public-compact.darwin"
+if [ -f "${PUBLIC_MANIFEST}" ]; then
+    b0=$(block_number)
+    if run_ant free mcx_public --json manifest export "${PUBLIC_MANIFEST}" --compact \
+        -o "${COMPACT_MANIFEST}"; then
+        if [ "$(block_number)" != "${b0}" ]; then
+            fail "manifest export --compact (mc_public)" "a transaction was sent"
+        elif py compacted "${OUT_DIR}/mcx_public.out" "${COMPACT_MANIFEST}" \
+            "${OUT_DIR}/mc_public.rows" > /dev/null 2> "${OUT_DIR}/mcx_public.problems"; then
+            pass "manifest export --compact (mc_public): each file at its envelope's address, nothing published"
+        else
+            fail_with "manifest export --compact (mc_public)" "${OUT_DIR}/mcx_public.problems"
+        fi
+        rm -rf "${DL_DIR}/mc_public"
+        if run_ant free mcd_public --json manifest download "${COMPACT_MANIFEST}" \
+                -o "${DL_DIR}/mc_public" \
+            && cmp -s "${FILES_DIR}/mc_public/a.bin" "${DL_DIR}/mc_public/a.bin" \
+            && cmp -s "${FILES_DIR}/mc_public/b.bin" "${DL_DIR}/mc_public/b.bin"; then
+            pass "the compacted manifest (mc_public) downloads both files"
+        else
+            fail "the compacted manifest (mc_public) downloads both files" "$(last_error mcd_public)"
+        fi
+        rm -rf "${DL_DIR}/mc_public"
+    else
+        fail "manifest export --compact (mc_public)" "$(last_error mcx_public)"
+    fi
+fi
+PRIVATE_MANIFEST="${WORK_DIR}/mc_private.darwin"
+if [ -f "${PRIVATE_MANIFEST}" ]; then
+    b0=$(block_number)
+    if run_ant free mcx_private --json manifest export "${PRIVATE_MANIFEST}" --compact \
+        -o "${WORK_DIR}/mc_private-compact.darwin"; then
+        fail "manifest export --compact (mc_private) is refused" "it compacted"
+    elif ! grep -qF "have no public address yet" "${OUT_DIR}/mcx_private.out" "${OUT_DIR}/mcx_private.err"; then
+        fail "manifest export --compact (mc_private) is refused" "$(last_error mcx_private)"
+    elif [ -e "${WORK_DIR}/mc_private-compact.darwin" ] || [ "$(block_number)" != "${b0}" ]; then
+        fail "manifest export --compact (mc_private) is refused" "it wrote a manifest or sent a transaction"
+    else
+        pass "manifest export --compact (mc_private) is refused: nothing published, nothing paid"
+    fi
+fi
+echo ""
+
+# Step 7: Paid commands that are off in this build
+#
+# A raw chunk can't carry an envelope, and `darwin node` would install
+# Autonomi's ant-node: both are refused before anything is paid or written.
+# The node commands run with proxies on a closed port, so a build that
+# didn't refuse them could fetch nothing.
+echo "=== Step 7: darwin chunk put and darwin node are refused ==="
+RAW_FILE="${FILES_DIR}/raw.bin"
+head -c 4096 /dev/urandom > "${RAW_FILE}"
+b0=$(block_number)
+if run_ant pay chunk_put chunk put "${RAW_FILE}"; then
+    fail "darwin chunk put is refused" "it stored a raw chunk"
+elif ! grep -qF '`darwin chunk put` is off in this build' "${OUT_DIR}/chunk_put.out" "${OUT_DIR}/chunk_put.err"; then
+    fail "darwin chunk put is refused" "$(last_error chunk_put)"
+elif [ "$(block_number)" != "${b0}" ]; then
+    fail "darwin chunk put is refused" "a transaction was sent"
+else
+    pass "darwin chunk put is refused before anything is paid"
+fi
+NODE_HOME="${WORK_DIR}/node-home"
+mkdir -p "${NODE_HOME}"
+for name in node_add node_status; do
+    if [ "${name}" = node_add ]; then
+        command=(node add --rewards-address 0x000000000000000000000000000000000000dEaD)
+    else
+        command=(node status)
+    fi
+    if env -u SECRET_KEY HOME="${NODE_HOME}" XDG_DATA_HOME="${NODE_HOME}/data" \
+        XDG_CONFIG_HOME="${NODE_HOME}/config" HTTP_PROXY=http://127.0.0.1:9 \
+        HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+        "${ANT_CLI}" "${command[@]}" > "${OUT_DIR}/${name}.out" 2> "${OUT_DIR}/${name}.err"; then
+        fail "darwin ${command[*]:0:2} is refused" "it ran"
+    elif grep -qF '`darwin node` is off in this build' "${OUT_DIR}/${name}.out" "${OUT_DIR}/${name}.err"; then
+        pass "darwin ${command[*]:0:2} is refused"
+    else
+        fail "darwin ${command[*]:0:2} is refused" "$(last_error "${name}")"
+    fi
+done
+if [ -n "$(ls -A "${NODE_HOME}")" ]; then
+    fail "darwin node writes nothing" "$(ls -A "${NODE_HOME}" | tr '\n' ' ')"
+else
+    pass "darwin node writes nothing under its home folder"
+fi
+echo ""
+
+# Step 8: The index
+echo "=== Step 8: darwin listings ==="
 INDEXED=$(awk -F'\t' 'NR > 1 && $4 == 1' "${EXPECTED_TSV}" | wc -l | tr -d ' ')
 echo "  Waiting for the ${INDEXED} uploads in the index to be served (up to ${LISTINGS_WAIT_SECS} s)..."
 DEADLINE=$(( $(date +%s) + LISTINGS_WAIT_SECS ))
@@ -1280,36 +1542,36 @@ done
 if run_ant free listings --json listings --all; then
     if vars=$(py listings "${OUT_DIR}/listings.out" "${EXPECTED_TSV}" "${NEAREST}" \
         2> "${OUT_DIR}/listings.problems"); then
-        pass "ant listings: exactly the ${INDEXED} uploads in the index, in order, as chosen"
+        pass "darwin listings: exactly the ${INDEXED} uploads in the index, in order, as chosen"
     else
-        fail_with "ant listings" "${OUT_DIR}/listings.problems"
+        fail_with "darwin listings" "${OUT_DIR}/listings.problems"
     fi
     SINCE=""
     if vars=$(py since-pick "${OUT_DIR}/listings.out"); then
         eval "${vars}"
     fi
     if [ -z "${SINCE}" ]; then
-        fail "ant listings --since" "no listing to take a time from"
+        fail "darwin listings --since" "no listing to take a time from"
     elif ! run_ant free listings_since --json listings --since "${SINCE}"; then
-        fail "ant listings --since ${SINCE}" "$(last_error listings_since)"
+        fail "darwin listings --since ${SINCE}" "$(last_error listings_since)"
     elif py since "${OUT_DIR}/listings.out" "${OUT_DIR}/listings_since.out" "${SINCE}" \
         > /dev/null 2> "${OUT_DIR}/listings_since.problems"; then
-        pass "ant listings --since ${SINCE}: the listings from then on, in order"
+        pass "darwin listings --since ${SINCE}: the listings from then on, in order"
     else
-        fail_with "ant listings --since ${SINCE}" "${OUT_DIR}/listings_since.problems"
+        fail_with "darwin listings --since ${SINCE}" "${OUT_DIR}/listings_since.problems"
     fi
 else
-    fail "ant listings" "$(last_error listings)"
+    fail "darwin listings" "$(last_error listings)"
 fi
 echo ""
 
-# Step 7: One listing at a time, for the uploads outside the index
-echo "=== Step 7: ant listing <address> ==="
+# Step 9: One listing at a time, for the uploads outside the index
+echo "=== Step 9: darwin listing <address> ==="
 while IFS=$'\t' read -r tag address readable index bits _rest <&3; do
     if [ "${index}" = 1 ]; then
         continue
     fi
-    label="ant listing: $(case_label "${readable}" "${index}" "${bits}") (${tag})"
+    label="darwin listing: $(case_label "${readable}" "${index}" "${bits}") (${tag})"
     if run_ant free "listing_${tag}" --json listing "${address}"; then
         if py listing "${OUT_DIR}/listing_${tag}.out" "${EXPECTED_TSV}" "${address}" "${NEAREST}" \
             > /dev/null 2> "${OUT_DIR}/listing_${tag}.problems"; then
@@ -1322,36 +1584,36 @@ while IFS=$'\t' read -r tag address readable index bits _rest <&3; do
     fi
 done 3< <(tail -n +2 "${EXPECTED_TSV}")
 # A readable upload without an envelope, and an address with nothing at it,
-# have no listing: `ant listing` fails.
+# have no listing: `darwin listing` fails.
 n=0
 while read -r address <&3; do
     n=$((n + 1))
     if run_ant free "no_listing_${n}" --json listing "${address}"; then
-        fail "ant listing: a plain data map has no listing" "it found one for ${address}"
+        fail "darwin listing: a plain data map has no listing" "it found one for ${address}"
     elif py no-listing "${OUT_DIR}/no_listing_${n}.out" > /dev/null 2> "${OUT_DIR}/no_listing_${n}.problems"; then
-        pass "ant listing: a plain data map has no listing"
+        pass "darwin listing: a plain data map has no listing"
     else
-        fail_with "ant listing: a plain data map has no listing" "${OUT_DIR}/no_listing_${n}.problems"
+        fail_with "darwin listing: a plain data map has no listing" "${OUT_DIR}/no_listing_${n}.problems"
     fi
 done 3< "${PLAIN_ADDRESSES}"
 RANDOM_ADDRESS=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 if run_ant free no_listing_random --json listing "${RANDOM_ADDRESS}"; then
-    fail "ant listing: an empty address has no listing" "it found one"
+    fail "darwin listing: an empty address has no listing" "it found one"
 else
-    pass "ant listing: an empty address has no listing"
+    pass "darwin listing: an empty address has no listing"
 fi
 echo ""
 
-# Step 8: Proofs
+# Step 10: Proofs
 #
 # Every record gives a proof that reveals the file; a private one also a
 # proof that doesn't. Representative uploads (all or nothing shown, or with
 # metadata) are downloaded with their proofs.
-echo "=== Step 8: ant file prove ==="
+echo "=== Step 10: darwin file prove ==="
 FIRST_RECORD=""
 while IFS=$'\t' read -r tag address readable index bits name ctype _size _tx _block _ts _log _quote _t0 _t1 file record _datamap <&3; do
     private=$([ "${readable}" = 1 ] && echo 0 || echo 1)
-    label="ant file prove: $(case_label "${readable}" "${index}" "${bits}") (${tag})"
+    label="darwin file prove: $(case_label "${readable}" "${index}" "${bits}") (${tag})"
     if run_ant free "prove_${tag}" --json file prove "${record}" -o "${PROOFS_DIR}/${tag}.proof" \
         && py prove "${OUT_DIR}/prove_${tag}.out" "${address}" "${private}" "${private}" \
             > /dev/null 2> "${OUT_DIR}/prove_${tag}.problems"; then
@@ -1391,28 +1653,28 @@ done 3< <(tail -n +2 "${EXPECTED_TSV}")
 if [ -n "${FIRST_RECORD}" ]; then
     RECORD_SHA=$(sha256_of "${FIRST_RECORD}")
     if run_ant free prove_onto_record --json file prove "${FIRST_RECORD}" -o "${FIRST_RECORD}" --force; then
-        fail "ant file prove never replaces its record" "it wrote over ${FIRST_RECORD}"
+        fail "darwin file prove never replaces its record" "it wrote over ${FIRST_RECORD}"
     elif [ "$(sha256_of "${FIRST_RECORD}")" = "${RECORD_SHA}" ]; then
-        pass "ant file prove never replaces its record, even with --force"
+        pass "darwin file prove never replaces its record, even with --force"
     else
-        fail "ant file prove never replaces its record" "the record changed"
+        fail "darwin file prove never replaces its record" "the record changed"
     fi
     if run_ant free prove_again --json file prove "${FIRST_RECORD}" -o "${PROOFS_DIR}/again.proof" \
         && ! run_ant free prove_exists --json file prove "${FIRST_RECORD}" -o "${PROOFS_DIR}/again.proof" \
         && run_ant free prove_force --json file prove "${FIRST_RECORD}" -o "${PROOFS_DIR}/again.proof" --force; then
-        pass "ant file prove replaces an existing proof only with --force"
+        pass "darwin file prove replaces an existing proof only with --force"
     else
-        fail "ant file prove replaces an existing proof only with --force"
+        fail "darwin file prove replaces an existing proof only with --force"
     fi
 fi
 echo ""
 
-# Step 9: Proofs checked from the chain alone
+# Step 11: Proofs checked from the chain alone
 #
 # The nodes run inside the devnet process: killing it stops them all, while
-# Anvil, a separate process, keeps the chain. `ant file verify` then gets a
+# Anvil, a separate process, keeps the chain. `darwin file verify` then gets a
 # manifest without a single node.
-echo "=== Step 9: ant file verify from the chain alone ==="
+echo "=== Step 11: darwin file verify from the chain alone ==="
 OLD_DEVNET_PID="${DEVNET_PID}"
 stop_devnet KILL
 if kill -0 "${OLD_DEVNET_PID}" 2>/dev/null; then
@@ -1431,7 +1693,7 @@ fi
 OTHER_FILE=""
 while IFS=$'\t' read -r tag address readable index bits name ctype size tx block ts log quote _t0 _t1 file _record _datamap <&3; do
     private=$([ "${readable}" = 1 ] && echo 0 || echo 1)
-    label="ant file verify: $(case_label "${readable}" "${index}" "${bits}") (${tag})"
+    label="darwin file verify: $(case_label "${readable}" "${index}" "${bits}") (${tag})"
     proof="${PROOFS_DIR}/${tag}.proof"
     [ -f "${proof}" ] || continue
     # The proof, and that the local file is the one it is for.
@@ -1496,7 +1758,7 @@ while IFS=$'\t' read -r tag address readable index bits name ctype size tx block
 done 3< <(tail -n +2 "${EXPECTED_TSV}")
 echo ""
 
-# Step 10: Summary
+# Step 12: Summary
 echo "=============================================="
 echo "  E2E Test Results"
 echo "=============================================="

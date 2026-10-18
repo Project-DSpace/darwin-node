@@ -7,6 +7,10 @@
 # private, 2026-10-06 to 2026-10-13, it ran only weekly and by hand: the org's
 # free plan gives private repos about 2,000 Actions minutes a month, and a run
 # is long.) The EVM tests start a local Anvil chain, hence Foundry.
+#
+# Weekly, and by hand when asked, it also runs scripts/test_e2e_listings.sh:
+# darwin-client (its main branch, or the ref given) uploading to these nodes on
+# a local devnet with listings and its own Anvil chain.
 
 name: Test
 
@@ -18,6 +22,15 @@ on:
     # top of the hour.
     - cron: '23 3 * * 1'
   workflow_dispatch:
+    inputs:
+      listings_cross_test:
+        description: Also run the listings cross-test (scripts/test_e2e_listings.sh)
+        type: boolean
+        default: false
+      client_ref:
+        description: darwin-client branch, tag or commit for the cross-test (empty = main)
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -108,3 +121,47 @@ jobs:
             echo "::error::failed: ${failed[*]}"
             exit 1
           fi
+
+  # darwin-client against these nodes' listings, on a local devnet with its own
+  # Anvil chain (scripts/test_e2e_listings.sh): envelopes, listings, records,
+  # per-chunk payment, manifests, and the paid commands that are off. Weekly,
+  # and by hand with listings_cross_test, not on pushes: it builds both
+  # projects in release mode.
+  listings-cross-test:
+    if: ${{ github.event_name == 'schedule' || inputs.listings_cross_test }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: darwin-node
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: Project-DSpace/darwin-client
+          ref: ${{ inputs.client_ref || 'main' }}
+          path: darwin-client
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.8.5
+
+      - name: Free disk space
+        run: |
+          df -h /
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$dir" ]; then sudo rm -rf "$dir"; fi
+          done
+          df -h /
+
+      - name: Cross-test
+        working-directory: darwin-node
+        env:
+          ANT_CLIENT_DIR: ${{ github.workspace }}/darwin-client
+        run: bash scripts/test_e2e_listings.sh
