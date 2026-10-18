@@ -3161,4 +3161,189 @@ mod tests {
         drop(pending);
         assert!(waiting.lock().is_empty());
     }
+
+    /// Envelopes and a record exactly as the client writes them (`golden`,
+    /// whose literals darwin-client pins too): they read back as themselves,
+    /// the same inputs build the same bytes under this lock, and a node lists
+    /// them as the client chose, finding each payment from the proof its PUT
+    /// carries.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn golden_envelopes_list_as_the_client_writes_them() {
+        use super::super::golden;
+        use ant_listings::{salted_hash, EnvelopeProof};
+
+        let hex = |text: &str| hex::decode(text).unwrap();
+        let address = |text: &str| -> XorName { hex(text).try_into().unwrap() };
+        let map_bytes = hex(golden::DATA_MAP);
+
+        // The data maps and the salted hash, under this lock's encoders.
+        assert_eq!(encode_data_map(&golden::data_map()).unwrap(), map_bytes);
+        assert_eq!(
+            encode_data_map(&golden::child_map()).unwrap(),
+            hex(golden::CHILD_MAP)
+        );
+        let child: DataMap = rmp_serde::from_slice(&hex(golden::CHILD_MAP)).unwrap();
+        assert_eq!(child, golden::child_map());
+        assert_eq!(
+            salted_hash(&golden::SALT, &map_bytes).to_vec(),
+            hex(golden::SALTED_HASH)
+        );
+
+        // Each envelope reads back as its own bytes, at the address the client
+        // stores it at, with the flags, metadata and size the client chose.
+        let flags = |in_index, withheld| Flags {
+            shown: ShownFields::ALL,
+            in_index,
+            withheld,
+        };
+        let mut envelopes = Vec::new();
+        for (bytes, at, flags, size) in [
+            (
+                golden::PRIVATE_ENVELOPE,
+                golden::PRIVATE_ADDRESS,
+                flags(false, true),
+                None,
+            ),
+            (
+                golden::UNLISTED_ENVELOPE,
+                golden::UNLISTED_ADDRESS,
+                flags(false, false),
+                Some(11_999),
+            ),
+            (
+                golden::LISTED_ENVELOPE,
+                golden::LISTED_ADDRESS,
+                flags(true, false),
+                Some(11_999),
+            ),
+        ] {
+            let bytes = hex(bytes);
+            let envelope = Envelope::from_bytes(&bytes).unwrap();
+            envelope.check_new_upload().unwrap();
+            assert_eq!(envelope.to_bytes(), bytes);
+            assert_eq!(envelope.address(), address(at));
+            assert_eq!(crate::client::compute_address(&bytes), address(at));
+            assert_eq!(envelope.flags(), flags);
+            assert_eq!(envelope.metadata(), &golden::metadata());
+            assert_eq!(envelope.file_size(), size);
+            envelopes.push(envelope);
+        }
+        let [private, unlisted, listed] = <[Envelope; 3]>::try_from(envelopes).unwrap();
+        // The same envelopes, built here from the inputs.
+        assert_eq!(
+            Envelope::withheld(
+                &golden::data_map(),
+                &golden::SALT,
+                golden::metadata(),
+                ShownFields::ALL,
+                false
+            )
+            .unwrap()
+            .to_bytes(),
+            private.to_bytes()
+        );
+        for (in_index, envelope) in [(false, &unlisted), (true, &listed)] {
+            let built = Envelope::readable(
+                &golden::data_map(),
+                golden::metadata(),
+                ShownFields::ALL,
+                in_index,
+            )
+            .unwrap();
+            assert_eq!(built.to_bytes(), envelope.to_bytes());
+        }
+
+        // The readable ones carry the data map as stored; the private one only
+        // its salted hash, which the data map and the salt reveal.
+        for envelope in [&unlisted, &listed] {
+            assert_eq!(envelope.data_map_bytes(), Some(map_bytes.as_slice()));
+            assert_eq!(envelope.data_map(), Some(&golden::data_map()));
+        }
+        assert_eq!(private.data_map(), None);
+        assert_eq!(
+            private.salted_hash().map(|hash| hash.to_vec()),
+            Some(hex(golden::SALTED_HASH))
+        );
+        assert!(private.check_reveal(&map_bytes, &golden::SALT).is_ok());
+        assert!(private.check_reveal(&map_bytes, &[4; 32]).is_err());
+
+        // The private upload's record: its envelope and payment, and the data
+        // map and salt that reveal it, in the one encoding a proof has.
+        let record = EnvelopeProof::from_hex(golden::PRIVATE_RECORD).unwrap();
+        assert_eq!(record.to_hex().unwrap(), golden::PRIVATE_RECORD);
+        assert_eq!(record.address, private.address());
+        assert_eq!(record.envelope, private.to_bytes());
+        assert_eq!(record.tx_hash, golden::PRIVATE_RECORD_TX);
+        assert_eq!(record.data_map.as_deref(), Some(map_bytes.as_slice()));
+        assert_eq!(record.salt, Some(golden::SALT));
+        let private_quote: PaymentQuote = rmp_serde::from_slice(&record.quote).unwrap();
+        assert_eq!(private_quote.content.0, private.address());
+
+        // A node finds each payment from the proof its PUT carries, the private
+        // one in the record's transaction, and only the listed one is in the
+        // index.
+        let paid = [
+            (&private, private_quote, golden::PRIVATE_RECORD_TX),
+            (
+                &unlisted,
+                signed_quote(unlisted.address(), 0, 88),
+                [0x61; 32],
+            ),
+            (&listed, signed_quote(listed.address(), 0, 89), [0x62; 32]),
+        ];
+        let mut chain = chain_with(400, &[]);
+        for (block, (_, quote, tx_hash)) in (300..).zip(&paid) {
+            chain.add_receipt(PaymentReceipt {
+                tx_hash: *tx_hash,
+                success: true,
+                block_number: block,
+                logs: vec![vault_log(quote.hash().0, 2)],
+            });
+        }
+        let url = MockChain::serve(Arc::new(Mutex::new(chain))).await;
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service_on(&dir, &url).await;
+        for (envelope, quote, tx_hash) in &paid {
+            let listing = listings
+                .listing_for_put(
+                    &envelope.address(),
+                    &envelope.to_bytes(),
+                    Some(&single_node_proof(quote, *tx_hash)),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(listing.matches(envelope));
+            assert!(listing.validate().is_ok());
+            chunks
+                .put(&envelope.address(), &envelope.to_bytes())
+                .await
+                .unwrap();
+            assert!(listings.record(listing).await);
+        }
+        let (page, more) = list(&listings, ListingKey::MIN, 256).await;
+        assert!(!more);
+        assert_eq!(
+            page.iter()
+                .map(|listing| listing.address)
+                .collect::<Vec<_>>(),
+            vec![listed.address()]
+        );
+        for (envelope, quote, tx_hash) in &paid {
+            let listing = get(&listings, envelope.address()).await.unwrap();
+            assert_eq!(listing.flags, envelope.flags());
+            assert_eq!(listing.metadata, golden::metadata());
+            assert_eq!(listing.size, envelope.file_size());
+            // Every payment field shown, as the client chose.
+            assert_eq!(listing.payment.tx_hash, Some(*tx_hash));
+            assert!(listing.payment.block_number.is_some());
+            assert!(listing.payment.block_timestamp.is_some());
+            assert_eq!(listing.payment.log_index, Some(2));
+            assert_eq!(
+                listing.payment.quote,
+                Some(rmp_serde::to_vec(quote).unwrap())
+            );
+        }
+    }
 }

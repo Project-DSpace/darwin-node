@@ -13,6 +13,9 @@
 //! address. Messages on older listings topics are not answered.
 
 mod chain;
+// Envelopes and a record exactly as the client writes them.
+#[cfg(test)]
+mod golden;
 mod service;
 mod store;
 

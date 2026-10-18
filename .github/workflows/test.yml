@@ -77,6 +77,13 @@ jobs:
       - name: Library and binaries
         run: cargo test --locked --features test-utils --lib --bins
 
+      # vendor/ant-listings' own tests, under this repository's Cargo.lock: a
+      # dependency this lock resolves differently from darwin-listings' fails
+      # here.
+      - name: Vendored ant-listings
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p ant-listings
+
       # Run whether or not the library tests passed, as long as the tests
       # built, and one target at a time, so every target reports even if an
       # earlier one fails. The ones upstream ran single-threaded (e2e flakes

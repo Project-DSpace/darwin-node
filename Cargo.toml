@@ -237,6 +237,12 @@ webrtc-direct = [
     "saorsa-transport/webrtc-direct",
 ]
 
+# The vendored ant-listings is a member so its own tests run under this lock
+# (`cargo test --locked -p ant-listings`, in test.yml). Commands run here
+# without -p still build and test ant-node alone.
+[workspace]
+members = [".", "vendor/ant-listings"]
+
 [patch.crates-io]
 ant-protocol = { path = "vendor/ant-protocol" }
 # Closing a browser session cancels a DTLS handshake still in progress

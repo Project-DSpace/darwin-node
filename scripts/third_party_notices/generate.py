@@ -461,7 +461,18 @@ def generate(args, config, github):
     by_name_version = {}
     for package in metadata["packages"]:
         by_name_version.setdefault((package["name"], package["version"]), []).append(package)
-    workspace = set(metadata["workspace_members"])
+    # First-party code is the package the notices are for: --package, or the
+    # workspace's root package. Other members of the workspace are vendored
+    # crates (vendor/ant-listings is a member only so its tests run under this
+    # lock), so they get their notices as any dependency does.
+    members = set(metadata["workspace_members"])
+    if args.package:
+        workspace = {package["id"] for package in metadata["packages"]
+                     if package["id"] in members and package["name"] == args.package}
+    elif (metadata.get("resolve") or {}).get("root"):
+        workspace = {metadata["resolve"]["root"]}
+    else:
+        workspace = members
 
     gaps, index, notes, texts = [], [], [], {}
     for name, version, annotation in sorted(release_graph(args)):
