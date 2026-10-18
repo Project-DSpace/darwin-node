@@ -132,9 +132,9 @@ jobs:
 
   # darwin-client against these nodes' listings, on a local devnet with its own
   # Anvil chain (scripts/test_e2e_listings.sh): envelopes, listings, records,
-  # per-chunk payment, manifests, and the paid commands that are off. Weekly,
-  # and by hand with listings_cross_test, not on pushes: it builds both
-  # projects in release mode.
+  # per-chunk payment, manifests and their compaction, raw chunks, and the
+  # node commands that are off. Weekly, and by hand with listings_cross_test,
+  # not on pushes: it builds both projects in release mode.
   listings-cross-test:
     if: ${{ github.event_name == 'schedule' || inputs.listings_cross_test }}
     runs-on: ubuntu-24.04

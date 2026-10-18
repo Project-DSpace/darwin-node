@@ -20,10 +20,14 @@
 #    with `--public`: each file in an envelope showing every payment field,
 #    its record saved in <manifest>.records/ and checked with
 #    `darwin file verify`. `darwin manifest export --compact` of the
-#    `--public` one publishes nothing and the result downloads; of the
-#    private one it is refused
-# 7. Checks that `darwin chunk put` and `darwin node` are refused, and pay
-#    and write nothing
+#    `--public` one publishes nothing and the result downloads. Of the
+#    private one it stops, publishing and paying nothing, and says how to
+#    make each file readable; with `--yes` it publishes their data maps as
+#    plain chunks, paid per chunk, with no envelope and no listing, and the
+#    result downloads
+# 7. Checks that `darwin chunk put` stores a raw chunk, paid, with no
+#    envelope and no listing, and that `darwin node` is refused and writes
+#    nothing
 # 8. Checks `darwin listings`: exactly the uploads in the index, in index
 #    order, hidden fields absent, the right check levels, `--since`
 # 9. Checks `darwin listing <address>` for the uploads outside the index,
@@ -272,6 +276,7 @@ assignments, prints what doesn't match the upload's choices to stderr as
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -517,9 +522,9 @@ def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
     """The vault transactions in blocks first..last, read with cast. Every
     upload pays per chunk, in transactions of up to PAYMENT_WAVE chunks: one
     for an upload under 64 chunks (`single`), as many as its chunks need for
-    a larger one, the envelope in the last (`waves`), and one for each file
-    of a manifest (`each:N`). Each chunk is paid once, and a merkle batch
-    payment is a problem in every mode."""
+    a larger one, the envelope in the last (`waves`), one for each file of a
+    manifest (`each:N`), or any number (`any`). Each chunk is paid once, and
+    a merkle batch payment is a problem in every mode."""
     vault, dpm_topic, mpm_topic = vault.lower(), dpm_topic.lower(), mpm_topic.lower()
     total = int(total)
     txs = []
@@ -554,9 +559,13 @@ def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
         expected = 1
     elif mode == "waves":
         expected = -(-total // PAYMENT_WAVE)
+    elif mode == "any":
+        expected = None
+        if not txs:
+            problem(f"no vault transaction, expected payments for {total} chunks")
     else:
         expected = int(mode.split(":", 1)[1])
-    if len(txs) != expected:
+    if expected is not None and len(txs) != expected:
         problem(f"{len(txs)} vault transactions, expected {expected} for {total} chunks "
                 f"({mode}), paid per chunk, up to {PAYMENT_WAVE} a transaction")
     for tx in per_chunk:
@@ -916,6 +925,37 @@ def cmd_compacted(path, manifest_file, rows):
     finish()
 
 
+def cmd_compacted_plain(path, manifest_file, rows, plain_addresses):
+    """`darwin --json manifest export M --compact --yes` of private uploads:
+    each file's data map published as a plain chunk, outside any envelope,
+    and referenced by that chunk's address, never by its private envelope's.
+    Adds the addresses to `plain_addresses`, which have no listing (Step 9)."""
+    j = load(path)
+    with open(rows) as f:
+        envelopes = dict(line.rstrip("\n").split("\t")[:2] for line in f if line.strip())
+    expect(j, "manifest_file", manifest_file)
+    expect(j, "data_maps_published", len(envelopes))
+    expect(j, "embedded_entries", 0)
+    expect(j, "public_entries", len(envelopes))
+    entries = j.get("entries") or []
+    if sorted(str(entry.get("path")) for entry in entries) != sorted(envelopes):
+        problem(f"entries {[entry.get('path') for entry in entries]}, expected {sorted(envelopes)}")
+    addresses = []
+    for entry in entries:
+        address = str(entry.get("address"))
+        if entry.get("kind") != "public":
+            problem(f"{entry.get('path')} is {entry.get('kind')}, not public")
+        if not re.fullmatch(r"[0-9a-f]{64}", address):
+            problem(f"{entry.get('path')} has no address: {address!r}")
+            continue
+        if address == envelopes.get(entry.get("path")):
+            problem(f"{entry.get('path')} is at its private envelope's address {address}")
+        addresses.append(address)
+    with open(plain_addresses, "a") as f:
+        f.writelines(f"{address}\n" for address in addresses)
+    finish(PUBLISHED=len(addresses))
+
+
 # ---------- the devnet ----------
 
 def cmd_manifest(path):
@@ -944,7 +984,7 @@ COMMANDS = {
     "listings": cmd_listings, "since-pick": cmd_since_pick, "since": cmd_since,
     "listing": cmd_listing, "no-listing": cmd_no_listing, "manifest": cmd_manifest,
     "chain-only": cmd_chain_only, "manifest-create": cmd_manifest_create,
-    "compacted": cmd_compacted,
+    "compacted": cmd_compacted, "compacted-plain": cmd_compacted_plain,
 }
 
 if __name__ == "__main__":
@@ -1462,39 +1502,102 @@ if [ -f "${PUBLIC_MANIFEST}" ]; then
     fi
 fi
 PRIVATE_MANIFEST="${WORK_DIR}/mc_private.darwin"
+PLAIN_COMPACT="${WORK_DIR}/mc_private-compact.darwin"
 if [ -f "${PRIVATE_MANIFEST}" ]; then
+    # Without --yes it stops: the files have no public address, and it says
+    # how to make each readable the standard way, in an envelope.
+    label="manifest export --compact (mc_private) stops without --yes"
     b0=$(block_number)
-    if run_ant free mcx_private --json manifest export "${PRIVATE_MANIFEST}" --compact \
-        -o "${WORK_DIR}/mc_private-compact.darwin"; then
-        fail "manifest export --compact (mc_private) is refused" "it compacted"
-    elif ! grep -qF "have no public address yet" "${OUT_DIR}/mcx_private.out" "${OUT_DIR}/mcx_private.err"; then
-        fail "manifest export --compact (mc_private) is refused" "$(last_error mcx_private)"
-    elif [ -e "${WORK_DIR}/mc_private-compact.darwin" ] || [ "$(block_number)" != "${b0}" ]; then
-        fail "manifest export --compact (mc_private) is refused" "it wrote a manifest or sent a transaction"
+    if run_ant pay mcx_private --json manifest export "${PRIVATE_MANIFEST}" --compact \
+        -o "${PLAIN_COMPACT}"; then
+        fail "${label}" "it compacted"
+    elif ! grep -qF -- "--visibility unlisted" "${OUT_DIR}/mcx_private.out" "${OUT_DIR}/mcx_private.err"; then
+        fail "${label}" "it doesn't say how to make the files readable: $(last_error mcx_private)"
+    elif [ -e "${PLAIN_COMPACT}" ] || [ "$(block_number)" != "${b0}" ]; then
+        fail "${label}" "it wrote a manifest or sent a transaction"
     else
-        pass "manifest export --compact (mc_private) is refused: nothing published, nothing paid"
+        pass "${label}: nothing published, nothing paid, and it says how to make each file readable"
+    fi
+
+    # With --yes it publishes their data maps as plain chunks, with no
+    # envelope: paid per chunk, unlisted, and the result downloads.
+    label="manifest export --compact --yes (mc_private)"
+    b0=$(block_number)
+    if run_ant pay mcy_private --json manifest export "${PRIVATE_MANIFEST}" --compact --yes \
+        -o "${PLAIN_COMPACT}"; then
+        b1=$(block_number)
+        PUBLISHED=""
+        vars=""
+        if vars=$(py compacted-plain "${OUT_DIR}/mcy_private.out" "${PLAIN_COMPACT}" \
+            "${OUT_DIR}/mc_private.rows" "${PLAIN_ADDRESSES}" 2> "${OUT_DIR}/mcy_private.problems"); then
+            pass "${label}: both data maps published as plain chunks, each file at its data map's address"
+        else
+            fail_with "${label}" "${OUT_DIR}/mcy_private.problems"
+        fi
+        eval "${vars}"
+        if py vault "${CAST}" "${RPC_URL}" "${VAULT_ADDRESS}" "${DPM_TOPIC}" "${MPM_TOPIC}" \
+            "$((b0 + 1))" "${b1}" "${PUBLISHED:-0}" any \
+            > /dev/null 2> "${OUT_DIR}/mcy_private.problems"; then
+            pass "${label}: paid per chunk, ${PUBLISHED:-0} chunk(s)"
+        else
+            fail_with "${label}: payments" "${OUT_DIR}/mcy_private.problems"
+        fi
+        if grep -qi "envelope" "${OUT_DIR}/mcy_private.out" "${OUT_DIR}/mcy_private.err"; then
+            pass "${label}: it says the data maps get no envelope"
+        else
+            fail "${label}: it says the data maps get no envelope" "nothing about envelopes in its output"
+        fi
+        rm -rf "${DL_DIR}/mc_private"
+        if run_ant free mcd_private --json manifest download "${PLAIN_COMPACT}" \
+                -o "${DL_DIR}/mc_private" \
+            && cmp -s "${FILES_DIR}/mc_private/a.bin" "${DL_DIR}/mc_private/a.bin" \
+            && cmp -s "${FILES_DIR}/mc_private/b.bin" "${DL_DIR}/mc_private/b.bin"; then
+            pass "the plainly compacted manifest (mc_private) downloads both files"
+        else
+            fail "the plainly compacted manifest (mc_private) downloads both files" "$(last_error mcd_private)"
+        fi
+        rm -rf "${DL_DIR}/mc_private"
+    else
+        fail "${label}" "$(last_error mcy_private)"
     fi
 fi
 echo ""
 
-# Step 7: Paid commands that are off in this build
+# Step 7: A raw chunk, and `darwin node`
 #
-# A raw chunk can't carry an envelope, and `darwin node` would install
-# Autonomi's ant-node: both are refused before anything is paid or written.
-# The node commands run with proxies on a closed port, so a build that
-# didn't refuse them could fetch nothing.
-echo "=== Step 7: darwin chunk put and darwin node are refused ==="
+# `darwin chunk put` stores a raw chunk, as the user chooses: paid like any
+# chunk, and with no envelope, so it has no listing (Step 9 checks that) and
+# is not in the index (Step 8). `darwin node` would install Autonomi's
+# ant-node, so it is refused before anything is written. The node commands
+# run with proxies on a closed port, so a build that didn't refuse them could
+# fetch nothing.
+echo "=== Step 7: darwin chunk put stores a raw chunk; darwin node is refused ==="
 RAW_FILE="${FILES_DIR}/raw.bin"
 head -c 4096 /dev/urandom > "${RAW_FILE}"
 b0=$(block_number)
 if run_ant pay chunk_put chunk put "${RAW_FILE}"; then
-    fail "darwin chunk put is refused" "it stored a raw chunk"
-elif ! grep -qF '`darwin chunk put` is off in this build' "${OUT_DIR}/chunk_put.out" "${OUT_DIR}/chunk_put.err"; then
-    fail "darwin chunk put is refused" "$(last_error chunk_put)"
-elif [ "$(block_number)" != "${b0}" ]; then
-    fail "darwin chunk put is refused" "a transaction was sent"
+    b1=$(block_number)
+    RAW_ADDRESS=$(strip_ansi < "${OUT_DIR}/chunk_put.out" | grep -oE '^[0-9a-f]{64}$' | tail -1 || true)
+    if [ -z "${RAW_ADDRESS}" ]; then
+        fail "darwin chunk put stores a raw chunk" "no address in its output: $(tail -c 300 "${OUT_DIR}/chunk_put.out")"
+    else
+        pass "darwin chunk put stores a raw chunk at ${RAW_ADDRESS}"
+        echo "${RAW_ADDRESS}" >> "${PLAIN_ADDRESSES}"
+        if py vault "${CAST}" "${RPC_URL}" "${VAULT_ADDRESS}" "${DPM_TOPIC}" "${MPM_TOPIC}" \
+            "$((b0 + 1))" "${b1}" 1 single > /dev/null 2> "${OUT_DIR}/chunk_put.problems"; then
+            pass "darwin chunk put: paid once, in one vault transaction"
+        else
+            fail_with "darwin chunk put: payment" "${OUT_DIR}/chunk_put.problems"
+        fi
+        if run_ant free chunk_get chunk get "${RAW_ADDRESS}" -o "${WORK_DIR}/raw-back.bin" \
+            && cmp -s "${RAW_FILE}" "${WORK_DIR}/raw-back.bin"; then
+            pass "darwin chunk get returns the raw chunk byte for byte"
+        else
+            fail "darwin chunk get returns the raw chunk byte for byte" "$(last_error chunk_get)"
+        fi
+    fi
 else
-    pass "darwin chunk put is refused before anything is paid"
+    fail "darwin chunk put stores a raw chunk" "$(last_error chunk_put)"
 fi
 NODE_HOME="${WORK_DIR}/node-home"
 mkdir -p "${NODE_HOME}"
@@ -1583,17 +1686,18 @@ while IFS=$'\t' read -r tag address readable index bits _rest <&3; do
         fail "${label}" "$(last_error "listing_${tag}")"
     fi
 done 3< <(tail -n +2 "${EXPECTED_TSV}")
-# A readable upload without an envelope, and an address with nothing at it,
-# have no listing: `darwin listing` fails.
+# A readable upload without an envelope, the data maps a compaction published
+# plainly, a raw chunk, and an address with nothing at it have no listing:
+# `darwin listing` fails.
 n=0
 while read -r address <&3; do
     n=$((n + 1))
     if run_ant free "no_listing_${n}" --json listing "${address}"; then
-        fail "darwin listing: a plain data map has no listing" "it found one for ${address}"
+        fail "darwin listing: a chunk with no envelope has no listing" "it found one for ${address}"
     elif py no-listing "${OUT_DIR}/no_listing_${n}.out" > /dev/null 2> "${OUT_DIR}/no_listing_${n}.problems"; then
-        pass "darwin listing: a plain data map has no listing"
+        pass "darwin listing: a chunk with no envelope has no listing (${address:0:16}...)"
     else
-        fail_with "darwin listing: a plain data map has no listing" "${OUT_DIR}/no_listing_${n}.problems"
+        fail_with "darwin listing: a chunk with no envelope has no listing" "${OUT_DIR}/no_listing_${n}.problems"
     fi
 done 3< "${PLAIN_ADDRESSES}"
 RANDOM_ADDRESS=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
