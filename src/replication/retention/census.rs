@@ -33,6 +33,14 @@
 //! dropped at the end of its scope. Nor can a count tell which receiver a
 //! listed call is on, so a listed call turned into another of the same name
 //! at the same site passes; the review of the change has to catch that.
+//!
+//! The same reading of the source pins other calls to reviewed sites, each in
+//! a test of its own: the disk-pressure state's builders, the routing loop's
+//! event reader, the penalty for an unheld close-group chunk, upstream's
+//! merkle payment code (compiled, never reached), and the payment vault reads
+//! and RPC addresses behind the payment check's fallback. A last test reads
+//! the vendored protocol's wire messages and payment proof types against a
+//! reviewed list of what a node does with each.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -1002,8 +1010,37 @@ enum Counting {
     /// Calls that can remove stored data (see the module documentation).
     Erasures,
     /// Calls of these functions, by name and, where given, the path segment
-    /// before it (`Type::name`).
+    /// before it (`Type::name`). A name ending in `*` stands for every name
+    /// that starts with what comes before it.
     Calls(&'static [(Option<&'static str>, &'static str)]),
+    /// Every mention of these names, called or not (an import, a type, a
+    /// path), as for [`Counting::Calls`]. Definitions are not mentions.
+    Mentions(&'static [(Option<&'static str>, &'static str)]),
+}
+
+/// The label a mention of `name`, after `owner::` if it has an owner, is
+/// counted under, if `wanted` lists it: the name, after the owner its entry
+/// asks for. An entry's name ending in `*` matches every name starting with
+/// what comes before it.
+fn wanted_label(
+    wanted: &[(Option<&str>, &str)],
+    owner: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    wanted
+        .iter()
+        .find(|(wanted_owner, pattern)| {
+            let named = pattern
+                .strip_suffix('*')
+                .map_or(*pattern == name, |prefix| name.starts_with(prefix));
+            named && wanted_owner.is_none_or(|wanted_owner| owner == Some(wanted_owner))
+        })
+        .map(|(wanted_owner, _)| {
+            wanted_owner.map_or_else(
+                || name.to_string(),
+                |wanted_owner| format!("{wanted_owner}::{name}"),
+            )
+        })
 }
 
 struct Walker<'a> {
@@ -1181,31 +1218,24 @@ impl<'a> Walker<'a> {
         let called = matches!(next, Some(Tok::Punct('(')))
             || (matches!(next, Some(Tok::Joint("::")))
                 && matches!(self.tok(pos + 2), Some(Tok::Punct('<'))));
-        match self.counting {
-            Counting::Erasures => self.count_erasure(pos, name, called, line),
-            Counting::Calls(functions) if called => {
-                let owner = if matches!(previous, Some(Tok::Joint("::"))) {
-                    pos.checked_sub(2)
-                        .and_then(|at| self.ident(at))
-                        .map(str::to_string)
-                } else {
-                    None
-                };
-                let label = functions
-                    .iter()
-                    .find(|(wanted, function)| {
-                        *function == name
-                            && wanted.is_none_or(|wanted| owner.as_deref() == Some(wanted))
-                    })
-                    .map(|(wanted, function)| {
-                        wanted
-                            .map_or_else(|| (*function).to_string(), |w| format!("{w}::{function}"))
-                    });
-                if let Some(label) = label {
-                    self.count(&label, line);
-                }
+        let wanted = match self.counting {
+            Counting::Erasures => {
+                self.count_erasure(pos, name, called, line);
+                return pos + 1;
             }
-            Counting::Calls(_) => {}
+            Counting::Calls(wanted) if called => wanted,
+            Counting::Calls(_) => return pos + 1,
+            Counting::Mentions(wanted) => wanted,
+        };
+        let owner = if matches!(previous, Some(Tok::Joint("::"))) {
+            pos.checked_sub(2)
+                .and_then(|at| self.ident(at))
+                .map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(label) = wanted_label(wanted, owner.as_deref(), name) {
+            self.count(&label, line);
         }
         pos + 1
     }
@@ -1625,6 +1655,404 @@ fn the_disk_pressure_state_is_built_once_per_node() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Other reviewed calls
+// ---------------------------------------------------------------------------
+
+/// A reviewed site of a call that one of the tests below pins: the file, site
+/// and call as the census names them, and how many times it is made there.
+type Reviewed = (&'static str, &'static str, &'static str, usize);
+
+/// What `counting` finds in this crate's production code, against
+/// `reviewed`: an empty string when they agree, else each difference, with
+/// the lines of the calls found.
+fn unreviewed(counting: Counting, reviewed: &[Reviewed]) -> String {
+    let found = census_counting(Path::new(env!("CARGO_MANIFEST_DIR")), counting);
+    let listed: BTreeMap<(String, String, String), usize> = reviewed
+        .iter()
+        .map(|(file, site, call, count)| {
+            (
+                (
+                    (*file).to_string(),
+                    (*site).to_string(),
+                    (*call).to_string(),
+                ),
+                *count,
+            )
+        })
+        .collect();
+    let mut report = String::new();
+    for (key, lines) in &found {
+        let allowed = listed.get(key).copied().unwrap_or(0);
+        if lines.len() != allowed {
+            let (file, site, call) = key;
+            let at: Vec<String> = lines.iter().map(|line| format!("{file}:{line}")).collect();
+            let _ = writeln!(
+                report,
+                "  {file}  {site}  {call}: found {}, reviewed {allowed}  ({})",
+                lines.len(),
+                at.join(", ")
+            );
+        }
+    }
+    for (key, allowed) in &listed {
+        if !found.contains_key(key) {
+            let (file, site, call) = key;
+            let _ = writeln!(
+                report,
+                "  {file}  {site}  {call}: found 0, reviewed {allowed}"
+            );
+        }
+    }
+    report
+}
+
+/// The protocol routing loop reads its events through `next_routing_event`,
+/// which carries on when the loop falls behind the event broadcast. Upstream's
+/// loop ended there, and the node then answered no request while it stayed
+/// connected.
+#[test]
+fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
+    const READER: &[(Option<&str>, &str)] = &[(None, "next_routing_event")];
+    const REVIEWED: &[Reviewed] = &[(
+        "src/node.rs",
+        "RunningNode::start_protocol_routing",
+        "next_routing_event",
+        1,
+    )];
+    let report = unreviewed(Counting::Calls(READER), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nThe protocol routing loop no longer reads its events only through \
+         next_routing_event.\n\n{report}\n\
+         RunningNode::start_protocol_routing (src/node.rs) must read saorsa-core's event \
+         broadcast through next_routing_event, which warns and carries on past \
+         RecvError::Lagged. A loop that ends there leaves the node connected and answering \
+         no request until it restarts.\n"
+    );
+}
+
+/// A peer is penalised for not holding a close-group chunk only through
+/// `penalise_unheld_close_group_chunk`, which withholds the penalty while the
+/// release suspends it, and at exactly the places that judge it.
+#[test]
+fn the_unheld_chunk_penalty_goes_through_its_release_switch() {
+    const PENALTY: &[(Option<&str>, &str)] = &[(None, "penalise_unheld_close_group_chunk")];
+    const REVIEWED: &[Reviewed] = &[
+        // A fetch for replication answered NotFound by a peer that should hold it.
+        (
+            "src/replication/mod.rs",
+            "charge_fetch_fault",
+            "penalise_unheld_close_group_chunk",
+            1,
+        ),
+        // A responsible-chunk audit the peer failed.
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "penalise_unheld_close_group_chunk",
+            1,
+        ),
+        // A replica hint whose sender then denied holding the chunk.
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "penalise_unheld_close_group_chunk",
+            1,
+        ),
+        // The fresh-replication possession check: no answer, or a wrong one.
+        (
+            "src/replication/possession.rs",
+            "report_possession_audit_failure",
+            "penalise_unheld_close_group_chunk",
+            1,
+        ),
+        // The fresh-replication possession check: a confirmed failure.
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "penalise_unheld_close_group_chunk",
+            1,
+        ),
+        // A prune audit the peer failed.
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "penalise_unheld_close_group_chunk",
+            1,
+        ),
+    ];
+    let report = unreviewed(Counting::Calls(PENALTY), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nThe calls of penalise_unheld_close_group_chunk no longer match the reviewed \
+         ones.\n\n{report}\n\
+         A node short of the disk to hold its chunks fails every one of these checks. While \
+         nodes are still moving off the legacy LMDB store, the penalty for that stays \
+         suspended (RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY in \
+         src/replication/config.rs), and penalise_unheld_close_group_chunk is the only \
+         place that applies the switch. Penalise a peer for an unheld close-group chunk \
+         through it, never with report_trust_event directly, and list each place that \
+         does here.\n"
+    );
+}
+
+/// Upstream's merkle (batch) payment code stays compiled, so that merges stay
+/// cheap, but no production code reaches it: a merkle quote request is refused
+/// before anything is signed, and a merkle proof before it is verified.
+#[test]
+fn the_merkle_payment_code_is_not_reached() {
+    const MERKLE: &[(Option<&str>, &str)] = &[
+        (None, "verify_merkle_payment"),
+        (None, "sign_merkle_candidate_quote"),
+        (None, "create_merkle_candidate_quote"),
+        (None, "get_completed_merkle_payment"),
+    ];
+    const REVIEWED: &[Reviewed] = &[
+        // Inside upstream's merkle proof verification, which nothing calls.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::verify_merkle_payment",
+            "get_completed_merkle_payment",
+            1,
+        ),
+        // Inside upstream's merkle quote signing, which nothing calls.
+        (
+            "src/storage/handler.rs",
+            "AntProtocol::sign_merkle_candidate_quote",
+            "create_merkle_candidate_quote",
+            1,
+        ),
+    ];
+    let report = unreviewed(Counting::Calls(MERKLE), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nProduction code calls upstream's merkle payment code.\n\n{report}\n\
+         This node refuses merkle (batch) payments: a merkle candidate quote request is \
+         answered with BATCH_PAYMENTS_REFUSED before anything is signed \
+         (AntProtocol::handle_merkle_candidate_quote), and a merkle proof is refused before \
+         it is verified, for chunks and pointers alike (PaymentVerifier::verify_payment_inner). \
+         A batch is paid on chain before any node sees a PUT, so a node that took the \
+         quote and then refused the PUT would let the client pay for nothing.\n"
+    );
+}
+
+/// The payment vault is read only by the payment check's two reads, each
+/// through `read_payment`, which tries the node's RPC and then the chain's
+/// other public RPCs.
+#[test]
+fn the_payment_vault_is_read_only_through_the_rpc_fallback() {
+    const VAULT: &[(Option<&str>, &str)] = &[
+        (None, "IPaymentVault"),
+        (None, "PaymentVaultHandler"),
+        (Some("payment_vault"), "get_*"),
+    ];
+    const REVIEWED: &[Reviewed] = &[
+        // completedPayments, through read_payment.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::completed_payment_settlement",
+            "IPaymentVault",
+            1,
+        ),
+        // completedMerklePayments, through read_payment; nothing calls it.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::verify_merkle_payment",
+            "PaymentVaultHandler",
+            1,
+        ),
+    ];
+    let report = unreviewed(Counting::Mentions(VAULT), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nThe payment vault is read somewhere new.\n\n{report}\n\
+         A payment check reads the vault through PaymentVerifier::read_payment, which \
+         tries the node's RPC and then the chain's other public RPCs, so that one busy \
+         provider does not make the node refuse a paid chunk. Read the vault through \
+         read_payment, and list the read here.\n"
+    );
+}
+
+/// The node's configured RPC address is taken only where a list of RPCs to
+/// fall back across is built from it, or by the local devnet tool.
+#[test]
+fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
+    const RPC: &[(Option<&str>, &str)] = &[(None, "rpc_url")];
+    const REVIEWED: &[Reviewed] = &[
+        // The devnet tool writes the test network's RPC into its manifest.
+        (
+            "src/bin/ant-devnet/main.rs",
+            "resolve_evm_info",
+            "rpc_url",
+            1,
+        ),
+        // The chain ID for browser clients, read through payment_chain_id_retrying,
+        // which falls back on the chain's other public RPCs.
+        ("src/browser.rs", "browser_payment_network", "rpc_url", 1),
+        // The local devnet's listing service, which builds its list from it.
+        ("src/devnet.rs", "Devnet::create_ant_protocol", "rpc_url", 1),
+        // The listing service, which builds its list from it (listings_rpc_urls).
+        (
+            "src/node.rs",
+            "NodeBuilder::build_ant_protocol",
+            "rpc_url",
+            1,
+        ),
+        // The payment check's list: the node's RPC, then the chain's other public ones.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::payment_rpc_urls",
+            "rpc_url",
+            1,
+        ),
+    ];
+    let report = unreviewed(Counting::Calls(RPC), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nThe node's RPC address is taken somewhere new.\n\n{report}\n\
+         Payments are read through PaymentVerifier::payment_rpc_urls, the node's RPC and \
+         then the chain's other public RPCs, and listings' payments through \
+         listings_rpc_urls. A read through the configured RPC alone fails whenever that \
+         provider is busy. Build the list from it instead, and list the call here.\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Wire messages
+// ---------------------------------------------------------------------------
+
+/// Every message of the vendored protocol's `ChunkMessageBody`, with what a
+/// node does when one arrives (`AntProtocol::handle_message_with_context`,
+/// src/storage/handler.rs).
+const CHUNK_MESSAGES: &[(&str, &str)] = &[
+    (
+        "PutRequest",
+        "Stores a chunk once paid per chunk; a merkle proof is refused.",
+    ),
+    (
+        "PointerPutRequest",
+        "Stores a pointer state once paid at its state, before any finality look; a merkle \
+         proof is refused.",
+    ),
+    ("QuoteRequest", "A single-node quote."),
+    (
+        "QuoteRequestV2",
+        "A single-node quote, after the settlement version check.",
+    ),
+    (
+        "MerkleCandidateQuoteRequest",
+        "Refused before anything is signed.",
+    ),
+    (
+        "MerkleCandidateQuoteRequestV2",
+        "Refused before anything is signed.",
+    ),
+    ("GetRequest", "A read: nothing is stored or paid."),
+    ("PointerGetRequest", "A read: nothing is stored or paid."),
+    ("PutResponse", "A response: dropped, never answered."),
+    ("GetResponse", "A response: dropped, never answered."),
+    ("QuoteResponse", "A response: dropped, never answered."),
+    (
+        "MerkleCandidateQuoteResponse",
+        "A response: dropped, never answered.",
+    ),
+    ("PointerPutResponse", "A response: dropped, never answered."),
+    ("PointerGetResponse", "A response: dropped, never answered."),
+];
+
+/// Every kind of payment proof the vendored protocol tells apart
+/// (`ProofType`), with what the payment check does with it
+/// (`PaymentVerifier::verify_payment_inner`).
+const PROOF_TYPES: &[(&str, &str)] = &[
+    (
+        "SingleNode",
+        "Verified: the median quote, its issuer's closeness and its settlement on chain.",
+    ),
+    (
+        "Merkle",
+        "Refused in every context, for chunks and pointers alike.",
+    ),
+];
+
+/// The variants of the enum called `name` in `source`, in the order they are
+/// declared; empty if there is no such enum.
+fn enum_variants(source: &str, name: &str) -> Vec<String> {
+    let tokens = tokenize(source);
+    let tok = |pos: usize| tokens.get(pos).map(|token| &token.tok);
+    let declared = (0..tokens.len()).find(|&pos| {
+        matches!(tok(pos), Some(Tok::Ident(word)) if word == "enum")
+            && matches!(tok(pos + 1), Some(Tok::Ident(word)) if word == name)
+    });
+    let Some(open) =
+        declared.and_then(|at| (at..tokens.len()).find(|&pos| tok(pos) == Some(&Tok::Punct('{'))))
+    else {
+        return Vec::new();
+    };
+    let close = matching_close(&tokens, open);
+    let mut variants = Vec::new();
+    let mut at_variant = true;
+    let mut pos = open + 1;
+    while pos < close {
+        match tok(pos) {
+            // An attribute on a variant.
+            Some(Tok::Punct('#')) if tok(pos + 1) == Some(&Tok::Punct('[')) => {
+                pos = matching_close(&tokens, pos + 1);
+            }
+            // A variant's fields.
+            Some(Tok::Punct('(' | '[' | '{')) => pos = matching_close(&tokens, pos),
+            Some(Tok::Punct(',')) => at_variant = true,
+            Some(Tok::Ident(variant)) if at_variant => {
+                variants.push(variant.clone());
+                at_variant = false;
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    variants
+}
+
+/// Every message the chunk protocol carries, and every kind of payment proof,
+/// is one whose handling has been reviewed. Both enums are `#[non_exhaustive]`
+/// in the vendored protocol, so the compiler says nothing when a new version
+/// of it adds a variant, or when a merge adds the handling of one; this does.
+#[test]
+fn the_wire_messages_are_the_reviewed_ones() {
+    let protocol = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/ant-protocol/src");
+    for (file, name, reviewed) in [
+        ("chunk.rs", "ChunkMessageBody", CHUNK_MESSAGES),
+        ("payment/proof.rs", "ProofType", PROOF_TYPES),
+    ] {
+        let source = std::fs::read_to_string(protocol.join(file)).unwrap_or_default();
+        let declared = enum_variants(&source, name);
+        let declared_set: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+        let listed: BTreeSet<&str> = reviewed.iter().map(|(variant, _)| *variant).collect();
+        let not_reviewed: Vec<&str> = declared_set.difference(&listed).copied().collect();
+        let gone: Vec<&str> = listed.difference(&declared_set).copied().collect();
+        let without_reason: Vec<&str> = reviewed
+            .iter()
+            .filter(|(_, reason)| reason.trim().is_empty())
+            .map(|(variant, _)| *variant)
+            .collect();
+        assert!(
+            !declared.is_empty()
+                && not_reviewed.is_empty()
+                && gone.is_empty()
+                && without_reason.is_empty(),
+            "\n{name} in vendor/ant-protocol/src/{file} no longer matches the reviewed list \
+             in src/replication/retention/census.rs.\n\n  declared: {declared:?}\n  \
+             not reviewed: {not_reviewed:?}\n  listed but gone: {gone:?}\n  \
+             listed without a reason: {without_reason:?}\n\n\
+             Nodes take single-node payments only, and refuse merkle (batch) payments at \
+             quote time and on any proof. Before listing a new message or proof type, make \
+             sure the node's handler (src/storage/handler.rs) and payment check \
+             (src/payment/verifier.rs) take it through those rules, with tests that pin it; \
+             until then, refuse it.\n"
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1839,6 +2267,80 @@ mod tests {
                 one("engine", "for_store")
             ]
         );
+    }
+
+    /// A mention is counted whether or not it is called: an import, a type, a
+    /// path. A name ending in `*` stands for every name it starts, after the
+    /// owner its entry asks for; a definition is no mention.
+    #[test]
+    fn mentions_are_counted_called_or_not_and_a_star_matches_a_prefix() {
+        const WANTED: &[(Option<&str>, &str)] =
+            &[(None, "IPaymentVault"), (Some("payment_vault"), "get_*")];
+        let source = r"
+            use evmlib::contract::payment_vault::interface::IPaymentVault;
+            fn read(p: P) {
+                IPaymentVault::new(vault, p).completedPayments(h);
+                payment_vault::get_completed_merkle_payment(p, h);
+                payment_vault::get_market_price(p);
+                other::get_completed_merkle_payment(p, h);
+                payment_vault::handler(p);
+            }
+            fn IPaymentVault() {}
+            fn get_everything() {}
+        ";
+        let found: Vec<(String, String, usize)> = scan_counting(source, Counting::Mentions(WANTED))
+            .calls
+            .into_iter()
+            .map(|((site, call), lines)| (site, call, lines.len()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                one("<module>", "IPaymentVault"),
+                one("read", "IPaymentVault"),
+                one("read", "payment_vault::get_completed_merkle_payment"),
+                one("read", "payment_vault::get_market_price"),
+            ]
+        );
+
+        // As calls, an import is not counted, and the prefix still applies.
+        let called: Vec<(String, String, usize)> = scan_counting(source, Counting::Calls(WANTED))
+            .calls
+            .into_iter()
+            .map(|((site, call), lines)| (site, call, lines.len()))
+            .collect();
+        assert_eq!(
+            called,
+            vec![
+                one("read", "payment_vault::get_completed_merkle_payment"),
+                one("read", "payment_vault::get_market_price"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_variants_of_an_enum_are_read_in_order() {
+        let source = r#"
+            /// Not this one, though it comes first.
+            enum Other { Wrong, AlsoWrong(u8) }
+            #[derive(Debug)]
+            #[non_exhaustive]
+            pub enum Body<T> {
+                /// A doc comment, then a tuple variant.
+                Put(Request<T>),
+                #[serde(rename = "fetch")]
+                Get { address: [u8; 32], data: Vec<(u8, u8)> },
+                // A comment: Ignored,
+                Unit,
+                Numbered = 7,
+            }
+        "#;
+        assert_eq!(
+            enum_variants(source, "Body"),
+            vec!["Put", "Get", "Unit", "Numbered"]
+        );
+        assert_eq!(enum_variants(source, "Other"), vec!["Wrong", "AlsoWrong"]);
+        assert!(enum_variants(source, "Missing").is_empty());
     }
 
     #[test]
