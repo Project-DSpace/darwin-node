@@ -1739,6 +1739,16 @@ async fn bridge_tick(
     true
 }
 
+// This fork keeps the legacy LMDB store and this migration (upstream's #218,
+// which removes them and turns the penalty back on, is reverted). A node that
+// has to give up chunks here must not be penalised by its peers for that, so a
+// build with the penalty switched back on doesn't compile while the migration
+// is here. tests/fork_pins.rs checks that a started node applies the switch.
+const _: () = assert!(
+    crate::replication::config::RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY,
+    "the unheld-chunk penalty stays suspended while this fork keeps the LMDB migration"
+);
+
 /// Decide whether the node may give up what it could not copy.
 #[allow(clippy::too_many_lines)]
 async fn evaluate_shed(

@@ -754,8 +754,11 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
 /// Whether this build penalises a peer for not holding a chunk it was supposed to hold.
 ///
-/// **`true` while the fleet moves off the legacy LMDB chunk store; back to `false` once it
-/// has.** Flipping it is a one-line change in one release.
+/// **`true` in this fork, which keeps the legacy LMDB chunk store and the move off it
+/// (upstream's #218, which removes both and applies the penalty again, is reverted).** A
+/// build with it `false` doesn't compile while the migration is here: an assertion beside
+/// `evaluate_shed` in `src/storage/migration.rs` refuses it, and `tests/fork_pins.rs` checks
+/// that a started node withholds the penalty.
 ///
 /// Deliberately narrow. It covers exactly one accusation: "you did not have a chunk you
 /// were supposed to be holding". It does **not** cover the commitment-bound subtree audit,
@@ -1526,8 +1529,9 @@ mod tests {
         set_close_group_storage_penalty_suspended(false);
         assert!(!close_group_storage_penalty_suspended());
 
-        // And applying the release policy lands on whatever this build ships, without
-        // asserting the constant itself, which the follow-up release flips on purpose.
+        // And applying the release policy lands on whatever this build ships. The constant
+        // itself is pinned elsewhere: it stays `true` while this fork keeps the LMDB
+        // migration (src/storage/migration.rs, tests/fork_pins.rs).
         apply_and_announce(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
         assert_eq!(
             close_group_storage_penalty_suspended(),
