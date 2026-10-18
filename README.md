@@ -84,12 +84,16 @@ never ran.
   test (`src/replication/retention/census.rs`) lists the calls in `src/` that
   delete files, directories or table entries, with the reason each is there,
   so a change that adds one fails the test suite until it is reviewed.
-- **Audits don't delete chunk files** (from ds.13). In upstream 0.23.0, digest
-  audits, possession checks, prune audits and the recheck of chunks an audit
-  found rotted delete a chunk file whose bytes don't match its name. Here they
-  take such a chunk out of service and leave the file: the node stops claiming
-  it, and the next good copy replaces it. Reads that hand a chunk on still
-  remove such a file (`get_or_quarantine`), and the census lists each of them.
+- **Audits remove rotted chunk files, and the census lists every removal**
+  (from ds.13). As upstream 0.23.0 does, digest audits, possession checks,
+  prune audits and the recheck of chunks a storage audit found rotted remove a
+  chunk file whose bytes don't match its name, after reading it again under its
+  write lane: no peer is judged against the rotted copy, the node stops
+  claiming the chunk, and replication restores it from other nodes. Reads that
+  hand a chunk on have done the same since ds.11. Every such read calls
+  `get_or_quarantine`, and the census lists each call with its reason. The
+  plain read, `get`, never removes a file, so a read an upstream merge adds
+  removes nothing until it has been reviewed.
 - **The LMDB chunk store and the move off it stay.** Upstream's v0.23.0
   removes them (#218): the legacy LMDB store, the migration that copies it
   into one file per chunk, the migration state each node announces in its

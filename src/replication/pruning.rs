@@ -1997,7 +1997,7 @@ async fn local_record_digest(
 /// holder and hold the prune back indefinitely, so it is taken out of service by the
 /// read instead, and the key is not audited.
 async fn local_record_bytes(key: &XorName, storage: &Arc<ChunkStore>) -> Option<Vec<u8>> {
-    match storage.get(key).await {
+    match storage.get_or_quarantine(key).await {
         Ok(Some(bytes)) => Some(bytes),
         Ok(None) => {
             debug!(
@@ -2199,9 +2199,8 @@ mod tests {
 
     /// A prune audit judges holders against this node's own copy. A copy that
     /// no longer hashes to its key would fail every honest holder and hold the
-    /// prune back forever, so it is not used as a reference: the read takes it
-    /// out of service instead, leaving the file for replication to repair, and an
-    /// intact copy is used as before.
+    /// prune back forever, so it is not used as a reference: the read removes it
+    /// instead, so replication repairs it, and an intact copy is used as before.
     #[tokio::test]
     async fn a_rotted_local_copy_is_not_used_to_judge_holders() {
         let dir = TempDir::new().expect("temp dir");
@@ -2230,19 +2229,16 @@ mod tests {
             local_record_bytes(&good, &storage).await,
             Some(good_bytes.clone())
         );
-        assert_eq!(local_record_bytes(&bad, &storage).await, None);
         // No digest, so no holder is judged against the rotted copy.
         let holder = peer_id_from_byte(9);
         assert_eq!(
             local_record_digest(&holder, &bad, &[0x5A; 32], &storage).await,
             None
         );
+        assert!(!path.exists(), "the rotted local copy is removed");
         assert!(!storage.exists(&bad).expect("exists"));
         assert!(!storage.all_keys().await.expect("keys").contains(&bad));
-        assert_eq!(
-            std::fs::read(&path).expect("the rotted local copy stays on disk"),
-            b"rotted"
-        );
+        assert_eq!(local_record_bytes(&bad, &storage).await, None);
 
         // Replication's repair, an ordinary store of the right bytes, makes it a
         // reference again.

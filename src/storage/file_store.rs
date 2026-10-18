@@ -1219,7 +1219,9 @@ impl FileStore {
     /// name and repairs it). The mark is held in memory only, so after a restart the
     /// node claims the chunk again until a verifying read finds it wrong again.
     ///
-    /// Reads that hand a chunk on use [`Self::get_or_quarantine`] instead.
+    /// Reads that hand a chunk on, the audits that judge a peer against this node's
+    /// copy and the recheck of chunks an audit found rotted use
+    /// [`Self::get_or_quarantine`] instead.
     ///
     /// # Errors
     ///
@@ -1234,9 +1236,11 @@ impl FileStore {
     /// Retrieve a chunk as [`Self::get`] does, and remove the file if its bytes do not
     /// hash to its name.
     ///
-    /// For reads that hand a chunk on. The file is read again under its write lane and
-    /// removed only if it is still wrong, so a copy repaired in the meantime stays. Every
-    /// call is listed in the erasure census (`src/replication/retention/census.rs`).
+    /// For reads that hand a chunk on, the audits that judge a peer against this node's
+    /// copy and the recheck of chunks an audit found rotted. The file is read again under
+    /// its write lane and removed only if it is still wrong, so a copy repaired in the
+    /// meantime stays. Every call is listed in the erasure census
+    /// (`src/replication/retention/census.rs`).
     ///
     /// # Errors
     ///

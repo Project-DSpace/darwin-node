@@ -622,7 +622,7 @@ async fn compare_with_local_copies(
             continue;
         }
 
-        let local_bytes = match storage.get(key).await {
+        let local_bytes = match storage.get_or_quarantine(key).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 // We should hold this key (we sampled it), but it's gone.
@@ -1379,8 +1379,7 @@ mod tests {
 
     /// The auditor's own copy is the reference a peer is judged against. A local
     /// copy that has rotted must not fail an honest peer, must not count as a
-    /// verification either, and is taken out of service, its file left in place,
-    /// so replication repairs it.
+    /// verification either, and is removed, so replication repairs it.
     #[tokio::test]
     async fn a_rotted_local_copy_neither_fails_nor_passes_the_peer() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -1402,8 +1401,6 @@ mod tests {
         let rot = |key: &XorName| {
             std::fs::write(chunk_path(key), b"rotted").expect("corrupt the file");
         };
-        let still_rotted =
-            |key: &XorName| std::fs::read(chunk_path(key)).is_ok_and(|bytes| bytes == b"rotted");
 
         let mut stored = Vec::new();
         for content in [
@@ -1444,6 +1441,10 @@ mod tests {
             AuditTickResult::Idle
         ));
         assert!(
+            !chunk_path(lone).exists(),
+            "the rotted local copy is removed"
+        );
+        assert!(
             !storage.exists(lone).expect("exists"),
             "the rotted local copy is taken out of service"
         );
@@ -1451,7 +1452,6 @@ mod tests {
             !storage.all_keys().await.expect("keys").contains(lone),
             "and leaves the view the next commitment is built from"
         );
-        assert!(still_rotted(lone), "the rotted file stays on disk");
 
         // A good and a rotted reference: the peer passes on what was checked.
         let partial = compare_with_local_copies(
@@ -1476,8 +1476,12 @@ mod tests {
             }
         ));
 
+        assert!(
+            !chunk_path(paired).exists(),
+            "the rotted local copy is removed"
+        );
         assert!(!storage.exists(paired).expect("exists"));
-        assert!(still_rotted(paired), "the rotted file stays on disk");
+        assert!(!storage.all_keys().await.expect("keys").contains(paired));
 
         // A wrong digest against a good reference still fails, as before.
         let wrong =
@@ -1486,14 +1490,15 @@ mod tests {
         assert_eq!(wrong.failed_keys.len(), 1);
         assert_eq!(wrong.verified, 0);
 
-        // Replication's repair, an ordinary store of the right bytes, replaces both in
-        // place, and they are references again.
+        // Replication's repair, an ordinary store of the right bytes, brings both back,
+        // and they are references again.
         for (key, bytes) in [(lone, lone_bytes), (paired, paired_bytes)] {
             assert!(storage.put(key, bytes).await.expect("repair"));
             assert_eq!(
                 storage.get(key).await.expect("get").as_deref(),
                 Some(bytes.as_slice())
             );
+            assert!(storage.all_keys().await.expect("keys").contains(key));
         }
         let repaired = compare_with_local_copies(
             &storage,

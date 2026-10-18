@@ -786,6 +786,103 @@ async fn possession_check_penalises_absent_peer_only_and_obeys_the_release_switc
     harness.teardown().await.expect("teardown");
 }
 
+/// The checker's own copy is the reference the possession check judges peers
+/// against. When that copy has rotted, the check removes the rotted file, so the
+/// key leaves the checker's store and replication can bring a good copy back, and
+/// it judges no peer: a peer that holds the chunk is not penalised. Once a good copy
+/// is stored again it is the reference again, and an absent peer is penalised as
+/// before.
+#[tokio::test]
+#[serial]
+async fn a_checker_whose_copy_rotted_removes_it_and_penalises_no_peer() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    // A is the checker; B never stores the chunk; C holds it.
+    let a = harness.test_node(3).expect("node a");
+    let b = harness.test_node(4).expect("node b");
+    let c = harness.test_node(5).expect("node c");
+
+    let p2p_a = a.p2p_node.as_ref().expect("p2p a");
+    let engine_a = a.replication_engine.as_ref().expect("engine a");
+    let store_a = a.ant_protocol.as_ref().expect("proto a").storage();
+    let peer_b = *b.p2p_node.as_ref().expect("p2p b").peer_id();
+    let peer_c = *c.p2p_node.as_ref().expect("p2p c").peer_id();
+
+    let content = b"possession-check payload whose checker copy rots";
+    let address = compute_address(content);
+    store_a
+        .put(&address, content)
+        .await
+        .expect("put on a (checker)");
+    c.ant_protocol
+        .as_ref()
+        .expect("proto c")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on c");
+    let chunk_file = store_a.test_chunk_path(&address);
+    fs::write(&chunk_file, b"rotted").expect("rot the checker's copy");
+
+    // The penalty switched on, so a peer judged against the rotted copy would show it.
+    let suspended = ant_node::replication::config::close_group_storage_penalty_suspended();
+    ant_node::replication::config::set_close_group_storage_penalty_suspended(false);
+
+    let trust_b_before = p2p_a.peer_trust(&peer_b);
+    let trust_c_before = p2p_a.peer_trust(&peer_c);
+    engine_a
+        .run_possession_check_now(address, vec![peer_b, peer_c])
+        .await;
+    let trust_b_after = p2p_a.peer_trust(&peer_b);
+    let trust_c_after = p2p_a.peer_trust(&peer_c);
+
+    assert!(!chunk_file.exists(), "the checker's rotted copy is removed");
+    assert!(
+        !store_a.exists(&address).expect("exists a"),
+        "the rotted copy leaves the checker's store"
+    );
+    assert!(!store_a.all_keys().await.expect("keys a").contains(&address));
+    assert!(
+        trust_c_after >= trust_c_before - f64::EPSILON,
+        "a peer holding the chunk was judged against a rotted copy: \
+         {trust_c_before} -> {trust_c_after}"
+    );
+    assert!(
+        trust_b_after >= trust_b_before - f64::EPSILON,
+        "no peer is judged while the checker has no good copy: \
+         {trust_b_before} -> {trust_b_after}"
+    );
+
+    // Replication's repair is an ordinary store of the right bytes: the good copy is
+    // the reference again.
+    store_a.put(&address, content).await.expect("repair on a");
+    assert_eq!(
+        store_a.get(&address).await.expect("get a").as_deref(),
+        Some(&content[..])
+    );
+    let trust_b_before = p2p_a.peer_trust(&peer_b);
+    let trust_c_before = p2p_a.peer_trust(&peer_c);
+    engine_a
+        .run_possession_check_now(address, vec![peer_b, peer_c])
+        .await;
+    let trust_b_after = p2p_a.peer_trust(&peer_b);
+    let trust_c_after = p2p_a.peer_trust(&peer_c);
+    ant_node::replication::config::set_close_group_storage_penalty_suspended(suspended);
+
+    assert!(
+        trust_b_after < trust_b_before,
+        "an absent peer is penalised against the repaired copy: \
+         {trust_b_before} -> {trust_b_after}"
+    );
+    assert!(
+        trust_c_after >= trust_c_before - f64::EPSILON,
+        "a peer holding the chunk is not penalised: {trust_c_before} -> {trust_c_after}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
 /// ADR-0003: the possession-check *scheduler* (not the direct-drive path)
 /// fires after the configured delay and penalises an absent close peer.
 ///

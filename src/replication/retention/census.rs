@@ -245,6 +245,16 @@ const ERASE_SITES: &[EraseSite] = &[
     ),
     site("src/pointer/store.rs", "stage", "remove_file", 1, TEMP_FILE),
     site(
+        "src/replication/audit.rs",
+        "compare_with_local_copies",
+        "get_or_quarantine",
+        1,
+        "Reads this node's own copy, the reference a digest audit judges a peer against; \
+         a copy whose bytes, read again under the write lane, don't hash to its name is \
+         removed, as upstream v0.23.0 does, and the key is skipped, so no peer is judged \
+         against it and replication restores the chunk from other nodes.",
+    ),
+    site(
         "src/replication/mod.rs",
         "ReplicationEngine::start_fresh_offer_dispatcher",
         "get_or_quarantine",
@@ -294,6 +304,17 @@ const ERASE_SITES: &[EraseSite] = &[
          re-check just before deleting passes.",
     ),
     site(
+        "src/replication/possession.rs",
+        "run_possession_check",
+        "get_or_quarantine",
+        1,
+        "Reads this node's own copy, the reference the possession check after a fresh \
+         write judges peers against; a copy whose bytes, read again under the write lane, \
+         don't hash to its name is removed, as upstream v0.23.0 does, and the check is \
+         skipped, so no peer is judged against it and replication restores the chunk from \
+         other nodes.",
+    ),
+    site(
         "src/replication/pruning.rs",
         "delete_paid_entries",
         "remove_batch",
@@ -316,6 +337,19 @@ const ERASE_SITES: &[EraseSite] = &[
         "delete",
         1,
         "The prune pass's only chunk removal, reached only from erase_if_still_eligible.",
+    ),
+    site(
+        "src/replication/pruning.rs",
+        "local_record_bytes",
+        "get_or_quarantine",
+        1,
+        "Reads this node's own copy, the reference that holders are judged against, through \
+         local_record_digest, by a prune audit and by the storage migration before it sheds \
+         a chunk; a copy whose bytes, read again under the write lane, don't hash to its \
+         name is removed, as upstream v0.23.0 does for prune audits, and the key is not \
+         audited, so no holder is judged against it and replication restores the chunk \
+         from other nodes. An intact legacy copy is served instead, and goes back on the \
+         copier's list.",
     ),
     site(
         "src/storage/chunk_store.rs",
@@ -348,6 +382,16 @@ const ERASE_SITES: &[EraseSite] = &[
         1,
         "The chunk store's read that can remove a chunk file whose bytes don't hash to \
          its name, through the file store's; its callers are each listed here.",
+    ),
+    site(
+        "src/storage/chunk_store.rs",
+        "ChunkStore::recheck_corrupt",
+        "get_or_quarantine",
+        1,
+        "Rechecks, one at a time on a single worker, a committed chunk this node's answer \
+         to a storage audit read raw and found not to hash to its name; a copy whose bytes, \
+         read again under the write lane, still don't is removed, as upstream v0.23.0 does, \
+         so the next commitment leaves it out and replication restores it from other nodes.",
     ),
     site(
         "src/storage/chunk_store.rs",
@@ -2215,7 +2259,7 @@ mod tests {
             async fn serve(store: &ChunkStore, key: &K) -> R {
                 store.get_or_quarantine(key).await
             }
-            async fn audit(store: &ChunkStore, key: &K) -> R { store.get(key).await }
+            async fn look(store: &ChunkStore, key: &K) -> R { store.get(key).await }
         ";
         assert_eq!(
             calls(source),

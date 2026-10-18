@@ -3631,7 +3631,7 @@ mod pointer_audit_tests {
     /// but the responder reports it, and the chunk store's recheck worker then
     /// stops the node claiming it, so its next commitment leaves the chunk out
     /// and replication can repair it rather than the node failing every audit
-    /// that lands on that key. The file stays until that repair replaces it.
+    /// that lands on that key. The rotted file is removed.
     #[tokio::test]
     async fn round_one_takes_a_rotted_committed_chunk_out_of_service() {
         let responder = Responder::new(24, 0).await;
@@ -3674,28 +3674,25 @@ mod pointer_audit_tests {
         // stops, so once it returns the chunk has been dealt with.
         responder.storage.report_corrupt(&work.corrupt_keys);
         let stop = CancellationToken::new();
-        let unclaimed = async {
+        let removed = async {
             let deadline = Instant::now() + Duration::from_secs(30);
-            while responder.storage.exists(&victim).unwrap_or(true) && Instant::now() < deadline {
+            while path.exists() && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             stop.cancel();
         };
-        tokio::join!(responder.storage.run_corrupt_rechecks(&stop), unclaimed);
+        tokio::join!(responder.storage.run_corrupt_rechecks(&stop), removed);
         let keys = responder.storage.all_keys().await.expect("keys");
         assert!(
             !keys.contains(&victim),
             "the rotted chunk leaves the view the next commitment is built from"
         );
+        assert!(!path.exists(), "the rotted file is removed");
         assert!(!responder.storage.exists(&victim).expect("exists"));
-        assert_eq!(
-            std::fs::read(&path).expect("the rotted file stays"),
-            b"rotted"
-        );
         assert_eq!(keys.len(), 23, "every intact chunk stays in service");
 
-        // Replication's repair, an ordinary store of the right bytes, replaces the
-        // rotted ones in place and puts the chunk back in service.
+        // Replication's repair, an ordinary store of the right bytes, puts the chunk
+        // back in service.
         assert!(responder
             .storage
             .put(&victim, &victim_bytes)

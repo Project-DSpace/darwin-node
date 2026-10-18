@@ -152,7 +152,7 @@ pub(crate) async fn run_possession_check(
     // the verifying path for the same reason: a local copy that no longer hashes
     // to its key would fail every honest peer, so it is taken out of service by
     // the read (replication repairs it) and the check is skipped.
-    let local_bytes = match storage.get(&key).await {
+    let local_bytes = match storage.get_or_quarantine(&key).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             debug!("Possession check: checker no longer holds {key_hex}; skipping");
