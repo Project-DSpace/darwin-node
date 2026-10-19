@@ -61,6 +61,7 @@ registry() { sudo jq -r "$2" "$1/manager/ant/node_registry.json"; }
 # that docker/Dockerfile sets the same).
 TOKEN=0x511f76a3de41f000ec11ea4fd212fb3587c6cef3
 VAULT=0xe0f627986c0438de0e314b644f3c8aa21d3f4f6b
+VAULT_DEPLOYED=81897121
 SERVERS="142.93.32.90:10000 165.22.193.90:10000 142.93.96.232:10000"
 # The line each node logs as it starts: the token and vault it is paid
 # through, and its RPC's host alone, since an RPC URL can carry an API key.
@@ -76,7 +77,8 @@ logs_payments() { # container count
 
 echo "== the image's settings: the Darwin network, and no bootstrap peers in the node's file"
 image_env=$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$IMAGE")
-for setting in "ANT_EVM_PAYMENT_TOKEN=$TOKEN" "ANT_EVM_PAYMENT_VAULT=$VAULT" "BOOTSTRAP_PEERS=$SERVERS" \
+for setting in "ANT_EVM_PAYMENT_TOKEN=$TOKEN" "ANT_EVM_PAYMENT_VAULT=$VAULT" \
+    "ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK=$VAULT_DEPLOYED" "BOOTSTRAP_PEERS=$SERVERS" \
     ANT_NETWORK_MODE=production IPV4_ONLY=true; do
     grep -qixF "$setting" <<<"$image_env" || fail "the image does not set $setting"
 done

@@ -1228,6 +1228,7 @@ impl TestNetwork {
             Arc::clone(&storage),
             listings_rpc_url,
             listings_vault,
+            None,
         )
         .await
         .map_err(|e| TestnetError::Core(format!("Failed to open listing store: {e}")))?;
@@ -1346,7 +1347,9 @@ impl TestNetwork {
                                     if listings.handle_response(&source, &data) {
                                         return;
                                     }
-                                    if let Some(response) = listings.handle_message(&data).await {
+                                    if let Some(response) =
+                                        listings.handle_message(&source, &data).await
+                                    {
                                         if let Err(e) = p2p
                                             .send_message(
                                                 &source,

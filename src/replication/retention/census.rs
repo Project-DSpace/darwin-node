@@ -39,8 +39,9 @@
 //! event reader, the lanes that penalise an unheld close-group chunk, upstream's
 //! merkle payment code (compiled, never reached), and the payment vault reads
 //! and RPC addresses behind the payment check's fallback. A last test reads
-//! the vendored protocol's wire messages and payment proof types against a
-//! reviewed list of what a node does with each.
+//! the vendored protocol's wire messages and payment proof types, and the
+//! vendored listings protocol's messages, against a reviewed list of what a
+//! node does with each.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -1981,6 +1982,43 @@ const CHUNK_MESSAGES: &[(&str, &str)] = &[
     ("PointerGetResponse", "A response: dropped, never answered."),
 ];
 
+/// Every message of the vendored listings protocol's `ListingsBody`, with
+/// what a node does when one arrives (`ListingService::handle_response` and
+/// `ListingService::handle_message`, src/listings/service.rs). None stores a
+/// record or takes a payment.
+const LISTINGS_MESSAGES: &[(&str, &str)] = &[
+    (
+        "ListRequest",
+        "A read of the listings index: nothing is stored or paid.",
+    ),
+    ("ListResponse", "A response: dropped, never answered."),
+    (
+        "GetRequest",
+        "A read of one listing: nothing is stored or paid.",
+    ),
+    (
+        "GetResponse",
+        "Handed to the node's own request waiting for it, if any; never answered.",
+    ),
+    ("Error", "A response: dropped, never answered."),
+    (
+        "ChangesRequest",
+        "A read of the listing change feed: nothing is stored or paid. It may set a watch, \
+         kept in memory only and at most 4 at once, that pushes the feed's new records in \
+         its range to the reader for at most 180 seconds.",
+    ),
+    (
+        "ChangesResponse",
+        "A response or a push: dropped, never answered.",
+    ),
+    (
+        "RangeListRequest",
+        "A read of the change feed's entries: nothing is stored or paid. A listing whose \
+         chunk has gone is dropped, as a list request drops one.",
+    ),
+    ("RangeListResponse", "A response: dropped, never answered."),
+];
+
 /// Every kind of payment proof the vendored protocol tells apart
 /// (`ProofType`), with what the payment check does with it
 /// (`PaymentVerifier::verify_payment_inner`).
@@ -2039,12 +2077,25 @@ fn enum_variants(source: &str, name: &str) -> Vec<String> {
 /// of it adds a variant, or when a merge adds the handling of one; this does.
 #[test]
 fn the_wire_messages_are_the_reviewed_ones() {
-    let protocol = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/ant-protocol/src");
+    let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor");
     for (file, name, reviewed) in [
-        ("chunk.rs", "ChunkMessageBody", CHUNK_MESSAGES),
-        ("payment/proof.rs", "ProofType", PROOF_TYPES),
+        (
+            "ant-protocol/src/chunk.rs",
+            "ChunkMessageBody",
+            CHUNK_MESSAGES,
+        ),
+        (
+            "ant-protocol/src/payment/proof.rs",
+            "ProofType",
+            PROOF_TYPES,
+        ),
+        (
+            "ant-listings/src/message.rs",
+            "ListingsBody",
+            LISTINGS_MESSAGES,
+        ),
     ] {
-        let source = std::fs::read_to_string(protocol.join(file)).unwrap_or_default();
+        let source = std::fs::read_to_string(vendor.join(file)).unwrap_or_default();
         let declared = enum_variants(&source, name);
         let declared_set: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
         let listed: BTreeSet<&str> = reviewed.iter().map(|(variant, _)| *variant).collect();
@@ -2060,7 +2111,7 @@ fn the_wire_messages_are_the_reviewed_ones() {
                 && not_reviewed.is_empty()
                 && gone.is_empty()
                 && without_reason.is_empty(),
-            "\n{name} in vendor/ant-protocol/src/{file} no longer matches the reviewed list \
+            "\n{name} in vendor/{file} no longer matches the reviewed list \
              in src/replication/retention/census.rs.\n\n  declared: {declared:?}\n  \
              not reviewed: {not_reviewed:?}\n  listed but gone: {gone:?}\n  \
              listed without a reason: {without_reason:?}\n\n\
@@ -2068,7 +2119,8 @@ fn the_wire_messages_are_the_reviewed_ones() {
              quote time and on any proof. Before listing a new message or proof type, make \
              sure the node's handler (src/storage/handler.rs) and payment check \
              (src/payment/verifier.rs) take it through those rules, with tests that pin it; \
-             until then, refuse it.\n"
+             until then, refuse it. A listings message is answered, or dropped, by \
+             src/listings/service.rs: list what it does there.\n"
         );
     }
 }

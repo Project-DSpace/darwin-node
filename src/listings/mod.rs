@@ -8,9 +8,13 @@
 //! only by address. A listing is deleted with its chunk.
 //!
 //! The node answers listing requests on [`ant_listings::TOPIC`]
-//! (`listings.v2`), separately from the chunk protocol: list requests page
-//! through the listings in the index, get requests return any listing by
-//! address. Messages on older listings topics are not answered.
+//! (`listings.v2`), separately from the chunk protocol, with permits of
+//! their own: list requests page through the listings in the index, get
+//! requests return any listing by address, and changes and range list
+//! requests read the change feed of the listings it serves in the index for
+//! an address range. A reader can watch a range and be pushed each new
+//! record in it. A request of a kind it doesn't know is answered
+//! `unsupported`. Messages on older listings topics are not answered.
 
 mod chain;
 // Envelopes and a record exactly as the client writes them.

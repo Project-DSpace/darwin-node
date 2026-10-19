@@ -106,6 +106,12 @@ pub struct Cli {
     #[arg(long, env = "ANT_EVM_PAYMENT_VAULT")]
     pub evm_payment_vault: Option<String>,
 
+    /// The block the payment vault was deployed in, on the custom EVM.
+    /// Listings showing an earlier block paid something else, and are never
+    /// taken. Read only with --evm-rpc-url.
+    #[arg(long, env = "ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK")]
+    pub evm_payment_vault_deployment_block: Option<u64>,
+
     /// Metrics port for Prometheus scraping (0 to disable).
     #[arg(long, default_value = "9100", env = "ANT_METRICS_PORT")]
     pub metrics_port: u16,
@@ -304,6 +310,7 @@ impl Cli {
                 rpc_url,
                 payment_token_address,
                 payment_vault_address,
+                payment_vault_deployment_block: self.evm_payment_vault_deployment_block,
             }
         } else {
             self.evm_network.into()
@@ -534,6 +541,8 @@ mod tests {
     const DARWIN_RPC_URL: &str = "https://rpc.mainnet.chain.robinhood.com";
     const DARWIN_TOKEN: &str = "0x511f76A3De41F000EC11EA4fD212fb3587c6cef3";
     const DARWIN_VAULT: &str = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B";
+    /// The block that vault was deployed in.
+    const DARWIN_VAULT_DEPLOYED: u64 = 81_897_121;
 
     /// The storage-node image hands every node its payment settings in these
     /// variables (docker/Dockerfile, docker/entrypoint.sh). Read from the
@@ -548,6 +557,10 @@ mod tests {
             ("evm_rpc_url", "ANT_EVM_RPC_URL"),
             ("evm_payment_token", "ANT_EVM_PAYMENT_TOKEN"),
             ("evm_payment_vault", "ANT_EVM_PAYMENT_VAULT"),
+            (
+                "evm_payment_vault_deployment_block",
+                "ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK",
+            ),
         ] {
             let arg = command.get_arguments().find(|arg| arg.get_id() == id);
             assert!(arg.is_some(), "no argument {id}");
@@ -565,6 +578,7 @@ mod tests {
     #[test]
     fn the_payment_settings_override_the_network_the_manager_passes(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let deployed = DARWIN_VAULT_DEPLOYED.to_string();
         let cli = Cli::try_parse_from([
             "ant-node",
             "--evm-network",
@@ -575,6 +589,8 @@ mod tests {
             DARWIN_TOKEN,
             "--evm-payment-vault",
             DARWIN_VAULT,
+            "--evm-payment-vault-deployment-block",
+            &deployed,
         ])?;
         let (config, _) = cli.into_config()?;
         assert_eq!(
@@ -583,7 +599,12 @@ mod tests {
                 rpc_url: DARWIN_RPC_URL.to_string(),
                 payment_token_address: DARWIN_TOKEN.to_string(),
                 payment_vault_address: DARWIN_VAULT.to_string(),
+                payment_vault_deployment_block: Some(DARWIN_VAULT_DEPLOYED),
             }
+        );
+        assert_eq!(
+            config.payment.evm_network.payment_vault_deployment_block(),
+            Some(DARWIN_VAULT_DEPLOYED)
         );
         let network = config.payment.evm_network.into_evm_network();
         assert_eq!(
@@ -597,6 +618,41 @@ mod tests {
         assert_eq!(
             network.rpc_url().as_str().trim_end_matches('/'),
             DARWIN_RPC_URL
+        );
+        Ok(())
+    }
+
+    /// The vault's deployment block goes with the custom network's vault:
+    /// a preset network leaves it out, and a custom one without it has none.
+    #[test]
+    fn the_vaults_deployment_block_goes_with_the_custom_network(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deployed = DARWIN_VAULT_DEPLOYED.to_string();
+        let preset = Cli::try_parse_from([
+            "ant-node",
+            "--evm-network",
+            "arbitrum-one",
+            "--evm-payment-vault-deployment-block",
+            &deployed,
+        ])?;
+        let (config, _) = preset.into_config()?;
+        assert_eq!(
+            config.payment.evm_network.payment_vault_deployment_block(),
+            None
+        );
+        let custom = Cli::try_parse_from([
+            "ant-node",
+            "--evm-rpc-url",
+            DARWIN_RPC_URL,
+            "--evm-payment-token",
+            DARWIN_TOKEN,
+            "--evm-payment-vault",
+            DARWIN_VAULT,
+        ])?;
+        let (config, _) = custom.into_config()?;
+        assert_eq!(
+            config.payment.evm_network.payment_vault_deployment_block(),
+            None
         );
         Ok(())
     }

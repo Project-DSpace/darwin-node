@@ -374,6 +374,11 @@ pub enum EvmNetworkConfig {
         payment_token_address: String,
         /// Deployed payment vault contract address.
         payment_vault_address: String,
+        /// The block the payment vault was deployed in, where known. No
+        /// payment to it is in an earlier block, so a listing showing one
+        /// paid something else, and is never taken.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payment_vault_deployment_block: Option<u64>,
     },
 }
 
@@ -386,11 +391,16 @@ impl std::fmt::Debug for EvmNetworkConfig {
                 rpc_url,
                 payment_token_address,
                 payment_vault_address,
+                payment_vault_deployment_block,
             } => f
                 .debug_struct("Custom")
                 .field("rpc_host", &rpc_host(rpc_url))
                 .field("payment_token_address", payment_token_address)
                 .field("payment_vault_address", payment_vault_address)
+                .field(
+                    "payment_vault_deployment_block",
+                    payment_vault_deployment_block,
+                )
                 .finish(),
         }
     }
@@ -416,7 +426,21 @@ impl EvmNetworkConfig {
                 rpc_url,
                 payment_token_address,
                 payment_vault_address,
+                ..
             } => EvmNetwork::new_custom(&rpc_url, &payment_token_address, &payment_vault_address),
+        }
+    }
+
+    /// The block the payment vault was deployed in, where the network's
+    /// config gives it: only a custom network's can.
+    #[must_use]
+    pub const fn payment_vault_deployment_block(&self) -> Option<u64> {
+        match self {
+            Self::Custom {
+                payment_vault_deployment_block,
+                ..
+            } => *payment_vault_deployment_block,
+            Self::ArbitrumOne | Self::ArbitrumSepolia => None,
         }
     }
 }
@@ -891,6 +915,7 @@ rewards_address = "0x0000000000000000000000000000000000000001"
                         .to_string(),
                     payment_token_address: "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3".to_string(),
                     payment_vault_address: "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B".to_string(),
+                    payment_vault_deployment_block: Some(81_897_121),
                 },
                 ..PaymentConfig::default()
             },
@@ -901,7 +926,8 @@ rewards_address = "0x0000000000000000000000000000000000000001"
             logged.contains(
                 "Custom { rpc_host: Some(\"rpc.example.org\"), \
                  payment_token_address: \"0x511f76a3de41f000ec11ea4fd212fb3587c6cef3\", \
-                 payment_vault_address: \"0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B\" }"
+                 payment_vault_address: \"0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B\", \
+                 payment_vault_deployment_block: Some(81897121) }"
             ),
             "{logged}"
         );
@@ -922,7 +948,12 @@ rewards_address = "0x0000000000000000000000000000000000000001"
             rpc_url: "not a url, key-in-text".to_string(),
             payment_token_address: String::new(),
             payment_vault_address: String::new(),
+            payment_vault_deployment_block: None,
         };
+        assert!(
+            format!("{unparsed:?}").ends_with("payment_vault_deployment_block: None }"),
+            "{unparsed:?}"
+        );
         let logged = format!("{unparsed:?}");
         assert!(logged.contains("rpc_host: None"), "{logged}");
         assert!(!logged.contains("key-in-text"), "{logged}");
@@ -934,6 +965,46 @@ rewards_address = "0x0000000000000000000000000000000000000001"
             format!("{:?}", EvmNetworkConfig::ArbitrumSepolia),
             "ArbitrumSepolia"
         );
+    }
+
+    /// A custom network can give the block its payment vault was deployed
+    /// in, beside the vault's address; a config without it reads as before
+    /// and is written as before.
+    #[test]
+    fn a_custom_network_can_give_its_vaults_deployment_block() {
+        let custom = "[payment.evm_network]\n\
+                      type = \"custom\"\n\
+                      rpc_url = \"http://127.0.0.1:8545\"\n\
+                      payment_token_address = \"0x511f76a3de41f000ec11ea4fd212fb3587c6cef3\"\n\
+                      payment_vault_address = \"0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B\"\n";
+        let given: NodeConfig = toml::from_str(&format!(
+            "{custom}payment_vault_deployment_block = 81897121\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            given.payment.evm_network.payment_vault_deployment_block(),
+            Some(81_897_121)
+        );
+        // The payment section alone: a whole default config holds numbers
+        // TOML can't.
+        let written = toml::to_string(&given.payment).unwrap();
+        assert!(
+            written.contains("payment_vault_deployment_block = 81897121"),
+            "{written}"
+        );
+        let without: NodeConfig = toml::from_str(custom).unwrap();
+        assert_eq!(
+            without.payment.evm_network.payment_vault_deployment_block(),
+            None
+        );
+        let written = toml::to_string(&without.payment).unwrap();
+        assert!(!written.contains("deployment"), "{written}");
+        for preset in [
+            EvmNetworkConfig::ArbitrumOne,
+            EvmNetworkConfig::ArbitrumSepolia,
+        ] {
+            assert_eq!(preset.payment_vault_deployment_block(), None);
+        }
     }
 
     #[test]

@@ -993,6 +993,7 @@ impl Devnet {
             Arc::clone(&storage),
             listings_rpc_url,
             listings_vault,
+            None,
         )
         .await
         .map_err(|e| DevnetError::Startup(format!("Failed to open listing store: {e}")))?;
@@ -1123,7 +1124,9 @@ impl Devnet {
                                     if listings.handle_response(&source, &data) {
                                         return;
                                     }
-                                    if let Some(response) = listings.handle_message(&data).await {
+                                    if let Some(response) =
+                                        listings.handle_message(&source, &data).await
+                                    {
                                         let _ = p2p
                                             .send_message(
                                                 &source,

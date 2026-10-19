@@ -578,6 +578,7 @@ impl NodeBuilder {
             Arc::clone(&storage),
             listings_rpc_url,
             listings_vault,
+            config.payment.evm_network.payment_vault_deployment_block(),
         )
         .await?;
 
@@ -1127,7 +1128,6 @@ impl RunningNode {
                                 Arc::clone(&p2p),
                                 source,
                                 data,
-                                semaphore.clone(),
                                 stopping.clone(),
                                 &children,
                             );
@@ -1187,42 +1187,54 @@ impl RunningNode {
         info!("Protocol message routing started");
     }
 
-    /// Answer one message on the listings topic, under the same concurrency
-    /// limit and shutdown rule as chunk requests. An answer to one of this
-    /// node's own requests is handed to it without waiting for a permit.
+    /// Answer one message on the listings topic, under the same shutdown
+    /// rule as chunk requests.
     fn answer_listings_request(
         listings: Arc<crate::listings::ListingService>,
         p2p: Arc<P2PNode>,
         source: saorsa_core::identity::PeerId,
         data: Vec<u8>,
-        semaphore: Arc<Semaphore>,
         stopping: CancellationToken,
         children: &TaskTracker,
     ) {
         children.spawn(async move {
-            if listings.handle_response(&source, &data) {
+            let Some(response) = Self::listings_answer(&listings, &source, &data, &stopping).await
+            else {
                 return;
-            }
-            let _permit = tokio::select! {
-                biased;
-                () = stopping.cancelled() => return,
-                permit = semaphore.acquire() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => return,
-                },
             };
-            if stopping.is_cancelled() {
-                return;
-            }
-            if let Some(response) = listings.handle_message(&data).await {
-                if let Err(e) = p2p
-                    .send_message(&source, ant_listings::TOPIC, response, &[])
-                    .await
-                {
-                    warn!("Failed to send listings response to {source}: {e}");
-                }
+            if let Err(e) = p2p
+                .send_message(&source, ant_listings::TOPIC, response, &[])
+                .await
+            {
+                warn!("Failed to send listings response to {source}: {e}");
             }
         });
+    }
+
+    /// The answer to one message `source` sent on the listings topic, if it
+    /// needs one. An answer to one of this node's own requests is handed to
+    /// it at once. A request waits for one of the listing service's own
+    /// permits ([`crate::listings::ListingService::request_permits`]), never
+    /// for one of those chunk requests take, so neither kind of request holds
+    /// up the other; it is dropped if the node starts stopping meanwhile.
+    async fn listings_answer(
+        listings: &crate::listings::ListingService,
+        source: &saorsa_core::identity::PeerId,
+        data: &[u8],
+        stopping: &CancellationToken,
+    ) -> Option<Vec<u8>> {
+        if listings.handle_response(source, data) {
+            return None;
+        }
+        let _permit = tokio::select! {
+            biased;
+            () = stopping.cancelled() => return None,
+            permit = listings.request_permits().acquire() => permit.ok()?,
+        };
+        if stopping.is_cancelled() {
+            return None;
+        }
+        listings.handle_message(source, data).await
     }
 
     /// Request the node to shut down.
@@ -1576,6 +1588,74 @@ mod tests {
     use super::*;
     use crate::config::NODES_SUBDIR;
 
+    /// Listing requests take permits of their own, 16, never those chunk
+    /// requests take: with all of them held, a request waits until one frees,
+    /// or is dropped once the node starts stopping. An answer to one of the
+    /// node's own requests takes none.
+    #[tokio::test]
+    async fn listing_requests_take_permits_of_their_own() {
+        use ant_listings::{ListingKey, ListingsBody, ListingsMessage};
+
+        let dir = TempDir::new().expect("temp dir");
+        let chunks = Arc::new(
+            ChunkStore::new(ChunkStoreConfig {
+                root_dir: dir.path().to_path_buf(),
+                ..ChunkStoreConfig::test_default()
+            })
+            .await
+            .expect("chunk store"),
+        );
+        let listings = crate::listings::ListingService::new(
+            dir.path(),
+            0,
+            chunks,
+            "http://127.0.0.1:0".into(),
+            [0x69; 20],
+            None,
+        )
+        .await
+        .expect("listing service");
+        let permits = listings.request_permits();
+        assert_eq!(permits.available_permits(), 16);
+        let source = saorsa_core::identity::PeerId::from_bytes([1; 32]);
+        let message = |request_id, body| {
+            ListingsMessage { request_id, body }
+                .encode()
+                .expect("encodes")
+        };
+        let request = message(
+            7,
+            ListingsBody::ListRequest {
+                from: ListingKey::MIN,
+                limit: 1,
+            },
+        );
+        let stopping = CancellationToken::new();
+
+        // Every one held: a request waits, and is answered once one frees.
+        let held = permits.acquire_many(16).await.expect("permits");
+        let answering = RunningNode::listings_answer(&listings, &source, &request, &stopping);
+        tokio::pin!(answering);
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut answering);
+        assert!(waited.await.is_err(), "answered without a permit");
+        drop(held);
+        let answer = answering.await.expect("an answer");
+        let answer = ListingsMessage::decode(&answer).expect("decodes");
+        assert_eq!(answer.request_id, 7);
+        assert!(matches!(answer.body, ListingsBody::ListResponse { .. }));
+
+        // An answer to a request of the node's takes none.
+        let held = permits.acquire_many(16).await.expect("permits");
+        let response = message(8, ListingsBody::GetResponse { listing: None });
+        let taken = RunningNode::listings_answer(&listings, &source, &response, &stopping).await;
+        assert_eq!(taken, None);
+        // A request waiting when the node starts stopping is dropped.
+        let answering = RunningNode::listings_answer(&listings, &source, &request, &stopping);
+        stopping.cancel();
+        assert_eq!(answering.await, None);
+        drop(held);
+    }
+
     /// What a node logs at start about where it is paid: the token, the vault
     /// and the RPC's host, never the rest of the URL.
     #[test]
@@ -1584,6 +1664,7 @@ mod tests {
             rpc_url: "https://rpc.mainnet.chain.robinhood.com".to_string(),
             payment_token_address: "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3".to_string(),
             payment_vault_address: "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B".to_string(),
+            payment_vault_deployment_block: Some(81_897_121),
         }
         .into_evm_network();
         assert_eq!(

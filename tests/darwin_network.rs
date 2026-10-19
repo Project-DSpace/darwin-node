@@ -20,6 +20,9 @@ use std::process::Command;
 const DARWIN_TOKEN: &str = "0x511f76A3De41F000EC11EA4fD212fb3587c6cef3";
 /// The payment vault storage payments go through.
 const DARWIN_VAULT: &str = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B";
+/// The block that vault was deployed in: no payment to it is in an earlier
+/// one.
+const DARWIN_VAULT_DEPLOYED: &str = "81897121";
 /// Robinhood Chain's own public RPC.
 const ROBINHOOD_RPC: &str = "https://rpc.mainnet.chain.robinhood.com";
 /// The network's three bootstrap servers.
@@ -130,6 +133,10 @@ fn the_image_runs_the_darwin_network() {
         "ANT_EVM_PAYMENT_VAULT={}",
         get("ANT_EVM_PAYMENT_VAULT")
     );
+    assert_eq!(
+        get("ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK"),
+        DARWIN_VAULT_DEPLOYED
+    );
     let rpcs: Vec<&str> = get("RPC_URLS").split_whitespace().collect();
     assert!(rpcs.contains(&ROBINHOOD_RPC), "RPC_URLS={rpcs:?}");
     let peers: Vec<&str> = get("BOOTSTRAP_PEERS").split_whitespace().collect();
@@ -161,6 +168,7 @@ fn every_variable_the_image_sets_is_one_the_node_reads() {
         "ANT_EVM_RPC_URL",
         "ANT_EVM_PAYMENT_TOKEN",
         "ANT_EVM_PAYMENT_VAULT",
+        "ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK",
     ] {
         assert!(names.iter().any(|n| n == expected), "{expected}: {names:?}");
     }

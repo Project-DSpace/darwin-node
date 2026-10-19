@@ -340,6 +340,23 @@ impl Chain {
         }
     }
 
+    /// The number of the latest block the chain has finalized: nothing at
+    /// or before it can change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a call fails, the chain doesn't say, or the answer
+    /// is malformed.
+    pub async fn finalized_block(&self) -> Result<u64> {
+        let block = self
+            .call("eth_getBlockByNumber", json!(["finalized", false]))
+            .await?;
+        block["number"]
+            .as_str()
+            .ok_or_else(|| malformed("the finalized block has no number"))
+            .and_then(parse_u64)
+    }
+
     /// The latest block's number.
     async fn latest_block(&self) -> Result<u64> {
         let number = self.call("eth_blockNumber", json!([])).await?;
@@ -746,6 +763,8 @@ pub mod tests {
         /// Methods answered with HTTP 403 when served, as PublicNode
         /// answers `eth_getLogs`.
         pub refused: Vec<&'static str>,
+        /// The block the chain has finalized; the latest if `None`.
+        pub finalized: Option<u64>,
     }
 
     impl MockChain {
@@ -775,10 +794,16 @@ pub mod tests {
             let result = match method {
                 "eth_blockNumber" => json!(quantity(*self.blocks.keys().last().unwrap())),
                 "eth_getBlockByNumber" => {
-                    let number = parse_u64(params[0].as_str().unwrap()).unwrap();
-                    self.blocks
-                        .get(&number)
-                        .map_or(Value::Null, |time| json!({ "timestamp": quantity(*time) }))
+                    let number = match params[0].as_str().unwrap() {
+                        "finalized" => self
+                            .finalized
+                            .unwrap_or_else(|| *self.blocks.keys().last().unwrap()),
+                        number => parse_u64(number).unwrap(),
+                    };
+                    self.blocks.get(&number).map_or(
+                        Value::Null,
+                        |time| json!({ "number": quantity(number), "timestamp": quantity(*time) }),
+                    )
                 }
                 "eth_getTransactionReceipt" => {
                     let hash: [u8; 32] = parse_bytes(params[0].as_str().unwrap()).unwrap();
@@ -1080,6 +1105,17 @@ pub mod tests {
                 .unwrap(),
             Fetched::new()
         );
+    }
+
+    #[tokio::test]
+    async fn reads_the_finalized_block() {
+        let (chain, mock) = client(chain_with(1000, &[])).await;
+        assert_eq!(chain.finalized_block().await.unwrap(), 999);
+        mock.lock().finalized = Some(500);
+        assert_eq!(chain.finalized_block().await.unwrap(), 500);
+        // A chain that names no such block: an error, never a guess.
+        mock.lock().finalized = Some(5_000);
+        assert!(chain.finalized_block().await.is_err());
     }
 
     #[tokio::test]

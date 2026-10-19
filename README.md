@@ -127,7 +127,25 @@ never ran.
   the same transaction as each change, with a count and set hash per 16-bit
   address prefix kept in memory (`src/listings/store.rs`). A start that
   finds the store written to by another version, which keeps no feed,
-  numbers the feed afresh under a new epoch. Tests check the chunk handler's
+  numbers the feed afresh under a new epoch. The node answers a
+  `ChangesRequest` with the feed's records in an address range (a page of
+  256 at most, from at most 4,096 records read), the range's count and set
+  hash, and a hash of its 20 nearest peers, and a `RangeListRequest` with
+  the digest entries it holds in a range, in address order. A reader can
+  watch a range: each new record in it is pushed to the reader as it is
+  made, for 3 minutes or until the reader's next request, to at most 4
+  readers at once (a fifth is answered, but not watched). A message of a
+  kind the node doesn't know is answered `unsupported` at once, so request
+  kinds added later cost their senders no wait. Listing requests take
+  permits of their own, 16, apart from the 64 storage requests share. When
+  an envelope in the index still has no listing once its checks' schedule
+  has run out, or the chain can't be read for a copy, the node checks again,
+  each wait twice the last up to 6 hours, for at most 7 days (a restart
+  keeps that end), and at most 60 such checks an hour, a minute apart. It
+  stops at once when no copy its close group serves can ever check out: one
+  showing a block before the payment vault was deployed (the image gives the
+  block in `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`), or one the chain shows,
+  in blocks it has finalized, doesn't pay its quote. Tests check the chunk handler's
   hook (`src/listings/hooks_tests.rs`), that a built node's handler and
   replication engine share one listing service (`src/node.rs`), and that a
   paid envelope stored on one node is served by at least 4 of its close
@@ -1246,7 +1264,11 @@ What is limited:
 | Limit | Where | Value |
 |-------|-------|-------|
 | Browser (WebRTC Direct) sessions and requests | `WebRtcDirectConfig` in `src/config.rs` | per IP, per session and in total |
-| Storage and listings requests handled at once | `start_protocol_routing` in `src/node.rs` | 64 per node, from all peers together |
+| Storage requests handled at once | `start_protocol_routing` in `src/node.rs` | 64 per node, from all peers together |
+| Listings requests handled at once | `ListingService::request_permits` in `src/listings/service.rs`, taken in `src/node.rs` | 16 per node, from all peers together, apart from the storage requests' 64 |
+| Watches on a node's listing change feed | `ListingService::changes` in `src/listings/service.rs` | 4 at once, each for 3 minutes or until its reader's next request; a fifth is refused, its request answered |
+| Records read for one change feed request | `ListingService::changes` in `src/listings/service.rs` | 4,096, of which at most 256 are sent |
+| Listing checks after their schedule has run out | `ListingService::recheck_slot` in `src/listings/service.rs` | 60 an hour per node, a minute apart; each envelope's for at most 7 days |
 | Replication requests from other nodes: chunk fetches, verification, neighbour sync, paid notifications, fresh offers and audits | `src/replication/mod.rs`, and `src/replication/config.rs` for audits | for each kind, in all and per peer; any more are turned away |
 | Pointer requests from other nodes | `src/replication/pointer.rs` | fetch and state requests: 128 admitted in all and 16 from one peer, 32 of them served at once, any more dropped; fresh offers: 16 verified at once, any more dropped |
 

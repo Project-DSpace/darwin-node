@@ -19,7 +19,9 @@
 //!   quorum of the close group behind it. Such a listing is kept but not
 //!   served until it is settled.
 //! - `pending`: the envelopes whose listing is still being checked with the
-//!   close group, so the checks go on after a restart.
+//!   close group, so the checks go on after a restart. Once checks have gone
+//!   on past their schedule as re-checks, the mark holds when those began
+//!   (Unix seconds, 8 bytes, big-endian), so a restart keeps their end.
 //! - `changes`: the change feed's records by number (big-endian), each the
 //!   address it records.
 //! - `change_of`: each address's record in the change feed: its number, and
@@ -41,7 +43,9 @@
 //! until then the feed can't be read, and no write records its id. The count
 //! and set hash of the feed's entries are kept in memory per address prefix
 //! of 16 bits, rebuilt at each start, so a range's totals are read without
-//! reading its entries.
+//! reading its entries. Each write that adds records is handed, as it
+//! commits, to the feed's watcher ([`ListingStore::watch_feed`]), which
+//! pushes them to the readers watching their range.
 //!
 //! The map is sized from the disk, as the chunk store's is, leaving the
 //! operator's disk reserve free, and grows when it fills. A store written by
@@ -65,7 +69,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::{AddAssign, Bound};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::task::spawn_blocking;
 
 /// First byte of every stored record: the format below.
@@ -128,6 +132,9 @@ pub struct ListingStore {
     /// recorded as this version's last, so the next start numbers it afresh
     /// whatever is written meanwhile.
     feed_behind: Arc<AtomicBool>,
+    /// Told of each write that adds records to the change feed, as it
+    /// commits: see [`Self::watch_feed`].
+    feed_watcher: Arc<OnceLock<FeedWatcher>>,
     /// Tests: every write fails while set, as when the disk has no room.
     #[cfg(test)]
     failing: Arc<std::sync::atomic::AtomicBool>,
@@ -260,6 +267,7 @@ impl ListingStore {
             change_meta,
             sums: Arc::new(Mutex::new(FeedSums::new())),
             feed_behind: Arc::default(),
+            feed_watcher: Arc::default(),
             #[cfg(test)]
             failing: Arc::default(),
             #[cfg(test)]
@@ -407,13 +415,56 @@ impl ListingStore {
         .map_err(join_error)?
     }
 
+    /// Mark the envelope at `address` as checked again past its schedule
+    /// since `since` (Unix seconds), so that a restart keeps the end of its
+    /// re-checks. Marked pending until [`Self::clear_pending`], as with
+    /// [`Self::mark_pending`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB write fails.
+    pub async fn mark_rechecking(&self, address: XorName, since: u64) -> Result<()> {
+        let store = self.clone();
+        spawn_blocking(move || {
+            store.write(|wtxn, _| Ok(store.pending.put(wtxn, &address, &since.to_be_bytes())?))
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     /// Every envelope marked pending.
     ///
     /// # Errors
     ///
     /// Returns an error if the LMDB read fails.
+    #[cfg(test)]
     pub async fn pending_addresses(&self) -> Result<Vec<XorName>> {
         self.addresses_in(self.pending).await
+    }
+
+    /// Every envelope marked pending, with when its re-checks began
+    /// ([`Self::mark_rechecking`]), if they have.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB read fails.
+    pub async fn pending_checks(&self) -> Result<Vec<(XorName, Option<u64>)>> {
+        let store = self.clone();
+        spawn_blocking(move || {
+            let _shared = store.env_lock.read();
+            let rtxn = store.env.read_txn().map_err(storage_error)?;
+            let mut checks = Vec::new();
+            for entry in store.pending.iter(&rtxn).map_err(storage_error)? {
+                let (key, value) = entry.map_err(storage_error)?;
+                if let Ok(address) = XorName::try_from(key) {
+                    let since = <[u8; 8]>::try_from(value).ok().map(u64::from_be_bytes);
+                    checks.push((address, since));
+                }
+            }
+            Ok(checks)
+        })
+        .await
+        .map_err(join_error)?
     }
 
     /// Every address in `table`, one of the tables of marks.
@@ -801,9 +852,10 @@ impl ListingStore {
     /// Run `op` in a write transaction and commit it, growing the map and
     /// trying again whenever it is full and could be grown. `op` records in
     /// the [`FeedWrites`] it is given what it adds to the change feed, which
-    /// the feed's totals take on once the transaction commits. Every
-    /// transaction also records its own id as this version's last write,
-    /// unless the feed is behind the store ([`Self::feed_behind`]).
+    /// the feed's totals take on once the transaction commits, and the
+    /// feed's watcher is told of. Every transaction also records its own id
+    /// as this version's last write, unless the feed is behind the store
+    /// ([`Self::feed_behind`]).
     fn write<T>(
         &self,
         op: impl Fn(&mut RwTxn, &mut FeedWrites) -> std::result::Result<T, TxnError>,
@@ -830,10 +882,12 @@ impl ListingStore {
                         }
                         // Readers of the feed take their snapshot and read
                         // the totals under this lock: they see both from
-                        // before the commit, or both from after it.
+                        // before the commit, or both from after it. So does
+                        // the watcher, which nothing else commits during.
                         let mut sums = self.sums.lock();
                         wtxn.commit()?;
                         sums.apply(&feed);
+                        self.tell_watcher(&sums, &feed);
                         drop(sums);
                         Ok(value)
                     });
@@ -1032,8 +1086,45 @@ impl ListingStore {
         state.next = seq.checked_add(1).ok_or_else(|| {
             Error::Storage("listings: the change feed has used every number".into())
         })?;
+        feed.epoch = state.epoch;
         feed.records.push((was, change));
         Ok(true)
+    }
+
+    /// Hand each write that adds records to the change feed, as it commits,
+    /// to `watcher`, while the feed can be read. It runs under the lock that
+    /// orders commits with reads of the feed, so the totals it reads are
+    /// those at the write's head and nothing else commits meanwhile: it must
+    /// be quick, and must not write to the store or read the feed but
+    /// through the [`FeedCommit`] it is given. Only the first call has an
+    /// effect.
+    pub fn watch_feed(&self, watcher: FeedWatcher) {
+        if self.feed_watcher.set(watcher).is_err() {
+            warn!("A change feed watcher is already set; keeping the first");
+        }
+    }
+
+    /// Tell the feed's watcher, if one is set and the feed can be read, what
+    /// a write that has just committed added to the feed, given the totals
+    /// with that write taken on.
+    fn tell_watcher(&self, sums: &FeedSums, feed: &FeedWrites) {
+        let Some(watcher) = self.feed_watcher.get() else {
+            return;
+        };
+        if !sums.ready {
+            return;
+        }
+        let records: Vec<FeedChange> = feed.records.iter().map(|(_, change)| *change).collect();
+        let Some(head) = records.last().map(FeedChange::seq) else {
+            return;
+        };
+        watcher(&FeedCommit {
+            epoch: feed.epoch,
+            head,
+            records: &records,
+            store: self,
+            sums,
+        });
     }
 
     /// The digest entry of the listing the node serves in the index at
@@ -1239,10 +1330,6 @@ impl ListingStore {
 }
 
 /// Reading the change feed.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the feed requests of the listing service")
-)]
 impl ListingStore {
     /// The change feed's records in `range` after record `after`, as a
     /// `ChangesRequest` asks for them, with where the feed stands and the
@@ -1430,10 +1517,6 @@ impl ListingStore {
 }
 
 /// A page of the change feed, read from one snapshot of the store.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the feed requests of the listing service")
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedPage {
     /// The feed's epoch.
@@ -1452,15 +1535,44 @@ pub struct FeedPage {
     pub changes: Vec<FeedChange>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by the feed requests of the listing service")
-)]
 impl FeedPage {
     /// Whether the feed has records after `next`.
     #[must_use]
     pub const fn more(&self) -> bool {
         self.next < self.head
+    }
+}
+
+/// Told of each write that adds records to the change feed, as it commits
+/// ([`ListingStore::watch_feed`]).
+pub type FeedWatcher = Box<dyn Fn(&FeedCommit<'_>) + Send + Sync>;
+
+/// What one write added to the change feed, as it commits: the records, in
+/// order, and where the feed stands after them. [`Self::totals`] gives any
+/// range's totals there.
+pub struct FeedCommit<'a> {
+    /// The feed's epoch.
+    pub epoch: u64,
+    /// The number of the last record the write added: the feed's head.
+    pub head: u64,
+    /// The records the write added, in order.
+    pub records: &'a [FeedChange],
+    store: &'a ListingStore,
+    sums: &'a FeedSums,
+}
+
+impl FeedCommit<'_> {
+    /// How many entries the feed holds in `range` at [`Self::head`], and
+    /// their set hash. `None` if they can't be read.
+    #[must_use]
+    pub fn totals(&self, range: &AddressRange) -> Option<(u64, SetHash)> {
+        let totals = if let Some(totals) = self.sums.totals(range) {
+            totals
+        } else {
+            let rtxn = self.store.env.read_txn().ok()?;
+            self.store.scan_totals(&rtxn, range).ok()?
+        };
+        Some((totals.count, totals.set_hash))
     }
 }
 
@@ -1641,10 +1753,6 @@ impl FeedSums {
     }
 
     /// The totals of `range`, if it fixes at most 16 bits.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the feed requests of the listing service")
-    )]
     fn totals(&self, range: &AddressRange) -> Option<Totals> {
         let (first, last) = (range.first(), range.last());
         let prefixes = match range.bits() {
@@ -1666,10 +1774,11 @@ fn fine_prefix(address: &XorName) -> usize {
 }
 
 /// What a write transaction added to the change feed: each new record, with
-/// the entry its address had before, if any. The totals take it on once the
-/// transaction commits.
+/// the entry its address had before, if any, and the feed's epoch. The
+/// totals take it on once the transaction commits.
 #[derive(Default)]
 struct FeedWrites {
+    epoch: u64,
     records: Vec<(Option<DigestEntry>, FeedChange)>,
 }
 
@@ -1880,6 +1989,29 @@ pub mod tests {
         pub fn fail_writes(&self, failing: bool) {
             self.failing
                 .store(failing, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// Make the change feed unreadable, as at a start that couldn't
+        /// total it, until it is totalled again.
+        pub fn hide_feed(&self) {
+            self.sums.lock().ready = false;
+        }
+
+        /// Insert each of `listings` whose address has no listing yet, in
+        /// one write, recording them in the change feed as
+        /// [`Self::insert`] does one at a time.
+        pub fn insert_all(&self, listings: &[Listing]) {
+            let records: Vec<StoredRecord> = listings.iter().map(StoredRecord::new).collect();
+            self.write(|wtxn, feed| {
+                for (listing, record) in listings.iter().zip(&records) {
+                    if !self.contains_in(wtxn, &listing.address)? {
+                        self.insert_in(wtxn, listing, record)?;
+                        self.note_change(wtxn, feed, &listing.address)?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
         }
     }
 
@@ -3080,12 +3212,15 @@ pub mod tests {
         .await
         .unwrap();
         // The node keeps and takes listings, but its feed, which lacks the
-        // other version's listing, can't be read, and records nothing.
+        // other version's listing, can't be read, and records nothing: its
+        // watcher is told of nothing.
+        let told = keep_told(&store, vec![AddressRange::ALL]);
         assert!(store
             .insert(listed_at([4; 32], 1_790_000_000))
             .await
             .unwrap());
         assert!(store.remove([1; 32]).await.unwrap());
+        assert_eq!(*told.lock(), Vec::new());
         assert_eq!(
             store
                 .feed_page(before.epoch, 0, AddressRange::ALL, 256, 4_096)
@@ -3375,6 +3510,154 @@ pub mod tests {
                  e87050248609ea5cecef0ed73f9bb95a3f80985dc703b7fca10d3c7291b07b3f",
                 "29".repeat(32)
             )
+        );
+    }
+
+    /// What the feed's watcher was told of one write.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Told {
+        epoch: u64,
+        head: u64,
+        records: Vec<FeedChange>,
+        /// The totals of each range watched, at the write's head.
+        totals: Vec<(u64, SetHash)>,
+    }
+
+    /// Set a watcher on `store`'s feed that keeps what it is told, with the
+    /// totals of `ranges`.
+    fn keep_told(store: &ListingStore, ranges: Vec<AddressRange>) -> Arc<Mutex<Vec<Told>>> {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&told);
+        store.watch_feed(Box::new(move |commit| {
+            let totals = ranges
+                .iter()
+                .map(|range| commit.totals(range).unwrap())
+                .collect();
+            kept.lock().push(Told {
+                epoch: commit.epoch,
+                head: commit.head,
+                records: commit.records.to_vec(),
+                totals,
+            });
+        }));
+        told
+    }
+
+    #[tokio::test]
+    async fn the_watcher_is_told_of_each_write_that_adds_records() {
+        let dir = TempDir::new().unwrap();
+        let store = ListingStore::open(dir.path(), 0).await.unwrap();
+        // The whole space, a range the prefix totals cover, and one finer
+        // than they go, which is counted from the store.
+        let ranges = vec![
+            AddressRange::ALL,
+            AddressRange::new([0x10; 32], 4),
+            AddressRange::new([0x10; 32], 24),
+        ];
+        let told = keep_told(&store, ranges.clone());
+        let epoch = feed_of(&store).0.epoch;
+
+        // An entry, then a listing outside the index, a provisional one and
+        // a mark, none of which the feed records, then a removal.
+        let a = listed_at([0x10; 32], 1_790_000_000);
+        store.insert(a.clone()).await.unwrap();
+        store.insert(unindexed_listing(0x20)).await.unwrap();
+        store
+            .insert_provisional(listed_at([0x30; 32], 1_790_000_000))
+            .await
+            .unwrap();
+        store.mark_pending([0x40; 32]).await.unwrap();
+        store.remove([0x10; 32]).await.unwrap();
+        let entry = DigestEntry::new(&a);
+        let with_a = (1, SetHash::of([&entry]));
+        let empty = (0, SetHash::EMPTY);
+        assert_eq!(
+            std::mem::take(&mut *told.lock()),
+            vec![
+                Told {
+                    epoch,
+                    head: 1,
+                    records: vec![FeedChange::Entry { seq: 1, entry }],
+                    totals: vec![with_a; 3],
+                },
+                Told {
+                    epoch,
+                    head: 2,
+                    records: vec![FeedChange::Removed {
+                        seq: 2,
+                        address: [0x10; 32],
+                    }],
+                    totals: vec![empty; 3],
+                },
+            ]
+        );
+
+        // One write that records several: told once, of all of them, with
+        // the totals a read of the feed gives at its head.
+        let many: Vec<Listing> = [0x11u8, 0x90, 0x12]
+            .iter()
+            .map(|&address| listed_at([address; 32], 1_790_000_000))
+            .collect();
+        let writer = store.clone();
+        let batch = many.clone();
+        spawn_blocking(move || writer.insert_all(&batch))
+            .await
+            .unwrap();
+        let told = std::mem::take(&mut *told.lock());
+        assert_eq!(told.len(), 1);
+        let (state, records) = feed_of(&store);
+        assert_eq!((told[0].epoch, told[0].head), (epoch, state.head()));
+        assert_eq!(told[0].records, records[records.len() - 3..].to_vec());
+        for (range, totals) in ranges.iter().zip(&told[0].totals) {
+            let page = store
+                .feed_page(epoch, state.head(), *range, 0, 1)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(*totals, (page.count, page.set_hash), "{range:?}");
+        }
+        assert_eq!(told[0].totals[1].0, 2);
+    }
+
+    #[tokio::test]
+    async fn pending_marks_keep_when_rechecks_began() {
+        let dir = TempDir::new().unwrap();
+        let store = ListingStore::open(dir.path(), 0).await.unwrap();
+        store.mark_pending([1; 32]).await.unwrap();
+        store.mark_pending([2; 32]).await.unwrap();
+        store.mark_rechecking([2; 32], 1_790_000_000).await.unwrap();
+        // Marked by the re-checks alone.
+        store.mark_rechecking([3; 32], 1_790_000_100).await.unwrap();
+        let expected = vec![
+            ([1; 32], None),
+            ([2; 32], Some(1_790_000_000)),
+            ([3; 32], Some(1_790_000_100)),
+        ];
+        assert_eq!(store.pending_checks().await.unwrap(), expected);
+        assert_eq!(
+            store.pending_addresses().await.unwrap(),
+            vec![[1; 32], [2; 32], [3; 32]]
+        );
+        // As kept: empty, as every version marks an envelope, or the time,
+        // 8 bytes big-endian. A version that reads only the addresses reads
+        // these as it always has.
+        {
+            let rtxn = store.env.read_txn().unwrap();
+            let kept = |address: XorName| store.pending.get(&rtxn, &address).unwrap().unwrap();
+            assert_eq!(kept([1; 32]), b"");
+            assert_eq!(hex::encode(kept([2; 32])), "000000006ab13b80");
+        }
+
+        // Kept across a restart. Stored again, an envelope's checks start
+        // afresh; checked, its mark goes.
+        drop(store);
+        let store = ListingStore::open(dir.path(), 0).await.unwrap();
+        assert_eq!(store.pending_checks().await.unwrap(), expected);
+        store.mark_pending([2; 32]).await.unwrap();
+        store.clear_pending([3; 32]).await.unwrap();
+        assert_eq!(
+            store.pending_checks().await.unwrap(),
+            vec![([1; 32], None), ([2; 32], None)]
         );
     }
 }

@@ -35,7 +35,8 @@ RUN chmod 755 /opt/ant/ant-node /entrypoint.sh /usr/local/bin/nodes
 # and Robinhood Chain RPCs shared out over the nodes. Operators set
 # REWARDS_ADDRESS, NODE_COUNT and usually BROWSER_PORT_START; servers also set
 # PUBLIC_IP. RPC_URL, if set, replaces RPC_URLS with one provider of the
-# operator's choice. The token, vault and bootstrap peers change only with a
+# operator's choice. The token, vault (with the block it was deployed in) and
+# bootstrap peers change only with a
 # new image. Browser access is off unless BROWSER_PORT_START is set (the compose
 # file sets 11000), so older installs don't advertise ports they never
 # forwarded. The XDG paths keep the node manager's state on the /data volume
@@ -43,6 +44,7 @@ RUN chmod 755 /opt/ant/ant-node /entrypoint.sh /usr/local/bin/nodes
 ENV ANT_NETWORK_MODE=production \
     ANT_EVM_PAYMENT_TOKEN=0x511f76a3de41f000ec11ea4fd212fb3587c6cef3 \
     ANT_EVM_PAYMENT_VAULT=0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B \
+    ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK=81897121 \
     BOOTSTRAP_PEERS="142.93.32.90:10000 165.22.193.90:10000 142.93.96.232:10000" \
     RPC_URL="" \
     RPC_URLS="https://rpc.mainnet.chain.robinhood.com https://rpc.ordofi.network" \
