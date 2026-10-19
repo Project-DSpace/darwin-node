@@ -174,9 +174,9 @@ never ran.
   is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
   its only change; `vendor/webrtc` is webrtc 0.14.0, whose
   `RTCDtlsTransport::stop()` cancels a DTLS handshake still in progress;
-  and `vendor/ant-listings` is darwin-listings v0.2.1, unchanged: the
-  envelope format, listings, their payment checks and the listings
-  protocol. `[patch.crates-io]` puts the first two in place of the
+  and `vendor/ant-listings` is darwin-listings 0.3.0, unchanged: the
+  envelope format, listings, their payment checks, the listings protocol
+  and its change feeds. `[patch.crates-io]` puts the first two in place of the
   crates.io releases. `vendor/ant-listings` is a workspace member, so its
   own tests run under this repository's `Cargo.lock` in the Test workflow,
   and the Build workflow checks its git objects against its `VENDORED.md`. saorsa-core and saorsa-transport are their crates.io

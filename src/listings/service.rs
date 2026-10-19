@@ -427,13 +427,19 @@ impl ListingService {
             }
         };
         match message.body {
-            ListingsBody::ListRequest { .. } | ListingsBody::GetRequest { .. } => false,
+            ListingsBody::ListRequest { .. }
+            | ListingsBody::GetRequest { .. }
+            | ListingsBody::ChangesRequest(_)
+            | ListingsBody::RangeListRequest(_) => false,
             ListingsBody::GetResponse { listing } => {
                 route_response(&self.waiting, source, message.request_id, listing);
                 true
             }
-            // Nodes send no list requests: nothing waits for these.
-            ListingsBody::ListResponse { .. } | ListingsBody::Error { .. } => true,
+            // Nodes send no list or feed requests: nothing waits for these.
+            ListingsBody::ListResponse { .. }
+            | ListingsBody::Error { .. }
+            | ListingsBody::ChangesResponse(_)
+            | ListingsBody::RangeListResponse(_) => true,
         }
     }
 

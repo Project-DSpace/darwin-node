@@ -37,7 +37,7 @@ mimalloc = "0.1"
 #
 ant-protocol = "5.0.0"
 # Listed files: envelope format, listings, payment checks, the listings protocol.
-# A copy of darwin-listings v0.2.1 (vendor/ant-listings/VENDORED.md).
+# A copy of darwin-listings 0.3.0 (vendor/ant-listings/VENDORED.md).
 ant-listings = { path = "vendor/ant-listings" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
