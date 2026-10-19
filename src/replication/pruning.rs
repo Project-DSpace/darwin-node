@@ -523,7 +523,6 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
 
     let failures = ctx.disk_retention.failed_chunk_checks();
     let erasable = erasable_in_order(
-        ctx.storage,
         stats.disk_pressure,
         &self_xor,
         floor.as_ref(),
@@ -594,25 +593,13 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
 /// none without disk pressure, only those strictly beyond the erase floor,
 /// farthest from the node first, with those whose audit failed earlier in
 /// this spell of pressure behind the rest (see [`retention::erase_order`]).
-/// Records only the legacy store holds are left out: erasing one returns no
-/// disk space, because the legacy store keeps its freed pages.
 fn erasable_in_order(
-    storage: &ChunkStore,
     under_disk_pressure: bool,
     self_xor: &XorName,
     floor: Option<&XorName>,
     failures: &retention::FailedChecks,
     candidates: Vec<RecordPruneCandidate>,
 ) -> Vec<RecordPruneCandidate> {
-    let candidates = if under_disk_pressure && !candidates.is_empty() && storage.has_legacy() {
-        let legacy_only: HashSet<XorName> = storage.legacy_only_keys().into_iter().collect();
-        candidates
-            .into_iter()
-            .filter(|candidate| !legacy_only.contains(&candidate.key))
-            .collect()
-    } else {
-        candidates
-    };
     retention::erase_order(
         under_disk_pressure,
         self_xor,
@@ -1303,54 +1290,6 @@ async fn collect_record_prune_proofs(
     }
 
     present_by_key
-}
-
-/// Prove that other nodes actually hold `keys`, by cryptographic challenge.
-///
-/// Exposed for the storage migration, which has to answer the same question the pruner
-/// answers before it deletes: is this chunk somewhere else? It deliberately reuses this
-/// path rather than the cheaper `VerificationRequest`, because that one carries a
-/// self-reported `present: bool` and a node that has silently lost a chunk will still say
-/// yes. Here the peer has to return `compute_audit_digest(nonce, peer, key, bytes)` over a
-/// nonce it has never seen, which it cannot do without the bytes.
-///
-/// Returns, per key, the set of peers that proved possession. The caller decides how many
-/// are enough; [`prune_proofs_needed`] is the rule the pruner uses.
-pub(crate) async fn prove_peers_hold_records(
-    keys_by_peer: &HashMap<PeerId, Vec<XorName>>,
-    local_stored_key_count: usize,
-    storage: &Arc<ChunkStore>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
-) -> HashMap<XorName, HashSet<PeerId>> {
-    if keys_by_peer.is_empty() {
-        return HashMap::new();
-    }
-    let candidates: Vec<RecordPruneCandidate> = {
-        let mut by_key: HashMap<XorName, Vec<PeerId>> = HashMap::new();
-        for (peer, keys) in keys_by_peer {
-            for key in keys {
-                by_key.entry(*key).or_default().push(*peer);
-            }
-        }
-        by_key
-            .into_iter()
-            .map(|(key, target_peers)| RecordPruneCandidate { key, target_peers })
-            .collect()
-    };
-    collect_record_prune_proofs(
-        &candidates,
-        local_stored_key_count,
-        storage,
-        p2p_node,
-        config,
-        sync_state,
-        audit_challenge_coordinator,
-        None,
-    )
-    .await
 }
 
 async fn stored_record_still_exists(key: &XorName, storage: &Arc<ChunkStore>) -> bool {
@@ -2062,13 +2001,12 @@ async fn report_prune_audit_failure_once(
         );
         return true;
     }
-    crate::replication::config::penalise_unheld_close_group_chunk(
-        p2p_node,
-        peer,
-        AuditType::Prune.as_str(),
-        AUDIT_FAILURE_TRUST_WEIGHT,
-    )
-    .await;
+    p2p_node
+        .report_trust_event(
+            peer,
+            saorsa_core::TrustEvent::ApplicationFailure(AUDIT_FAILURE_TRUST_WEIGHT),
+        )
+        .await;
     true
 }
 
@@ -2173,7 +2111,7 @@ async fn peer_is_currently_responsible(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::storage::file_store::CHUNKS_DIR_NAME;
+    use crate::storage::chunk_store::CHUNKS_DIR_NAME;
     use crate::storage::ChunkStoreConfig;
     use tempfile::TempDir;
 
@@ -2574,9 +2512,8 @@ mod tests {
 
     /// The per-pass audit budget goes to the eligible candidates farthest
     /// from the node; nearer ones wait for a later pass.
-    #[tokio::test]
-    async fn audit_budget_goes_to_the_farthest_eligible_candidates() {
-        let (storage, _dir) = test_chunk_store().await;
+    #[test]
+    fn audit_budget_goes_to_the_farthest_eligible_candidates() {
         let node = [0u8; 32];
         let floor = [0u8; 32];
         let peers = peer_ids(2);
@@ -2586,7 +2523,7 @@ mod tests {
             .collect();
 
         let failures = retention::FailedChecks::default();
-        let ordered = erasable_in_order(&storage, true, &node, Some(&floor), &failures, candidates);
+        let ordered = erasable_in_order(true, &node, Some(&floor), &failures, candidates);
         let selected = select_record_prune_audits(&ordered, 100, 3, 100);
 
         let selected_keys: Vec<XorName> = selected.candidates.iter().map(|c| c.key).collect();
@@ -2604,9 +2541,8 @@ mod tests {
     /// Candidates whose audit failed earlier in the same spell of pressure
     /// wait behind the ones not audited yet, so a budget the failing ones
     /// would fill still reaches the rest.
-    #[tokio::test]
-    async fn the_budget_reaches_candidates_behind_those_whose_audit_failed() {
-        let (storage, _dir) = test_chunk_store().await;
+    #[test]
+    fn the_budget_reaches_candidates_behind_those_whose_audit_failed() {
         let node = [0u8; 32];
         let floor = [0u8; 32];
         let peers = peer_ids(2);
@@ -2618,8 +2554,7 @@ mod tests {
         };
         let failures = retention::FailedChecks::default();
         let selected = |candidates: Vec<RecordPruneCandidate>| -> Vec<XorName> {
-            let ordered =
-                erasable_in_order(&storage, true, &node, Some(&floor), &failures, candidates);
+            let ordered = erasable_in_order(true, &node, Some(&floor), &failures, candidates);
             select_record_prune_audits(&ordered, 100, 3, 100)
                 .candidates
                 .iter()
@@ -2663,8 +2598,8 @@ mod tests {
         assert!(pass.penalises(&key_from_byte(0x30)));
         assert!(pass.penalises(&key_from_byte(0x01)));
 
-        let migration = PruneAuditReportState::new(None);
-        assert!(migration.penalises(&key_from_byte(0xFF)));
+        let without_a_floor = PruneAuditReportState::new(None);
+        assert!(without_a_floor.penalises(&key_from_byte(0xFF)));
     }
 
     /// The prune pass logs one line in the shape the server watchdog parses.
@@ -3326,9 +3261,8 @@ mod tests {
     /// Nothing is audited, so nothing can be erased, without disk pressure or
     /// within the floor; under pressure only candidates beyond the floor are,
     /// farthest first.
-    #[tokio::test]
-    async fn only_candidates_beyond_the_floor_are_audited_and_only_under_pressure() {
-        let (storage, _dir) = test_chunk_store().await;
+    #[test]
+    fn only_candidates_beyond_the_floor_are_audited_and_only_under_pressure() {
         let node = [0u8; 32];
         let peers = peer_ids(PROD_CLOSE_GROUP);
         let candidates = || -> Vec<RecordPruneCandidate> {
@@ -3340,17 +3274,10 @@ mod tests {
         let floor = key_from_byte(0x30);
         let failures = retention::FailedChecks::default();
         let erasable = |under_pressure: bool, floor: Option<&XorName>| -> Vec<XorName> {
-            erasable_in_order(
-                &storage,
-                under_pressure,
-                &node,
-                floor,
-                &failures,
-                candidates(),
-            )
-            .iter()
-            .map(|c| c.key)
-            .collect()
+            erasable_in_order(under_pressure, &node, floor, &failures, candidates())
+                .iter()
+                .map(|c| c.key)
+                .collect()
         };
 
         let nothing: Vec<XorName> = Vec::new();
@@ -3361,55 +3288,6 @@ mod tests {
             erasable(true, Some(&floor)),
             vec![key_from_byte(0xC0), key_from_byte(0x90)]
         );
-    }
-
-    /// Under disk pressure, a record only the legacy store holds is not
-    /// erased: the legacy store keeps its freed pages, so erasing it would
-    /// return no disk.
-    #[tokio::test]
-    async fn records_only_the_legacy_store_holds_are_not_erased() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let legacy_content = b"legacy only".to_vec();
-        let legacy_key = crate::client::compute_address(&legacy_content);
-        {
-            let lmdb = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
-                root_dir: dir.path().to_path_buf(),
-                verify_on_read: true,
-                max_map_size: 0,
-                disk_reserve: 0,
-            })
-            .await
-            .expect("legacy store");
-            lmdb.put(&legacy_key, &legacy_content).await.expect("put");
-            lmdb.wait_idle().await;
-        }
-        let storage = ChunkStore::new(crate::storage::ChunkStoreConfig {
-            root_dir: dir.path().to_path_buf(),
-            ..crate::storage::ChunkStoreConfig::test_default()
-        })
-        .await
-        .expect("chunk store");
-        let file_content = b"in a file".to_vec();
-        let file_key = crate::client::compute_address(&file_content);
-        storage.put(&file_key, &file_content).await.expect("put");
-        assert!(storage.has_legacy());
-
-        let peers = peer_ids(PROD_CLOSE_GROUP);
-        let erasable: Vec<XorName> = erasable_in_order(
-            &storage,
-            true,
-            &[0u8; 32],
-            Some(&[0u8; 32]),
-            &retention::FailedChecks::default(),
-            vec![
-                candidate(legacy_key, peers.clone()),
-                candidate(file_key, peers),
-            ],
-        )
-        .iter()
-        .map(|c| c.key)
-        .collect();
-        assert_eq!(erasable, vec![file_key]);
     }
 
     /// #12: self moving back inside the retention width between the audit and

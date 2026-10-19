@@ -129,7 +129,7 @@ jobs:
         shell: bash
         run: |
           shopt -s nullglob
-          serial=" e2e migration_reclaims_disk migration_crash_safety storage_scale "
+          serial=" e2e chunk_store_crash_safety storage_scale "
           failed=()
           for target in tests/*.rs tests/*/mod.rs; do
             name=${target#tests/}; name=${name%/mod.rs}; name=${name%.rs}

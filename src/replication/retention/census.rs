@@ -36,7 +36,7 @@
 //!
 //! The same reading of the source pins other calls to reviewed sites, each in
 //! a test of its own: the disk-pressure state's builders, the routing loop's
-//! event reader, the penalty for an unheld close-group chunk, upstream's
+//! event reader, the lanes that penalise an unheld close-group chunk, upstream's
 //! merkle payment code (compiled, never reached), and the payment vault reads
 //! and RPC addresses behind the payment check's fallback. A last test reads
 //! the vendored protocol's wire messages and payment proof types against a
@@ -65,24 +65,21 @@ const PRIMITIVES: &[&str] = &[
 /// Functions of this crate that remove stored records under another name,
 /// counted where they are called.
 const ERASERS: &[&str] = &[
+    "clean_up",
     "delete_blocking",
     "delete_held",
-    "delete_in_txn",
-    "delete_retired_directory",
+    "delete_mark_last",
     "delete_unobserved",
-    "delete_with_slack",
+    "empty_and_unmark",
     "erase_stored_record",
     "get_or_quarantine",
     "quarantine_corrupt",
-    "remove_legacy_dir",
-    "remove_marked_directory",
-    "retire_legacy",
-    "try_delete",
+    "remove_all",
 ];
 
-/// Calls that build a node's disk-pressure state. The prune passes and the
-/// storage migration must share one, so that the pressure lasts until 15% is
-/// free for all of them: one built afresh would end it at 10%.
+/// Calls that build a node's disk-pressure state. The chunk and pointer prune
+/// passes must share one, so that the pressure lasts until 15% is free for
+/// both: one built afresh would end it at 10%.
 const DISK_PRESSURE_STATE_BUILDERS: &[(Option<&str>, &str)] =
     &[(None, "for_store"), (Some("DiskRetention"), "new")];
 
@@ -119,11 +116,11 @@ const fn site(
 
 const TEMP_FILE: &str = "Removes the temporary file of a write that did not complete; \
      the stored record, if any, is untouched.";
-const LEGACY_DELETE: &str = "The legacy store's record removal, reached only through \
-     ChunkStore::delete_unobserved and ChunkStore::copy_batch.";
-const LEGACY_RETIREMENT: &str = "Part of removing a retired legacy store directory, which \
-     only ChunkStore::retire_legacy and the restart sweep of a directory carrying the \
-     retirement mark do.";
+const LEGACY_LEFTOVER: &str = "Part of removing, once the chunk store has opened, a \
+     chunks.mdb directory left by an earlier release's storage migration that carries its \
+     RETIRED mark or is empty (upstream v0.23.0, ADR-0022): retirement marked it only after \
+     every chunk the node kept was in the file store and every chunk it gave up was proven \
+     held by its close group. Anything else there is kept.";
 const UPGRADE_CACHE: &str = "Upgrade cache files; no record data.";
 const LISTING_METADATA: &str = "Listing metadata, not record data.";
 
@@ -198,6 +195,17 @@ const ERASE_SITES: &[EraseSite] = &[
         "delete",
         1,
         LISTING_METADATA,
+    ),
+    site(
+        "src/node.rs",
+        "NodeBuilder::build",
+        "clean_up",
+        1,
+        "Removes what an earlier release's storage migration left in the node root, only \
+         once the chunk store has opened and only for a node that stores chunks: a \
+         chunks.mdb directory, or a numbered tombstone of one, that carries its RETIRED \
+         mark or is empty (upstream v0.23.0, ADR-0022). An unmarked one with data in it, a \
+         link, or one whose state can't be read is kept and named in a warning.",
     ),
     site(
         "src/pointer/store.rs",
@@ -344,44 +352,41 @@ const ERASE_SITES: &[EraseSite] = &[
         "get_or_quarantine",
         1,
         "Reads this node's own copy, the reference that holders are judged against, through \
-         local_record_digest, by a prune audit and by the storage migration before it sheds \
-         a chunk; a copy whose bytes, read again under the write lane, don't hash to its \
-         name is removed, as upstream v0.23.0 does for prune audits, and the key is not \
-         audited, so no holder is judged against it and replication restores the chunk \
-         from other nodes. An intact legacy copy is served instead, and goes back on the \
-         copier's list.",
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "ChunkStore::copy_batch",
-        "delete",
-        2,
-        "Drops legacy records the file store cannot hold or serve: larger than a chunk \
-         may be, or bytes that do not hash to their name.",
+         local_record_digest, by a prune audit; a copy whose bytes, read again under the \
+         write lane, don't hash to its name is removed, as upstream v0.23.0 does for prune \
+         audits, and the key is not audited, so no holder is judged against it and \
+         replication restores the chunk from other nodes.",
     ),
     site(
         "src/storage/chunk_store.rs",
         "ChunkStore::delete",
         "delete_unobserved",
         1,
-        "Removes a chunk from both backings; the only production caller of \
-         ChunkStore::delete is the prune pass's erase_stored_record.",
+        "Removes a chunk; the only production caller of ChunkStore::delete is the prune \
+         pass's erase_stored_record.",
     ),
     site(
         "src/storage/chunk_store.rs",
         "ChunkStore::delete_unobserved",
-        "delete",
-        2,
-        "The chunk store's removal from the legacy store and the file store, reached \
-         only through ChunkStore::delete.",
+        "remove_file",
+        1,
+        "The chunk store's chunk removal, reached only through ChunkStore::delete.",
     ),
     site(
         "src/storage/chunk_store.rs",
         "ChunkStore::get_or_quarantine",
-        "get_or_quarantine",
+        "quarantine_corrupt",
         1,
-        "The chunk store's read that can remove a chunk file whose bytes don't hash to \
-         its name, through the file store's; its callers are each listed here.",
+        "The chunk store's read that can remove a chunk file whose bytes, read again under \
+         the write lane, do not hash to its name: never a valid record. Its callers are each \
+         listed here.",
+    ),
+    site(
+        "src/storage/chunk_store.rs",
+        "ChunkStore::quarantine_corrupt",
+        "remove_file",
+        1,
+        "Removes a chunk file proven not to hold the record its name says.",
     ),
     site(
         "src/storage/chunk_store.rs",
@@ -395,140 +400,48 @@ const ERASE_SITES: &[EraseSite] = &[
     ),
     site(
         "src/storage/chunk_store.rs",
-        "ChunkStore::remove_legacy_dir",
-        "delete_retired_directory",
-        1,
-        LEGACY_RETIREMENT,
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "ChunkStore::retire_legacy",
-        "remove_legacy_dir",
-        1,
-        LEGACY_RETIREMENT,
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "delete_retired_directory",
-        "remove_marked_directory",
-        1,
-        LEGACY_RETIREMENT,
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "mark_directory_retired",
-        "remove_file",
-        1,
-        "Removes a partly written retirement mark; no record data.",
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "remove_marked_directory",
-        "remove_dir",
-        1,
-        LEGACY_RETIREMENT,
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "remove_marked_directory",
-        "remove_dir_all",
-        1,
-        LEGACY_RETIREMENT,
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "remove_marked_directory",
-        "remove_file",
-        2,
-        LEGACY_RETIREMENT,
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "restore_unmarked_environment",
-        "remove_dir",
-        1,
-        "Removes an empty tombstone directory; no record data.",
-    ),
-    site(
-        "src/storage/chunk_store.rs",
-        "sweep_retired_legacy",
-        "delete_retired_directory",
-        1,
-        LEGACY_RETIREMENT,
-    ),
-    site(
-        "src/storage/file_store.rs",
-        "FileStore::delete",
-        "remove_file",
-        1,
-        "The file store's chunk removal, reached only through ChunkStore::delete.",
-    ),
-    site(
-        "src/storage/file_store.rs",
-        "FileStore::get_or_quarantine",
-        "quarantine_corrupt",
-        1,
-        "Removes a chunk file whose bytes, read again, do not hash to its name: never a \
-         valid record. Reached only through ChunkStore::get_or_quarantine.",
-    ),
-    site(
-        "src/storage/file_store.rs",
-        "FileStore::quarantine_corrupt",
-        "remove_file",
-        1,
-        "Removes a chunk file proven not to hold the record its name says.",
-    ),
-    site(
-        "src/storage/file_store.rs",
         "publish_in_place",
         "remove_file",
         2,
         "Removes a chunk file this same write created and could not complete.",
     ),
     site(
-        "src/storage/file_store.rs",
+        "src/storage/chunk_store.rs",
         "publish_via_rename",
         "remove_file",
         1,
         TEMP_FILE,
     ),
     site(
-        "src/storage/file_store.rs",
-        "sweep_marker_temps",
-        "remove_file",
-        1,
-        "Sweeps temporary marker files of an interrupted write at startup.",
-    ),
-    site(
-        "src/storage/file_store.rs",
+        "src/storage/chunk_store.rs",
         "sweep_temp",
         "remove_file",
         1,
         "Sweeps temporary chunk files of an interrupted write at startup.",
     ),
     site(
-        "src/storage/file_store.rs",
+        "src/storage/chunk_store.rs",
         "write_and_replace",
         "remove_file",
         1,
         TEMP_FILE,
     ),
     site(
-        "src/storage/file_store.rs",
+        "src/storage/chunk_store.rs",
         "write_and_replace",
         "truncate",
         1,
         "Overwrites, with verified bytes, a chunk file proven not to hash to its name.",
     ),
     site(
-        "src/storage/file_store.rs",
+        "src/storage/chunk_store.rs",
         "write_file_atomic",
         "remove_file",
         1,
         TEMP_FILE,
     ),
     site(
-        "src/storage/file_store.rs",
+        "src/storage/chunk_store.rs",
         "write_temp",
         "remove_file",
         2,
@@ -552,51 +465,49 @@ const ERASE_SITES: &[EraseSite] = &[
          lane, don't hash to its name is removed, as in v0.21.0+ds.11.",
     ),
     site(
-        "src/storage/lmdb.rs",
-        "LmdbStorage::delete",
-        "delete_with_slack",
+        "src/storage/legacy_artifacts.rs",
+        "clean_up",
+        "remove_all",
         1,
-        LEGACY_DELETE,
+        LEGACY_LEFTOVER,
     ),
     site(
-        "src/storage/lmdb.rs",
-        "LmdbStorage::delete",
-        "try_delete",
+        "src/storage/legacy_artifacts.rs",
+        "delete_mark_last",
+        "empty_and_unmark",
         1,
-        LEGACY_DELETE,
+        LEGACY_LEFTOVER,
     ),
     site(
-        "src/storage/lmdb.rs",
-        "LmdbStorage::delete_with_slack",
-        "delete_in_txn",
+        "src/storage/legacy_artifacts.rs",
+        "delete_mark_last",
+        "remove_dir",
         1,
-        LEGACY_DELETE,
+        LEGACY_LEFTOVER,
     ),
     site(
-        "src/storage/lmdb.rs",
-        "LmdbStorage::try_delete",
-        "delete_in_txn",
-        1,
-        LEGACY_DELETE,
+        "src/storage/legacy_artifacts.rs",
+        "empty_and_unmark",
+        "remove_file",
+        2,
+        "Part of removing a finished-with migration leftover (see clean_up), off Unix: its \
+         files, then its mark.",
     ),
     site(
-        "src/storage/lmdb.rs",
-        "delete_in_txn",
-        "delete",
-        1,
-        LEGACY_DELETE,
+        "src/storage/legacy_artifacts.rs",
+        "empty_and_unmark",
+        "unlinkat",
+        2,
+        "Part of removing a finished-with migration leftover (see clean_up), on Unix: its \
+         files, then its mark, each against one directory handle opened without following \
+         links, refusing any subdirectory.",
     ),
     site(
-        "src/storage/migration.rs",
-        "retire_tick",
-        "retire_legacy",
+        "src/storage/legacy_artifacts.rs",
+        "remove_all",
+        "delete_mark_last",
         1,
-        "Retires the legacy store once every record copied to files is verified there and \
-         every record given up (shed) is proven held by all but one of its current close \
-         group. Shedding needs the copier to have run out of room and the disk to be under \
-         the prune passes' disk pressure, measured again just before the removal; the \
-         floor and the order do not apply, since the store frees nothing until it is \
-         removed whole (ADR-0014, note of 2026-10-16).",
+        LEGACY_LEFTOVER,
     ),
     site(
         "src/upgrade/binary_cache.rs",
@@ -1663,16 +1574,15 @@ fn every_call_that_can_remove_stored_data_is_reviewed() {
          src/replication/retention/census.rs.\n\n\
          To review a new call: decide whether it can remove the only local copy of a valid \
          record or pointer. If it can, route it through the prune passes' rule instead, or \
-         at least through their disk-pressure state, as the storage migration's shed does. \
-         If it cannot (temporary files, metadata, data proven wrong), add an entry to \
+         at least through their disk-pressure state. If it cannot (temporary files, metadata, data proven wrong), add an entry to \
          ERASE_SITES with the file, the site and call exactly as shown above, the count, and \
          a one-line reason, and have it reviewed. For a listed call that has gone, remove or \
          lower its entry.\n"
     );
 }
 
-/// The prune passes and the storage migration share one disk-pressure state
-/// per node, built in one place in production code. One built anywhere else
+/// The chunk and pointer prune passes share one disk-pressure state per
+/// node, built in one place in production code. One built anywhere else
 /// would start without the pressure the others are under, and end it at 10%
 /// free instead of 15%.
 #[test]
@@ -1694,8 +1604,8 @@ fn the_disk_pressure_state_is_built_once_per_node() {
             1
         )],
         "\nA node's disk-pressure state (DiskRetention) is built once, in \
-         ReplicationEngine::new, and shared. Pass the engine's \
-         (ReplicationEngine::disk_retention) instead of building another.\n"
+         ReplicationEngine::new, and shared. Pass the engine's instead of building \
+         another.\n"
     );
 }
 
@@ -1776,68 +1686,112 @@ fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
     );
 }
 
-/// A peer is penalised for not holding a close-group chunk only through
-/// `penalise_unheld_close_group_chunk`, which withholds the penalty while the
-/// release suspends it, and at exactly the places that judge it.
+/// A peer that doesn't hold a close-group chunk it should is penalised on
+/// every lane that finds it out, as in upstream v0.23.0: the responsible-chunk
+/// audit, the possession check after a fresh write, the prune audit, a
+/// sole-source replica hint its sender then denies, and a fetch a verified
+/// source can't serve. Nothing can withhold it: the release switch, its
+/// environment override and the helper the lanes went through while nodes
+/// moved off the LMDB chunk store are gone, and stay gone. Each lane charges
+/// the peer's trust itself, and the functions holding the lanes keep the
+/// reviewed number of trust charges.
 #[test]
-fn the_unheld_chunk_penalty_goes_through_its_release_switch() {
-    const PENALTY: &[(Option<&str>, &str)] = &[(None, "penalise_unheld_close_group_chunk")];
-    const REVIEWED: &[Reviewed] = &[
-        // A fetch for replication answered NotFound by a peer that should hold it.
+fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
+    const SWITCH: &[(Option<&str>, &str)] = &[
+        (None, "penalise_unheld_close_group_chunk"),
+        (None, "close_group_storage_penalty_suspended"),
+        (None, "set_close_group_storage_penalty_suspended"),
+        (None, "apply_close_group_storage_penalty_policy"),
+        (None, "RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY"),
+        (None, "SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV"),
+        (None, "CLOSE_GROUP_STORAGE_PENALTY_SUSPENDED"),
+    ];
+    let switch = unreviewed(Counting::Mentions(SWITCH), &[]);
+    assert!(
+        switch.is_empty(),
+        "\nThe switch that withheld the penalty for an unheld close-group chunk is back.\n\n\
+         {switch}\n\
+         It existed only while nodes moved off the LMDB chunk store, which is gone. A peer \
+         that doesn't hold a chunk it should is penalised on every lane, as in upstream \
+         v0.23.0.\n"
+    );
+
+    const CHARGE: &[(Option<&str>, &str)] = &[(None, "report_trust_event")];
+    const LANES: &[Reviewed] = &[
+        // A fetch a verified source answered NotFound or Error, among the fetch
+        // path's other charges (6 in all).
         (
             "src/replication/mod.rs",
-            "charge_fetch_fault",
-            "penalise_unheld_close_group_chunk",
-            1,
+            "execute_single_fetch",
+            "report_trust_event",
+            6,
         ),
-        // A responsible-chunk audit the peer failed.
+        // A responsible-chunk audit the peer failed, whatever the reason, timeouts
+        // included; with the audit's pass and its bootstrap-claim abuse (3 in all).
         (
             "src/replication/mod.rs",
             "handle_audit_result",
-            "penalise_unheld_close_group_chunk",
-            1,
+            "report_trust_event",
+            3,
         ),
-        // A replica hint whose sender then denied holding the chunk.
+        // A sole-source replica hint the close group rejected, or its sender denied.
         (
             "src/replication/mod.rs",
             "run_verification_cycle",
-            "penalise_unheld_close_group_chunk",
+            "report_trust_event",
             1,
         ),
-        // The fresh-replication possession check: no answer, or a wrong one.
+        // The possession check after a fresh write: no answer, or a wrong one.
         (
             "src/replication/possession.rs",
             "report_possession_audit_failure",
-            "penalise_unheld_close_group_chunk",
+            "report_trust_event",
             1,
         ),
-        // The fresh-replication possession check: a confirmed failure.
+        // The possession check after a fresh write: a confirmed failure.
         (
             "src/replication/possession.rs",
             "report_possession_confirmed_failure",
-            "penalise_unheld_close_group_chunk",
+            "report_trust_event",
             1,
         ),
-        // A prune audit the peer failed.
+        // A prune audit the peer failed, for a key within the erase floor.
         (
             "src/replication/pruning.rs",
             "report_prune_audit_failure_once",
-            "penalise_unheld_close_group_chunk",
+            "report_trust_event",
             1,
         ),
     ];
-    let report = unreviewed(Counting::Calls(PENALTY), REVIEWED);
+    let found = census_counting(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Counting::Calls(CHARGE),
+    );
+    let mut lanes = String::new();
+    for (file, site, call, count) in LANES {
+        let key = (
+            (*file).to_string(),
+            (*site).to_string(),
+            (*call).to_string(),
+        );
+        let lines = found.get(&key).map_or(&[][..], Vec::as_slice);
+        if lines.len() != *count {
+            let at: Vec<String> = lines.iter().map(|line| format!("{file}:{line}")).collect();
+            let _ = writeln!(
+                lanes,
+                "  {file}  {site}  {call}: found {}, reviewed {count}  ({})",
+                lines.len(),
+                at.join(", ")
+            );
+        }
+    }
     assert!(
-        report.is_empty(),
-        "\nThe calls of penalise_unheld_close_group_chunk no longer match the reviewed \
-         ones.\n\n{report}\n\
-         A node short of the disk to hold its chunks fails every one of these checks. While \
-         nodes are still moving off the legacy LMDB store, the penalty for that stays \
-         suspended (RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY in \
-         src/replication/config.rs), and penalise_unheld_close_group_chunk is the only \
-         place that applies the switch. Penalise a peer for an unheld close-group chunk \
-         through it, never with report_trust_event directly, and list each place that \
-         does here.\n"
+        lanes.is_empty(),
+        "\nThe lanes that penalise a peer for an unheld close-group chunk no longer charge \
+         its trust as reviewed.\n\n{lanes}\n\
+         Each of these functions charges the peer itself with report_trust_event. If a \
+         charge moved, follow it and list where it went; if one is gone, find out why \
+         before changing the count.\n"
     );
 }
 
@@ -2214,7 +2168,7 @@ mod tests {
             impl<'a> std::fmt::Display for Wrapper<'a> {
                 fn fmt(&self) -> impl Iterator<Item = u8> { store.delete(k) }
             }
-            fn free(cb: fn(u8) -> u8) { remove_marked_directory(dir); }
+            fn free(cb: fn(u8) -> u8) { delete_mark_last(dir); }
             trait Eraser { fn wipe(&self) { std::fs::remove_file(p); } fn plain(&self); }
         ";
         assert_eq!(
@@ -2224,7 +2178,7 @@ mod tests {
                 one("Guard::drop", "remove_dir_all"),
                 one("Store::erase", "delete"),
                 one("Wrapper::fmt", "delete"),
-                one("free", "remove_marked_directory"),
+                one("free", "delete_mark_last"),
             ]
         );
     }
@@ -2240,7 +2194,7 @@ mod tests {
         let source = r"
             fn delete(&self) {}
             async fn erase_stored_record(k: &K) -> bool { true }
-            fn f(config: &Config) { if config.retire_legacy { } }
+            fn f(config: &Config) { if config.delete_mark_last { } }
         ";
         assert!(calls(source).is_empty(), "{:?}", calls(source));
     }

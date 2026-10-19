@@ -19,6 +19,7 @@ mod golden;
 // The chunk handler's listings hook.
 #[cfg(test)]
 mod hooks_tests;
+mod map_size;
 mod service;
 mod store;
 

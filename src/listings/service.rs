@@ -2209,7 +2209,9 @@ pub(super) mod tests {
     /// The file holding the chunk at `address` under `dir`.
     fn chunk_file(dir: &TempDir, address: &XorName) -> std::path::PathBuf {
         let name = hex::encode(address);
-        let chunks = dir.path().join(crate::storage::file_store::CHUNKS_DIR_NAME);
+        let chunks = dir
+            .path()
+            .join(crate::storage::chunk_store::CHUNKS_DIR_NAME);
         std::fs::read_dir(chunks)
             .unwrap()
             .filter_map(|shard| Some(shard.ok()?.path().join(&name)))

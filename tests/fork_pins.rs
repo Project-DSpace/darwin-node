@@ -1,8 +1,8 @@
 //! Values this fork sets on purpose, each of which a merge from upstream could
 //! quietly put back: the repository nodes upgrade from and the key its
 //! releases are signed with, the bootstrap peers that ship (none), the
-//! allowance of new browser sessions per source, and the suspended penalty for
-//! not holding a close-group chunk.
+//! allowance of new browser sessions per source, and the penalty for not
+//! holding a close-group chunk, which nothing can withhold.
 //!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes.
@@ -10,11 +10,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ant_node::config::{BootstrapPeersConfig, NodeConfig, UpgradeConfig, WebRtcDirectConfig};
-use ant_node::replication::config::{
-    apply_close_group_storage_penalty_policy, close_group_storage_penalty_suspended,
-    set_close_group_storage_penalty_suspended, SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV,
-};
-use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -172,23 +167,55 @@ fn a_browser_source_opens_12_sessions_then_6_a_minute() {
     }
 }
 
-/// Serial, and the variable put back afterwards: the switch and the
-/// environment are process-wide.
-#[test]
-#[serial]
-fn a_started_node_withholds_the_unheld_chunk_penalty() {
-    let saved = std::env::var_os(SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV);
-    std::env::remove_var(SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV);
-    // Start from the other state, so the result is the policy's doing.
-    set_close_group_storage_penalty_suspended(false);
-    apply_close_group_storage_penalty_policy();
-    let suspended = close_group_storage_penalty_suspended();
-    if let Some(saved) = saved {
-        std::env::set_var(SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV, saved);
+/// The names the switch that withheld the unheld-chunk penalty went by, while
+/// nodes moved off the LMDB chunk store: its environment override, the build
+/// constant, and the helper every lane went through.
+const PENALTY_SWITCH: &[&str] = &[
+    "ANT_SUSPEND_UNHELD_CHUNK_PENALTY",
+    "RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY",
+    "close_group_storage_penalty_suspended",
+    "penalise_unheld_close_group_chunk",
+];
+
+/// Every `.rs` file under `dir`, recursively.
+fn rust_files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, found);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            found.push(path);
+        }
     }
+}
+
+/// A peer that doesn't hold a close-group chunk it should is penalised, as in
+/// upstream v0.23.0, and nothing in the node or the image can withhold it: no
+/// switch and no environment override. The census
+/// (src/replication/retention/census.rs) pins the lanes that charge it, and a
+/// build whose trust weights fall to zero doesn't compile (src/replication/mod.rs).
+#[test]
+fn nothing_withholds_the_unheld_chunk_penalty() {
+    // The census names the switch's parts to pin them away, in test-only code.
+    let census = repo_path("src/replication/retention/census.rs");
+    let mut sources = Vec::new();
+    rust_files(&repo_path("src"), &mut sources);
+    sources.retain(|path| *path != census);
     assert!(
-        suspended,
-        "with {SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV} unset, a node must withhold the \
-         penalty for not holding a close-group chunk while this fork keeps the LMDB migration"
+        sources.len() > 50,
+        "found only {} source files",
+        sources.len()
     );
+    let image = ["docker/Dockerfile", "docker/entrypoint.sh"].map(repo_path);
+    for path in sources.iter().chain(image.iter()) {
+        let text = std::fs::read_to_string(path).unwrap();
+        for name in PENALTY_SWITCH {
+            assert!(
+                !text.contains(name),
+                "{} names {name}: the penalty for an unheld close-group chunk is applied \
+                 on every lane, and nothing may withhold it",
+                path.display()
+            );
+        }
+    }
 }

@@ -48,7 +48,7 @@ use saorsa_core::P2PNode;
 use crate::ant_protocol::XorName;
 use crate::client::xor_distance;
 use crate::logging::{debug, info, warn};
-use crate::storage::file_store::CHUNKS_DIR_NAME;
+use crate::storage::chunk_store::CHUNKS_DIR_NAME;
 use crate::storage::ChunkStore;
 
 #[cfg(test)]

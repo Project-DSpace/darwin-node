@@ -1746,9 +1746,7 @@ mod tests {
         let chunks = crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
             root_dir: dir.path().to_path_buf(),
             verify_on_read: false,
-            max_map_size: 0,
             disk_reserve: 0,
-            migration: crate::storage::MigrationConfig::default(),
         })
         .await
         .expect("chunk store");
@@ -1788,9 +1786,7 @@ mod tests {
         let chunks = crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
             root_dir: dir.path().to_path_buf(),
             verify_on_read: false,
-            max_map_size: 0,
             disk_reserve: 0,
-            migration: crate::storage::MigrationConfig::default(),
         })
         .await
         .expect("chunk store");

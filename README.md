@@ -77,9 +77,7 @@ never ran.
   only records out of range for three days and far from it (more than 10
   times the distance to its 7th-nearest peer), farthest first, each after the
   nodes now nearest to the record prove they hold it, until 15% is free again
-  or nothing else qualifies. A node still moving off the legacy LMDB store
-  gives up the chunks it could not copy only under the same disk pressure,
-  each proven held elsewhere. Upstream deletes such records once they have
+  or nothing else qualifies. Upstream deletes such records once they have
   been out of range for three days, whether or not the disk needs the room. A
   test (`src/replication/retention/census.rs`) lists the calls in `src/` that
   delete files, directories or table entries, with the reason each is there,
@@ -94,22 +92,23 @@ never ran.
   `get_or_quarantine`, and the census lists each call with its reason. The
   plain read, `get`, never removes a file, so a read an upstream merge adds
   removes nothing until it has been reviewed.
-- **The LMDB chunk store and the move off it stay.** Upstream's v0.23.0
-  removes them (#218): the legacy LMDB store, the migration that copies it
-  into one file per chunk, the migration state each node announces in its
-  user agent, and the record of commitment deliveries the migration reads.
-  It also penalises peers again for close-group chunks they don't hold.
-  This fork reverts #218, so a node that still has a `chunks.mdb` goes on
-  migrating, and that penalty stays suspended
-  (`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY` in
-  `src/replication/config.rs`), until every node has finished migrating. A
-  census test lists the six places that can apply that penalty, each through
-  the one function that checks the switch, so a change that drops or adds
-  one fails the tests. A build with the switch turned off doesn't compile
-  while the migration is here (an assertion in `src/storage/migration.rs`),
-  and `tests/fork_pins.rs` checks that a started node withholds the penalty.
-  Tests of a built node (`src/node.rs`) check the migration state it
-  announces in its user agent, with and without a `chunks.mdb`.
+- **Peers that don't hold their close-group chunks are penalised, as
+  upstream's are** (from ds.14). ds.12 and ds.13 kept the legacy LMDB chunk
+  store and the migration off it, reverting upstream's #218, and withheld
+  that penalty until every node had moved its chunks into files. Every node
+  has, so ds.14 takes #218 as upstream v0.23.0 has it: the LMDB store, the
+  migration, the migration state in the user agent and the record of
+  commitment deliveries are gone, and a peer is penalised on every lane that
+  finds it missing a chunk it should hold. A node removes what an earlier
+  migration left behind only once its chunk store has opened, and only a
+  `chunks.mdb` directory marked as finished with, or empty; anything else
+  stays and is named in a warning (upstream's ADR-0022). A census test
+  checks that each lane charges the peer and that the switch which withheld
+  the penalty is gone, `tests/fork_pins.rs` that nothing in the node or the
+  image can withhold it, and a build whose trust weights are zero doesn't
+  compile. A test of a built node (`src/node.rs`) checks that it announces
+  `node/<version>` alone in its user agent. The listing store sizes its own
+  LMDB map from the disk as before (`src/listings/map_size.rs`).
 - **Nodes keep listings** (from ds.2) of the files stored with an
   envelope: a node records the payment of each envelope chunk it stores,
   found from the proof that comes with a PUT or a fresh replication offer,

@@ -27,10 +27,10 @@
 //! is opened, a batch at a time; what can't be moved then, as on a full disk,
 //! is moved at a later start.
 
+use super::map_size::compute_map_size;
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
-use crate::storage::lmdb::compute_map_size;
 use ::ant_protocol::evm::PaymentQuote;
 use ant_listings::{Flags, Listing, ListingKey, ListingPayment, ListingV1, Metadata};
 use heed::types::Bytes;
