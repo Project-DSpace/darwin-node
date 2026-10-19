@@ -19,13 +19,11 @@
 //! only when a quorum of the close group return the same one, and its shown
 //! fields still check out. A copy a quorum serves is dated so that a quorum
 //! of the peers date it then or earlier, leaving out dates that fail their
-//! own check ([`check_copies`]), but takes a date earlier than the node's
-//! own only when [`QUORUM_THRESHOLD`] of the peers asked serve it, however
-//! few the node knows: just after it joins, its view of the close group can
-//! hold one, two or three peers, a quorum of which must not move a
-//! listing's date earlier ([`check_quorum_copy`]). A provisional copy is
-//! dated by its peers' dates that check out, as before; it shows its quote,
-//! so its payment's block bounds them. Copies are checked as far as possible
+//! own check ([`check_copies`]). A date earlier than the node's own takes
+//! [`QUORUM_THRESHOLD`] of the peers asked, however few the node knows:
+//! just after it joins, its view of the close group can hold two or three
+//! peers, a quorum of which must not move a listing's date earlier
+//! ([`check_quorum_copy`]). Copies are checked as far as possible
 //! without the chain before any is looked up on it, and the payment of a
 //! copy fewer than a quorum serve is searched for only briefly. A copy
 //! showing a block before the payment vault was deployed paid something
