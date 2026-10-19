@@ -1230,8 +1230,8 @@ pub(super) mod tests {
     use ::ant_protocol::payment::proof::{serialize_single_node_proof, PaymentProof};
     use ant_listings::self_encryption::{ChunkInfo, DataMap, XorName as SeXorName};
     use ant_listings::{
-        encode_data_map, first_seen_at, Flags, ListingPayment, Metadata, PaymentReceipt,
-        ShownFields, MAGIC,
+        encode_data_map, first_seen_at, AddressRange, DigestEntry, Flags, ListingPayment, Metadata,
+        PaymentReceipt, ShownFields, MAGIC,
     };
     use tempfile::TempDir;
     use tokio::time::Instant;
@@ -1366,6 +1366,19 @@ pub(super) mod tests {
             panic!("expected a list response");
         };
         (listings, more)
+    }
+
+    /// The digest entries in the change feed of `listings`' store, in
+    /// address order.
+    pub async fn feed_entries(listings: &ListingService) -> Vec<DigestEntry> {
+        let (entries, more) = listings
+            .store
+            .feed_entries(AddressRange::ALL, None, usize::MAX)
+            .await
+            .unwrap()
+            .expect("the change feed can be read");
+        assert!(!more);
+        entries
     }
 
     /// Wait for `condition`, checking every 20 ms. The background work the
@@ -3352,6 +3365,13 @@ pub(super) mod tests {
                 .collect::<Vec<_>>(),
             vec![listed.address()]
         );
+        // The change feed holds the listed one alone, as it is served.
+        assert_eq!(
+            feed_entries(&listings).await,
+            vec![DigestEntry::new(&page[0])]
+        );
+        assert!(feed_entries(&listings).await[0]
+            .describes(&get(&listings, listed.address()).await.unwrap()));
         for (envelope, quote, tx_hash) in &paid {
             let listing = get(&listings, envelope.address()).await.unwrap();
             assert_eq!(listing.flags, envelope.flags());

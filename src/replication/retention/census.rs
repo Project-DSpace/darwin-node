@@ -183,11 +183,30 @@ const ERASE_SITES: &[EraseSite] = &[
     ),
     site(
         "src/listings/store.rs",
+        "ListingStore::number_feed",
+        "clear",
+        2,
+        "Empties the listing change feed to number the listings the node serves afresh \
+         under a new epoch, when a start finds the feed new, its numbering cut short, or \
+         the store written to by another version; listing metadata, rebuilt from the \
+         listings themselves, which stay.",
+    ),
+    site(
+        "src/listings/store.rs",
         "ListingStore::remove_in",
         "delete",
         5,
         "Drops the listing of an envelope chunk the node no longer holds; it follows \
          the chunk's removal and never removes chunk bytes.",
+    ),
+    site(
+        "src/listings/store.rs",
+        "ListingStore::renew_record",
+        "delete",
+        1,
+        "Drops an address's old row in the listing change feed as its new record is \
+         written, in the same transaction: the feed keeps one row per address. Listing \
+         metadata.",
     ),
     site(
         "src/listings/store.rs",

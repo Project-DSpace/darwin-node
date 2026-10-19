@@ -1,8 +1,9 @@
 //! The listings hook of the chunk handler, through the handler itself: a node
 //! records an envelope's listing when its PUT stores it, keeping only the
-//! payment fields the envelope shows, and refuses an envelope whose payment it
-//! can't find. A merge that builds the handler without its listing service,
-//! or bypasses the hook in the PUT path, fails here.
+//! payment fields the envelope shows, and numbers it in its change feed, and
+//! refuses an envelope whose payment it can't find. A merge that builds the
+//! handler without its listing service, or bypasses the hook in the PUT path,
+//! fails here.
 //!
 //! The payment verifier has each address in its cache, as if paid, so what
 //! decides each PUT here is the listing hook alone.
@@ -10,7 +11,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::chain::tests::{chain_with, vault_log, MockChain};
-use super::service::tests::{envelope_with, get, service_on, single_node_proof, DEAD_CHAIN};
+use super::service::tests::{
+    envelope_with, feed_entries, get, service_on, single_node_proof, DEAD_CHAIN,
+};
 use super::store::tests::signed_quote;
 use super::ListingService;
 use crate::ant_protocol::{
@@ -22,7 +25,7 @@ use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, QuoteGenerator,
 };
 use crate::storage::{AntProtocol, ChunkStore};
-use ant_listings::{PaymentField, PaymentReceipt, ShownFields};
+use ant_listings::{DigestEntry, PaymentField, PaymentReceipt, ShownFields};
 use bytes::Bytes;
 use evmlib::RewardsAddress;
 use parking_lot::Mutex;
@@ -90,6 +93,7 @@ async fn an_envelope_put_without_its_proof_is_refused() {
     assert!(message.contains("needs its payment proof"), "{message}");
     assert!(!chunks.exists(&envelope.address()).unwrap());
     assert_eq!(get(&listings, envelope.address()).await, None);
+    assert_eq!(feed_entries(&listings).await, Vec::new());
 }
 
 #[tokio::test]
@@ -138,6 +142,11 @@ async fn a_paid_envelope_is_listed_with_exactly_its_shown_fields() {
         listing.payment.quote,
         Some(rmp_serde::to_vec(&quote).unwrap())
     );
+    // In the index: numbered in the change feed as it is served.
+    assert_eq!(
+        feed_entries(&listings).await,
+        vec![DigestEntry::new(&listing)]
+    );
 }
 
 #[tokio::test]
@@ -175,6 +184,7 @@ async fn an_envelope_whose_proof_pays_something_else_is_refused() {
         refusal(response);
         assert!(!chunks.exists(&envelope.address()).unwrap());
         assert_eq!(get(&listings, envelope.address()).await, None);
+        assert_eq!(feed_entries(&listings).await, Vec::new());
     }
 }
 
@@ -196,4 +206,5 @@ async fn an_ordinary_chunk_is_still_taken() {
         Some(&content[..])
     );
     assert_eq!(get(&listings, address).await, None);
+    assert_eq!(feed_entries(&listings).await, Vec::new());
 }

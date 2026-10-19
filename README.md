@@ -121,7 +121,13 @@ never ran.
   envelope: a node records the payment of each envelope chunk it stores,
   found from the proof that comes with a PUT or a fresh replication offer,
   keeping only the payment fields the envelope shows, and serves listings on
-  `listings.v2` (see `vendor/ant-listings`). Tests check the chunk handler's
+  `listings.v2` (see `vendor/ant-listings`). From ds.15 the listing store
+  also keeps a change feed of the listings a node serves in the index: one
+  numbered record per address, its digest entry or its removal, written in
+  the same transaction as each change, with a count and set hash per 16-bit
+  address prefix kept in memory (`src/listings/store.rs`). A start that
+  finds the store written to by another version, which keeps no feed,
+  numbers the feed afresh under a new epoch. Tests check the chunk handler's
   hook (`src/listings/hooks_tests.rs`), that a built node's handler and
   replication engine share one listing service (`src/node.rs`), and that a
   paid envelope stored on one node is served by at least 4 of its close
