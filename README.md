@@ -145,18 +145,20 @@ never ran.
   stops at once when no copy its close group serves can ever check out: one
   showing a block before the payment vault was deployed (the image gives the
   block in `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`), or one the chain shows,
-  in blocks it has finalized, doesn't pay its quote. A node takes the date
-  a quorum of its close group gives a listing, when that is earlier than
-  its own, only if at least 4 of the peers it asked serve that copy: just
-  after it joins, a node can know only one, two or three peers near an
-  address, and a majority of so few no longer moves a listing's date
-  earlier. Tests
-  check the chunk handler's hook (`src/listings/hooks_tests.rs`), that a
-  built node's handler and
+  in blocks it has finalized, doesn't pay its quote. A node takes the date a
+  quorum of its close group gives a listing, when that is earlier than its
+  own, only if at least 4 of the peers it asked serve that copy and date it
+  then or earlier with dates that check out: just after it joins, a node can
+  know only one, two or three peers near an address, and a majority of so few
+  no longer moves a listing's date earlier, nor do fewer than 4 among more by
+  sending dates that fail their check. A copy taken for now without a quorum,
+  which shows its quote, is still dated by its peers' dates that check out,
+  which its payment's block bounds. Tests check the chunk handler's hook
+  (`src/listings/hooks_tests.rs`), that a built node's handler and
   replication engine share one listing service (`src/node.rs`), and that a
-  paid envelope stored on one node is served by at least 4 of its close
-  group within 30 seconds (`tests/e2e/listings.rs`), and the local devnet's
-  nodes keep and serve listings (`tests/webrtc_direct_devnet.rs`). Over the
+  paid envelope stored on one node is served by at least 4 of its close group
+  within 30 seconds (`tests/e2e/listings.rs`), and the local devnet's nodes
+  keep and serve listings (`tests/webrtc_direct_devnet.rs`). Over the
   network, a reader follows a node's change feed across a restart, and is
   sent to a new epoch after a wipe and after another version wrote to the
   store; a reader built on darwin-listings 0.2.1 is answered as before; and
