@@ -19,7 +19,11 @@
 //! only when a quorum of the close group return the same one, and its shown
 //! fields still check out. A copy a quorum serves is dated so that a quorum
 //! of the peers date it then or earlier, leaving out dates that fail their
-//! own check ([`check_copies`]). Copies are checked as far as possible
+//! own check ([`check_copies`]). A date earlier than the node's own takes
+//! [`QUORUM_THRESHOLD`] of the peers asked, however few the node knows:
+//! just after it joins, its view of the close group can hold two or three
+//! peers, a quorum of which must not move a listing's date earlier
+//! ([`check_quorum_copy`]). Copies are checked as far as possible
 //! without the chain before any is looked up on it, and the payment of a
 //! copy fewer than a quorum serve is searched for only briefly. A copy
 //! showing a block before the payment vault was deployed paid something
@@ -52,12 +56,13 @@ use ::ant_protocol::evm::PaymentQuote;
 use ::ant_protocol::payment::proof::deserialize_single_node_proof;
 use ::ant_protocol::{detect_proof_type, ProofType};
 use ant_listings::{
-    check_copies, check_get_response, check_offline, choose_verified, find_payment, is_envelope,
-    listing_to_check, merge_copies, payment_lookup, push_request_id, quorum_listing, quorum_needed,
-    verify_listing_receipts, view_hash, AddressRange, ChangesRequest, ChangesResponse, Envelope,
-    FeedChange, Listing, ListingKey, ListingsBody, ListingsMessage, Lookup, MergedListing, Payment,
-    PaymentError, PaymentField, RangeListRequest, RangeListResponse, MAX_LIST_LIMIT, MAX_WATCHERS,
-    TOPIC, VIEW_PEERS, WATCH_LEASE,
+    check_copies, check_get_response, check_offline, choose_verified, find_payment, first_seen_at,
+    is_envelope, listing_to_check, merge_copies, payment_lookup, push_request_id, quorum_listing,
+    quorum_needed, verify_listing_receipts, view_hash, AddressRange, ChangesRequest,
+    ChangesResponse, Envelope, FeedChange, Listing, ListingCheck, ListingKey, ListingsBody,
+    ListingsMessage, Lookup, MergedListing, Payment, PaymentError, PaymentField, RangeListRequest,
+    RangeListResponse, MAX_LIST_LIMIT, MAX_WATCHERS, QUORUM_THRESHOLD, TOPIC, VIEW_PEERS,
+    WATCH_LEASE,
 };
 use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::PeerId;
@@ -1384,11 +1389,12 @@ impl ListingService {
     /// close group's answers. Any valid payment for the address passed that
     /// check, so a node given another one, outside the close group or before
     /// joining it, must not keep a listing the close group doesn't serve: the
-    /// copy a quorum of the peers `asked` serve ([`quorum_listing`]) replaces
-    /// it if it differs, or dates the same listing earlier, and checks out,
-    /// dated as [`check_copies`] dates it. Otherwise it stays, and nothing is
-    /// looked up on chain. A copy the chain has nothing for yet, or can't be
-    /// read for now, is asked about again later.
+    /// copy a quorum of the peers `asked` serve ([`quorum_copy`]) replaces it
+    /// if it differs, or dates the same listing earlier, and checks out,
+    /// dated as [`check_quorum_copy`] dates it: never earlier than `held`
+    /// unless [`QUORUM_THRESHOLD`] of `asked` serve it. Otherwise it stays,
+    /// and nothing is looked up on chain. A copy the chain has nothing for
+    /// yet, or can't be read for now, is asked about again later.
     ///
     /// # Errors
     ///
@@ -1402,10 +1408,11 @@ impl ListingService {
     ) -> Result<Checked> {
         let groups = merge_copies(answers);
         let needed = quorum_needed(asked.len());
+        let own = held.first_seen;
         // At most one copy has a quorum: it needs more than half the peers.
         let Some((group, listing)) = groups
             .iter()
-            .find_map(|group| Some((group, quorum_listing(group, asked, needed)?)))
+            .find_map(|group| Some((group, quorum_copy(group, asked, needed, own)?)))
         else {
             return Ok(Checked::Done);
         };
@@ -1424,7 +1431,7 @@ impl ListingService {
             }
         };
         let now = unix_now();
-        let checked = check_copies(group, asked, needed, |listing| {
+        let checked = check_quorum_copy(group, asked, needed, own, |listing| {
             verify_listing_receipts(listing, envelope, &fetched, &self.vault, now)
         });
         match checked {
@@ -1551,8 +1558,11 @@ impl ListingService {
         let mut fetched: Vec<Option<Fetched>> = vec![None; groups.len()];
         // The copies looked up that can't check out whatever the chain says.
         let mut refused = vec![false; groups.len()];
+        // Looked up as `decide_repair` dates it: this node's own date for a
+        // listing it takes now is the hour of `now`.
+        let own = Some(first_seen_at(now));
         for &i in &quorum {
-            if let Some(listing) = quorum_listing(&groups[i], asked, needed) {
+            if let Some(listing) = quorum_copy(&groups[i], asked, needed, own) {
                 fetched[i] = self.fetch_for(envelope, &listing, Search::Full).await?;
                 refused[i] = fetched[i].is_none();
             }
@@ -1797,6 +1807,78 @@ fn gives_way(held: &Listing, quorum: &Listing) -> bool {
     !held.eq_apart_from_first_seen(quorum) || held.first_seen > quorum.first_seen
 }
 
+/// The copy of `group` this node takes as a quorum's, unchecked, if at least
+/// `needed` of the peers `asked` serve it. When at least [`QUORUM_THRESHOLD`]
+/// of them do, it is dated as a quorum of a full close group dates it
+/// ([`quorum_listing`] with that many). Otherwise it is dated with `needed`
+/// of them, but never earlier than `own`, this node's own date for the
+/// address: `needed` is [`quorum_needed`] of the peers the node knows, as
+/// few as one, two or three just after it joins, and so few must not move a
+/// listing's date earlier.
+fn quorum_copy<P: PartialEq>(
+    group: &MergedListing<P>,
+    asked: &[P],
+    needed: usize,
+    own: Option<u64>,
+) -> Option<Listing> {
+    if group.count_among(asked) >= QUORUM_THRESHOLD {
+        return quorum_listing(group, asked, QUORUM_THRESHOLD);
+    }
+    quorum_listing(group, asked, needed).map(|listing| no_earlier_than(listing, own))
+}
+
+/// Check `group`, the copies of a listing the peers `asked` serve, as
+/// [`check_copies`] does with a quorum of `needed`, dating a copy at least
+/// `needed` of them serve as [`quorum_copy`] does: as a quorum of a full
+/// close group dates it, over the dates that pass their own check, when at
+/// least [`QUORUM_THRESHOLD`] of `asked` serve it; otherwise never earlier
+/// than `own`, this node's own date for the address, with that date checked
+/// in turn. A copy fewer than `needed` serve, which can only be taken for now
+/// without a quorum, is dated by [`check_copies`] alone, as with a full view
+/// of the close group.
+///
+/// # Errors
+///
+/// The error `check` gives for the listing, as [`check_copies`] returns it,
+/// or for the date this gives it.
+fn check_quorum_copy<P: PartialEq>(
+    group: &MergedListing<P>,
+    asked: &[P],
+    needed: usize,
+    own: Option<u64>,
+    mut check: impl FnMut(&Listing) -> std::result::Result<ListingCheck, PaymentError>,
+) -> std::result::Result<(Listing, ListingCheck), PaymentError> {
+    let serving = group.count_among(asked);
+    if serving >= QUORUM_THRESHOLD {
+        return check_copies(group, asked, QUORUM_THRESHOLD, check);
+    }
+    let (listing, checked) = check_copies(group, asked, needed, &mut check)?;
+    if serving < needed {
+        return Ok((listing, checked));
+    }
+    let dated = no_earlier_than(listing.clone(), own);
+    if dated == listing {
+        return Ok((listing, checked));
+    }
+    debug!(
+        "Only {serving} of the {} peers asked serve the listing of {}: it keeps this node's \
+         own date, not an earlier one",
+        asked.len(),
+        hex::encode(listing.address)
+    );
+    let checked = check(&dated)?;
+    Ok((dated, checked))
+}
+
+/// `listing`, dated `own` if it has an earlier date. Unchanged if it has no
+/// date, or `own` is `None`.
+fn no_earlier_than(mut listing: Listing, own: Option<u64>) -> Listing {
+    if let (Some(date), Some(own)) = (listing.first_seen, own) {
+        listing.first_seen = Some(date.max(own));
+    }
+    listing
+}
+
 /// The repair rule, given the merged answers of the peers `asked` and what the
 /// chain has for each group (`None`: not fetched).
 ///
@@ -1807,9 +1889,12 @@ fn gives_way(held: &Listing, quorum: &Listing) -> bool {
 /// - It hides its quote: a copy at least [`quorum_needed`] of `asked` served,
 ///   whose shown fields check out.
 ///
-/// Each copy is checked and dated by [`check_copies`]: one a quorum serves as
-/// [`quorum_listing`] dates it, over the dates that pass their own check; any
-/// other by the median of its peers' dates that check out.
+/// Each copy is checked and dated by [`check_quorum_copy`]: one a quorum
+/// serves as [`quorum_listing`] dates it, over the dates that pass their own
+/// check, and never earlier than the hour of `now`, this node's own date for
+/// a listing it takes now, unless [`QUORUM_THRESHOLD`] of `asked` serve it;
+/// any other by the median of its peers' dates that check out
+/// ([`check_copies`]).
 fn decide_repair<P: PartialEq>(
     envelope: &Envelope,
     asked: &[P],
@@ -1819,8 +1904,9 @@ fn decide_repair<P: PartialEq>(
     now: u64,
 ) -> Repair {
     let needed = quorum_needed(asked.len());
+    let own = Some(first_seen_at(now));
     let check = |group: &MergedListing<P>, fetched: &Fetched| {
-        check_copies(group, asked, needed, |listing| {
+        check_quorum_copy(group, asked, needed, own, |listing| {
             verify_listing_receipts(listing, envelope, fetched, vault, now)
         })
     };
@@ -1939,9 +2025,9 @@ pub(super) mod tests {
     use ::ant_protocol::payment::proof::{serialize_single_node_proof, PaymentProof};
     use ant_listings::self_encryption::{ChunkInfo, DataMap, XorName as SeXorName};
     use ant_listings::{
-        check_changes_page, check_push, check_range_page, encode_data_map, first_seen_at,
-        ChangesPage, DigestEntry, FeedSync, Flags, ListingPayment, Metadata, PaymentReceipt,
-        Pushed, SetHash, ShownFields, MAGIC,
+        check_changes_page, check_push, check_range_page, encode_data_map, ChangesPage,
+        DigestEntry, FeedSync, Flags, ListingPayment, Metadata, PaymentReceipt, Pushed, SetHash,
+        ShownFields, MAGIC,
     };
     use tempfile::TempDir;
 
@@ -2475,11 +2561,21 @@ pub(super) mod tests {
         answers: Vec<(u8, Listing)>,
         fetched_for: impl Fn(&MergedListing<u8>) -> Option<Fetched>,
     ) -> Repair {
+        decide_among(envelope, &ASKED, answers, fetched_for)
+    }
+
+    /// [`decide`], with `asked` the peers asked.
+    fn decide_among(
+        envelope: &Envelope,
+        asked: &[u8],
+        answers: Vec<(u8, Listing)>,
+        fetched_for: impl Fn(&MergedListing<u8>) -> Option<Fetched>,
+    ) -> Repair {
         let groups = merge_copies(answers);
         let fetched: Vec<_> = groups.iter().map(fetched_for).collect();
         decide_repair(
             envelope,
-            &ASKED,
+            asked,
             &groups,
             &fetched,
             &VAULT,
@@ -2587,6 +2683,83 @@ pub(super) mod tests {
         );
         // Three: not a quorum, so a listing hiding its quote isn't taken.
         assert_eq!(dated_by(&[hour, hour, hour]), Repair::Nothing);
+    }
+
+    #[test]
+    fn a_sparse_view_of_the_close_group_cant_date_a_listing_earlier() {
+        // In the index, nothing shown: dated by first_seen alone.
+        let envelope = envelope_with(1, ShownFields::NONE, true);
+        let listing = listing_for(&envelope, 10);
+        let hour = first_seen_at(BLOCK_TIME);
+        // The node's own date for a listing it takes when `decide` decides.
+        let own = first_seen_at(BLOCK_TIME + 7200);
+        assert!(own > hour);
+        let dated_by = |asked: &[u8], dates: &[u64]| {
+            let peers: Vec<(u8, Option<u64>)> = asked
+                .iter()
+                .zip(dates)
+                .map(|(peer, date)| (*peer, Some(*date)))
+                .collect();
+            decide_among(&envelope, asked, copies(&listing, &peers), |_| {
+                Some(Vec::new())
+            })
+        };
+        let taken_on = |date| {
+            let mut taken = listing.clone();
+            taken.first_seen = Some(date);
+            Repair::Settled(taken)
+        };
+
+        // Just after joining, a node can know only one, two or three peers
+        // near an address. A quorum of those still has the listing taken,
+        // but fewer than four can't date it before the node's own date.
+        assert_eq!(dated_by(&[1], &[0]), taken_on(own));
+        assert_eq!(dated_by(&[1, 2], &[hour, hour]), taken_on(own));
+        assert_eq!(dated_by(&[1, 2, 3], &[0, 0]), taken_on(own));
+        assert_eq!(dated_by(&[1, 2, 3], &[hour, 0, hour]), taken_on(own));
+        assert_eq!(dated_by(&[1, 2, 3, 4], &[0, 0, 0]), taken_on(own));
+        assert_eq!(
+            dated_by(&[1, 2, 3, 4, 5], &[hour, hour, hour]),
+            taken_on(own)
+        );
+        // A later date than the node's own stands.
+        let later = own + 3600;
+        assert_eq!(dated_by(&[1, 2, 3], &[later, later]), taken_on(later));
+        // Four agree, of four or five asked: dated as a full close group's
+        // quorum dates it, the latest of the earliest four, as with seven.
+        assert_eq!(dated_by(&[1, 2, 3, 4], &[0, 0, 0, hour]), taken_on(hour));
+        assert_eq!(
+            dated_by(&[1, 2, 3, 4, 5], &[0, 0, 0, hour - 3600, hour]),
+            taken_on(hour - 3600)
+        );
+        assert_eq!(dated_by(&ASKED, &[0, 0, 0, hour]), taken_on(hour));
+
+        // Showing its quote and all but the block's time: a copy a quorum
+        // of three serves keeps the node's own date, and one a single peer
+        // serves, taken for now without a quorum, is dated as with a full
+        // view, by the date that peer sends.
+        let envelope = envelope_with(
+            2,
+            ShownFields::ALL.without(PaymentField::BlockTimestamp),
+            true,
+        );
+        let upload = payment(&envelope, 0, 10);
+        let listing = Listing::new(&envelope, &upload, BLOCK_TIME);
+        let dated = |first_seen| Listing {
+            first_seen: Some(first_seen),
+            ..listing.clone()
+        };
+        let paid_by_upload = |_: &MergedListing<u8>| Some(vec![paid(&upload)]);
+        let quorum = copies(&listing, &[(1, Some(hour)), (2, Some(hour))]);
+        assert_eq!(
+            decide_among(&envelope, &[1, 2, 3], quorum, paid_by_upload),
+            Repair::Settled(dated(own))
+        );
+        let alone = copies(&listing, &[(1, Some(hour))]);
+        assert_eq!(
+            decide_among(&envelope, &[1, 2, 3], alone, paid_by_upload),
+            Repair::Provisional(dated(hour))
+        );
     }
 
     #[test]
@@ -3677,6 +3850,112 @@ pub(super) mod tests {
         assert_eq!(checked.unwrap(), Checked::Done);
         assert_eq!(get(&listings, address).await, Some(earlier));
         assert!(chain.lock().calls.is_empty(), "{:?}", chain.lock().calls);
+    }
+
+    #[tokio::test]
+    async fn a_sparse_view_of_the_close_group_cant_backdate_a_listing() {
+        // In the index, nothing shown: no chain to check a date against.
+        let envelope = envelope_with(1, ShownFields::NONE, true);
+        let address = envelope.address();
+        let (chain, url) = serve(chain_with(1000, &[])).await;
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service_on(&dir, &url).await;
+        chunks.put(&address, &envelope.to_bytes()).await.unwrap();
+        let held = listing_for(&envelope, 10);
+        let hour = held.first_seen.unwrap();
+        assert!(listings.record(held.clone()).await);
+        let dated = |first_seen| Listing {
+            first_seen: Some(first_seen),
+            ..held.clone()
+        };
+
+        // Just after joining, the node knows two or three peers near the
+        // address, a quorum of which it would have taken a date from: every
+        // one of them dates it earlier, even in 1970. Kept.
+        for asked in [peers(2), peers(3)] {
+            for date in [hour - 3600, 0] {
+                let answers = served_by(&asked, &dated(date));
+                let checked = listings.confirm(&envelope, &held, &asked, answers).await;
+                assert_eq!(checked.unwrap(), Checked::Done);
+                assert_eq!(get(&listings, address).await, Some(held.clone()));
+            }
+        }
+        // Three of the five it knows: kept.
+        let asked = peers(5);
+        let answers = served_by(&asked[..3], &dated(0));
+        let checked = listings.confirm(&envelope, &held, &asked, answers).await;
+        assert_eq!(checked.unwrap(), Checked::Done);
+        assert_eq!(get(&listings, address).await, Some(held.clone()));
+        // Four: the latest of the earliest four dates is taken, as with
+        // seven asked, not the 1970 three of them send.
+        let earlier = dated(hour - 3600);
+        let mut answers = served_by(&asked[..3], &dated(0));
+        answers.extend(served_by(&asked[3..4], &earlier));
+        let checked = listings.confirm(&envelope, &held, &asked, answers).await;
+        assert_eq!(checked.unwrap(), Checked::Done);
+        assert_eq!(get(&listings, address).await, Some(earlier));
+        assert!(chain.lock().calls.is_empty(), "{:?}", chain.lock().calls);
+
+        // Another listing for an address, paid again and PUT here an hour
+        // after the upload, and two of the three peers the node knows serve
+        // the upload's: it is taken, as a quorum of them serves it, but
+        // keeps the date of the listing held.
+        let envelope = envelope_with(2, ShownFields::NONE.with(PaymentField::BlockNumber), true);
+        let address = envelope.address();
+        chunks.put(&address, &envelope.to_bytes()).await.unwrap();
+        let upload = listing_for(&envelope, 10);
+        let mut planted = listing_for(&envelope, 11);
+        planted.first_seen = upload.first_seen.map(|date| date + 3600);
+        assert!(listings.record(planted.clone()).await);
+        let asked = peers(3);
+        let answers = served_by(&asked[..2], &upload);
+        let checked = listings.confirm(&envelope, &planted, &asked, answers).await;
+        assert_eq!(checked.unwrap(), Checked::Done);
+        let taken = Listing {
+            first_seen: planted.first_seen,
+            ..upload.clone()
+        };
+        assert_eq!(get(&listings, address).await, Some(taken));
+    }
+
+    #[tokio::test]
+    async fn a_repair_from_a_sparse_view_keeps_the_nodes_own_date() {
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service(&dir).await;
+        let take = async |seed: u8, asked: &[PeerId], dates: &[u64]| {
+            // In the index, nothing shown: dated by first_seen alone.
+            let envelope = envelope_with(seed, ShownFields::NONE, true);
+            let address = envelope.address();
+            chunks.put(&address, &envelope.to_bytes()).await.unwrap();
+            let listing = listing_for(&envelope, 10);
+            let answers = asked
+                .iter()
+                .zip(dates)
+                .map(|(peer, date)| {
+                    let mut copy = listing.clone();
+                    copy.first_seen = Some(*date);
+                    (*peer, copy)
+                })
+                .collect();
+            answer_for(&listings, asked, answers);
+            let checked = listings.ensure_listing(&address).await;
+            assert_eq!(checked.unwrap(), Checked::Done);
+            let taken = get(&listings, address).await.unwrap();
+            assert!(taken.eq_apart_from_first_seen(&listing));
+            taken.first_seen.unwrap()
+        };
+        let hour = first_seen_at(BLOCK_TIME);
+
+        // Repaired onto a node that has just joined, which knows three peers
+        // near the address: two of them date the listing in 1970. It is
+        // taken, dated the hour the node took it.
+        let before = first_seen_at(unix_now());
+        let date = take(1, &peers(3), &[0, 0]).await;
+        let after = first_seen_at(unix_now());
+        assert!(before <= date && date <= after, "{date}");
+        // Four of the five it knows: their date.
+        let date = take(2, &peers(5), &[0, 0, 0, hour]).await;
+        assert_eq!(date, hour);
     }
 
     #[tokio::test]

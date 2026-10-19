@@ -145,8 +145,13 @@ never ran.
   stops at once when no copy its close group serves can ever check out: one
   showing a block before the payment vault was deployed (the image gives the
   block in `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`), or one the chain shows,
-  in blocks it has finalized, doesn't pay its quote. Tests check the chunk handler's
-  hook (`src/listings/hooks_tests.rs`), that a built node's handler and
+  in blocks it has finalized, doesn't pay its quote. A node takes a date
+  earlier than its own for a listing, from the copies its close group
+  serves, only when at least 4 of the peers it asked serve that copy: just
+  after it joins, a node can know only two or three peers near an address,
+  and a majority of so few no longer moves a listing's date earlier. Tests
+  check the chunk handler's hook (`src/listings/hooks_tests.rs`), that a
+  built node's handler and
   replication engine share one listing service (`src/node.rs`), and that a
   paid envelope stored on one node is served by at least 4 of its close
   group within 30 seconds (`tests/e2e/listings.rs`), and the local devnet's
