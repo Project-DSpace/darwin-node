@@ -20,16 +20,18 @@
 //! fields still check out. A copy a quorum serves is dated so that a quorum
 //! of the peers date it then or earlier, leaving out dates that fail their
 //! own check ([`check_copies`]), but takes a date earlier than the node's
-//! own only when [`QUORUM_THRESHOLD`] of the peers asked serve it, however
-//! few the node knows: just after it joins, its view of the close group can
-//! hold one, two or three peers, a quorum of which must not move a
-//! listing's date earlier ([`check_quorum_copy`]). A provisional copy is
-//! dated by its peers' dates that check out, as before; it shows its quote,
-//! so its payment's block bounds them. Copies are checked as far as possible
-//! without the chain before any is looked up on it, and the payment of a
-//! copy fewer than a quorum serve is searched for only briefly. A copy
-//! showing a block before the payment vault was deployed paid something
-//! else, and is never taken.
+//! own only when [`QUORUM_THRESHOLD`] of the peers asked date it then or
+//! earlier with dates that check out, however few the node knows: just
+//! after it joins, its view of the close group can hold one, two or three
+//! peers, a quorum of which must not move a listing's date earlier, and
+//! peers fewer than that among more must not either, by sending dates that
+//! fail their check so that only theirs count ([`check_quorum_copy`]). A
+//! provisional copy is dated by its peers' dates that check out, as before;
+//! it shows its quote, so its payment's block bounds them. Copies are
+//! checked as far as possible without the chain before any is looked up on
+//! it, and the payment of a copy fewer than a quorum serve is searched for
+//! only briefly. A copy showing a block before the payment vault was
+//! deployed paid something else, and is never taken.
 //!
 //! When the rounds run out while the chain can't be read for a copy that
 //! could be taken, or while an envelope in the index has no listing and its
@@ -1411,9 +1413,10 @@ impl ListingService {
     /// copy a quorum of the peers `asked` serve ([`quorum_copy`]) replaces it
     /// if it differs, or dates the same listing earlier, and checks out,
     /// dated as [`check_quorum_copy`] dates it: never earlier than `held`
-    /// unless [`QUORUM_THRESHOLD`] of `asked` serve it. Otherwise it stays,
-    /// and nothing is looked up on chain. A copy the chain has nothing for
-    /// yet, or can't be read for now, is asked about again later.
+    /// unless [`QUORUM_THRESHOLD`] of `asked` date it then or earlier with
+    /// dates that check out. Otherwise it stays, and nothing is looked up on
+    /// chain. A copy the chain has nothing for yet, or can't be read for now,
+    /// is asked about again later.
     ///
     /// # Errors
     ///
@@ -1847,12 +1850,15 @@ fn quorum_copy<P: PartialEq>(
 }
 
 /// Check `group`, the copies of a listing the peers `asked` serve, as
-/// [`check_copies`] does with a quorum of `needed`, dating a copy at least
-/// `needed` of them serve as [`quorum_copy`] does: as a quorum of a full
-/// close group dates it, over the dates that pass their own check, when at
-/// least [`QUORUM_THRESHOLD`] of `asked` serve it; otherwise never earlier
-/// than `own`, this node's own date for the address, with that date checked
-/// in turn. A copy fewer than `needed` serve, which can only be taken for now
+/// [`check_copies`] does with a quorum of [`QUORUM_THRESHOLD`] when that
+/// many of them serve it, otherwise of `needed`, and date a copy at least
+/// `needed` of them serve never earlier than `own`, this node's own date for
+/// the address, unless [`QUORUM_THRESHOLD`] of `asked` date it then or
+/// earlier with dates that pass their own check; a date this moves later is
+/// checked in turn. So peers fewer than that can't date a listing earlier,
+/// whether they are all the node knows near its address, or the only ones
+/// among more whose dates pass, which [`check_copies`] then dates by their
+/// median. A copy fewer than `needed` serve, which can only be taken for now
 /// without a quorum, is dated by [`check_copies`] alone, as with a full view
 /// of the close group.
 ///
@@ -1868,11 +1874,35 @@ fn check_quorum_copy<P: PartialEq>(
     mut check: impl FnMut(&Listing) -> std::result::Result<ListingCheck, PaymentError>,
 ) -> std::result::Result<(Listing, ListingCheck), PaymentError> {
     let serving = group.count_among(asked);
-    if serving >= QUORUM_THRESHOLD {
-        return check_copies(group, asked, QUORUM_THRESHOLD, check);
-    }
-    let (listing, checked) = check_copies(group, asked, needed, &mut check)?;
+    let quorum = if serving >= QUORUM_THRESHOLD {
+        QUORUM_THRESHOLD
+    } else {
+        needed
+    };
+    let (listing, checked) = check_copies(group, asked, quorum, &mut check)?;
+    let Some(date) = listing.first_seen else {
+        return Ok((listing, checked));
+    };
     if serving < needed {
+        return Ok((listing, checked));
+    }
+    // The peers asked whose own dates put the listing at `date` or earlier
+    // and pass their own check.
+    let backing = group
+        .peers()
+        .iter()
+        .filter(|(peer, _)| asked.contains(peer))
+        .filter_map(|(_, first_seen)| *first_seen)
+        .filter(|&first_seen| {
+            first_seen <= date
+                && check(&Listing {
+                    first_seen: Some(first_seen),
+                    ..listing.clone()
+                })
+                .is_ok()
+        })
+        .count();
+    if backing >= QUORUM_THRESHOLD {
         return Ok((listing, checked));
     }
     let dated = no_earlier_than(listing.clone(), own);
@@ -1880,8 +1910,9 @@ fn check_quorum_copy<P: PartialEq>(
         return Ok((listing, checked));
     }
     debug!(
-        "Only {serving} of the {} peers asked serve the listing of {}: it keeps this node's \
-         own date, not an earlier one",
+        "Only {backing} of the {} peers asked, {serving} of which serve the listing of {}, \
+         date it then or earlier with dates that check out: it keeps this node's own date, \
+         not an earlier one",
         asked.len(),
         hex::encode(listing.address)
     );
@@ -1911,9 +1942,9 @@ fn no_earlier_than(mut listing: Listing, own: Option<u64>) -> Listing {
 /// Each copy is checked and dated by [`check_quorum_copy`]: one a quorum
 /// serves as [`quorum_listing`] dates it, over the dates that pass their own
 /// check, and never earlier than the hour of `now`, this node's own date for
-/// a listing it takes now, unless [`QUORUM_THRESHOLD`] of `asked` serve it;
-/// any other by the median of its peers' dates that check out
-/// ([`check_copies`]).
+/// a listing it takes now, unless [`QUORUM_THRESHOLD`] of `asked` date it
+/// then or earlier with dates that check out; any other by the median of
+/// its peers' dates that check out ([`check_copies`]).
 fn decide_repair<P: PartialEq>(
     envelope: &Envelope,
     asked: &[P],
@@ -2695,10 +2726,13 @@ pub(super) mod tests {
         );
 
         // Four answer and one dates it in the future: that date is dropped,
-        // so one peer can't fail a listing three others date honestly.
+        // so one peer can't fail a listing three others date. Three dates
+        // are not a full quorum's, though, so they can't date it before the
+        // node's own date, the hour it takes it.
+        let own = first_seen_at(BLOCK_TIME + 7200);
         assert_eq!(
             dated_by(&[hour, hour, hour, hour + 100 * 3600]),
-            taken_on(hour)
+            taken_on(own)
         );
         // Three: not a quorum, so a listing hiding its quote isn't taken.
         assert_eq!(dated_by(&[hour, hour, hour]), Repair::Nothing);
@@ -2752,6 +2786,34 @@ pub(super) mod tests {
             taken_on(hour - 3600)
         );
         assert_eq!(dated_by(&ASKED, &[0, 0, 0, hour]), taken_on(hour));
+        // Four serve, but one sends a date that fails its own check, here
+        // one in the future: the three dates left are not a full quorum's,
+        // so their median, 1970, can't date it before the node's own date,
+        // of four, five or seven asked.
+        let future = own + 7200;
+        assert_eq!(
+            dated_by(&[1, 2, 3, 4], &[0, 0, future, hour]),
+            taken_on(own)
+        );
+        assert_eq!(
+            dated_by(&[1, 2, 3, 4, 5], &[0, 0, future, hour]),
+            taken_on(own)
+        );
+        assert_eq!(dated_by(&ASKED, &[0, 0, future, hour]), taken_on(own));
+        // Four whose dates check out and put it then or earlier still date
+        // it before the node's own date, whatever dates others send.
+        assert_eq!(
+            dated_by(&[1, 2, 3, 4, 5], &[0, 0, 0, hour, future]),
+            taken_on(hour)
+        );
+        assert_eq!(
+            dated_by(&[1, 2, 3, 4, 5], &[hour, hour, hour, hour, future]),
+            taken_on(hour)
+        );
+        assert_eq!(
+            dated_by(&ASKED, &[0, 0, future, hour, hour, future]),
+            taken_on(hour)
+        );
 
         // Showing its quote and all but the block's time: a copy a quorum
         // of three serves keeps the node's own date, and one a single peer
@@ -2824,10 +2886,12 @@ pub(super) mod tests {
         );
         // With a quorum, dates that fail their own check are dropped first:
         // three dating it before its payment neither fail it nor date it.
-        // Fewer than four dates are left, so it takes their median.
+        // Fewer than four dates are left, too few to date it before the
+        // node's own date, the hour it takes it, which it keeps.
+        let own = first_seen_at(BLOCK_TIME + 7200);
         assert_eq!(
             dated_by(&[early, early, early, hour, hour + h]),
-            Repair::Settled(dated(hour + h))
+            Repair::Settled(dated(own))
         );
         // Where every date passes, the latest of the earliest four.
         assert_eq!(
@@ -2839,10 +2903,11 @@ pub(super) mod tests {
             Repair::Settled(dated(hour))
         );
         // Four dating it before its payment, which no node can: those dates
-        // are dropped, and the one that checks out dates it.
+        // are dropped, and the one that checks out can't date it alone
+        // before the node's own date.
         assert_eq!(
             dated_by(&[early, early, early, early, hour]),
-            Repair::Settled(dated(hour))
+            Repair::Settled(dated(own))
         );
         // None checks out: nothing is taken.
         assert_eq!(dated_by(&[early, early, early, future]), Repair::Nothing);
