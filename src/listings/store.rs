@@ -1336,8 +1336,10 @@ impl ListingStore {
     /// totals of `range` there, all from one snapshot. If `epoch` is not the
     /// feed's, or `after` is beyond its head, there are no records and `next`
     /// is the head. Otherwise the records come in order, at most `limit` of
-    /// them (none for 0), and reading stops once `max_read` records of the
-    /// feed have been read, in the range or not. `None` while the feed can't
+    /// them, and reading stops once `max_read` records of the feed have been
+    /// read, in the range or not. With a `limit` of 0 it stops before the
+    /// first record in the range, so `next` never passes a record the page
+    /// leaves out. `None` while the feed can't
     /// be read: before its listings are numbered, or when numbering or
     /// totalling them failed at this start.
     ///
@@ -1432,9 +1434,13 @@ impl ListingStore {
             ) else {
                 continue;
             };
+            if limit == 0 && range.contains(&address) {
+                to_the_end = false;
+                break;
+            }
             read += 1;
             page.next = seq;
-            if limit > 0 && range.contains(&address) {
+            if range.contains(&address) {
                 // A row its address's record no longer names is left over
                 // from a record that didn't decode: skipped.
                 let change = self
@@ -3329,9 +3335,14 @@ pub mod tests {
         let short = page(0, 256, 2).await.unwrap().unwrap();
         assert_eq!((short.next, short.changes.clone()), (3, vec![record(3)]));
         assert!(short.more());
-        // With no room for records, it still moves on as far as it reads.
+        // With no room for records, it stops before the first in the range,
+        // never passing a record it leaves out.
         let none = page(0, 0, 3).await.unwrap().unwrap();
+        assert_eq!((none.next, none.changes.len()), (2, 0));
+        assert!(none.more());
+        let none = page(3, 0, 3).await.unwrap().unwrap();
         assert_eq!((none.next, none.changes.len()), (4, 0));
+        assert!(none.more());
         // At the head, nothing more; another epoch, or a number beyond the
         // head, gets no records and the head.
         for (epoch, after) in [(epoch, 6), (epoch ^ 1, 0), (epoch, 7)] {

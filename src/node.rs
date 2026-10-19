@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -1198,35 +1198,67 @@ impl RunningNode {
         children: &TaskTracker,
     ) {
         children.spawn(async move {
-            let Some(response) = Self::listings_answer(&listings, &source, &data, &stopping).await
-            else {
-                return;
-            };
-            if let Err(e) = p2p
-                .send_message(&source, ant_listings::TOPIC, response, &[])
-                .await
-            {
-                warn!("Failed to send listings response to {source}: {e}");
-            }
+            let (p2p, to) = (&p2p, &source);
+            Self::answer_listings(
+                &listings,
+                &source,
+                &data,
+                &stopping,
+                move |response| async move {
+                    if let Err(e) = p2p
+                        .send_message(to, ant_listings::TOPIC, response, &[])
+                        .await
+                    {
+                        warn!("Failed to send listings response to {to}: {e}");
+                    }
+                },
+            )
+            .await;
         });
     }
 
-    /// The answer to one message `source` sent on the listings topic, if it
-    /// needs one. An answer to one of this node's own requests is handed to
-    /// it at once. A request waits for one of the listing service's own
-    /// permits ([`crate::listings::ListingService::request_permits`]), never
-    /// for one of those chunk requests take, so neither kind of request holds
-    /// up the other; it is dropped if the node starts stopping meanwhile.
-    async fn listings_answer(
+    /// Answer one message `source` sent on the listings topic, if it needs
+    /// one, by handing the answer to `send`. The permit the answer was built
+    /// under ([`Self::listings_answer`]) is held until `send` has finished,
+    /// so an answer waiting to go out to a peer that reads slowly counts
+    /// against the listing service's permits as one being built does: no
+    /// more answers than there are permits are held at once.
+    async fn answer_listings<F, Fut>(
         listings: &crate::listings::ListingService,
         source: &saorsa_core::identity::PeerId,
         data: &[u8],
         stopping: &CancellationToken,
-    ) -> Option<Vec<u8>> {
+        send: F,
+    ) where
+        F: FnOnce(Vec<u8>) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let Some((permit, answer)) = Self::listings_answer(listings, source, data, stopping).await
+        else {
+            return;
+        };
+        send(answer).await;
+        drop(permit);
+    }
+
+    /// The answer to one message `source` sent on the listings topic, if it
+    /// needs one, with the permit it was built under. An answer to one of
+    /// this node's own requests is handed to it at once. A request waits for
+    /// one of the listing service's own permits
+    /// ([`crate::listings::ListingService::request_permits`]), never for one
+    /// of those chunk requests take, so neither kind of request holds up the
+    /// other; it is dropped if the node starts stopping meanwhile. The permit
+    /// is to be held until the answer has been sent.
+    async fn listings_answer<'a>(
+        listings: &'a crate::listings::ListingService,
+        source: &saorsa_core::identity::PeerId,
+        data: &[u8],
+        stopping: &CancellationToken,
+    ) -> Option<(SemaphorePermit<'a>, Vec<u8>)> {
         if listings.handle_response(source, data) {
             return None;
         }
-        let _permit = tokio::select! {
+        let permit = tokio::select! {
             biased;
             () = stopping.cancelled() => return None,
             permit = listings.request_permits().acquire() => permit.ok()?,
@@ -1234,7 +1266,8 @@ impl RunningNode {
         if stopping.is_cancelled() {
             return None;
         }
-        listings.handle_message(source, data).await
+        let answer = listings.handle_message(source, data).await?;
+        Some((permit, answer))
     }
 
     /// Request the node to shut down.
@@ -1590,8 +1623,9 @@ mod tests {
 
     /// Listing requests take permits of their own, 16, never those chunk
     /// requests take: with all of them held, a request waits until one frees,
-    /// or is dropped once the node starts stopping. An answer to one of the
-    /// node's own requests takes none.
+    /// or is dropped once the node starts stopping. A request's permit is
+    /// held until its answer has been sent. An answer to one of the node's
+    /// own requests takes none.
     #[tokio::test]
     async fn listing_requests_take_permits_of_their_own() {
         use ant_listings::{ListingKey, ListingsBody, ListingsMessage};
@@ -1639,20 +1673,52 @@ mod tests {
         let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut answering);
         assert!(waited.await.is_err(), "answered without a permit");
         drop(held);
-        let answer = answering.await.expect("an answer");
+        let (permit, answer) = answering.await.expect("an answer");
         let answer = ListingsMessage::decode(&answer).expect("decodes");
         assert_eq!(answer.request_id, 7);
         assert!(matches!(answer.body, ListingsBody::ListResponse { .. }));
+        // The answer comes with its permit.
+        assert_eq!(permits.available_permits(), 15);
+        drop(permit);
+        assert_eq!(permits.available_permits(), 16);
+
+        // The permit is held until the answer has been sent: one waiting to
+        // go out counts against the 16 as one being built does.
+        let send_done = tokio::sync::Notify::new();
+        let finish = &send_done;
+        let sending = RunningNode::answer_listings(
+            &listings,
+            &source,
+            &request,
+            &stopping,
+            move |answer| async move {
+                let answer = ListingsMessage::decode(&answer).expect("decodes");
+                assert_eq!(answer.request_id, 7);
+                assert_eq!(permits.available_permits(), 15, "sent without its permit");
+                finish.notified().await;
+            },
+        );
+        tokio::pin!(sending);
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut sending);
+        assert!(waited.await.is_err(), "the send was not waited for");
+        assert_eq!(
+            permits.available_permits(),
+            15,
+            "the permit was let go before the answer was sent"
+        );
+        send_done.notify_one();
+        sending.await;
+        assert_eq!(permits.available_permits(), 16);
 
         // An answer to a request of the node's takes none.
         let held = permits.acquire_many(16).await.expect("permits");
         let response = message(8, ListingsBody::GetResponse { listing: None });
         let taken = RunningNode::listings_answer(&listings, &source, &response, &stopping).await;
-        assert_eq!(taken, None);
+        assert!(taken.is_none());
         // A request waiting when the node starts stopping is dropped.
         let answering = RunningNode::listings_answer(&listings, &source, &request, &stopping);
         stopping.cancel();
-        assert_eq!(answering.await, None);
+        assert!(answering.await.is_none());
         drop(held);
     }
 

@@ -111,9 +111,10 @@ const RECHECK_SPACING: Duration = Duration::from_secs(3_600 / RECHECKS_PER_HOUR)
 /// and says where, and the reader asks on from it.
 const MAX_FEED_READ: usize = 4_096;
 
-/// The most listing requests from other nodes answered at once: permits of
-/// their own, apart from those chunk requests take, so that neither kind
-/// holds up the other ([`ListingService::request_permits`]).
+/// The most listing requests from other nodes answered at once, from
+/// building an answer until it has been sent: permits of their own, apart
+/// from those chunk requests take, so that neither kind holds up the other
+/// ([`ListingService::request_permits`]).
 const MAX_REQUESTS: usize = 16;
 
 /// The answer to a message on [`TOPIC`] that doesn't decode but whose
@@ -394,8 +395,9 @@ impl ListingService {
     }
 
     /// The permits listing requests from other nodes take while they are
-    /// answered: [`MAX_REQUESTS`], apart from those chunk requests take.
-    /// Answers to this node's own requests take none.
+    /// answered, until each answer has been sent: [`MAX_REQUESTS`], apart
+    /// from those chunk requests take. Answers to this node's own requests
+    /// take none.
     pub fn request_permits(&self) -> &Semaphore {
         &self.requests
     }
@@ -744,8 +746,9 @@ impl ListingService {
     /// its range after its `after`, in address order, at most
     /// [`MAX_LIST_LIMIT`]. An entry whose chunk has gone is dropped with its
     /// listing, as [`Self::list`] drops one, and the page reads on past it.
-    /// One whose chunk can't be read now stays, as the feed and its totals
-    /// keep it: a reader's copy of the range then matches them.
+    /// One whose chunk can't be read now, or whose listing can't be dropped
+    /// now, stays, as the feed and its totals keep it: a reader's copy of
+    /// the range then matches them.
     async fn range_list(&self, request: &RangeListRequest) -> ListingsBody {
         let range = request.range();
         let limit = usize::try_from(request.limit.min(MAX_LIST_LIMIT)).unwrap_or(0);
@@ -766,11 +769,12 @@ impl ListingService {
             };
             after = page.last().map(|entry| entry.address).or(after);
             for entry in page {
-                if self.held(&entry.address).await == Held::Gone {
-                    self.forget(&entry.address).await;
-                } else {
-                    entries.push(entry);
+                if self.held(&entry.address).await == Held::Gone
+                    && self.forget(&entry.address).await
+                {
+                    continue;
                 }
+                entries.push(entry);
             }
             if !more || entries.len() >= limit {
                 return ListingsBody::RangeListResponse(RangeListResponse { entries, more });
@@ -953,18 +957,27 @@ impl ListingService {
         true
     }
 
-    /// Remove the listing of a chunk this node no longer holds.
-    async fn forget(&self, address: &XorName) {
+    /// Remove the listing of a chunk this node no longer holds. Returns
+    /// whether the store holds none for it now: false if it couldn't be
+    /// removed.
+    async fn forget(&self, address: &XorName) -> bool {
         match self.store.remove(*address).await {
-            Ok(true) => debug!(
-                "Dropped the listing of {} with its chunk",
-                hex::encode(address)
-            ),
-            Ok(false) => {}
-            Err(e) => warn!(
-                "Could not drop the listing of {}: {e}",
-                hex::encode(address)
-            ),
+            Ok(removed) => {
+                if removed {
+                    debug!(
+                        "Dropped the listing of {} with its chunk",
+                        hex::encode(address)
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "Could not drop the listing of {}: {e}",
+                    hex::encode(address)
+                );
+                false
+            }
         }
     }
 
@@ -1110,16 +1123,15 @@ impl ListingService {
         }
         loop {
             if let Some(until) = rechecks_until {
-                let Some(slot) = service.upgrade().map(|listings| listings.recheck_slot()) else {
+                let Some(listings) = service.upgrade() else {
                     return;
                 };
-                tokio::time::sleep_until(slot).await;
-                if slot > until {
-                    if let Some(listings) = service.upgrade() {
-                        listings.end_checks(&address, RECHECKS_RAN_OUT).await;
-                    }
+                let Some(slot) = listings.recheck_slot(until) else {
+                    listings.end_checks(&address, RECHECKS_RAN_OUT).await;
                     return;
-                }
+                };
+                drop(listings);
+                tokio::time::sleep_until(slot).await;
             }
             let Some(listings) = service.upgrade() else {
                 return;
@@ -1183,12 +1195,17 @@ impl ListingService {
     /// first at least [`RECHECK_SPACING`] after the last slot given, and not
     /// before now. Re-checks are spread that far apart, so a node makes at
     /// most [`RECHECKS_PER_HOUR`] an hour, however many envelopes it checks
-    /// again.
-    fn recheck_slot(&self) -> Instant {
+    /// again. `None` if that slot is after `until`, when the envelope's
+    /// re-checks end: the slot is then left for the next envelope.
+    fn recheck_slot(&self, until: Instant) -> Option<Instant> {
         let mut next = self.next_recheck.lock();
         let slot = (*next).max(Instant::now());
+        if slot > until {
+            return None;
+        }
         *next = slot + RECHECK_SPACING;
-        slot
+        drop(next);
+        Some(slot)
     }
 
     /// The checks of `address` go on past their schedule from now, as
@@ -5396,6 +5413,27 @@ pub(super) mod tests {
             tokio::time::sleep_until(slot + Duration::from_secs(1)).await;
             wait_until(async || times_asked(&checked) == made).await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slot_past_the_end_of_the_rechecks_is_left_for_the_next() {
+        let dir = TempDir::new().unwrap();
+        let (listings, _chunks) = service(&dir).await;
+        let now = Instant::now();
+        let first = listings
+            .recheck_slot(now + Duration::from_hours(1))
+            .unwrap();
+        assert_eq!(first, now);
+        // The next slot is a minute on: an envelope whose re-checks end
+        // before it takes none.
+        let second = now + RECHECK_SPACING;
+        assert_eq!(listings.recheck_slot(second - Duration::from_secs(1)), None);
+        // The next envelope has it, and the one after the minute after.
+        assert_eq!(listings.recheck_slot(second), Some(second));
+        assert_eq!(
+            listings.recheck_slot(now + Duration::from_hours(1)),
+            Some(second + RECHECK_SPACING)
+        );
     }
 
     #[tokio::test(start_paused = true)]
