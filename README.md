@@ -160,7 +160,9 @@ never ran.
   sent to a new epoch after a wipe and after another version wrote to the
   store; a reader built on darwin-listings 0.2.1 is answered as before; and
   a request of a kind the node doesn't know is answered at once
-  (`tests/e2e/listings.rs`).
+  (`tests/e2e/listings.rs`). `the_change_feed_at_scale`
+  (`src/listings/store.rs`, run by hand) times the feed with 100,000 or more
+  listings.
   `golden_envelopes_list_as_the_client_writes_them` reads envelopes and a
   record exactly as darwin-client writes them, from constants
   (`src/listings/golden.rs`) darwin-client pins too.

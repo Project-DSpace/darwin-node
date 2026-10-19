@@ -3660,4 +3660,257 @@ pub mod tests {
             vec![([1; 32], None), ([2; 32], None)]
         );
     }
+
+    /// How many listings one write of the benchmark's fill takes.
+    const BENCH_FILL_BATCH: usize = 10_000;
+
+    /// A listing at a random address, in the index, every payment field
+    /// shown, its paid quote's bytes `quote`: as most listings on the network
+    /// are, about 3.6 KB stored.
+    fn bench_listing(rng: &mut StdRng, n: u64, quote: &[u8]) -> Listing {
+        Listing {
+            address: rng.gen(),
+            flags: Flags::V1,
+            metadata: Metadata {
+                content_type: Some("text/plain".into()),
+                name: Some(format!("file-{n}.txt")),
+            },
+            size: Some(1_000 + n),
+            payment: ListingPayment {
+                tx_hash: Some(rng.gen()),
+                block_number: Some(80_000_000 + n),
+                block_timestamp: Some(1_790_000_000 + n),
+                log_index: Some(0),
+                quote: Some(quote.to_vec()),
+            },
+            first_seen: None,
+        }
+    }
+
+    /// The median and the longest of `runs` runs of `op`.
+    fn timed<T>(runs: usize, mut op: impl FnMut() -> T) -> (Duration, Duration) {
+        let mut times: Vec<Duration> = (0..runs)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                std::hint::black_box(op());
+                started.elapsed()
+            })
+            .collect();
+        times.sort_unstable();
+        (times[times.len() / 2], times[times.len() - 1])
+    }
+
+    /// Bytes `table` takes in `store`'s map: its pages, of every kind.
+    fn table_bytes(store: &ListingStore, table: Database<Bytes, Bytes>) -> u64 {
+        let rtxn = store.env.read_txn().unwrap();
+        let stat = table.stat(&rtxn).unwrap();
+        let pages = stat.branch_pages + stat.leaf_pages + stat.overflow_pages;
+        u64::from(stat.page_size) * u64::try_from(pages).unwrap()
+    }
+
+    /// The change feed at scale: a store with `ANT_LISTINGS_BENCH` synthetic
+    /// listings (100,000 if unset), filled as a version without the feed
+    /// leaves them, then the first start's numbering of them, the rebuild of
+    /// the prefix sums each start makes, `ChangesRequest` and `RangeList`
+    /// pages as the node reads them, and writes with their feed rows.
+    /// Nothing joins a network. Run by hand, in release mode, as
+    ///
+    /// ```text
+    /// ANT_LISTINGS_BENCH=1000000 cargo test --release --lib \
+    ///     listings::store::tests::the_change_feed_at_scale -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a benchmark of the change feed at scale, run by hand"]
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+    fn the_change_feed_at_scale() {
+        let count: u64 = std::env::var("ANT_LISTINGS_BENCH")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(100_000);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("listings.mdb");
+        std::fs::create_dir_all(&path).unwrap();
+        let report = |what: &str, time: Duration| println!("{what:<58} {time:>12.3?}");
+        println!("The change feed with {count} listings");
+
+        // Filled as a version without the feed leaves a store: listings in
+        // the index, no feed, and no write recorded as this version's.
+        let store = ListingStore::open_env(path.clone(), 0, None).unwrap();
+        store.feed_behind.store(true, Ordering::Relaxed);
+        let quote = rmp_serde::to_vec(&signed_quote([0; 32], 0, 87)).unwrap();
+        let mut rng = StdRng::seed_from_u64(1);
+        let started = std::time::Instant::now();
+        let mut batch = Vec::with_capacity(BENCH_FILL_BATCH);
+        for n in 0..count {
+            batch.push(bench_listing(&mut rng, n, &quote));
+            if batch.len() == BENCH_FILL_BATCH || n + 1 == count {
+                store.insert_all(&batch);
+                batch.clear();
+            }
+        }
+        report("Fill, without the feed (setup)", started.elapsed());
+        let listings_bytes = [store.index, store.index_addresses, store.quote_keys]
+            .into_iter()
+            .map(|table| table_bytes(&store, table))
+            .sum::<u64>();
+        drop(store);
+
+        // The first start of this version: the check, the numbering of every
+        // listing served in a new epoch, and the totals.
+        let started = std::time::Instant::now();
+        let store = ListingStore::open_env(path.clone(), 0, None).unwrap();
+        let why = store.feed_needs_numbering().unwrap();
+        assert_eq!(why, Some("the feed is new"));
+        let numbering = std::time::Instant::now();
+        assert_eq!(store.number_feed(FEED_BATCH).unwrap(), count);
+        let numbering = numbering.elapsed();
+        store.migrate_v1_or_keep();
+        let totalling = std::time::Instant::now();
+        store.load_sums().unwrap();
+        let totalling = totalling.elapsed();
+        report(
+            "First start: open, number and total, in all",
+            started.elapsed(),
+        );
+        report("  numbering every listing in the feed", numbering);
+        report("  totalling the prefix sums", totalling);
+        let feed_bytes = [store.changes, store.change_of, store.change_meta]
+            .into_iter()
+            .map(|table| table_bytes(&store, table))
+            .sum::<u64>();
+        drop(store);
+
+        // A start after that: the feed is the store's, so only its totals
+        // are rebuilt.
+        let started = std::time::Instant::now();
+        let store = ListingStore::open_env(path, 0, None).unwrap();
+        store.number_feed_or_wait();
+        store.migrate_v1_or_keep();
+        store.load_sums_or_wait();
+        report("A later start: open and total", started.elapsed());
+        let (median, longest) = timed(5, || store.load_sums().unwrap());
+        report("  rebuilding the prefix sums, median", median);
+        report("  rebuilding the prefix sums, longest", longest);
+        let state = {
+            let rtxn = store.env.read_txn().unwrap();
+            store.feed_state(&rtxn).unwrap().unwrap()
+        };
+        assert!(state.numbered);
+        assert_eq!(state.head(), count);
+
+        // ChangesRequest pages, as the node reads them: at most 256 records
+        // from at most 4,096 read.
+        let (epoch, head) = (state.epoch, state.head());
+        let mut leaf: XorName = rng.gen();
+        leaf[0] = 0x5a;
+        let pages = [
+            ("ALL, from the start", AddressRange::ALL, 0),
+            ("ALL, from the middle", AddressRange::ALL, head / 2),
+            (
+                "ALL, 10 records before the head",
+                AddressRange::ALL,
+                head - 10,
+            ),
+            (
+                "ALL, at the head (a poll with nothing new)",
+                AddressRange::ALL,
+                head,
+            ),
+            ("8-bit range, from the start", AddressRange::new(leaf, 8), 0),
+            (
+                "16-bit range, from the start",
+                AddressRange::new(leaf, 16),
+                0,
+            ),
+            (
+                "16-bit range, at the head",
+                AddressRange::new(leaf, 16),
+                head,
+            ),
+            (
+                "24-bit range, from the start",
+                AddressRange::new(leaf, 24),
+                0,
+            ),
+            (
+                "24-bit range, at the head",
+                AddressRange::new(leaf, 24),
+                head,
+            ),
+        ];
+        println!("ChangesRequest pages (median of 21):");
+        for (what, range, after) in pages {
+            let page = store
+                .feed_page_blocking(epoch, after, range, 256, 4_096)
+                .unwrap()
+                .unwrap();
+            let (median, _) = timed(21, || {
+                store
+                    .feed_page_blocking(epoch, after, range, 256, 4_096)
+                    .unwrap()
+            });
+            let read = page.next - after.min(page.next);
+            let what = format!(
+                "  {what}: {} records, {read} read, count {}",
+                page.changes.len(),
+                page.count
+            );
+            report(&what, median);
+        }
+
+        // RangeList pages: at most 256 entries in address order.
+        let middle: XorName = [0x80; 32];
+        let lists = [
+            ("ALL, from the start", AddressRange::ALL, None),
+            ("ALL, from the middle", AddressRange::ALL, Some(middle)),
+            (
+                "8-bit range, from the start",
+                AddressRange::new(leaf, 8),
+                None,
+            ),
+            (
+                "16-bit range, from the start",
+                AddressRange::new(leaf, 16),
+                None,
+            ),
+        ];
+        println!("RangeList pages (median of 21):");
+        for (what, range, after) in lists {
+            let (entries, _) = store
+                .feed_entries_blocking(range, after, 256)
+                .unwrap()
+                .unwrap();
+            let (median, _) = timed(21, || {
+                store.feed_entries_blocking(range, after, 256).unwrap()
+            });
+            report(&format!("  {what}: {} entries", entries.len()), median);
+        }
+
+        // Writes as a node records new listings, one to a transaction: with
+        // their feed rows, and without, as a version without the feed.
+        let writes = 1_000u32;
+        let mut write_all = |store: &ListingStore| {
+            let started = std::time::Instant::now();
+            for n in 0..writes {
+                let listing = bench_listing(&mut rng, count + u64::from(n), &quote);
+                assert!(store.insert_blocking(&listing, false).unwrap());
+            }
+            started.elapsed() / writes
+        };
+        report("A write with its feed row, mean", write_all(&store));
+        store.feed_behind.store(true, Ordering::Relaxed);
+        report("A write without the feed, mean", write_all(&store));
+
+        let per = |bytes: u64| bytes as f64 / count as f64;
+        println!(
+            "Disk: listings {:.0} B each, the feed {:.0} B each; data file {} MB",
+            per(listings_bytes),
+            per(feed_bytes),
+            store.env.real_disk_size().unwrap() / 1_000_000
+        );
+        println!(
+            "Memory: the prefix sums take {} KB, whatever the count",
+            std::mem::size_of::<Totals>() * ((1 << 16) + (1 << 8)) / 1_000
+        );
+    }
 }
