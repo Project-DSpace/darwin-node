@@ -155,7 +155,12 @@ never ran.
   replication engine share one listing service (`src/node.rs`), and that a
   paid envelope stored on one node is served by at least 4 of its close
   group within 30 seconds (`tests/e2e/listings.rs`), and the local devnet's
-  nodes keep and serve listings (`tests/webrtc_direct_devnet.rs`).
+  nodes keep and serve listings (`tests/webrtc_direct_devnet.rs`). Over the
+  network, a reader follows a node's change feed across a restart, and is
+  sent to a new epoch after a wipe and after another version wrote to the
+  store; a reader built on darwin-listings 0.2.1 is answered as before; and
+  a request of a kind the node doesn't know is answered at once
+  (`tests/e2e/listings.rs`).
   `golden_envelopes_list_as_the_client_writes_them` reads envelopes and a
   record exactly as darwin-client writes them, from constants
   (`src/listings/golden.rs`) darwin-client pins too.
