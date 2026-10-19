@@ -75,6 +75,17 @@ const PAYMENT_READ_ROUNDS: u32 = 2;
 /// The pause before each later round of a payment read.
 const PAYMENT_READ_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The pause before payment records that read empty are read once more.
+///
+/// A client pays and sends the chunk at once. The RPC this node reads through
+/// can be a block or two behind the one the client paid through, and then
+/// answers with the record as it was before the payment: no amount and no
+/// rewards address, which the check refuses as a redirected payment. Read
+/// again a moment later, the payment is there. Long enough for an RPC a few of
+/// Robinhood Chain's blocks behind to catch up; short, because a store nobody
+/// paid for waits it out too before it is refused, once.
+const EMPTY_PAYMENT_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Number of nearest DHT peers accepted for paid-quote issuer locality.
 ///
 /// This is the Kademlia K width, intentionally wider than `CLOSE_GROUP_SIZE`.
@@ -313,6 +324,17 @@ struct LegacyMedianCandidate<'a> {
     encoded_peer_id: &'a evmlib::EncodedPeerId,
     quote: &'a PaymentQuote,
     expected_amount: Amount,
+}
+
+/// How a median-priced candidate that passed every check before the chain
+/// came out of its on-chain one.
+enum CandidateSettlement {
+    /// Paid as quoted: the settled amount.
+    Paid(Amount),
+    /// Its payment record read empty, with no amount and no rewards address,
+    /// so the RPC may not have seen the payment's block yet. The error the
+    /// check gives it.
+    ReadEmpty(Error),
 }
 
 fn median_quote_index(quote_count: usize) -> usize {
@@ -1508,11 +1530,15 @@ impl PaymentVerifier {
         // gossip-lottery audit path.
         let mut paid_peer: Option<[u8; 32]> = None;
 
+        // Candidates whose payment record read empty, read once more below if
+        // no candidate verifies.
+        let mut read_empty = Vec::new();
+
         for candidate in candidates {
             let paid_price = candidate.quote.price;
             let candidate_peer = *candidate.encoded_peer_id.as_bytes();
             match self.verify_legacy_median_candidate(target, candidate).await {
-                Ok(settled_amount) => {
+                Ok(CandidateSettlement::Paid(settled_amount)) => {
                     verified_paid_quote = Some((paid_price, settled_amount));
                     // First settlement-verified median candidate wins the paid
                     // slot and the sole first-audit nomination. If a client
@@ -1523,7 +1549,53 @@ impl PaymentVerifier {
                     paid_peer = Some(candidate_peer);
                     break;
                 }
+                Ok(CandidateSettlement::ReadEmpty(err)) => {
+                    failures.push(err.to_string());
+                    read_empty.push(candidate);
+                }
                 Err(err) => failures.push(err.to_string()),
+            }
+        }
+
+        // A client pays and stores at once, so the RPC may not have the
+        // payment's block yet: an empty record is read once more, after one
+        // pause, before the store is refused. Not before the other candidates
+        // have been tried, so a paid one is never held up by an unpaid one.
+        if verified_paid_quote.is_none() && !read_empty.is_empty() {
+            debug!(
+                "{} payment record(s) for {} read empty; reading them again in {:?}",
+                read_empty.len(),
+                hex::encode(xorname),
+                EMPTY_PAYMENT_RECHECK_DELAY
+            );
+            tokio::time::sleep(EMPTY_PAYMENT_RECHECK_DELAY).await;
+            for candidate in read_empty {
+                let paid_price = candidate.quote.price;
+                let candidate_peer = *candidate.encoded_peer_id.as_bytes();
+                let settled = match self
+                    .completed_payment_settlement(candidate.quote.hash())
+                    .await
+                {
+                    Ok((amount, recorded)) => {
+                        Self::check_median_settlement(candidate, amount, recorded)
+                    }
+                    Err(err) => Err(err),
+                };
+                match settled {
+                    Ok(settled_amount) => {
+                        info!(
+                            "The payment for {} read empty at first, and was there {:?} later",
+                            hex::encode(xorname),
+                            EMPTY_PAYMENT_RECHECK_DELAY
+                        );
+                        verified_paid_quote = Some((paid_price, settled_amount));
+                        paid_peer = Some(candidate_peer);
+                        break;
+                    }
+                    Err(err) => failures.push(format!(
+                        "read again after {EMPTY_PAYMENT_RECHECK_DELAY:?}: {err}"
+                    )),
+                }
             }
         }
 
@@ -1623,11 +1695,14 @@ impl PaymentVerifier {
     /// price-floor policy compares against the close group's median
     /// commitment price (the settled amount, not the quoted price, so an
     /// honest client may overpay a cheap quote to clear stricter receivers).
+    /// A candidate whose payment record read empty, with no amount and no
+    /// rewards address, comes back as [`CandidateSettlement::ReadEmpty`] with
+    /// the error it would otherwise fail with.
     async fn verify_legacy_median_candidate(
         &self,
         target: &PaymentTarget,
         candidate: LegacyMedianCandidate<'_>,
-    ) -> Result<Amount> {
+    ) -> Result<CandidateSettlement> {
         // The two checks take different addresses. The quote must name what was
         // paid for; the issuer must be close to what the network routes. A
         // chunk supplies one address for both, a pointer two.
@@ -1643,6 +1718,22 @@ impl PaymentVerifier {
         let (on_chain_amount, recorded_rewards_prefix) = self
             .completed_payment_settlement(candidate.quote.hash())
             .await?;
+        let read_empty = on_chain_amount.is_zero() && recorded_rewards_prefix == Some([0u8; 16]);
+        match Self::check_median_settlement(candidate, on_chain_amount, recorded_rewards_prefix) {
+            Ok(settled_amount) => Ok(CandidateSettlement::Paid(settled_amount)),
+            Err(err) if read_empty => Ok(CandidateSettlement::ReadEmpty(err)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Whether the settlement recorded for a candidate's quote pays its quote:
+    /// recorded for the quote's rewards address, and at least the expected
+    /// amount. Returns the settled amount.
+    fn check_median_settlement(
+        candidate: LegacyMedianCandidate<'_>,
+        on_chain_amount: Amount,
+        recorded_rewards_prefix: Option<[u8; 16]>,
+    ) -> Result<Amount> {
         // ADR-0004 Amendment 2: the settlement must be RECORDED FOR THE QUOTE'S
         // rewards address, not merely under its quote hash. The vault stores
         // whatever `(rewardsAddress, amount)` the payer supplied for the hash,
@@ -4288,6 +4379,250 @@ mod tests {
         assert!(
             second.duration_since(first) >= PAYMENT_READ_BACKOFF,
             "the second round waits {PAYMENT_READ_BACKOFF:?}"
+        );
+    }
+
+    /// A `completedPayments` answer: `(bytes16 rewardsAddress, uint128 amount)`.
+    fn completed_payment_words(rewards_prefix: [u8; 16], amount: u128) -> String {
+        let mut words = [0u8; 64];
+        words[..16].copy_from_slice(&rewards_prefix);
+        words[48..].copy_from_slice(&amount.to_be_bytes());
+        format!("0x{}", hex::encode(words))
+    }
+
+    /// The record of a payment the RPC hasn't seen: no rewards address, no amount.
+    fn empty_payment_words() -> String {
+        completed_payment_words([0u8; 16], 0)
+    }
+
+    /// The record of the payment of `quote` with `amount`.
+    fn paid_payment_words(quote: &PaymentQuote, amount: Amount) -> String {
+        completed_payment_words(
+            PaymentVerifier::rewards_address_prefix(&quote.rewards_address),
+            u128::try_from(amount).expect("a test amount fits u128"),
+        )
+    }
+
+    /// A JSON-RPC provider on 127.0.0.1 that answers each request with
+    /// `answer(n, call)`: `n` counts its requests from 1, and `call` is the
+    /// request's `eth_call` input. Returns its URL and the requests it gets.
+    async fn rpc_answering<F>(answer: F) -> (String, Arc<Mutex<Vec<StubRequest>>>)
+    where
+        F: Fn(usize, &str) -> String + Send + Sync + 'static,
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        let requests: Arc<Mutex<Vec<StubRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                let answer = Arc::clone(&answer);
+                tokio::spawn(async move {
+                    while let Some(body) = read_http_body(&mut socket).await {
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&body).expect("a JSON-RPC request");
+                        let call = request["params"][0]["input"]
+                            .as_str()
+                            .or_else(|| request["params"][0]["data"].as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let count = {
+                            let mut seen = seen.lock();
+                            seen.push((
+                                request["method"].as_str().unwrap_or_default().to_string(),
+                                request["params"].clone(),
+                                Instant::now(),
+                            ));
+                            seen.len()
+                        };
+                        let response = serde_json::json!({ "jsonrpc": "2.0",
+                            "id": request["id"], "result": answer(count, &call) });
+                        let body = response.to_string();
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if socket.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    /// The quote hash each request asked the vault about.
+    fn quote_hashes_read(requests: &[StubRequest]) -> Vec<String> {
+        requests
+            .iter()
+            .map(|(method, params, _)| {
+                assert_eq!(method, "eth_call");
+                let call = params[0]["input"]
+                    .as_str()
+                    .or_else(|| params[0]["data"].as_str())
+                    .unwrap_or_default();
+                call.get(call.len().saturating_sub(64)..)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The median quote was paid through an RPC this node reads a moment ahead
+    /// of: its record reads empty, is read again after the pause, holds the
+    /// payment, and the store is verified.
+    #[tokio::test]
+    async fn a_payment_record_read_empty_is_read_again_and_verifies() {
+        assert_eq!(
+            EMPTY_PAYMENT_RECHECK_DELAY,
+            std::time::Duration::from_millis(1500)
+        );
+        let xorname = [0xA4u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        let paid = paid_payment_words(&paid_quote, expected_median_payment(&peer_quotes));
+        let (url, requests) = rpc_answering(move |n, _| {
+            if n == 1 {
+                empty_payment_words()
+            } else {
+                paid.clone()
+            }
+        })
+        .await;
+        let verifier = verifier_reading_through(&url);
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+        assert_eq!(
+            result.expect("the second read finds the payment"),
+            PaymentStatus::PaymentVerified
+        );
+
+        let requests = requests.lock().clone();
+        let paid_hash = hex::encode(paid_quote.hash());
+        assert_eq!(
+            quote_hashes_read(&requests),
+            vec![paid_hash.clone(), paid_hash],
+            "an empty read of the paid quote's record, then one more"
+        );
+        let (_, _, first) = requests[0];
+        let (_, _, second) = requests[1];
+        assert!(
+            second.duration_since(first) >= EMPTY_PAYMENT_RECHECK_DELAY,
+            "the second read waits {EMPTY_PAYMENT_RECHECK_DELAY:?}"
+        );
+    }
+
+    /// Two median candidates tie and the client paid the second: the first's
+    /// record is rightly empty, and the second verifies at once. Records are
+    /// read again only when no candidate verifies.
+    #[tokio::test]
+    async fn a_paid_tied_candidate_is_not_held_up_by_an_unpaid_one() {
+        let xorname = [0xA6u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, tied_median_test_prices());
+        let candidates = median_test_candidates(&peer_quotes);
+        assert_eq!(candidates.len(), 2, "two candidates tie at the median");
+        let (unpaid, paid) = (candidates[0].1.clone(), candidates[1].1.clone());
+        let paid_hash = hex::encode(paid.hash());
+        let record = paid_payment_words(&paid, expected_median_payment(&peer_quotes));
+        let wanted = paid_hash.clone();
+        let (url, requests) = rpc_answering(move |_, call| {
+            if call.contains(&wanted) {
+                record.clone()
+            } else {
+                empty_payment_words()
+            }
+        })
+        .await;
+        let verifier = verifier_reading_through(&url);
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+
+        let started = Instant::now();
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+        assert_eq!(
+            result.expect("the paid candidate verifies"),
+            PaymentStatus::PaymentVerified
+        );
+        assert!(
+            started.elapsed() < EMPTY_PAYMENT_RECHECK_DELAY,
+            "no pause while a candidate verifies: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            quote_hashes_read(&requests.lock()),
+            vec![hex::encode(unpaid.hash()), paid_hash],
+            "each candidate's record read once"
+        );
+    }
+
+    /// Records that are still empty when read again are refused as before,
+    /// after one pause however many candidates there are: the node never waits
+    /// longer for a payment that isn't there.
+    #[tokio::test]
+    async fn payment_records_empty_twice_are_refused_after_one_pause() {
+        let xorname = [0xA5u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, tied_median_test_prices());
+        let candidates = median_test_candidates(&peer_quotes);
+        assert_eq!(candidates.len(), 2, "two candidates tie at the median");
+        let (url, requests) = rpc_answering(|_, _| empty_payment_words()).await;
+        let verifier = verifier_reading_through(&url);
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+
+        let started = Instant::now();
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("a store nobody paid for is refused");
+        let took = started.elapsed();
+        let err = err.to_string();
+        assert!(
+            err.contains("Median quote payment verification failed")
+                && err.contains(&format!(
+                    "was redirected: recorded rewards address prefix {} does not match",
+                    hex::encode([0u8; 16])
+                )),
+            "refused as before: {err}"
+        );
+        let hashes: Vec<String> = candidates
+            .iter()
+            .map(|(_, quote)| hex::encode(quote.hash()))
+            .collect();
+        let mut twice = hashes.clone();
+        twice.extend(hashes);
+        assert_eq!(
+            quote_hashes_read(&requests.lock()),
+            twice,
+            "each record read once, then once more, and no more"
+        );
+        assert!(
+            took >= EMPTY_PAYMENT_RECHECK_DELAY,
+            "the records were read again after the pause: {took:?}"
+        );
+        assert!(
+            took < EMPTY_PAYMENT_RECHECK_DELAY * 2,
+            "one pause in all, not one per candidate: {took:?}"
         );
     }
 

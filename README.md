@@ -50,9 +50,17 @@ never ran.
   was paid, settles the check. Upstream reads once, through one RPC, so a
   provider answering `-32005 the network is busy` made nodes refuse paid
   chunks. Reads of listings' payments have fallen back the same way since
-  ds.4. A census test fails if the vault is read, or the node's RPC address
-  taken, anywhere new, and `a_settlement_read_survives_a_busy_rpc` reads a
-  payment through a stub RPC that answers busy first.
+  ds.4. From ds.14, when no median quote's payment checks out and a
+  payment record read empty, with no amount and no rewards address, that
+  record is read once more 1.5 seconds later, through the same RPCs: a
+  client pays and stores at once, and the node's RPC can be a block or two
+  behind the one it paid through. Upstream refuses such a store as a
+  redirected payment. A store nobody paid for is still refused, after that
+  one pause. A census test fails if the vault is read, or the node's RPC
+  address taken, anywhere new; `a_settlement_read_survives_a_busy_rpc` reads
+  a payment through a stub RPC that answers busy first, and
+  `a_payment_record_read_empty_is_read_again_and_verifies` one that answers
+  with an empty record first.
 - **Relay serving can be turned off** (from ds.10). saorsa-core gives every
   node a MASQUE relay server, on which any peer can open a session and have
   the node send UDP for it to any address. `ANT_RELAY_SERVING=false` (or
