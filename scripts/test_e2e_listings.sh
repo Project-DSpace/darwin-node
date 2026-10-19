@@ -511,11 +511,20 @@ def cmd_warnings(readable, in_index, bits, has_metadata):
 # ---------- the chain ----------
 
 def cast_json(cast, *args):
+    """`cast ARGS --json`, parsed. Foundry 1.8 wraps the JSON of some commands
+    (`cast block`, not `cast receipt`) as {"schema_version", "success", "data",
+    "errors", "warnings"}; the value is then its `data`."""
     out = subprocess.run([cast, *args, "--json"], capture_output=True, text=True, check=False)
     if out.returncode != 0:
         problem(f"cast {' '.join(args)}: {out.stderr.strip()[:200]}")
         finish()
-    return json.loads(out.stdout)
+    value = json.loads(out.stdout)
+    if isinstance(value, dict) and "schema_version" in value:
+        if value.get("success") is not True or "data" not in value:
+            problem(f"cast {' '.join(args)}: {value.get('errors')}")
+            finish()
+        value = value["data"]
+    return value
 
 
 def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
@@ -530,12 +539,22 @@ def cmd_vault(cast, rpc, vault, dpm_topic, mpm_topic, first, last, total, mode):
     txs = []
     for number in range(int(first), int(last) + 1):
         block = cast_json(cast, "block", str(number), "--rpc-url", rpc)
-        for tx in block.get("transactions", []):
+        # A block or receipt read wrongly fails the check: it never counts as
+        # one without vault transactions.
+        if not (isinstance(block, dict) and num(block.get("number", -1)) == number
+                and isinstance(block.get("transactions"), list) and "timestamp" in block):
+            problem(f"cast block {number}: no block {number} with transactions and a timestamp")
+            finish()
+        for tx in block["transactions"]:
             tx_hash = tx if isinstance(tx, str) else tx.get("hash")
             receipt = cast_json(cast, "receipt", tx_hash, "--rpc-url", rpc)
-            if (receipt.get("to") or "").lower() != vault:
+            if not (isinstance(receipt, dict) and norm(receipt.get("transactionHash")) == norm(tx_hash)
+                    and "to" in receipt and isinstance(receipt.get("logs"), list)):
+                problem(f"cast receipt {tx_hash}: not its receipt with to and logs")
+                finish()
+            if (receipt["to"] or "").lower() != vault:
                 continue
-            vault_logs = [log for log in receipt.get("logs", [])
+            vault_logs = [log for log in receipt["logs"]
                           if log.get("address", "").lower() == vault and log.get("topics")]
             payments = [(num(log["logIndex"]), norm(log["topics"][3]))
                         for log in vault_logs
