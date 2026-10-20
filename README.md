@@ -224,7 +224,7 @@ never ran.
   is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
   its only change; `vendor/webrtc` is webrtc 0.14.0, whose
   `RTCDtlsTransport::stop()` cancels a DTLS handshake still in progress;
-  and `vendor/ant-listings` is darwin-listings 0.3.0, unchanged: the
+  and `vendor/ant-listings` is darwin-listings 0.3.1, unchanged: the
   envelope format, listings, their payment checks, the listings protocol
   and its change feeds. `[patch.crates-io]` puts the first two in place of the
   crates.io releases. `vendor/ant-listings` is a workspace member, so its
