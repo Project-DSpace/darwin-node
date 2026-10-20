@@ -156,20 +156,20 @@ never ran.
   upgrade of the binary alone, a node paid in the production network's token
   through its vault takes the block built in, 81,897,121, where that vault was
   deployed on Robinhood Chain; a node on any other network has none, and says
-  so once as it starts (`src/config.rs`). A node takes the date a quorum of
-  its close group gives a listing, when that is earlier than its own, only if
-  at least 4 of the peers it asked serve that copy and date it then or earlier
-  with dates that check out: just after it joins, a node can know only one,
-  two or three peers near an address, and a majority of so few no longer
+  so once as it starts (`src/config.rs`). From ds.15 a node takes the date a
+  quorum of its close group gives a listing, when that is earlier than its own,
+  only if at least 4 of the peers it asked serve that copy and date it then or
+  earlier with dates that check out: just after it joins, a node can know only
+  one, two or three peers near an address, and a majority of so few no longer
   moves a listing's date earlier, nor do fewer than 4 among more by sending
   dates that fail their check. Nor does a copy taken for now without a
   quorum, which fewer than 4 serve: it is dated no earlier than the node's
   own date, the hour it takes it, and while the node holds it, later rounds
-  keep that date unless a peer dates it later. Dating a listing later takes
-  less: where fewer of the peers' dates check out than a quorum needs, the
-  latest of them counts (darwin-listings 0.3.1), so one peer serving the
-  copy can date it later with a date that checks out, up to an hour past the
-  node's clock. Tests check the chunk handler's hook
+  keep that date unless a peer dates it later. From ds.15
+  (darwin-listings 0.3.1), dating a listing later takes less: where fewer of
+  the peers' dates check out than a quorum needs, the latest of them counts,
+  so one peer serving the copy can date it later with a date that checks out,
+  up to an hour past the node's clock. Tests check the chunk handler's hook
   (`src/listings/hooks_tests.rs`), that a built node's handler and replication
   engine share one listing service (`src/node.rs`), and that a paid envelope
   stored on one node is served by at least 4 of its close group within 30
