@@ -43,9 +43,13 @@
 //! until then the feed can't be read, and no write records its id. The count
 //! and set hash of the feed's entries are kept in memory per address prefix
 //! of 16 bits, rebuilt at each start, so a range's totals are read without
-//! reading its entries. Each write that adds records is handed, as it
-//! commits, to the feed's watcher ([`ListingStore::watch_feed`]), which
-//! pushes them to the readers watching their range.
+//! reading its entries. A range's entries in address order, and the totals
+//! of a range finer than those prefixes, are read through `index_addresses`,
+//! each listing's record looked up in `change_of`, so the removal records the
+//! feed keeps cost those reads nothing. Each write that adds records is
+//! handed, as it commits, to the feed's watcher
+//! ([`ListingStore::watch_feed`]), which pushes them to the readers watching
+//! their range.
 //!
 //! The map is sized from the disk, as the chunk store's is, leaving the
 //! operator's disk reserve free, and grows when it fills. A store written by
@@ -142,6 +146,10 @@ pub struct ListingStore {
     /// beyond (0: as the disk allows).
     #[cfg(test)]
     map_ceiling: Arc<std::sync::atomic::AtomicUsize>,
+    /// Tests: how many rows of `index_addresses` the reads of the change
+    /// feed's entries by address have read.
+    #[cfg(test)]
+    index_rows_read: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A failure inside a write transaction: LMDB's own, so a full map can be
@@ -272,6 +280,8 @@ impl ListingStore {
             failing: Arc::default(),
             #[cfg(test)]
             map_ceiling: Arc::default(),
+            #[cfg(test)]
+            index_rows_read: Arc::default(),
         })
     }
 
@@ -1363,7 +1373,12 @@ impl ListingStore {
     /// The digest entries the change feed holds in `range`, in address order,
     /// after `after` (from the range's first address if `None`): at most
     /// `limit`, and whether it holds more there. `None` while the feed can't
-    /// be read.
+    /// be read. They are read through `index_addresses`, the addresses of
+    /// the listings in the index, each with its record in the feed: the
+    /// feed holds an entry exactly for each listing served there, and a
+    /// removal record, which it keeps for good, is never read, so a page
+    /// costs as many rows as the listings held in the range up to its end,
+    /// however many have been removed.
     ///
     /// # Errors
     ///
@@ -1489,13 +1504,15 @@ impl ListingStore {
         });
         let bounds: (Bound<&[u8]>, Bound<&[u8]>) = (start, Bound::Included(&last[..]));
         let mut entries = Vec::new();
-        for record in self
-            .change_of
+        for row in self
+            .index_addresses
             .range(&rtxn, &bounds)
             .map_err(storage_error)?
         {
-            let (_, value) = record.map_err(storage_error)?;
-            if let Some(FeedChange::Entry { entry, .. }) = decode_change(value) {
+            let (address, _) = row.map_err(storage_error)?;
+            #[cfg(test)]
+            self.index_rows_read.fetch_add(1, Ordering::Relaxed);
+            if let Some(entry) = self.feed_entry(&rtxn, address)? {
                 if entries.len() == limit {
                     return Ok(Some((entries, true)));
                 }
@@ -1507,18 +1524,37 @@ impl ListingStore {
 
     /// The totals of the change feed's entries in `range`, counted from the
     /// store: for a range finer than the prefixes the totals are kept for.
+    /// Read through `index_addresses`, as [`Self::feed_entries`] reads them,
+    /// so removal records cost nothing.
     fn scan_totals(&self, txn: &RoTxn, range: &AddressRange) -> Result<Totals> {
         let (first, last) = (range.first(), range.last());
         let bounds: (Bound<&[u8]>, Bound<&[u8]>) =
             (Bound::Included(&first[..]), Bound::Included(&last[..]));
         let mut totals = Totals::default();
-        for record in self.change_of.range(txn, &bounds).map_err(storage_error)? {
-            let (_, value) = record.map_err(storage_error)?;
-            if let Some(FeedChange::Entry { entry, .. }) = decode_change(value) {
+        for row in self
+            .index_addresses
+            .range(txn, &bounds)
+            .map_err(storage_error)?
+        {
+            let (address, _) = row.map_err(storage_error)?;
+            #[cfg(test)]
+            self.index_rows_read.fetch_add(1, Ordering::Relaxed);
+            if let Some(entry) = self.feed_entry(txn, address)? {
                 totals.add(SetHash::of_entry(&entry));
             }
         }
         Ok(totals)
+    }
+
+    /// The digest entry the change feed holds for `address`, a listing in
+    /// the index: `None` if its record is a removal, as for a provisional
+    /// listing or a record that doesn't decode, or if it has none.
+    fn feed_entry(&self, txn: &RoTxn, address: &[u8]) -> Result<Option<DigestEntry>> {
+        let record = self.change_of.get(txn, address).map_err(storage_error)?;
+        Ok(match record.and_then(decode_change) {
+            Some(FeedChange::Entry { entry, .. }) => Some(entry),
+            _ => None,
+        })
     }
 }
 
@@ -2018,6 +2054,27 @@ pub mod tests {
                 Ok(())
             })
             .unwrap();
+        }
+
+        /// Remove the listing of each of `addresses` that has one, in one
+        /// write, recording the removals in the change feed as
+        /// [`Self::remove`] does one at a time.
+        pub fn remove_each(&self, addresses: &[XorName]) {
+            self.write(|wtxn, feed| {
+                for address in addresses {
+                    if self.remove_in(wtxn, address)? {
+                        self.note_change(wtxn, feed, address)?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        /// How many rows of `index_addresses` the reads of the change
+        /// feed's entries by address have read since the last call.
+        pub fn take_index_rows_read(&self) -> usize {
+            self.index_rows_read.swap(0, Ordering::Relaxed)
         }
     }
 
@@ -2769,7 +2826,9 @@ pub mod tests {
 
     /// Check the change feed's totals against a count of `served`: those of
     /// every prefix the store keeps them for, and those of ranges of every
-    /// size around each entry, as a feed page gives them.
+    /// size around each entry, as a feed page gives them. Check too that a
+    /// range list of each of those ranges gives the entries of `served` in
+    /// it, in address order.
     async fn check_totals(store: &ListingStore, served: &[DigestEntry]) {
         let mut fine = vec![Totals::default(); 1 << 16];
         let mut coarse = vec![Totals::default(); 1 << 8];
@@ -2817,6 +2876,13 @@ pub mod tests {
                 u64::try_from(inside.len()).unwrap(),
                 "{range:?}"
             );
+            let (listed, more) = store
+                .feed_entries(range, None, usize::MAX)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!more);
+            assert_eq!(listed.iter().collect::<Vec<_>>(), inside, "{range:?}");
             assert_eq!(page.set_hash, SetHash::of(inside), "{range:?}");
         }
     }
@@ -3415,6 +3481,96 @@ pub mod tests {
             unnumbered.feed_entries(lower, None, 256).await.unwrap(),
             None
         );
+    }
+
+    /// Range lists, and the totals of a range finer than the prefixes they
+    /// are kept for, read the listings in the index, not the feed's records:
+    /// the removal records the feed keeps for good, one for each address it
+    /// stopped serving, cost them nothing.
+    #[tokio::test]
+    async fn range_lists_read_no_removals() {
+        let dir = TempDir::new().unwrap();
+        let store = ListingStore::open(dir.path(), 0).await.unwrap();
+        let mut rng = StdRng::seed_from_u64(23);
+        // 4,000 listings in one 24-bit range, then all but every 100th
+        // removed with its chunk.
+        let prefix = [0x5a, 0x5a, 0x5a];
+        let range = AddressRange::new([0x5a; 32], 24);
+        let listings: Vec<Listing> = (0..4_000u64)
+            .map(|i| {
+                let mut address: XorName = rng.gen();
+                address[..3].copy_from_slice(&prefix);
+                listed_at(address, 1_790_000_000 + i)
+            })
+            .collect();
+        let removed: Vec<XorName> = listings
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 100 != 0)
+            .map(|(_, listing)| listing.address)
+            .collect();
+        let writer = store.clone();
+        spawn_blocking(move || {
+            writer.insert_all(&listings);
+            writer.remove_each(&removed);
+        })
+        .await
+        .unwrap();
+        let served = served(&store).await;
+        assert_eq!(served.len(), 40);
+        let (state, records) = feed_of(&store);
+        assert_eq!(records.len(), 4_000);
+        assert_eq!(entries_in(&records), served);
+        assert!(records
+            .iter()
+            .all(|record| range.contains(&record.address())));
+
+        // Page by page, at every size: what is served, in address order, from
+        // a row per listing held and one more for each page with more after
+        // it, however many were removed.
+        for whole in [AddressRange::ALL, range] {
+            for limit in [1, 3, 39, 40, 256] {
+                store.take_index_rows_read();
+                let (mut listed, mut after, mut pages) = (Vec::new(), None, 0);
+                loop {
+                    let (page, more) = store
+                        .feed_entries(whole, after, limit)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    pages += 1;
+                    after = page.last().map(|entry| entry.address).or(after);
+                    listed.extend(page);
+                    if !more {
+                        break;
+                    }
+                }
+                assert_eq!(listed, served, "{whole:?}, {limit}");
+                assert_eq!(
+                    store.take_index_rows_read(),
+                    served.len() + pages - 1,
+                    "{whole:?}, {limit}"
+                );
+            }
+        }
+
+        // The range's totals, counted from the store as it is finer than 16
+        // bits: from the 40 listings held.
+        let page = store
+            .feed_page(state.epoch, state.head(), range, 256, 4_096)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((page.count, page.set_hash), (40, SetHash::of(&served)));
+        assert_eq!(store.take_index_rows_read(), 40);
+        // So are the totals a watcher of the range is told of, as one more
+        // listing is removed.
+        let told = keep_told(&store, vec![range]);
+        assert!(store.remove(served[0].address).await.unwrap());
+        let told = std::mem::take(&mut *told.lock());
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].totals, vec![(39, SetHash::of(&served[1..]))]);
+        assert_eq!(store.take_index_rows_read(), 39);
     }
 
     /// The bytes the change feed keeps, pinned: a change to them would change
