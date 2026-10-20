@@ -717,7 +717,12 @@ impl ListingService {
     /// view. The request ends `source`'s watch, and sets a new one if it
     /// asks for one and fewer than [`MAX_WATCHERS`] other readers watch
     /// (answered either way). That is done before the feed is read, so a
-    /// record made meanwhile is pushed, or in the answer, or both.
+    /// record made meanwhile is pushed, or in the answer, or both. A request
+    /// with a `limit` of 0 whose next record is in its range is refused, and
+    /// keeps no watch: an answer that moves on would pass a record it leaves
+    /// out, and one with more to come must move on ([`check_changes_page`]).
+    ///
+    /// [`check_changes_page`]: ant_listings::check_changes_page
     async fn changes(
         &self,
         source: &PeerId,
@@ -751,8 +756,17 @@ impl ListingService {
                 return feed_unavailable();
             }
         };
-        let peers = self.view_peers().await;
         let more = page.more();
+        // Only a page with a limit of 0 stops where it began with more to
+        // come: before the next record, one in the range, which it can't
+        // leave out.
+        if more && page.next == request.after {
+            self.watches.lock().renew(*source, None, now);
+            return ListingsBody::Error {
+                message: "a limit of 0 can't move past the next record in the range".into(),
+            };
+        }
+        let peers = self.view_peers().await;
         ListingsBody::ChangesResponse(ChangesResponse {
             epoch: page.epoch,
             head: page.head,
@@ -4837,6 +4851,43 @@ pub(super) mod tests {
         // The next answer reads on from there.
         let request = changes_request(lower, epoch, 300 + read, false);
         let (_, page) = changes_for(&listings, &reader, 4, &request).await;
+        assert_eq!(page, ChangesPage::Follows(None));
+    }
+
+    #[tokio::test]
+    async fn a_limit_of_0_is_answered_only_where_it_can_move_on() {
+        let dir = TempDir::new().unwrap();
+        let (listings, _) = service(&dir).await;
+        // Records 1 to 3: in the lower half of the address space, the upper,
+        // and the lower.
+        for (address, block) in [(0x10u8, 1), (0x90, 2), (0x20, 3)] {
+            let listing = listed_at([address; 32], block);
+            listings.store.insert(listing).await.unwrap();
+        }
+        let lower = AddressRange::new([0; 32], 1);
+        let reader = reader();
+        let (start, _) =
+            changes_for(&listings, &reader, 1, &changes_request(lower, 0, 0, false)).await;
+        let none_after = |after| ChangesRequest {
+            limit: 0,
+            ..changes_request(lower, start.epoch, after, true)
+        };
+
+        // Record 1, the next after 0, is in the range: an answer can't move
+        // past it without leaving it out, nor stay where it began with more
+        // to come. Refused, and no watch is kept for it.
+        let body = ListingsBody::ChangesRequest(none_after(0));
+        let answer = ask_as(&listings, &reader, 2, body).await;
+        assert!(matches!(answer, ListingsBody::Error { .. }), "{answer:?}");
+        assert!(listings.watches.lock().all().is_empty());
+        // Record 2, the next after 1, is not: the answer moves past it, and
+        // stops before record 3, which is.
+        let (answer, page) = changes_for(&listings, &reader, 3, &none_after(1)).await;
+        assert_eq!(page, ChangesPage::Follows(Some(2)));
+        assert_eq!(answer.changes, Vec::new());
+        assert_eq!(listings.watches.lock().all().len(), 1);
+        // At the head: nothing more.
+        let (_, page) = changes_for(&listings, &reader, 4, &none_after(3)).await;
         assert_eq!(page, ChangesPage::Follows(None));
     }
 
