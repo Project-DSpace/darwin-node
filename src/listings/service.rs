@@ -34,14 +34,17 @@
 //! deployed paid something else, and is never taken.
 //!
 //! When the rounds run out while the chain can't be read for a copy that
-//! could be taken, or while an envelope in the index has no listing and its
-//! close group nothing to take yet, the node checks again: each wait twice
-//! the last up to [`MAX_UNREAD_DELAY`], for at most [`MAX_RECHECK_TIME`],
-//! and at most [`RECHECKS_PER_HOUR`] such checks an hour, spread out. An
-//! envelope in the index whose close group serves only copies that can
-//! never check out is given up at once. The envelopes still being checked
-//! are kept in the store, so the checks go on after a restart, and a
-//! restart keeps the end of their re-checks.
+//! could be taken, while an envelope in the index has no listing and its
+//! close group nothing to take yet, or after a check that failed, as when
+//! the listing store or the chunk couldn't be read or written, the node
+//! checks again: each wait twice the last up to [`MAX_UNREAD_DELAY`], for
+//! at most [`MAX_RECHECK_TIME`], and at most [`RECHECKS_PER_HOUR`] such
+//! checks an hour, spread out. A provisional listing whose last check
+//! failed is served, as when its rounds run out. An envelope in the index
+//! whose close group serves only copies that can never check out is given
+//! up at once. The envelopes still being checked are kept in the store, so
+//! the checks go on after a restart, and a restart keeps the end of their
+//! re-checks.
 //!
 //! A listing is deleted with its chunk. Listings are served on
 //! [`ant_listings::TOPIC`]: pages of the index, any listing by address, and
@@ -285,9 +288,11 @@ enum Repair {
 enum Checked {
     /// Nothing more to check.
     Done,
-    /// Try again later: nothing could be taken yet, the listing taken has no
-    /// quorum behind it, or the chain has nothing yet for the copy a quorum
-    /// serves.
+    /// Try again later: nothing could be taken yet (for an envelope held
+    /// without any listing, outside the index, a close group that couldn't
+    /// be asked counts as one with nothing to take), the listing taken has
+    /// no quorum behind it, or the chain has nothing yet for the copy a
+    /// quorum serves.
     Again,
     /// Try again later: the chain couldn't be read for the copy a quorum
     /// serves, or, with no listing held, for a copy fewer serve. The checks
@@ -304,6 +309,20 @@ enum Checked {
         /// Whether no copy the close group served can ever check out.
         definite: bool,
     },
+}
+
+/// Why the checks of an envelope go on past the end of the retry schedule,
+/// as re-checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Inconclusive {
+    /// The chain couldn't be read ([`Checked::ChainUnread`]).
+    ChainUnread,
+    /// An envelope in the index held without a listing, none taken yet
+    /// ([`Checked::Unlisted`]).
+    Unlisted,
+    /// The check failed, with this error, as when the listing store or the
+    /// chunk couldn't be read or written: it says nothing of the listing.
+    Failed(String),
 }
 
 /// Whether this node holds a chunk.
@@ -1101,15 +1120,19 @@ impl ListingService {
 
     /// Run [`Self::ensure_listing`] on the retry schedule until it is done or
     /// the schedule runs out. Then, if the last check was inconclusive (the
-    /// chain couldn't be read, [`Checked::ChainUnread`], or an envelope in
-    /// the index still has no listing to take, [`Checked::Unlisted`]), the
-    /// checks go on as re-checks: each wait twice the one before, up to
+    /// chain couldn't be read, [`Checked::ChainUnread`]; an envelope in the
+    /// index still has no listing to take, [`Checked::Unlisted`]; or the
+    /// check failed, as when the listing store or the chunk couldn't be read
+    /// or written, unless the listing is provisional), the checks go on as
+    /// re-checks: each wait twice the one before, up to
     /// [`MAX_UNREAD_DELAY`], for at most [`MAX_RECHECK_TIME`], and each in
     /// the next of the slots all re-checks share, [`RECHECK_SPACING`] apart.
-    /// An envelope in the index whose close group serves only copies that
-    /// can never check out is given up at once. `rechecks_since` is when a
-    /// previous run began the envelope's re-checks, if it did: they go on
-    /// from the next slot, and end when they would have.
+    /// A provisional listing whose last check failed is served, as when its
+    /// checks run out ([`Self::give_up`]). An envelope in the index whose
+    /// close group serves only copies that can never check out is given up
+    /// at once. `rechecks_since` is when a previous run began the envelope's
+    /// re-checks, if it did: they go on from the next slot, and end when
+    /// they would have.
     async fn ensure_listing_with_retries(
         service: Weak<Self>,
         address: XorName,
@@ -1154,17 +1177,21 @@ impl ListingService {
                     listings.done_checking(&address).await;
                     return;
                 }
-                Ok(outcome) => Some(outcome),
+                Ok(outcome) => Ok(outcome),
                 Err(e) => {
                     debug!("Listing check for {} failed: {e}", hex::encode(address));
-                    None
+                    Err(e)
                 }
             };
             if let Some(next) = retries.next() {
                 delay = next;
             } else {
-                match outcome {
-                    Some(Checked::Unlisted { definite: true }) => {
+                // A failed check says nothing of the listing. A provisional
+                // one is served once the checks run out, whatever the last
+                // found; for any other, it is inconclusive.
+                let provisional = outcome.is_err() && listings.holds_provisional(&address).await;
+                let inconclusive = match outcome {
+                    Ok(Checked::Unlisted { definite: true }) => {
                         listings
                             .end_checks(
                                 &address,
@@ -1174,30 +1201,37 @@ impl ListingService {
                             .await;
                         return;
                     }
-                    Some(Checked::ChainUnread | Checked::Unlisted { definite: false }) => {
-                        let until = if let Some(until) = rechecks_until {
-                            until
-                        } else {
-                            let chain_unread = outcome == Some(Checked::ChainUnread);
-                            let until = listings.begin_rechecks(&address, chain_unread).await;
-                            rechecks_until = Some(until);
-                            until
-                        };
-                        delay = delay.saturating_mul(2).min(MAX_UNREAD_DELAY);
-                        if Instant::now() + delay > until {
-                            listings.end_checks(&address, RECHECKS_RAN_OUT).await;
-                            return;
-                        }
-                    }
-                    _ => {
-                        listings.give_up(&address).await;
-                        return;
-                    }
+                    Ok(Checked::ChainUnread) => Some(Inconclusive::ChainUnread),
+                    Ok(Checked::Unlisted { definite: false }) => Some(Inconclusive::Unlisted),
+                    Err(e) if !provisional => Some(Inconclusive::Failed(e.to_string())),
+                    Ok(Checked::Done | Checked::Again) | Err(_) => None,
+                };
+                let Some(why) = inconclusive else {
+                    listings.give_up(&address).await;
+                    return;
+                };
+                let until = if let Some(until) = rechecks_until {
+                    until
+                } else {
+                    let until = listings.begin_rechecks(&address, &why).await;
+                    rechecks_until = Some(until);
+                    until
+                };
+                delay = delay.saturating_mul(2).min(MAX_UNREAD_DELAY);
+                if Instant::now() + delay > until {
+                    listings.end_checks(&address, RECHECKS_RAN_OUT).await;
+                    return;
                 }
             }
             drop(listings);
             tokio::time::sleep(delay).await;
         }
+    }
+
+    /// Whether the store holds a provisional listing for `address`. `false`
+    /// if it can't be read now.
+    async fn holds_provisional(&self, address: &XorName) -> bool {
+        matches!(self.store.is_provisional(*address).await, Ok(true))
     }
 
     /// The slot for the next check made after its schedule has run out: the
@@ -1220,7 +1254,7 @@ impl ListingService {
     /// The checks of `address` go on past their schedule from now, as
     /// re-checks: record when they began, so that a restart keeps their end,
     /// and say why. Returns when they end.
-    async fn begin_rechecks(&self, address: &XorName, chain_unread: bool) -> Instant {
+    async fn begin_rechecks(&self, address: &XorName, why: &Inconclusive) -> Instant {
         if let Err(e) = self.store.mark_rechecking(*address, unix_now()).await {
             warn!(
                 "Could not record when the checks of envelope {} began again: {e}",
@@ -1228,18 +1262,22 @@ impl ListingService {
             );
         }
         let days = MAX_RECHECK_TIME.as_secs() / 86_400;
-        if chain_unread {
-            warn!(
+        match why {
+            Inconclusive::ChainUnread => warn!(
                 "Could not read the payment chain to check the listing of {}; checking it \
                  again for up to {days} days",
                 hex::encode(address)
-            );
-        } else {
-            info!(
+            ),
+            Inconclusive::Unlisted => info!(
                 "The close group of envelope {} has no listing to take yet; checking it again \
                  for up to {days} days",
                 hex::encode(address)
-            );
+            ),
+            Inconclusive::Failed(e) => warn!(
+                "Could not check the listing of envelope {} ({e}); checking it again for up \
+                 to {days} days",
+                hex::encode(address)
+            ),
         }
         Instant::now() + MAX_RECHECK_TIME
     }
@@ -1253,9 +1291,10 @@ impl ListingService {
         self.done_checking(address).await;
     }
 
-    /// After the last attempt for `address`, one that could read the chain:
-    /// a provisional listing is settled, and the envelope is no longer
-    /// checked.
+    /// After the last attempt for `address`, one that left nothing to check
+    /// again for, or that failed while its listing is provisional: a
+    /// provisional listing is settled, so it is served, and the envelope is
+    /// no longer checked.
     async fn give_up(&self, address: &XorName) {
         match self.store.settle(*address).await {
             Ok(true) => info!(
@@ -1295,6 +1334,13 @@ impl ListingService {
     /// what the close group decides; one recorded from an upload's proof is
     /// checked against it, once unless the chain can't tell (see
     /// [`Checked`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the check fails, saying nothing of the listing:
+    /// the store or the chunk can't be read or written now, or, for an
+    /// envelope with a listing, provisional or not, its close group can't be
+    /// asked.
     async fn ensure_listing(&self, address: &XorName) -> Result<Checked> {
         let provisional = self.store.is_provisional(*address).await?;
         let held = if !provisional && self.store.contains(*address).await? {
@@ -1327,12 +1373,18 @@ impl ListingService {
         let unlisted = held.is_none() && !provisional && envelope.flags().in_index;
         let (asked, answers) = match self.ask_close_group(address).await {
             Ok(asked) => asked,
-            Err(e) if unlisted => {
+            // For an envelope held without any listing, a close group that
+            // can't be asked has nothing to take yet.
+            Err(e) if held.is_none() && !provisional => {
                 debug!(
                     "Could not ask the close group of {} for its listing: {e}",
                     hex::encode(address)
                 );
-                return Ok(Checked::Unlisted { definite: false });
+                return Ok(if unlisted {
+                    Checked::Unlisted { definite: false }
+                } else {
+                    Checked::Again
+                });
             }
             Err(e) => return Err(e),
         };
@@ -5551,5 +5603,270 @@ pub(super) mod tests {
         assert_eq!(times_asked(&listings), 1);
         tokio::time::sleep(MAX_RECHECK_TIME).await;
         assert_eq!(times_asked(&listings), 1);
+    }
+
+    #[tokio::test]
+    async fn a_close_group_that_cant_be_asked_has_nothing_to_take_for_an_envelope_unlisted() {
+        // No P2P node is attached: the close group can't be asked.
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service(&dir).await;
+        let (inside, outside) = (envelope(1), envelope_with(2, ShownFields::ALL, false));
+        for envelope in [&inside, &outside] {
+            chunks
+                .put(&envelope.address(), &envelope.to_bytes())
+                .await
+                .unwrap();
+        }
+        // Held without any listing: nothing to take yet, so an envelope in
+        // the index is checked again past its schedule, one outside it not.
+        let checked = listings.ensure_listing(&inside.address()).await;
+        assert_eq!(checked.unwrap(), Checked::Unlisted { definite: false });
+        let checked = listings.ensure_listing(&outside.address()).await;
+        assert_eq!(checked.unwrap(), Checked::Again);
+        // With a listing, provisional or not, it is a failed check.
+        let provisional = listing_for(&outside, 10);
+        let repair = Repair::Provisional(provisional);
+        let address = outside.address();
+        assert!(!listings
+            .apply_repair(&address, false, repair)
+            .await
+            .unwrap());
+        assert!(listings.ensure_listing(&address).await.is_err());
+        assert!(listings.record(listing_for(&inside, 10)).await);
+        assert!(listings.ensure_listing(&inside.address()).await.is_err());
+    }
+
+    /// A service whose chain has `payment`'s receipt, and an envelope in the
+    /// index stored on it, whose close group a quorum of which serves the
+    /// listing `payment` makes, which checks out: the listing, and when the
+    /// envelope was stored. Writes to the listing store fail from before the
+    /// envelope is stored, so every check of it fails until they are
+    /// allowed again.
+    async fn failing_to_take(
+        dir: &TempDir,
+        envelope: &Envelope,
+        payment: &Payment,
+    ) -> (Arc<ListingService>, Listing, Instant) {
+        let mut mock = chain_with(1000, &[]);
+        mock.add_receipt(paid(payment).0.unwrap());
+        let (listings, chunks) = service(dir).await;
+        listings.chain.answer_from(Arc::new(Mutex::new(mock)));
+        // Let the start read what an earlier run left to check first.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let copy = Listing::new(envelope, payment, BLOCK_TIME);
+        let asked = peers(7);
+        answer_for(&listings, &asked, served_by(&asked[..4], &copy));
+        listings.store.fail_writes(true);
+        let start = Instant::now();
+        chunks
+            .put(&envelope.address(), &envelope.to_bytes())
+            .await
+            .unwrap();
+        (listings, copy, start)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_check_that_fails_goes_on_past_its_schedule_until_it_works() {
+        let dir = TempDir::new().unwrap();
+        let envelope = envelope(1);
+        let address = envelope.address();
+        let (listings, copy, start) =
+            failing_to_take(&dir, &envelope, &payment(&envelope, 0, 20)).await;
+        let checked = Arc::clone(&listings);
+
+        // Every check of the schedule fails: the store can't take the copy.
+        let schedule = 1 + RETRY_DELAYS.len();
+        let end = start + whole_schedule();
+        tokio::time::sleep_until(end + Duration::from_secs(1)).await;
+        wait_until(async || times_asked(&checked) == schedule).await;
+        assert!(!listings.store.contains(address).await.unwrap());
+
+        // Not given up: checked again two hours on, as a check the chain
+        // can't answer is, and fails again.
+        let mut waits = unread_delays();
+        let first = end + waits.next().unwrap();
+        tokio::time::sleep_until(first - Duration::from_secs(1)).await;
+        assert_eq!(times_asked(&listings), schedule);
+        tokio::time::sleep_until(first + Duration::from_secs(1)).await;
+        wait_until(async || times_asked(&checked) == schedule + 1).await;
+        assert!(!listings.store.contains(address).await.unwrap());
+
+        // The store can take it again: the next check, four hours on, takes
+        // the close group's copy, and is the last.
+        listings.store.fail_writes(false);
+        let second = first + waits.next().unwrap();
+        tokio::time::sleep_until(second + Duration::from_secs(1)).await;
+        wait_until(async || get(&checked, address).await == Some(copy.clone())).await;
+        assert_eq!(times_asked(&listings), schedule + 2);
+        assert!(listings.store.pending_addresses().await.unwrap().is_empty());
+        tokio::time::sleep(2 * MAX_UNREAD_DELAY).await;
+        assert_eq!(times_asked(&listings), schedule + 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_check_that_keeps_failing_is_given_up_after_a_week() {
+        let dir = TempDir::new().unwrap();
+        let envelope = envelope(1);
+        let address = envelope.address();
+        let (listings, _copy, start) =
+            failing_to_take(&dir, &envelope, &payment(&envelope, 0, 20)).await;
+        let checked = Arc::clone(&listings);
+
+        // Checked as an envelope whose close group has nothing to take yet:
+        // after the schedule, each wait twice the last up to the longest,
+        // until the next would come over a week after the re-checks began.
+        let mut due = start + whole_schedule();
+        let end = due + MAX_RECHECK_TIME;
+        let mut times = 1 + RETRY_DELAYS.len();
+        for wait in unread_delays() {
+            tokio::time::sleep_until(due + Duration::from_secs(1)).await;
+            wait_until(async || times_asked(&checked) == times).await;
+            if due + wait > end {
+                break;
+            }
+            tokio::time::sleep_until(due + wait - Duration::from_secs(1)).await;
+            assert_eq!(times_asked(&listings), times);
+            due += wait;
+            times += 1;
+        }
+        assert_eq!(times, 1 + RETRY_DELAYS.len() + 29);
+        // Then given up: no listing, and no more checks.
+        tokio::time::sleep(2 * MAX_UNREAD_DELAY).await;
+        assert_eq!(times_asked(&listings), times);
+        assert!(!listings.store.contains(address).await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_checks_past_their_schedule_are_spread_a_minute_apart() {
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service(&dir).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // Three envelopes in the index, stored together, whose chunks can't
+        // be read: every check of them fails, before the close group is
+        // asked.
+        let start = Instant::now();
+        let envelopes: Vec<Envelope> = (1..=3).map(envelope).collect();
+        for envelope in &envelopes {
+            chunks
+                .put(&envelope.address(), &envelope.to_bytes())
+                .await
+                .unwrap();
+            let file = chunk_file(&dir, &envelope.address());
+            std::fs::remove_file(&file).unwrap();
+            std::fs::create_dir(&file).unwrap();
+        }
+        let all: Vec<XorName> = {
+            let mut all: Vec<XorName> = envelopes.iter().map(Envelope::address).collect();
+            all.sort_unstable();
+            all
+        };
+        /// How many envelopes `listings` checks again past their schedule.
+        async fn rechecking(listings: &ListingService) -> usize {
+            let checks = listings.store.pending_checks().await.unwrap();
+            checks.iter().filter(|(_, since)| since.is_some()).count()
+        }
+
+        // Their schedules run out together, and each goes on as re-checks,
+        // marked so that a restart keeps their end.
+        let marked = Arc::clone(&listings);
+        tokio::time::sleep_until(start + whole_schedule() + Duration::from_secs(1)).await;
+        wait_until(async || rechecking(&marked).await == 3).await;
+        assert_eq!(listings.store.pending_addresses().await.unwrap(), all);
+
+        // Their first re-checks are all due two hours later, and are made
+        // one a minute. Readable again in the meantime, each finds the
+        // close group with nothing to take, and goes on.
+        for envelope in &envelopes {
+            let file = chunk_file(&dir, &envelope.address());
+            std::fs::remove_dir(&file).unwrap();
+            std::fs::write(&file, envelope.to_bytes()).unwrap();
+        }
+        answer_for(&listings, &peers(7), Vec::new());
+        let first = start + whole_schedule() + Duration::from_hours(2);
+        for n in 1..=3u32 {
+            let slot = first + RECHECK_SPACING * (n - 1);
+            tokio::time::sleep_until(slot - Duration::from_secs(1)).await;
+            let made = usize::try_from(n).unwrap();
+            assert_eq!(times_asked(&listings), made - 1);
+            tokio::time::sleep_until(slot + Duration::from_secs(1)).await;
+            wait_until(async || times_asked(&marked) == made).await;
+        }
+        assert_eq!(listings.store.pending_addresses().await.unwrap(), all);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_provisional_listing_is_served_once_its_failing_checks_run_out() {
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service(&dir).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let envelope = envelope(1);
+        let address = envelope.address();
+        let start = Instant::now();
+        chunks.put(&address, &envelope.to_bytes()).await.unwrap();
+        let listing = Listing::new(&envelope, &payment(&envelope, 1, 10), BLOCK_TIME);
+        let repair = Repair::Provisional(listing.clone());
+        assert!(!listings
+            .apply_repair(&address, false, repair)
+            .await
+            .unwrap());
+        // Its chunk can't be read: every check fails.
+        let file = chunk_file(&dir, &address);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+
+        // The last check fails too: settled, and checked no more.
+        let checked = Arc::clone(&listings);
+        tokio::time::sleep_until(start + whole_schedule() - Duration::from_secs(1)).await;
+        assert!(listings.store.is_provisional(address).await.unwrap());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        wait_until(async || checked.store.pending_addresses().await.unwrap().is_empty()).await;
+        assert!(!listings.store.is_provisional(address).await.unwrap());
+        tokio::time::sleep(2 * MAX_UNREAD_DELAY).await;
+        assert!(listings.store.pending_checks().await.unwrap().is_empty());
+
+        // Served once its chunk can be read.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, envelope.to_bytes()).unwrap();
+        assert_eq!(get(&listings, address).await, Some(listing));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_held_whose_check_fails_is_checked_again_past_its_schedule() {
+        // In the index, only the block shown: dated by first_seen. A quorum
+        // of the close group serves the upload's copy; another was recorded
+        // here from a later payment.
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service(&dir).await;
+        listings
+            .chain
+            .answer_from(Arc::new(Mutex::new(chain_with(1000, &[]))));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let envelope = envelope_with(1, ShownFields::NONE.with(PaymentField::BlockNumber), true);
+        let address = envelope.address();
+        let upload = listing_for(&envelope, 10);
+        let planted = listing_for(&envelope, 11);
+        let asked = peers(7);
+        answer_for(&listings, &asked, served_by(&asked[..4], &upload));
+        let start = Instant::now();
+        chunks.put(&address, &envelope.to_bytes()).await.unwrap();
+        assert!(listings.record(planted.clone()).await);
+        let checked = Arc::clone(&listings);
+
+        // The store can't take the close group's copy in its place: every
+        // check of the schedule fails, and the next, two hours on, too.
+        listings.store.fail_writes(true);
+        let schedule = 1 + RETRY_DELAYS.len();
+        let first = start + whole_schedule() + unread_delays().next().unwrap();
+        tokio::time::sleep_until(first + Duration::from_secs(1)).await;
+        wait_until(async || times_asked(&checked) == schedule + 1).await;
+        assert_eq!(get(&listings, address).await, Some(planted));
+
+        // It can again: the next check takes the close group's copy.
+        listings.store.fail_writes(false);
+        let second = first + unread_delays().nth(1).unwrap();
+        tokio::time::sleep_until(second + Duration::from_secs(1)).await;
+        wait_until(async || get(&checked, address).await == Some(upload.clone())).await;
+        wait_until(async || checked.store.pending_addresses().await.unwrap().is_empty()).await;
+        assert_eq!(times_asked(&listings), schedule + 2);
     }
 }
