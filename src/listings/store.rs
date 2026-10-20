@@ -546,7 +546,6 @@ impl ListingStore {
     /// # Errors
     ///
     /// Returns an error if the LMDB read fails.
-    #[cfg(test)]
     pub async fn get(&self, address: XorName) -> Result<Option<Listing>> {
         let store = self.clone();
         spawn_blocking(move || store.get_blocking(&address, true))

@@ -159,9 +159,10 @@ never ran.
   out: just after it joins, a node can know only one, two or three peers near
   an address, and a majority of so few no longer moves a listing's date
   earlier, nor do fewer than 4 among more by sending dates that fail their
-  check. A copy taken for now without a quorum, which shows its quote, is
-  still dated by its peers' dates that check out, which its payment's block
-  bounds. Tests check the chunk handler's hook
+  check. Nor does a copy taken for now without a quorum, which fewer than 4
+  serve: it is dated no earlier than the node's own date, the hour it takes
+  it, and while the node holds it, later rounds keep that date. Tests check
+  the chunk handler's hook
   (`src/listings/hooks_tests.rs`), that a built node's handler and replication
   engine share one listing service (`src/node.rs`), and that a paid envelope
   stored on one node is served by at least 4 of its close group within 30
