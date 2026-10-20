@@ -3058,6 +3058,94 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn one_peer_can_date_a_copy_later_where_few_dates_check_out() {
+        // In the index, all shown but the block's time: dated by first_seen,
+        // which the payment's block bounds from below.
+        let envelope = envelope_with(
+            1,
+            ShownFields::ALL.without(PaymentField::BlockTimestamp),
+            true,
+        );
+        let upload = payment(&envelope, 0, 10);
+        let listing = Listing::new(&envelope, &upload, BLOCK_TIME);
+        let hour = listing.first_seen.unwrap();
+        let h = 3600;
+        let now = BLOCK_TIME + 7200;
+        // The first peers of seven asked serve it, dated `dates`, decided by
+        // a node whose own date for it is `own`.
+        let decided = |own: u64, dates: &[u64]| {
+            let peers: Vec<(u8, Option<u64>)> = ASKED
+                .iter()
+                .zip(dates)
+                .map(|(peer, date)| (*peer, Some(*date)))
+                .collect();
+            let groups = merge_copies(copies(&listing, &peers));
+            let fetched: Vec<_> = groups.iter().map(|_| Some(vec![paid(&upload)])).collect();
+            decide_repair(&envelope, &ASKED, &groups, &fetched, &VAULT, now, own)
+        };
+        let dated = |first_seen| Listing {
+            first_seen: Some(first_seen),
+            ..listing.clone()
+        };
+        // The node's own date, the hour it takes the listing; the latest
+        // date that checks out, an hour past its clock; and a later one,
+        // which doesn't.
+        let own = first_seen_at(now);
+        let latest = own + h;
+        let future = latest + h;
+        assert!(latest <= now + h && future > now + h);
+
+        // Three of seven serve it: taken for now. Three dates are fewer
+        // than the four a quorum needs, so the latest of them counts: one of
+        // the three dating it later dates it so, however the other two date
+        // it, where the median of the three would keep the node's own date.
+        assert_eq!(
+            decided(own, &[hour, hour, latest]),
+            Repair::Provisional(dated(latest))
+        );
+        assert_eq!(
+            decided(own, &[latest, hour - h, hour]),
+            Repair::Provisional(dated(latest))
+        );
+        // Never earlier than the node's own date; and a date later than the
+        // check allows fails, and doesn't count.
+        assert_eq!(
+            decided(own, &[hour - h, hour, hour + h]),
+            Repair::Provisional(dated(own))
+        );
+        assert_eq!(
+            decided(own, &[hour, hour, future]),
+            Repair::Provisional(dated(own))
+        );
+        // Held provisionally from an earlier round: later rounds keep its
+        // date unless one of the three dates it later.
+        let then = hour + h;
+        assert_eq!(
+            decided(then, &[hour, hour, hour]),
+            Repair::Provisional(dated(then))
+        );
+        assert_eq!(
+            decided(then, &[hour, hour, own]),
+            Repair::Provisional(dated(own))
+        );
+
+        // Four serve it, one with a date that fails its own check: the three
+        // dates left are fewer than a quorum's, so the latest of them counts
+        // here too.
+        assert_eq!(
+            decided(own, &[hour, hour, future, latest]),
+            Repair::Settled(dated(latest))
+        );
+        // Four dates that check out date it as a quorum does, the latest of
+        // the earliest four, here before the node's own date: a fifth date,
+        // later, doesn't move it.
+        assert_eq!(
+            decided(own, &[hour, hour, latest, hour, hour]),
+            Repair::Settled(dated(hour))
+        );
+    }
+
+    #[test]
     fn a_listing_with_its_quote_prefers_the_close_group() {
         let envelope = envelope(1);
         let upload = payment(&envelope, 0, 20);
@@ -4260,6 +4348,65 @@ pub(super) mod tests {
         let checked = listings.ensure_listing(&address).await;
         assert_eq!(checked.unwrap(), Checked::Done);
         assert_eq!(get(&listings, address).await, Some(dated(early)));
+    }
+
+    #[tokio::test]
+    async fn a_copy_taken_for_now_takes_a_later_date_one_peer_gives() {
+        // In the index, showing all but the block's time: dated by
+        // first_seen, which the payment's block bounds from below.
+        let envelope = envelope_with(
+            1,
+            ShownFields::ALL.without(PaymentField::BlockTimestamp),
+            true,
+        );
+        let upload = payment(&envelope, 0, 10);
+        let mut mock = chain_with(1000, &[]);
+        mock.add_receipt(paid(&upload).0.unwrap());
+        let (_chain, url) = serve(mock).await;
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service_on(&dir, &url).await;
+        let address = envelope.address();
+        chunks.put(&address, &envelope.to_bytes()).await.unwrap();
+        let listing = Listing::new(&envelope, &upload, BLOCK_TIME);
+        let hour = listing.first_seen.unwrap();
+        let dated = |first_seen| Listing {
+            first_seen: Some(first_seen),
+            ..listing.clone()
+        };
+        // Taken for now by an earlier round, an hour after its payment's.
+        let then = hour + 3600;
+        assert!(listings
+            .store
+            .insert_provisional(dated(then))
+            .await
+            .unwrap());
+        let asked = peers(7);
+
+        // Three of seven serve it, none dating it later: the next round
+        // keeps that date.
+        answer_for(&listings, &asked, served_by(&asked[..3], &dated(hour)));
+        let checked = listings.ensure_listing(&address).await;
+        assert_eq!(checked.unwrap(), Checked::Again);
+        assert!(listings.store.is_provisional(address).await.unwrap());
+        assert_eq!(
+            listings.store.get(address).await.unwrap(),
+            Some(dated(then))
+        );
+
+        // One of the three dates it in the hour after this node's: fewer
+        // dates check out than a quorum needs, so the latest of them counts,
+        // and the next round dates it so.
+        let later = first_seen_at(unix_now()) + 3600;
+        let mut answers = served_by(&asked[..2], &dated(hour));
+        answers.extend(served_by(&asked[2..3], &dated(later)));
+        answer_for(&listings, &asked, answers);
+        let checked = listings.ensure_listing(&address).await;
+        assert_eq!(checked.unwrap(), Checked::Again);
+        assert!(listings.store.is_provisional(address).await.unwrap());
+        assert_eq!(
+            listings.store.get(address).await.unwrap(),
+            Some(dated(later))
+        );
     }
 
     #[tokio::test]
