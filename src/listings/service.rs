@@ -44,8 +44,10 @@
 //! at most [`MAX_RECHECK_TIME`], and at most [`RECHECKS_PER_HOUR`] such
 //! checks an hour, spread out. A provisional listing whose last check
 //! failed is served, as when its rounds run out. An envelope in the index
-//! whose close group serves only copies that can never check out is given
-//! up at once. The envelopes still being checked are kept in the store, so
+//! is given up at once when [`QUORUM_THRESHOLD`] or more of the peers asked
+//! serve copies of its listing and none of them can ever check out; fewer
+//! can't end its checks, as the peers holding its listing may not have
+//! answered. The envelopes still being checked are kept in the store, so
 //! the checks go on after a restart, and a restart keeps the end of their
 //! re-checks.
 //!
@@ -68,7 +70,7 @@ use ::ant_protocol::{detect_proof_type, ProofType};
 use ant_listings::{
     check_copies, check_get_response, check_offline, choose_verified, find_payment, first_seen_at,
     is_envelope, listing_to_check, merge_copies, payment_lookup, push_request_id, quorum_listing,
-    quorum_needed, verify_listing_receipts, view_hash, AddressRange, ChangesRequest,
+    quorum_needed, support_among, verify_listing_receipts, view_hash, AddressRange, ChangesRequest,
     ChangesResponse, Envelope, FeedChange, Listing, ListingCheck, ListingKey, ListingsBody,
     ListingsMessage, Lookup, MergedListing, Payment, PaymentError, PaymentField, RangeListRequest,
     RangeListResponse, MAX_LIST_LIMIT, MAX_WATCHERS, QUORUM_THRESHOLD, TOPIC, VIEW_PEERS,
@@ -280,9 +282,9 @@ enum Repair {
     /// Nothing to take yet, and the chain couldn't be read for a copy fewer
     /// than a quorum of the peers asked served, which might have been taken.
     Unread,
-    /// Nothing to take, ever: no copy the peers served can check out,
-    /// whatever the chain says later
-    /// ([`ListingService::none_can_check_out`]).
+    /// Nothing to take, ever: [`QUORUM_THRESHOLD`] or more of the peers
+    /// asked served copies, and none of them can check out, whatever the
+    /// chain says later ([`ListingService::none_can_check_out`]).
     Refused,
 }
 
@@ -305,11 +307,13 @@ enum Checked {
     ChainUnread,
     /// An envelope in the index held without a listing, none taken: the
     /// close group didn't answer, or had nothing to take yet. If `definite`,
-    /// no copy it served can ever check out ([`Repair::Refused`]). Once the
-    /// retry schedule has run out, the checks of such an envelope end there
-    /// if `definite`, and otherwise go on as for [`Checked::ChainUnread`].
+    /// [`QUORUM_THRESHOLD`] or more of the peers asked served copies, and
+    /// none of them can ever check out ([`Repair::Refused`]). Once the retry
+    /// schedule has run out, the checks of such an envelope end there if
+    /// `definite`, and otherwise go on as for [`Checked::ChainUnread`].
     Unlisted {
-        /// Whether no copy the close group served can ever check out.
+        /// Whether enough of the close group served copies that can never
+        /// check out, and nothing else.
         definite: bool,
     },
 }
@@ -1145,11 +1149,12 @@ impl ListingService {
     /// [`MAX_UNREAD_DELAY`], for at most [`MAX_RECHECK_TIME`], and each in
     /// the next of the slots all re-checks share, [`RECHECK_SPACING`] apart.
     /// A provisional listing whose last check failed is served, as when its
-    /// checks run out ([`Self::give_up`]). An envelope in the index whose
-    /// close group serves only copies that can never check out is given up
-    /// at once. `rechecks_since` is when a previous run began the envelope's
-    /// re-checks, if it did: they go on from the next slot, and end when
-    /// they would have.
+    /// checks run out ([`Self::give_up`]). An envelope in the index is given
+    /// up at once when [`QUORUM_THRESHOLD`] or more of the peers asked serve
+    /// copies of its listing and none can ever check out
+    /// ([`Repair::Refused`]). `rechecks_since` is when a previous run began
+    /// the envelope's re-checks, if it did: they go on from the next slot,
+    /// and end when they would have.
     async fn ensure_listing_with_retries(
         service: Weak<Self>,
         address: XorName,
@@ -1209,13 +1214,11 @@ impl ListingService {
                 let provisional = outcome.is_err() && listings.holds_provisional(&address).await;
                 let inconclusive = match outcome {
                     Ok(Checked::Unlisted { definite: true }) => {
-                        listings
-                            .end_checks(
-                                &address,
-                                "no copy its close group serves can check out, whatever \
-                                 the chain says later",
-                            )
-                            .await;
+                        let why = format!(
+                            "{QUORUM_THRESHOLD} or more of its close group serve copies, and \
+                             none can check out, whatever the chain says later"
+                        );
+                        listings.end_checks(&address, &why).await;
                         return;
                     }
                     Ok(Checked::ChainUnread) => Some(Inconclusive::ChainUnread),
@@ -1738,8 +1741,15 @@ impl ListingService {
     /// shows against what was `fetched` for it in a way the chain has
     /// finalized ([`fails_for_good`]). A copy not looked up because too few
     /// peers serve it, one whose payment isn't found, and one found only in
-    /// blocks not yet final could still be taken. `false` when there is no
-    /// copy at all: the close group has nothing to say yet.
+    /// blocks not yet final could still be taken.
+    ///
+    /// `false` unless [`QUORUM_THRESHOLD`] or more of the peers `asked`
+    /// served copies ([`support_among`]), as many as it takes to date a
+    /// listing earlier than this node's own date: the peers that don't answer
+    /// may be those that hold the listing, so one peer serving a copy that
+    /// can never check out, or the few this node knows near the address just
+    /// after it joins, can't end its checks for good. `false` too when there
+    /// is no copy at all: the close group has nothing to say yet.
     async fn none_can_check_out(
         &self,
         envelope: &Envelope,
@@ -1748,7 +1758,7 @@ impl ListingService {
         fetched: &[Option<Fetched>],
         refused: &[bool],
     ) -> bool {
-        if groups.is_empty() {
+        if groups.is_empty() || support_among(groups, asked) < QUORUM_THRESHOLD {
             return false;
         }
         let needed = quorum_needed(asked.len());
@@ -3142,9 +3152,24 @@ pub(super) mod tests {
         let (listings, _) = service_on(&dir, &url).await;
         let asked = peers(7);
         let quote_only = ShownFields::NONE.with(PaymentField::Quote);
+        // What the close group's answers decide when one of the seven peers
+        // serves `copy`, and when four do.
+        let decided = async |envelope: &Envelope, copy: &Listing| {
+            let mut decided = Vec::new();
+            for serving in [1, 4] {
+                let answers = served_by(&asked[..serving], copy);
+                let repair = listings.repair_from(envelope, &asked, answers, None);
+                decided.push(repair.await.unwrap());
+            }
+            decided
+        };
+        // Nothing to take, ever, when four serve copies none of which can
+        // check out. One peer, while the others don't answer, can't end the
+        // checks for good: nothing to take yet.
+        let refused = vec![Repair::Nothing, Repair::Refused];
 
-        // One peer's copy hides what its envelope shows, so the quote would
-        // be searched for over the whole chain.
+        // A copy that hides what its envelope shows, so the quote would be
+        // searched for over the whole chain.
         let envelope = envelope(1);
         let mismatched = Listing {
             address: envelope.address(),
@@ -3162,38 +3187,19 @@ pub(super) mod tests {
             first_seen: None,
         };
         assert!(mismatched.validate().is_ok());
-        // Nothing to take, ever: none of the copies can check out.
-        assert_eq!(
-            listings
-                .repair_from(&envelope, &asked, vec![(asked[0], mismatched)], None)
-                .await
-                .unwrap(),
-            Repair::Refused
-        );
+        assert_eq!(decided(&envelope, &mismatched).await, refused);
 
         // Flags as the envelope's, the quote's signature forged.
         let envelope = envelope_with(2, quote_only, false);
         let mut forged = Listing::new(&envelope, &payment(&envelope, 0, 10), BLOCK_TIME);
         forged.payment.quote = Some(forged_quote(envelope.address()));
-        assert_eq!(
-            listings
-                .repair_from(&envelope, &asked, vec![(asked[0], forged)], None)
-                .await
-                .unwrap(),
-            Repair::Refused
-        );
-        // As before, dated in the future by the one peer that sent it.
+        assert_eq!(decided(&envelope, &forged).await, refused);
+        // As before, dated in the future by the peers that sent it.
         let indexed = envelope_with(3, quote_only, true);
         let mut future = Listing::new(&indexed, &payment(&indexed, 0, 10), BLOCK_TIME);
         future.payment.quote = Some(forged_quote(indexed.address()));
         future.first_seen = Some(first_seen_at(u64::MAX / 2));
-        assert_eq!(
-            listings
-                .repair_from(&indexed, &asked, vec![(asked[0], future)], None)
-                .await
-                .unwrap(),
-            Repair::Refused
-        );
+        assert_eq!(decided(&indexed, &future).await, refused);
         assert!(chain.lock().calls.is_empty(), "{:?}", chain.lock().calls);
 
         // A signed quote nobody paid is looked up: it could have checked
@@ -5529,6 +5535,85 @@ pub(super) mod tests {
             .await;
         assert_eq!(repair.unwrap(), Repair::Nothing);
         assert!(calls_to(&chain, "eth_getTransactionReceipt") > 0);
+    }
+
+    #[tokio::test]
+    async fn fewer_than_four_peers_cant_refuse_a_listing_for_good() {
+        let dir = TempDir::new().unwrap();
+        let (listings, _) = service_with(&dir, DEAD_CHAIN, Some(600)).await;
+        let envelope = envelope(1);
+        // Copies paid in blocks 500 and 501, before the vault was deployed
+        // in block 600: neither can ever check out.
+        let (old, other) = (listing_for(&envelope, 500), listing_for(&envelope, 501));
+        let repair = async |asked: &[PeerId], answers: Vec<(PeerId, Listing)>| {
+            let repair = listings.repair_from(&envelope, asked, answers, None);
+            repair.await.unwrap()
+        };
+        let asked = peers(7);
+
+        // One, two or three of the seven peers asked serve one, and the
+        // others don't answer: those may be the peers that hold the
+        // listing. Nothing to take yet.
+        for serving in 1..QUORUM_THRESHOLD {
+            let answers = served_by(&asked[..serving], &old);
+            assert_eq!(repair(&asked, answers).await, Repair::Nothing, "{serving}");
+        }
+        // A node that knows only three peers near the address, each serving
+        // one: nothing to take yet either.
+        let few = peers(3);
+        assert_eq!(repair(&few, served_by(&few, &old)).await, Repair::Nothing);
+
+        // Four serving such copies, the same or not, of four asked or of
+        // seven: nothing to take, ever.
+        for asked in [peers(4), peers(7)] {
+            let answers = served_by(&asked[..4], &old);
+            assert_eq!(repair(&asked, answers).await, Repair::Refused);
+            let mut answers = served_by(&asked[..2], &old);
+            answers.extend(served_by(&asked[2..4], &other));
+            assert_eq!(repair(&asked, answers).await, Repair::Refused);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_peer_serving_a_copy_that_can_never_check_out_doesnt_end_the_checks() {
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service_with(&dir, DEAD_CHAIN, Some(1_000)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // In the index. One of the seven peers asked serves a copy paid
+        // before the vault was deployed, and the other six don't answer.
+        let envelope = envelope(1);
+        let address = envelope.address();
+        let asked = peers(7);
+        let old = listing_for(&envelope, 500);
+        answer_for(&listings, &asked, served_by(&asked[..1], &old));
+        let start = Instant::now();
+        chunks.put(&address, &envelope.to_bytes()).await.unwrap();
+        let checked = Arc::clone(&listings);
+
+        // Not given up when the schedule runs out: checked again two hours
+        // on, as an envelope whose close group has nothing to take yet.
+        let schedule = 1 + RETRY_DELAYS.len();
+        let mut waits = unread_delays();
+        let first = start + whole_schedule() + waits.next().unwrap();
+        tokio::time::sleep_until(first - Duration::from_secs(1)).await;
+        assert_eq!(times_asked(&listings), schedule);
+        tokio::time::sleep_until(first + Duration::from_secs(1)).await;
+        wait_until(async || times_asked(&checked) == schedule + 1).await;
+        assert_eq!(
+            listings.store.pending_addresses().await.unwrap(),
+            vec![address]
+        );
+        assert!(!listings.store.contains(address).await.unwrap());
+
+        // Four serve such copies at the next check: given up then, for good.
+        answer_for(&listings, &asked, served_by(&asked[..4], &old));
+        let second = first + waits.next().unwrap();
+        tokio::time::sleep_until(second + Duration::from_secs(1)).await;
+        wait_until(async || checked.store.pending_addresses().await.unwrap().is_empty()).await;
+        assert_eq!(times_asked(&listings), 1);
+        tokio::time::sleep(2 * MAX_UNREAD_DELAY).await;
+        assert_eq!(times_asked(&listings), 1);
+        assert!(!listings.store.contains(address).await.unwrap());
     }
 
     #[tokio::test]

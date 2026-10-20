@@ -145,24 +145,27 @@ never ran.
   again, each wait twice the last up to 6 hours, for at most 7 days (a restart
   keeps that end), and at most 60 such checks an hour, a minute apart; a
   provisional listing whose last check failed is served instead, as when its
-  checks run out. It stops at once when no copy its close group serves can
-  ever check out: one showing a block before the payment vault was deployed
-  (the image gives the block in `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`), or
-  one the chain shows, in blocks it has finalized, doesn't pay its quote.
-  Without that setting, as under an older image after an upgrade of the binary
-  alone, a node paid in the production network's token through its vault takes
-  the block built in, 81,897,121, where that vault was deployed on Robinhood
-  Chain; a node on any other network has none, and says so once as it starts
-  (`src/config.rs`). A node takes the date a quorum of its close group gives a
-  listing, when that is earlier than its own, only if at least 4 of the peers
-  it asked serve that copy and date it then or earlier with dates that check
-  out: just after it joins, a node can know only one, two or three peers near
-  an address, and a majority of so few no longer moves a listing's date
-  earlier, nor do fewer than 4 among more by sending dates that fail their
-  check. Nor does a copy taken for now without a quorum, which fewer than 4
-  serve: it is dated no earlier than the node's own date, the hour it takes
-  it, and while the node holds it, later rounds keep that date. Tests check
-  the chunk handler's hook
+  checks run out. It stops at once when at least 4 of the peers it asked serve
+  copies and none of them can ever check out: one showing a block before the
+  payment vault was deployed (the image gives the block in
+  `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`), or one the chain shows, in blocks
+  it has finalized, doesn't pay its quote. Fewer can't stop it: the peers that
+  don't answer may be those that hold the listing, and a node that has just
+  joined may know only a few peers near the address. Without
+  `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`, as under an older image after an
+  upgrade of the binary alone, a node paid in the production network's token
+  through its vault takes the block built in, 81,897,121, where that vault was
+  deployed on Robinhood Chain; a node on any other network has none, and says
+  so once as it starts (`src/config.rs`). A node takes the date a quorum of
+  its close group gives a listing, when that is earlier than its own, only if
+  at least 4 of the peers it asked serve that copy and date it then or earlier
+  with dates that check out: just after it joins, a node can know only one,
+  two or three peers near an address, and a majority of so few no longer
+  moves a listing's date earlier, nor do fewer than 4 among more by sending
+  dates that fail their check. Nor does a copy taken for now without a
+  quorum, which fewer than 4 serve: it is dated no earlier than the node's
+  own date, the hour it takes it, and while the node holds it, later rounds
+  keep that date. Tests check the chunk handler's hook
   (`src/listings/hooks_tests.rs`), that a built node's handler and replication
   engine share one listing service (`src/node.rs`), and that a paid envelope
   stored on one node is served by at least 4 of its close group within 30
