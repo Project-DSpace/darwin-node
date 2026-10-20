@@ -165,7 +165,11 @@ never ran.
   dates that fail their check. Nor does a copy taken for now without a
   quorum, which fewer than 4 serve: it is dated no earlier than the node's
   own date, the hour it takes it, and while the node holds it, later rounds
-  keep that date. Tests check the chunk handler's hook
+  keep that date unless a peer dates it later. Dating a listing later takes
+  less: where fewer of the peers' dates check out than a quorum needs, the
+  latest of them counts (darwin-listings 0.3.1), so one peer serving the
+  copy can date it later with a date that checks out, up to an hour past the
+  node's clock. Tests check the chunk handler's hook
   (`src/listings/hooks_tests.rs`), that a built node's handler and replication
   engine share one listing service (`src/node.rs`), and that a paid envelope
   stored on one node is served by at least 4 of its close group within 30
