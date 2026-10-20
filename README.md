@@ -19,11 +19,12 @@ never ran.
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
   (Autonomi's contracts): run it on Darwin only with those three set (see
   [Join the Network](#join-the-network)). `tests/darwin_network.rs` checks
-  that the image sets DARWIN's token and vault, Robinhood Chain's RPC, the
-  bootstrap servers and production mode, and that the binary reads every
+  that the image sets DARWIN's token and vault, the block that vault was
+  deployed in (which the binary has built in for them), Robinhood Chain's RPC,
+  the bootstrap servers and production mode, and that the binary reads every
   `ANT_*` variable the image sets; tests in `src/bin/ant-node/cli.rs` check
-  the three names, and that they override the `--evm-network arbitrum-one`
-  the image's node manager passes. From ds.13 a node logs, as it starts, the
+  the three names, and that they override the `--evm-network arbitrum-one` the
+  image's node manager passes. From ds.13 a node logs, as it starts, the
   token, vault and RPC host it is paid through, and never the rest of the
   RPC's URL, which can carry an API key, there or in the config it logs. The
   image's smoke test checks its settings, that its bootstrap file names no
@@ -1166,6 +1167,11 @@ Options:
     --evm-rpc-url <URL>, --evm-payment-token <ADDRESS>, --evm-payment-vault <ADDRESS>
         Custom EVM network; all three together replace --evm-network
         (default: arbitrum-one). Darwin: Robinhood Chain, DARWIN token and vault
+
+    --evm-payment-vault-deployment-block <BLOCK>
+        The block the custom network's vault was deployed in; listings showing
+        an earlier one are never taken. Without it, a node paid in DARWIN
+        through its vault takes 81897121, when that vault was deployed
 
     --enable-logging
         Turn on log output; the other --log-* options need it

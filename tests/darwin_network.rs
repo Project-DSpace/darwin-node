@@ -7,7 +7,8 @@
 //! only by name, so a name that changed in a merge would leave nodes on
 //! upstream's defaults (Arbitrum One, Autonomi's contracts) with nothing
 //! failing. Upstream has no such file, so a merge can't drop it while
-//! resolving a conflict.
+//! resolving a conflict. The vault's deployment block the binary has built
+//! in for the image's token and vault is checked against the image's too.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -136,6 +137,20 @@ fn the_image_runs_the_darwin_network() {
     assert_eq!(
         get("ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK"),
         DARWIN_VAULT_DEPLOYED
+    );
+    // The image's token and vault are the network a node takes as the
+    // production one, whose vault's deployment block it has built in: the
+    // same block, so a node that upgrades its binary alone, under an image
+    // that doesn't give it, has it too.
+    let without_the_block = ant_node::config::EvmNetworkConfig::Custom {
+        rpc_url: ROBINHOOD_RPC.to_string(),
+        payment_token_address: get("ANT_EVM_PAYMENT_TOKEN").to_string(),
+        payment_vault_address: get("ANT_EVM_PAYMENT_VAULT").to_string(),
+        payment_vault_deployment_block: None,
+    };
+    assert_eq!(
+        without_the_block.vault_deployment_block(),
+        ant_node::config::VaultDeploymentBlock::BuiltIn(DARWIN_VAULT_DEPLOYED.parse().unwrap())
     );
     let rpcs: Vec<&str> = get("RPC_URLS").split_whitespace().collect();
     assert!(rpcs.contains(&ROBINHOOD_RPC), "RPC_URLS={rpcs:?}");
