@@ -1,4 +1,4 @@
-# Vendored from Project-DSpace/darwin-listings 0.3.0 (commit 88abb624b286e25cb6d7e6ceb194d255976c602b), unchanged; only .github/ is left out.
+# Vendored from Project-DSpace/darwin-listings 0.3.0, tagged v0.3.0 at commit 88abb624b286e25cb6d7e6ceb194d255976c602b, unchanged; only .github/ is left out.
 # darwin-listings is public again; whether to return to the git dependency is open.
 
 The copy's git objects, the same as at that commit. The Build workflow
