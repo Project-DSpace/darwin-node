@@ -432,7 +432,9 @@ impl EvmNetworkConfig {
     }
 
     /// The block the payment vault was deployed in, where the network's
-    /// config gives it: only a custom network's can.
+    /// config gives it: only a custom network's can. A node takes
+    /// [`Self::vault_deployment_block`], which falls back on the production
+    /// network's block when this gives none.
     #[must_use]
     pub const fn payment_vault_deployment_block(&self) -> Option<u64> {
         match self {
@@ -442,6 +444,92 @@ impl EvmNetworkConfig {
             } => *payment_vault_deployment_block,
             Self::ArbitrumOne | Self::ArbitrumSepolia => None,
         }
+    }
+
+    /// The block the payment vault was deployed in, as a node takes it: the
+    /// one the network's config gives ([`Self::payment_vault_deployment_block`],
+    /// from `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK` or its flag); else, on
+    /// the production network ([`Self::is_production`]), the one built in,
+    /// [`PRODUCTION_VAULT_DEPLOYMENT_BLOCK`]; else none.
+    #[must_use]
+    pub fn vault_deployment_block(&self) -> VaultDeploymentBlock {
+        match self.payment_vault_deployment_block() {
+            Some(block) => VaultDeploymentBlock::Given(block),
+            None if self.is_production() => {
+                VaultDeploymentBlock::BuiltIn(PRODUCTION_VAULT_DEPLOYMENT_BLOCK)
+            }
+            None => VaultDeploymentBlock::Unknown,
+        }
+    }
+
+    /// Whether this is the production network: a custom network paying in
+    /// [`PRODUCTION_PAYMENT_TOKEN`] through [`PRODUCTION_PAYMENT_VAULT`],
+    /// through whatever RPC. Addresses are compared as the node parses them,
+    /// whatever their case.
+    #[must_use]
+    pub fn is_production(&self) -> bool {
+        match self {
+            Self::Custom {
+                payment_token_address,
+                payment_vault_address,
+                ..
+            } => {
+                same_address(payment_token_address, PRODUCTION_PAYMENT_TOKEN)
+                    && same_address(payment_vault_address, PRODUCTION_PAYMENT_VAULT)
+            }
+            Self::ArbitrumOne | Self::ArbitrumSepolia => false,
+        }
+    }
+}
+
+/// The production network's payment token, on Robinhood Chain.
+pub const PRODUCTION_PAYMENT_TOKEN: &str = "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3";
+
+/// The production network's payment vault, on Robinhood Chain.
+pub const PRODUCTION_PAYMENT_VAULT: &str = "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B";
+
+/// The block [`PRODUCTION_PAYMENT_VAULT`] was deployed in, on Robinhood Chain.
+///
+/// No payment to that vault is in an earlier block, as the chain records
+/// it. The image gives the same block in
+/// `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`; built in, a node has it without
+/// that setting too, as when an upgrade replaced its binary alone under an
+/// image that doesn't set it.
+pub const PRODUCTION_VAULT_DEPLOYMENT_BLOCK: u64 = 81_897_121;
+
+/// The block a node's payment vault was deployed in, and where it is from
+/// ([`EvmNetworkConfig::vault_deployment_block`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultDeploymentBlock {
+    /// Given by the network's config.
+    Given(u64),
+    /// Not given, and built in for the production network.
+    BuiltIn(u64),
+    /// Not given, on a network with none built in.
+    Unknown,
+}
+
+impl VaultDeploymentBlock {
+    /// The block, where known.
+    #[must_use]
+    pub const fn block(self) -> Option<u64> {
+        match self {
+            Self::Given(block) | Self::BuiltIn(block) => Some(block),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Whether `a` and `b` parse as the same EVM address, as the node parses
+/// the addresses it is given: hex, with or without `0x`, in any case.
+fn same_address(a: &str, b: &str) -> bool {
+    use std::str::FromStr;
+    match (
+        evmlib::common::Address::from_str(a),
+        evmlib::common::Address::from_str(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -1005,6 +1093,98 @@ rewards_address = "0x0000000000000000000000000000000000000001"
         ] {
             assert_eq!(preset.payment_vault_deployment_block(), None);
         }
+    }
+
+    /// A custom network with these addresses, through `rpc_url`.
+    fn custom_network(
+        rpc_url: &str,
+        token: &str,
+        vault: &str,
+        block: Option<u64>,
+    ) -> EvmNetworkConfig {
+        EvmNetworkConfig::Custom {
+            rpc_url: rpc_url.to_string(),
+            payment_token_address: token.to_string(),
+            payment_vault_address: vault.to_string(),
+            payment_vault_deployment_block: block,
+        }
+    }
+
+    /// A node on the production network knows the block its payment vault
+    /// was deployed in without a setting, as one does after an upgrade of
+    /// its binary alone under an image that doesn't give it, through any
+    /// RPC and with the addresses written in any case. A setting still wins,
+    /// and no other network has a block unless its setting gives one.
+    #[test]
+    fn the_production_vaults_deployment_block_is_built_in() {
+        // The block as the chain records it, the image's too.
+        assert_eq!(PRODUCTION_VAULT_DEPLOYMENT_BLOCK, 81_897_121);
+        let built_in = VaultDeploymentBlock::BuiltIn(81_897_121);
+        let robinhood = "https://rpc.mainnet.chain.robinhood.com";
+        let production = custom_network(
+            robinhood,
+            PRODUCTION_PAYMENT_TOKEN,
+            PRODUCTION_PAYMENT_VAULT,
+            None,
+        );
+        assert!(production.is_production());
+        assert_eq!(production.payment_vault_deployment_block(), None);
+        assert_eq!(production.vault_deployment_block(), built_in);
+        assert_eq!(built_in.block(), Some(81_897_121));
+        // As the image writes the addresses, through another RPC; in capitals
+        // and without 0x.
+        for (token, vault) in [
+            (
+                "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3",
+                "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B",
+            ),
+            (
+                "511F76A3DE41F000EC11EA4FD212FB3587C6CEF3",
+                "e0f627986c0438de0e314b644f3c8aa21d3f4f6b",
+            ),
+        ] {
+            let network = custom_network("https://rpc.ordofi.network", token, vault, None);
+            assert_eq!(
+                network.vault_deployment_block(),
+                built_in,
+                "{token} {vault}"
+            );
+        }
+        // A setting wins.
+        let given = custom_network(
+            robinhood,
+            PRODUCTION_PAYMENT_TOKEN,
+            PRODUCTION_PAYMENT_VAULT,
+            Some(81_000_000),
+        );
+        assert_eq!(
+            given.vault_deployment_block(),
+            VaultDeploymentBlock::Given(81_000_000)
+        );
+        // Any other network has none, unless its setting gives one.
+        let anvil_vault = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+        let anvil_token = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
+        for other in [
+            EvmNetworkConfig::ArbitrumOne,
+            EvmNetworkConfig::ArbitrumSepolia,
+            custom_network(robinhood, PRODUCTION_PAYMENT_TOKEN, anvil_vault, None),
+            custom_network(robinhood, anvil_token, PRODUCTION_PAYMENT_VAULT, None),
+            custom_network("http://127.0.0.1:8545", anvil_token, anvil_vault, None),
+            custom_network(robinhood, "not an address", PRODUCTION_PAYMENT_VAULT, None),
+        ] {
+            assert!(!other.is_production(), "{other:?}");
+            assert_eq!(
+                other.vault_deployment_block(),
+                VaultDeploymentBlock::Unknown,
+                "{other:?}"
+            );
+            assert_eq!(other.vault_deployment_block().block(), None);
+        }
+        let local = custom_network("http://127.0.0.1:8545", anvil_token, anvil_vault, Some(7));
+        assert_eq!(
+            local.vault_deployment_block(),
+            VaultDeploymentBlock::Given(7)
+        );
     }
 
     #[test]

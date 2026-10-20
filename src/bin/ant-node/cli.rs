@@ -108,7 +108,9 @@ pub struct Cli {
 
     /// The block the payment vault was deployed in, on the custom EVM.
     /// Listings showing an earlier block paid something else, and are never
-    /// taken. Read only with --evm-rpc-url.
+    /// taken. Read only with --evm-rpc-url. Without it, a node paid in the
+    /// production network's token through its vault takes 81897121, when
+    /// that vault was deployed on Robinhood Chain; other networks have none.
     #[arg(long, env = "ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK")]
     pub evm_payment_vault_deployment_block: Option<u64>,
 
@@ -623,10 +625,15 @@ mod tests {
     }
 
     /// The vault's deployment block goes with the custom network's vault:
-    /// a preset network leaves it out, and a custom one without it has none.
+    /// a preset network leaves it out, and a custom one without it gives
+    /// none. A node on the production network then takes the block built in,
+    /// as one whose image doesn't set it does after an upgrade of its binary
+    /// alone; on any other network it has none.
     #[test]
     fn the_vaults_deployment_block_goes_with_the_custom_network(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        use ant_node::config::VaultDeploymentBlock;
+
         let deployed = DARWIN_VAULT_DEPLOYED.to_string();
         let preset = Cli::try_parse_from([
             "ant-node",
@@ -639,6 +646,10 @@ mod tests {
         assert_eq!(
             config.payment.evm_network.payment_vault_deployment_block(),
             None
+        );
+        assert_eq!(
+            config.payment.evm_network.vault_deployment_block(),
+            VaultDeploymentBlock::Unknown
         );
         let custom = Cli::try_parse_from([
             "ant-node",
@@ -653,6 +664,41 @@ mod tests {
         assert_eq!(
             config.payment.evm_network.payment_vault_deployment_block(),
             None
+        );
+        assert_eq!(
+            config.payment.evm_network.vault_deployment_block(),
+            VaultDeploymentBlock::BuiltIn(DARWIN_VAULT_DEPLOYED)
+        );
+        // The setting wins, on the production network or another.
+        let given = Cli::try_parse_from([
+            "ant-node",
+            "--evm-rpc-url",
+            DARWIN_RPC_URL,
+            "--evm-payment-token",
+            DARWIN_TOKEN,
+            "--evm-payment-vault",
+            DARWIN_VAULT,
+            "--evm-payment-vault-deployment-block",
+            "81000000",
+        ])?;
+        let (config, _) = given.into_config()?;
+        assert_eq!(
+            config.payment.evm_network.vault_deployment_block(),
+            VaultDeploymentBlock::Given(81_000_000)
+        );
+        let other = Cli::try_parse_from([
+            "ant-node",
+            "--evm-rpc-url",
+            "http://127.0.0.1:8545",
+            "--evm-payment-token",
+            DARWIN_TOKEN,
+            "--evm-payment-vault",
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+        ])?;
+        let (config, _) = other.into_config()?;
+        assert_eq!(
+            config.payment.evm_network.vault_deployment_block(),
+            VaultDeploymentBlock::Unknown
         );
         Ok(())
     }

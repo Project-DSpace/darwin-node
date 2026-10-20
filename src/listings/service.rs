@@ -396,6 +396,13 @@ impl ListingService {
         *self.p2p.write() = Some(node);
     }
 
+    /// Tests only: the block the service takes the payment vault to have
+    /// been deployed in, if any.
+    #[cfg(test)]
+    pub const fn vault_deployment_block(&self) -> Option<u64> {
+        self.vault_deployment_block
+    }
+
     /// The permits listing requests from other nodes take while they are
     /// answered, until each answer has been sent: [`MAX_REQUESTS`], apart
     /// from those chunk requests take. Answers to this node's own requests

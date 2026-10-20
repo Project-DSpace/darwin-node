@@ -2,7 +2,8 @@
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
 use crate::config::{
-    default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, NODE_IDENTITY_FILENAME,
+    default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, VaultDeploymentBlock,
+    NODE_IDENTITY_FILENAME,
 };
 use crate::error::{Error, Result};
 use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEventsSender};
@@ -572,13 +573,17 @@ impl NodeBuilder {
             .with_payments(Arc::clone(&payment_verifier));
 
         // Listings for envelope chunks, kept beside the chunks under the same root.
+        let vault_deployment_block = config.payment.evm_network.vault_deployment_block();
+        if let Some(line) = vault_deployment_line(vault_deployment_block) {
+            info!("{line}");
+        }
         let listings = crate::listings::ListingService::new(
             &config.root_dir,
             disk_reserve,
             Arc::clone(&storage),
             listings_rpc_url,
             listings_vault,
-            config.payment.evm_network.payment_vault_deployment_block(),
+            vault_deployment_block.block(),
         )
         .await?;
 
@@ -606,6 +611,26 @@ fn payment_settings(network: &evmlib::Network) -> String {
         network.payment_vault_address(),
         network.rpc_url().host_str().unwrap_or("(none)")
     )
+}
+
+/// The line a node logs once at start about the block its payment vault was
+/// deployed in, when no setting gives it: that it takes the production
+/// network's, built in, or that it knows none, so listings showing any block
+/// are checked on chain alone. `None` for a block a setting gives, which the
+/// listing service names as it starts.
+fn vault_deployment_line(block: VaultDeploymentBlock) -> Option<String> {
+    match block {
+        VaultDeploymentBlock::Given(_) => None,
+        VaultDeploymentBlock::BuiltIn(block) => Some(format!(
+            "No setting gives the block the payment vault was deployed in; taking {block}, \
+             the production network's"
+        )),
+        VaultDeploymentBlock::Unknown => Some(
+            "No block the payment vault was deployed in is known for this network: listings \
+             showing any block are checked on chain alone"
+                .to_string(),
+        ),
+    }
 }
 
 /// A running Ant node.
@@ -1563,13 +1588,20 @@ mod tests {
 
     /// Build a node on a random port of the test range, retrying a bind failure.
     async fn build_on_a_free_port(root: &std::path::Path) -> RunningNode {
+        build_on_a_free_port_paid_on(root, crate::config::EvmNetworkConfig::default()).await
+    }
+
+    /// [`build_on_a_free_port`], the node paid on `network`.
+    async fn build_on_a_free_port_paid_on(
+        root: &std::path::Path,
+        network: crate::config::EvmNetworkConfig,
+    ) -> RunningNode {
         let mut last_err = String::new();
         for _ in 0..BIND_ATTEMPTS {
             let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
-            match NodeBuilder::new(local_node_config(root, port))
-                .build()
-                .await
-            {
+            let mut config = local_node_config(root, port);
+            config.payment.evm_network = network.clone();
+            match NodeBuilder::new(config).build().await {
                 Ok(node) => return node,
                 Err(e) => {
                     last_err = e.to_string();
@@ -1616,6 +1648,67 @@ mod tests {
             "the listing service must watch the node's chunk store for stored and removed chunks"
         );
         node.shutdown.cancel();
+    }
+
+    /// A built node on the production network takes the block its payment
+    /// vault was deployed in from its setting, or, with none, as after an
+    /// upgrade of its binary alone, the one built in. A node on another
+    /// network has none.
+    #[tokio::test]
+    async fn a_built_node_knows_the_block_its_vault_was_deployed_in() {
+        use crate::config::{
+            EvmNetworkConfig, PRODUCTION_PAYMENT_TOKEN, PRODUCTION_PAYMENT_VAULT,
+            PRODUCTION_VAULT_DEPLOYMENT_BLOCK,
+        };
+        let production = |block| EvmNetworkConfig::Custom {
+            rpc_url: "http://127.0.0.1:0".to_string(),
+            payment_token_address: PRODUCTION_PAYMENT_TOKEN.to_string(),
+            payment_vault_address: PRODUCTION_PAYMENT_VAULT.to_string(),
+            payment_vault_deployment_block: block,
+        };
+        for (network, expected) in [
+            (production(None), Some(PRODUCTION_VAULT_DEPLOYMENT_BLOCK)),
+            (production(Some(81_000_000)), Some(81_000_000)),
+            (EvmNetworkConfig::ArbitrumOne, None),
+        ] {
+            let dir = TempDir::new().expect("temp dir");
+            let root = dir.path().join("node");
+            std::fs::create_dir_all(&root).expect("mkdir");
+            let node = build_on_a_free_port_paid_on(&root, network.clone()).await;
+            let listings = node
+                .ant_protocol
+                .as_ref()
+                .and_then(|protocol| protocol.listing_service())
+                .expect("a built node keeps listings");
+            assert_eq!(listings.vault_deployment_block(), expected, "{network:?}");
+            node.shutdown.cancel();
+        }
+    }
+
+    /// What a node logs once at start about the block its payment vault was
+    /// deployed in: nothing more for a block a setting gives, which the
+    /// listing service names; the production network's, built in, when none
+    /// does; and on another network, that it knows none.
+    #[test]
+    fn the_vault_deployment_line_says_where_the_block_is_from() {
+        assert_eq!(
+            vault_deployment_line(VaultDeploymentBlock::Given(81_897_121)),
+            None
+        );
+        assert_eq!(
+            vault_deployment_line(VaultDeploymentBlock::BuiltIn(81_897_121)).as_deref(),
+            Some(
+                "No setting gives the block the payment vault was deployed in; taking \
+                 81897121, the production network's"
+            )
+        );
+        assert_eq!(
+            vault_deployment_line(VaultDeploymentBlock::Unknown).as_deref(),
+            Some(
+                "No block the payment vault was deployed in is known for this network: \
+                 listings showing any block are checked on chain alone"
+            )
+        );
     }
 
     use super::*;
