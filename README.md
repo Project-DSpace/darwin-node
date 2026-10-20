@@ -137,13 +137,15 @@ never ran.
   made, for 3 minutes or until the reader's next request, to at most 4
   readers at once (a fifth is answered, but not watched). A message of a
   kind the node doesn't know is answered `unsupported` at once, so request
-  kinds added later cost their senders no wait. Listing requests take
-  permits of their own, 16, apart from the 64 storage requests share. When an
-  envelope in the index still has no listing once its checks' schedule has run
-  out, the chain can't be read for a copy, or the last check failed, as when
-  the listing store or the chunk couldn't be read or written, the node checks
-  again, each wait twice the last up to 6 hours, for at most 7 days (a restart
-  keeps that end), and at most 60 such checks an hour, a minute apart; a
+  kinds added later cost their senders no wait. From ds.15 listing requests
+  take permits of their own, 16, apart from the 64 storage requests share (ds.14
+  answered them within those 64). When an envelope in the index still has no
+  listing once its checks' schedule has run out, the chain can't be read for a
+  copy, or the last check failed, as when the listing store or the chunk
+  couldn't be read or written, the node checks again, each wait twice the last
+  up to 6 hours, from ds.15 for at most 7 days (a restart keeps that end), and
+  at most 60 such checks an hour, a minute apart (ds.14 checked again only while
+  the chain couldn't be read, with no end); a
   provisional listing whose last check failed is served instead, as when its
   checks run out. It stops at once when at least 4 of the peers it asked serve
   copies and none of them can ever check out: one showing a block before the
@@ -151,7 +153,7 @@ never ran.
   `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`), or one the chain shows, in blocks
   it has finalized, doesn't pay its quote. Fewer can't stop it: the peers that
   don't answer may be those that hold the listing, and a node that has just
-  joined may know only a few peers near the address. Without
+  joined may know only a few peers near the address. From ds.15, without
   `ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK`, as under an older image after an
   upgrade of the binary alone, a node paid in the production network's token
   through its vault takes the block built in, 81,897,121, where that vault was
