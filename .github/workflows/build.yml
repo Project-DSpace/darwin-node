@@ -148,7 +148,7 @@ jobs:
         shell: bash
         run: |
           help=$(target/release/ant-node --help)
-          for name in ANT_EVM_RPC_URL ANT_EVM_PAYMENT_TOKEN ANT_EVM_PAYMENT_VAULT; do
+          for name in ANT_EVM_RPC_URL ANT_EVM_PAYMENT_TOKEN ANT_EVM_PAYMENT_VAULT ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK; do
             if ! grep -qF "[env: $name=" <<<"$help"; then
               echo "::error::ant-node --help doesn't name $name"
               exit 1
