@@ -1,7 +1,9 @@
-# Builds the Linux node binary on every push to main, packages it as the
-# storage-node Docker image (run by home operators and our servers), tests the
-# image on an isolated network and publishes it as :<commit>. Also checks that
-# the third-party notices a release ships can be generated.
+# Builds the Linux node binary on every push to main, and the image's node
+# manager from the darwin-client commit docker/manager-revision pins, packages
+# them as the storage-node Docker image (run by home operators and our
+# servers), tests the image on an isolated network and publishes it as
+# :<commit>. Also checks that the third-party notices a release ships can be
+# generated.
 #
 # It never publishes :latest, which home operators run: release.yml points
 # :latest at the image a push run here made from a release's commit, once that
@@ -14,7 +16,8 @@
 # Run by hand with `reuse_build` set to an earlier run's ID to test image
 # changes against that run's node binary instead of rebuilding it. The image
 # takes its licence and notice files from that build too, so builds from
-# before they were packaged with the binary can't be reused.
+# before they were packaged with the binary can't be reused. The node
+# manager is built in every run, from the pin in the run's own commit.
 
 name: Build
 
@@ -188,11 +191,103 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Packages the binary as the Docker image, tests it on an isolated network
+  # The image's node manager, darwin-nodes: built from the darwin-client
+  # commit docker/manager-revision pins (darwin-client's repository on its
+  # first line, the commit on its second), with that commit's own lockfile,
+  # and packaged with darwin-client's licence files, the third-party notices
+  # of the package it is built from and the Rust standard library's notices,
+  # as the node binary is above. darwin-client's tests pin what it leaves out
+  # (no reset, no download source, no log forwarding, no eviction); this job
+  # checks the binary the image ships.
+  manager:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Check out the pinned darwin-client
+        shell: bash
+        run: |
+          { read -r repository; read -r revision; } < docker/manager-revision
+          if [[ "$repository" != https://github.com/Project-DSpace/darwin-client.git || ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::docker/manager-revision must name darwin-client's repository, then a full commit"
+            exit 1
+          fi
+          git init -q darwin-client
+          git -C darwin-client fetch -q --depth 1 "$repository" "$revision"
+          git -C darwin-client checkout -q FETCH_HEAD
+          echo "REVISION=$revision" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: darwin-client -> target
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        working-directory: darwin-client
+        run: cargo build --release --locked -p ant-cli --bin darwin-nodes
+
+      # The binary names the pinned commit (ant-cli's build script records the
+      # checkout's), and holds no Autonomi download or log address and none of
+      # the reset and log-forwarding routes the darwin CLI's own daemon serves.
+      - name: Check the manager
+        shell: bash
+        working-directory: darwin-client
+        run: |
+          version=$(target/release/darwin-nodes --version)
+          echo "$version"
+          if [[ "$version" != *"commit ${REVISION:0:7}" ]]; then
+            echo "::error::darwin-nodes --version doesn't name commit ${REVISION:0:7}"
+            exit 1
+          fi
+          for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v1/logs/forward; do
+            if grep -aqF "$text" target/release/darwin-nodes; then
+              echo "::error::target/release/darwin-nodes holds $text"
+              exit 1
+            fi
+          done
+
+      # darwin-client's own generator and policy, for the package the binary
+      # is built from (see the notices job for what it checks).
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        working-directory: darwin-client
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/third_party_notices/generate.py
+          --package ant-cli
+          --target x86_64-unknown-linux-gnu
+          --config scripts/third_party_notices/config.toml
+          --output THIRD-PARTY-NOTICES.txt
+
+      - name: Package
+        working-directory: darwin-client
+        run: |
+          mkdir dist
+          cp target/release/darwin-nodes LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt dist/
+          cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" dist/RUST-STD-COPYRIGHT.html
+          tar -C dist -czf ../darwin-nodes-linux-x64.tar.gz .
+
+      - name: Upload build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: darwin-nodes-linux-x64
+          path: darwin-nodes-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  # Packages the binaries as the Docker image, tests it on an isolated network
   # and pushes it to GitHub's container registry.
   image:
-    needs: linux-x64
-    if: ${{ always() && (needs.linux-x64.result == 'success' || needs.linux-x64.result == 'skipped') }}
+    needs: [linux-x64, manager]
+    if: ${{ always() && (needs.linux-x64.result == 'success' || needs.linux-x64.result == 'skipped') && needs.manager.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -209,8 +304,15 @@ jobs:
           run-id: ${{ inputs.reuse_build || github.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Unpack build
-        run: mkdir dist && tar -xzf ant-node-linux-x64.tar.gz -C dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: darwin-nodes-linux-x64
+
+      - name: Unpack builds
+        run: |
+          mkdir -p dist/darwin-nodes
+          tar -xzf ant-node-linux-x64.tar.gz -C dist
+          tar -xzf darwin-nodes-linux-x64.tar.gz -C dist/darwin-nodes
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -218,18 +320,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # IMAGE_VERSION is the image marker the entrypoint passes to every node:
+      # the commit the image is built from, as its tag.
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/Dockerfile
           load: true
+          build-args: IMAGE_VERSION=${{ github.sha }}
           tags: ${{ env.IMAGE }}:${{ github.sha }}
 
       # Runs the image on a small isolated network (never the live one): its
-      # network settings, joining, the token and vault every node names,
-      # browser addresses, restarts, taking over the previous image's layout,
-      # retiring nodes and keeping their data 3 days, clean stops, and
-      # disk-pressure eviction and clearing it.
+      # network settings and node manager, joining, the token and vault and
+      # the image marker every node gets, browser addresses, restarts, taking
+      # over the previous image's layout, retiring nodes and keeping their
+      # data 3 days, setting unregistered folders aside for good, clean stops,
+      # a nearly full disk on which nothing is evicted or deleted, and the
+      # move from the image before (Autonomi's node manager): every node kept,
+      # and the nodes it evicted dismissed once.
       - name: Smoke test
         run: bash docker/smoke-test.sh "$IMAGE:${{ github.sha }}"
 

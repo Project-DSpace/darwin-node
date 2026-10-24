@@ -1,2 +1,4 @@
 docker/*.sh text eol=lf
 docker/Dockerfile text eol=lf
+docker/nodes text eol=lf
+docker/manager-revision text eol=lf

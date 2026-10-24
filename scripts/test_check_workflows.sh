@@ -244,6 +244,31 @@ edit "${RELEASE}" $'      - name: Install ant-keygen 0.1.0\n' \
     $'      - name: Move latest\n        run: docker buildx imagetools create --tag "$IMAGE:latest" x\n\n      - name: Install ant-keygen 0.1.0\n'
 expect ":latest moved by publish" "only release.yml's latest job may write the :latest tag"
 
+# The image's node manager: built with --locked from the pinned commit,
+# checked, and taken by the image with its marker.
+fresh
+edit "${BUILD}" 'run: cargo build --release --locked -p ant-cli --bin darwin-nodes' \
+    'run: cargo build --release -p ant-cli --bin darwin-nodes'
+expect "the manager built without its lockfile" "build.yml's manager job must build darwin-nodes with --locked"
+
+fresh
+edit "${BUILD}" '{ read -r repository; read -r revision; } < docker/manager-revision' \
+    'repository=https://github.com/Project-DSpace/darwin-client.git revision=main'
+expect "the manager built from a branch" "build.yml's manager job must build darwin-nodes with --locked"
+
+fresh
+edit "${BUILD}" 'for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v1/logs/forward; do' \
+    'for text in /api/v1/reset; do'
+expect "the manager's binary checked for less" "build.yml's manager job must build darwin-nodes with --locked"
+
+fresh
+edit "${BUILD}" '    needs: [linux-x64, manager]' '    needs: linux-x64'
+expect "the image without the manager's build" "build.yml's image job must need the manager job"
+
+fresh
+edit "${BUILD}" $'          build-args: IMAGE_VERSION=${{ github.sha }}\n' ''
+expect "the image without its marker" "build.yml's image job must pass the image marker"
+
 # The filter release.yml's checks job gives gh api --jq to pick the tagged
 # commit's Test run from the runs of test.yml.
 filter=$(awk -v q="'" '

@@ -163,10 +163,21 @@ fn the_image_runs_the_darwin_network() {
     assert_eq!(get("IPV4_ONLY"), "true");
 }
 
+/// Variables the image gives every node before the node reads them, each
+/// with what it is for. A node ignores a variable it doesn't read. Once the
+/// node reads one, the test below fails until it is taken off this list, so
+/// the test then checks it as it checks the rest.
+const GIVEN_BEFORE_THE_NODE_READS_THEM: &[(&str, &str)] = &[(
+    "ANT_IMAGE_VERSION",
+    "the image marker: the commit the image was built from, so a node can \
+     tell that its node manager deletes no node's data",
+)];
+
 #[test]
 fn every_variable_the_image_sets_is_one_the_node_reads() {
-    // The ARGs ANT_VERSION and ANT_SHA256 name the bundled node manager's
-    // release; only ENV instructions reach the nodes.
+    // The ARG IMAGE_VERSION is the image marker, which the entrypoint passes
+    // on as ANT_IMAGE_VERSION; only ENV instructions and the entrypoint's
+    // variables reach the nodes.
     let image_env = dockerfile_env(&repo_text("docker/Dockerfile"));
     let mut names: Vec<String> = image_env
         .keys()
@@ -194,9 +205,25 @@ fn every_variable_the_image_sets_is_one_the_node_reads() {
         .expect("run ant-node --help");
     assert!(output.status.success(), "ant-node --help: {output:?}");
     let help = String::from_utf8_lossy(&output.stdout);
+    let reads = |name: &str| help.contains(&format!("[env: {name}="));
+    for (name, what) in GIVEN_BEFORE_THE_NODE_READS_THEM {
+        assert!(
+            names.iter().any(|n| n == name),
+            "the image no longer gives {name} ({what}): take it off GIVEN_BEFORE_THE_NODE_READS_THEM"
+        );
+        assert!(
+            !reads(name),
+            "ant-node reads {name} now: take it off GIVEN_BEFORE_THE_NODE_READS_THEM"
+        );
+    }
     let unread: Vec<&String> = names
         .iter()
-        .filter(|name| !help.contains(&format!("[env: {name}=")))
+        .filter(|name| !reads(name))
+        .filter(|name| {
+            !GIVEN_BEFORE_THE_NODE_READS_THEM
+                .iter()
+                .any(|(given, _)| given == name)
+        })
         .collect();
     assert!(
         unread.is_empty(),

@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# Runs our storage nodes with Autonomi's own node manager (`ant node`, the
-# same code as in our client fork), set up the way Autonomi's operators run
-# theirs: the operator picks how many nodes, nodes use the free space where
-# /data lives, and the manager removes a node when that disk is nearly full.
-# Added on top: our network's settings and fixed browser (WebRTC Direct)
-# ports, so home routers can forward them.
+# Runs our storage nodes with our node manager, darwin-nodes (built from
+# darwin-client: /usr/share/doc/storage-node/NOTICE names the commit), set up
+# the way Autonomi's operators run theirs: the operator picks how many nodes,
+# and nodes use the free space where /data lives. The manager deletes no
+# node's data: when that disk is nearly full, nodes take no new data and the
+# manager reports the low disk. Added on top: our network's settings and fixed
+# browser (WebRTC Direct) ports, so home routers can forward them.
 #
 # On every start: check the settings, clear process files left by the last
 # run, take over nodes from the previous image's layout, move nodes onto a
-# newer node binary if the image has one, retire nodes above NODE_COUNT, bring
-# the manager's registry in line with these settings (moving nodes if the
-# ports changed), add nodes up to NODE_COUNT, then start the manager and the
-# nodes and stream their logs. docker stop stops the nodes before the manager.
+# newer node binary if the image has one, dismiss nodes an earlier node
+# manager evicted, retire nodes above NODE_COUNT, bring the manager's registry
+# in line with these settings (moving nodes if the ports changed), add nodes
+# up to NODE_COUNT, set aside node folders no node is registered for, then
+# start the manager and the nodes and stream their logs. docker stop stops the
+# nodes before the manager.
 set -euo pipefail
 
 STATE=/data/manager/ant              # the manager's registry and process files
@@ -19,11 +22,12 @@ REGISTRY=$STATE/node_registry.json
 NODES=/data/nodes                    # node-<id>: one node's data (its --root-dir)
 LOGS=/data/logs                      # node-<id>/logs: one node's daily log files
 RETIRED=/data/retired                # nodes removed by lowering NODE_COUNT, kept 3 days
+UNREGISTERED=$RETIRED/unregistered   # node folders no node is registered for, never deleted
 MIN_FREE_PER_NODE=$((20 * 1024 ** 3)) # Autonomi's recommended minimum disk per node
 
 fail() { echo "$*" >&2; exit 1; }
 as_user() { setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"; }
-manager() { as_user ant node "$@"; }
+manager() { as_user darwin-nodes "$@"; }
 # Move a folder into $RETIRED, dated now: mv keeps its modification time, which
 # the cleanup below reads, so a folder unchanged for days would otherwise be
 # deleted at the next start instead of kept 3 days from its retirement.
@@ -85,8 +89,18 @@ elif [[ "$relay_serving" != true && "$relay_serving" != false ]]; then
     fail "ANT_RELAY_SERVING must be true or false"
 fi
 
+# The image marker: the darwin-node commit this image was built from
+# (docker/Dockerfile). Every node gets it in ANT_IMAGE_VERSION, so a node can
+# tell that the manager it runs under deletes no node's data. It reaches the
+# nodes only from the manager's environment, never from the registry: an
+# older image started on this /data reads the same registry and would pass a
+# marker kept there on to its nodes. A node that doesn't read the variable
+# ignores it.
+image_marker=$(cat /opt/ant/image-version)
+[[ "$image_marker" =~ ^[0-9a-f]{40}$ ]] || fail "/opt/ant/image-version does not name the commit this image was built from"
+
 # Settings every node inherits from the manager's environment.
-export ANT_EVM_RPC_URL="${rpc_urls[0]}" ANT_METRICS_PORT=0
+export ANT_EVM_RPC_URL="${rpc_urls[0]}" ANT_METRICS_PORT=0 ANT_IMAGE_VERSION="$image_marker"
 [[ "$IPV4_ONLY" == true ]] && export ANT_IPV4_ONLY=true
 (( BROWSER_PORT_START == 0 )) && export ANT_DISABLE_WEBRTC_DIRECT=true
 
@@ -121,8 +135,8 @@ if [[ ",$(findmnt -no OPTIONS --target /data 2>/dev/null || true)," == *,noexec,
     fail "The data folder is on a file system mounted noexec, but nodes run their own copy of the node program from it. Use a data folder where programs can run."
 fi
 
-mkdir -p "$STATE" "$NODES" "$LOGS" "$RETIRED"
-chown "$PUID:$PGID" /data /data/manager "$STATE" "$NODES" "$LOGS" "$RETIRED"
+mkdir -p "$STATE" "$NODES" "$LOGS" "$RETIRED" "$UNREGISTERED"
+chown "$PUID:$PGID" /data /data/manager "$STATE" "$NODES" "$LOGS" "$RETIRED" "$UNREGISTERED"
 
 # The previous image kept node n in /data/node-<port>. Take those over in
 # port order as node-1, node-2, ... so every node keeps its identity, data and
@@ -139,7 +153,9 @@ fi
 # Process files from a previous run: process IDs start again from 1 in a new
 # container, so a stale one could match an unrelated process.
 rm -f "$STATE/daemon.pid" "$STATE/daemon.port" "$NODES"/node-*/node.pid
-find "$RETIRED" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +
+# Folders retired by lowering NODE_COUNT are deleted 3 days after their
+# retirement. Unregistered folders are never deleted here.
+find "$RETIRED" -mindepth 1 -maxdepth 1 ! -name unregistered -mtime +3 -exec rm -rf {} +
 
 # Nodes keep the data they hold while the disk has room, so a disk they have
 # filled is normal: the space their own data takes counts as theirs.
@@ -148,17 +164,17 @@ held=$(du -sb "$NODES" 2>/dev/null | cut -f1) || held=0
 usable=$((avail + ${held:-0}))
 if (( usable < NODE_COUNT * MIN_FREE_PER_NODE )); then
     echo "WARNING: only $((usable / 1024 ** 3)) GiB free under /data, counting what the nodes already hold, below the $((NODE_COUNT * 20)) GiB recommended for $NODE_COUNT node(s)." \
-        "Each node needs at least 20 GB of disk space; with less, the disk fills sooner and the node manager may remove a node to make room."
+        "Each node needs at least 20 GB of disk space; with less, the disk fills sooner, and nodes on a nearly full disk take no new data."
 fi
 
 # A node runs its own copy of the binary (and may upgrade it itself), so give
 # it the image's binary only when that is newer than the copy it has.
-image_version=$(/opt/ant/ant-node --version | awk '{print $NF}')
+image_node_version=$(/opt/ant/ant-node --version | awk '{print $NF}')
 for copy in "$NODES"/node-*/ant-node; do
     [[ -x "$copy" ]] || continue
     current=$("$copy" --version 2>/dev/null | awk '{print $NF}') || current=0
-    if [[ "$current" != "$image_version" && "$(printf '%s\n%s\n' "$current" "$image_version" | sort -V | tail -n 1)" == "$image_version" ]]; then
-        echo "$(basename "$(dirname "$copy")"): node binary $current -> $image_version"
+    if [[ "$current" != "$image_node_version" && "$(printf '%s\n%s\n' "$current" "$image_node_version" | sort -V | tail -n 1)" == "$image_node_version" ]]; then
+        echo "$(basename "$(dirname "$copy")"): node binary $current -> $image_node_version"
         install -m 755 -o "$PUID" -g "$PGID" /opt/ant/ant-node "$copy"
     fi
 done
@@ -177,34 +193,42 @@ free_port() {
     echo $((PORT_START + index))
 }
 
-# Lowering NODE_COUNT removes nodes from the registry: first any the manager
-# evicted (their data is already gone), then running ones from the highest
-# port down, whose data is kept in $RETIRED for 3 days in case the change is
-# undone.
-for id in $(registered '.nodes | to_entries | sort_by(.value.eviction == null, -(.value.node_port // 0)) | .[].key'); do
+# The node manager of earlier images, Autonomi's `ant` 0.3.9, evicted a node
+# when the disk was nearly full: it deleted the node's data and kept the node
+# in the registry, marked evicted. This image's manager never starts such a
+# node, so each is dismissed once, here: taken out of the registry, its data
+# being gone already, and replaced by a new node below while NODE_COUNT asks
+# for one. Its logs are retired, and anything left of its data folder is set
+# aside with the unregistered folders at the end, so no node takes it over.
+for id in $(registered '.nodes | to_entries | map(select(.value.eviction != null)) | .[].key'); do
+    echo "Dismissing node-$id, which an earlier node manager evicted when the disk was nearly full, deleting its data"
+    manager dismiss "$id" >/dev/null
+    if [[ -d "$LOGS/node-$id" ]]; then retire "$LOGS/node-$id" "$RETIRED/$(date -u +%Y%m%dT%H%M%S)-node-$id-logs"; fi
+done
+
+# Lowering NODE_COUNT removes nodes from the registry, from the highest port
+# down. Their data is kept in $RETIRED for 3 days in case the change is undone.
+for id in $(registered '.nodes | to_entries | sort_by(-(.value.node_port // 0)) | .[].key'); do
     (( $(registered '.nodes | length') > NODE_COUNT )) || break
     port=$(registered ".nodes[\"$id\"].node_port")
-    if [[ "$(registered ".nodes[\"$id\"].eviction != null")" == true ]]; then
-        echo "Dismissing evicted node-$id: NODE_COUNT is $NODE_COUNT"
-    else
-        echo "Retiring node-$id (port $port): NODE_COUNT is $NODE_COUNT"
-    fi
+    echo "Retiring node-$id (port $port): NODE_COUNT is $NODE_COUNT"
     manager dismiss "$id" >/dev/null
     stamp=$(date -u +%Y%m%dT%H%M%S)
     if [[ -d "$NODES/node-$id" ]]; then retire "$NODES/node-$id" "$RETIRED/$stamp-node-$id"; fi
     if [[ -d "$LOGS/node-$id" ]]; then retire "$LOGS/node-$id" "$RETIRED/$stamp-node-$id-logs"; fi
 done
 
-# Every node takes these settings. A running node whose port is outside
+# Every node takes these settings. A node whose port is outside
 # PORT_START..PORT_START+NODE_COUNT-1 (PORT_START was changed) moves to the
-# lowest free port in it, keeping its identity and data.
+# lowest free port in it, keeping its identity and data. The image marker is
+# never kept in the registry (see ANT_IMAGE_VERSION above).
 if [[ -s "$REGISTRY" ]]; then
     tmp=$(mktemp)
     jq --arg rewards "$REWARDS_ADDRESS" --argjson boot "$(printf '%s\n' "${bootstrap[@]}" | jq -R . | jq -s 'map(select(. != ""))')" \
         '.nodes |= with_entries(.value.rewards_address = $rewards | .value.bootstrap_peers = $boot)' \
         "$REGISTRY" > "$tmp"
     install -m 644 -o "$PUID" -g "$PGID" "$tmp" "$REGISTRY"
-    for id in $(registered '.nodes | to_entries | map(select(.value.eviction == null)) | sort_by(.value.node_port) | .[].key'); do
+    for id in $(registered '.nodes | to_entries | sort_by(.value.node_port) | .[].key'); do
         port=$(registered ".nodes[\"$id\"].node_port")
         if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < PORT_START || port >= PORT_START + NODE_COUNT )); then
             new=$(free_port)
@@ -216,7 +240,7 @@ if [[ -s "$REGISTRY" ]]; then
             .nodes[$id].node_port = $port
           | .nodes[$id].bootstrap_peers = $boot
           | .nodes[$id].env_variables |= (with_entries(select(.key
-                | IN("ANT_WEBRTC_DIRECT_PORT", "ANT_WEBRTC_DIRECT_ADVERTISED_ADDR", "ANT_EVM_RPC_URL") | not))
+                | IN("ANT_WEBRTC_DIRECT_PORT", "ANT_WEBRTC_DIRECT_ADVERTISED_ADDR", "ANT_EVM_RPC_URL", "ANT_IMAGE_VERSION") | not))
               + ($env | split(",") | map(split("=") | {key: .[0], value: (.[1:] | join("="))}) | from_entries))' \
             "$REGISTRY" > "$tmp"
         install -m 644 -o "$PUID" -g "$PGID" "$tmp" "$REGISTRY"
@@ -224,19 +248,10 @@ if [[ -s "$REGISTRY" ]]; then
     rm -f "$tmp"
 fi
 
-evicted=$(registered '[.nodes[] | select(.eviction != null)] | length')
-evicted=${evicted:-0}
-if (( evicted > 0 )); then
-    echo "$evicted node(s) were removed by the node manager because the disk was nearly full and stay removed:" \
-        "free up space, then run 'docker exec <container> nodes clear-evicted' and restart the container to replace them," \
-        "or lower NODE_COUNT to run fewer nodes."
-fi
-target=$((NODE_COUNT - evicted))
-
 # Raising NODE_COUNT (or a first start) adds nodes on the lowest free ports.
 while :; do
-    active=$(registered '[.nodes[] | select(.eviction == null)] | length')
-    (( ${active:-0} < target )) || break
+    registered_nodes=$(registered '.nodes | length')
+    (( ${registered_nodes:-0} < NODE_COUNT )) || break
     port=$(free_port)
     args=(--count 1 --rewards-address "$REWARDS_ADDRESS" --node-port "$port" --path /opt/ant/ant-node
           --data-dir-path "$NODES" --log-dir-path "$LOGS" --env "$(node_env "$port")")
@@ -246,14 +261,16 @@ while :; do
     echo "Added node on UDP port $port"
 done
 
-# Node folders without a registered node (taken over from the old layout but
-# beyond NODE_COUNT) go to $RETIRED too, rather than sitting unused.
+# Node folders no registered node has (taken over from the old layout beyond
+# NODE_COUNT, or left from a node an earlier manager evicted) are set aside in
+# $UNREGISTERED, which nothing here ever deletes: such a folder can hold a
+# node's identity and data, and only the operator knows whether it is needed.
 for dir in "$NODES"/node-*; do
     [[ -d "$dir" ]] || continue
     id=${dir##*/node-}
     if [[ "$(registered ".nodes | has(\"$id\")")" != true ]]; then
-        echo "Retiring unused $(basename "$dir")"
-        retire "$dir" "$RETIRED/$(date -u +%Y%m%dT%H%M%S)-$(basename "$dir")"
+        echo "Setting aside $(basename "$dir"), which no registered node has, in $UNREGISTERED"
+        mv "$dir" "$UNREGISTERED/$(date -u +%Y%m%dT%H%M%S)-$(basename "$dir")"
     fi
 done
 
@@ -268,9 +285,9 @@ done
 # Started as a plain command, not through as_user: bash runs a function put in
 # the background in a subshell, and $! would be that subshell, not the manager.
 setpriv --reuid="$PUID" --regid="$PGID" --clear-groups \
-    ant node daemon run --listen-addr 127.0.0.1 --port "$MANAGER_PORT" --log-path "$LOGS/manager" &
+    darwin-nodes daemon run --listen-addr 127.0.0.1 --port "$MANAGER_PORT" --log-path "$LOGS/manager" &
 manager_pid=$!
-# Ready once its API answers (`ant node daemon status` succeeds even before).
+# Ready once its API answers (`darwin-nodes daemon status` succeeds even before).
 for attempt in $(seq 1 60); do
     curl -fsS -o /dev/null "http://127.0.0.1:$MANAGER_PORT/api/v1/status" 2>/dev/null && break
     kill -0 "$manager_pid" 2>/dev/null || fail "The node manager failed to start; see $LOGS/manager.*.log"

@@ -1,27 +1,20 @@
 #!/usr/bin/env bash
-# Runs Autonomi's node manager commands (`ant node ...`) as the nodes' user,
+# Runs the node manager's commands (`darwin-nodes ...`) as the nodes' user,
 # against this container's nodes. Examples:
 #
 #   docker exec storage-node nodes status
 #   docker exec storage-node nodes daemon status
-#   docker exec storage-node nodes clear-evicted
 #
-# clear-evicted forgets nodes the manager removed because the disk was nearly
-# full (their data is already deleted), so the next container start replaces
-# them with new nodes. Free up disk space first.
+# clear-evicted, which forgot the nodes an earlier node manager evicted when
+# the disk was nearly full, does nothing now: this image's manager evicts no
+# node, and the container's start dismisses the nodes an earlier one evicted.
+# It stays for the operators and scripts that still run it.
 set -euo pipefail
 
-as_user() { setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"; }
-
 if [[ "${1:-}" == clear-evicted ]]; then
-    registry=/data/manager/ant/node_registry.json
-    ids=$(jq -r '.nodes | to_entries[] | select(.value.eviction != null) | .key' "$registry" 2>/dev/null || true)
-    [[ -n "$ids" ]] || { echo "No removed nodes to clear"; exit 0; }
-    for id in $ids; do
-        as_user ant node dismiss "$id" >/dev/null
-        echo "Cleared node-$id; restart the container to replace it"
-    done
+    echo "No removed nodes to clear: this image's node manager deletes no node's data," \
+        "and nodes an earlier one evicted are dismissed when the container starts"
     exit 0
 fi
 
-exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups ant node "$@"
+exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups darwin-nodes "$@"

@@ -25,6 +25,11 @@
 # - its latest job needs checks and publish;
 # - nothing in release.yml has an if: or continues on error, so no job can
 #   run after a failed need and no step can skip a check;
+# - build.yml's manager job builds the image's node manager, darwin-nodes,
+#   with --locked from the darwin-client commit docker/manager-revision pins,
+#   and checks the binary for Autonomi's addresses and the reset and
+#   log-forwarding routes; its image job needs that job and passes the image
+#   marker;
 # - nothing but release.yml's latest job names the image's :latest tag.
 #
 # A release runs release.yml as it is at the tagged commit, so this can't
@@ -37,6 +42,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 DIR=.github/workflows
+BUILD="${DIR}/build.yml"
 RELEASE="${DIR}/release.yml"
 TEST="${DIR}/test.yml"
 PROBLEMS=0
@@ -65,10 +71,10 @@ job() {
     ' "${2:-${RELEASE}}"
 }
 
-# The jobs a job of release.yml needs, one a line, from `needs: x` or
-# `needs: [x, y]`.
+# The jobs a job of a workflow needs, release.yml unless another is given,
+# one a line, from `needs: x` or `needs: [x, y]`.
 needs() {
-    job "$1" | sed -n 's/^    needs:[[:space:]]*//p' | sed 's/[][]//g' | tr ',' '\n' \
+    job "$1" "${2:-${RELEASE}}" | sed -n 's/^    needs:[[:space:]]*//p' | sed 's/[][]//g' | tr ',' '\n' \
         | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed '/^$/d'
 }
 
@@ -207,6 +213,32 @@ else
     done
 fi
 
+if [[ ! -f "${BUILD}" ]]; then
+    problem "${BUILD} is missing"
+else
+    # The image's node manager is built from the darwin-client commit
+    # docker/manager-revision pins, with that commit's own lockfile, and the
+    # binary the image ships is checked for what darwin-client's tests say it
+    # leaves out.
+    manager=$(job manager "${BUILD}")
+    for line in \
+        '{ read -r repository; read -r revision; } < docker/manager-revision' \
+        'run: cargo build --release --locked -p ant-cli --bin darwin-nodes' \
+        'for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v1/logs/forward; do'; do
+        if ! grep -qF -- "${line}" <<<"${manager}"; then
+            problem "build.yml's manager job must build darwin-nodes with --locked from the commit docker/manager-revision pins, and check the binary (missing: ${line})"
+        fi
+    done
+    # The image takes that build, and the commit it is built from as the
+    # image marker every node gets.
+    if ! needs image "${BUILD}" | grep -qx manager; then
+        problem "build.yml's image job must need the manager job"
+    fi
+    if ! grep -qF -- 'build-args: IMAGE_VERSION=${{ github.sha }}' <<<"$(job image "${BUILD}")"; then
+        problem "build.yml's image job must pass the image marker (build-args: IMAGE_VERSION=\${{ github.sha }})"
+    fi
+fi
+
 # Only release.yml's latest job names the image's :latest tag, outside
 # comments.
 while IFS= read -r hit; do
@@ -229,4 +261,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; test.yml's test job runs every test; only release.yml's latest job moves :latest."
+echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, checks it, and gives the image its marker; only release.yml's latest job moves :latest."

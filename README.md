@@ -22,7 +22,9 @@ never ran.
   that the image sets DARWIN's token and vault, the block that vault was
   deployed in (which the binary has built in for them), Robinhood Chain's RPC,
   the bootstrap servers and production mode, and that the binary reads every
-  `ANT_*` variable the image sets; tests in `src/bin/ant-node/cli.rs` check
+  `ANT_*` variable the image sets, but for those it lists as given before
+  the node reads them (the image marker, `ANT_IMAGE_VERSION`, which nodes
+  ignore until then); tests in `src/bin/ant-node/cli.rs` check
   the three names, and that they override the `--evm-network arbitrum-one` the
   image's node manager passes. From ds.13 a node logs, as it starts, the
   token, vault and RPC host it is paid through, and never the rest of the
@@ -210,8 +212,23 @@ never ran.
   are turned away from some of those places and add load for less storage,
   so run 2 nodes per IP. From ds.13 the image dates each node folder it
   retires, so the folder is kept 3 days from its retirement however long it
-  sat unchanged before; the smoke test checks that, and that
-  `nodes clear-evicted` forgets nodes the disk-pressure eviction removed.
+  sat unchanged before. The image's node manager is `darwin-nodes`, built by
+  the Build workflow with `--locked` from the darwin-client commit
+  `docker/manager-revision` pins, in place of Autonomi's `ant` 0.3.9, which
+  the images up to ds.15's downloaded. It deletes no node's data: Autonomi's
+  deleted the data of the node holding the least at 500 MiB free on a disk
+  shared by 2 or more nodes. It keeps the registry where `ant` did
+  (`/data/manager/ant/node_registry.json`), and passes nodes the same
+  arguments. At its first start the entrypoint dismisses, once, the nodes
+  `ant` evicted, whose data is gone, and new nodes take their places up to
+  `NODE_COUNT`; node folders no registered node has move to
+  `retired/unregistered/`, which nothing deletes. Every node gets the image marker, the commit the image is
+  built from, in `ANT_IMAGE_VERSION`, from the manager's environment only.
+  The smoke test checks all of it: on a nearly full 1.5 GB disk nothing is
+  evicted or deleted, and a `/data` written by ds.15's image keeps every
+  node's id, port, data and identity. `tests/darwin_image.rs` pins the
+  manager's install, the registry's place, the marker's path, and every
+  deletion the image's scripts make, each with its reason.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
   releases without credentials, and orders `+ds.N` builds by their number,
@@ -232,8 +249,11 @@ never ran.
   only build.yml, release.yml and test.yml, every action is pinned to a
   commit, release.yml keeps its tag trigger, empty default permissions,
   key check, release environment, that order of jobs and the only write of
-  `:latest`, and test.yml's test job runs every test: the library and
-  binaries, both vendored crates' own tests and every target in `tests/`.
+  `:latest`, test.yml's test job runs every test: the library and
+  binaries, both vendored crates' own tests and every target in `tests/`,
+  and build.yml builds the image's node manager with `--locked` from the
+  pinned darwin-client commit, checks the binary, and gives the image its
+  marker.
 - **Three crates are vendored**, each with a `VENDORED.md` saying what it
   is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
   its only change; `vendor/webrtc` is webrtc 0.14.0, whose
@@ -256,8 +276,9 @@ never ran.
   `scripts/third_party_notices/` with the licences and notices of every
   crate in the build (self_encryption's in full), and the Rust standard
   library's `RUST-STD-COPYRIGHT.html`. The Docker image has them in
-  `/usr/share/doc/storage-node/`, with a `NOTICE` for the `ant` node manager
-  it bundles.
+  `/usr/share/doc/storage-node/`, with the node manager's own, from
+  darwin-client's generator, in `darwin-nodes/`, and a `NOTICE` saying what
+  each program is and where its source is.
 - **Rate limits**: browser (WebRTC Direct) sessions and requests are
   limited, and so are the replication requests nodes send each other: a
   node accepts only so many of each kind at once and turns the rest away.
