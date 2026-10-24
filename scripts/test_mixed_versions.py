@@ -207,8 +207,10 @@ def build_old(args, cache):
     commit = git("rev-parse", f"{ref}^{{commit}}")
     tree = cache / commit[:12]
     stamp = tree / ".harness-build"
-    wanted = json.dumps({"commit": commit, "profile": args.profile,
-                         "cargo_args": args.cargo_arg})
+    # The job count changes how a build runs, not what it makes.
+    settings = [arg for arg in args.cargo_arg
+                if not (arg.startswith("-j") or arg.startswith("--jobs"))]
+    wanted = json.dumps({"commit": commit, "profile": args.profile, "cargo_args": settings})
     bins = tree / "target" / profile_dir(args.profile)
     if stamp.exists() and stamp.read_text() == wanted and all(
             (bins / f"{name}{EXE}").exists() for name in ("ant-node", "ant-devnet")):
