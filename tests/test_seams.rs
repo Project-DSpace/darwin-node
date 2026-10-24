@@ -1,4 +1,4 @@
-//! The free-space seam (src/test_seams.rs) reaches the node's readings of
+//! The free-space seam (`src/test_seams.rs`) reaches the node's readings of
 //! its free space: the chunk store's capacity check and the disk-pressure
 //! state, so a test can make a node's disk read as full on a disk with room.
 //! One test, alone in its process, because the seam is read from the

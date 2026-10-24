@@ -409,15 +409,16 @@ mod payment_reads {
                 tokio::spawn(async move {
                     while let Some(body) = read_http_body(&mut socket).await {
                         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                        let response = if let Some(batch) = request.as_array() {
-                            batch
-                                .iter()
-                                .map(|one| respond(one, answer.as_ref(), &seen, &others))
-                                .collect::<Option<Vec<_>>>()
-                                .map(serde_json::Value::from)
-                        } else {
-                            respond(&request, answer.as_ref(), &seen, &others)
-                        };
+                        let response = request.as_array().map_or_else(
+                            || respond(&request, answer.as_ref(), &seen, &others),
+                            |batch| {
+                                batch
+                                    .iter()
+                                    .map(|one| respond(one, answer.as_ref(), &seen, &others))
+                                    .collect::<Option<Vec<_>>>()
+                                    .map(serde_json::Value::from)
+                            },
+                        );
                         // A dropped call: the connection closes unanswered.
                         let Some(response) = response else {
                             return;

@@ -1,7 +1,8 @@
-//! Test-only seams: values a test sets from outside a node's process, to
-//! reach states a short run on a roomy disk never does. The mixed-version
-//! harness (`scripts/test_mixed_versions.py`) runs nodes of two releases as
-//! separate processes and sets them through the environment.
+//! Test-only seams: values a test sets from outside a node's process.
+//!
+//! They reach states a short run on a roomy disk never does. The
+//! mixed-version harness (`scripts/test_mixed_versions.py`) runs nodes of two
+//! releases as separate processes and sets them through the environment.
 //!
 //! This module is compiled only into builds with the `test-utils` feature (and
 //! into the crate's own unit tests). No release is built with that feature, so
@@ -18,14 +19,15 @@ use std::path::Path;
 /// Every seam's environment variable starts with this.
 pub const PREFIX: &str = "ANT_TEST_SEAM_";
 
-/// Names a file holding the free space that every reading of the node's
-/// storage partition returns in place of the partition's own: the chunk
-/// store's capacity check, the listing store's map size, and the disk-pressure
-/// state. The file holds the free bytes, then, optionally, the partition's
-/// size in bytes (otherwise its real size is read), separated by white space.
-/// The test rewrites the file to fill or free the disk while the node runs. A
-/// file that can't be read or parsed is a failed measurement, as a failed
-/// `statvfs` is.
+/// Names a file holding the free space the node reads for its partition.
+///
+/// Every reading of the free space on the node's storage partition returns
+/// it in place of the partition's own: the chunk store's capacity check, the
+/// listing store's map size, and the disk-pressure state. The file holds the
+/// free bytes, then, optionally, the partition's size in bytes (otherwise its
+/// real size is read), separated by white space. The test rewrites the file
+/// to fill or free the disk while the node runs. A file that can't be read or
+/// parsed is a failed measurement, as a failed `statvfs` is.
 pub const FREE_SPACE_FILE: &str = "ANT_TEST_SEAM_FREE_SPACE_FILE";
 
 /// Free and total bytes a test set for the storage partition.

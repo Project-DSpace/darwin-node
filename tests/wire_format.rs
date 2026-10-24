@@ -14,7 +14,7 @@
 //! older node's decoder makes of the new bytes (as
 //! `old_decoder_tolerates_new_neighbor_sync_request` in
 //! src/replication/protocol.rs does for the last field added, before the
-//! rule). The mixed-version harness (scripts/test_mixed_versions.py) then
+//! rule). The mixed-version harness (`scripts/test_mixed_versions.py`) then
 //! runs old and new nodes together.
 //!
 //! On a mismatch the test prints every sample's bytes as they are now, for
@@ -35,6 +35,7 @@ use ant_node::replication::protocol::{
     VerificationResponse,
 };
 use ant_node::replication::subtree::{SubtreeLeaf, SubtreeProof};
+use std::fmt::Write as _;
 
 /// The request id every sample is sent with: two bytes as a varint, so a
 /// sample's bytes show where the id ends and the body starts.
@@ -548,10 +549,14 @@ fn every_message_between_nodes_keeps_its_bytes() {
     names.dedup();
     assert_eq!(names.len(), before, "two samples share a name: {names:?}");
 
-    let table: String = found
-        .iter()
-        .map(|(name, bytes)| format!("    (\n        \"{name}\",\n        \"{bytes}\",\n    ),\n"))
-        .collect();
+    let mut table = String::new();
+    for (name, bytes) in &found {
+        writeln!(
+            table,
+            "    (\n        \"{name}\",\n        \"{bytes}\",\n    ),"
+        )
+        .unwrap();
+    }
     let pinned: Vec<(String, String)> = PINNED
         .iter()
         .map(|(name, bytes)| ((*name).to_string(), (*bytes).to_string()))
