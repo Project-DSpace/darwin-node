@@ -61,7 +61,14 @@ never ran.
   address taken, anywhere new; `a_settlement_read_survives_a_busy_rpc` reads
   a payment through a stub RPC that answers busy first, and
   `a_payment_record_read_empty_is_read_again_and_verifies` one that answers
-  with an empty record first.
+  with an empty record first. `tests/fork_pins.rs` pins the same through the
+  payment check's whole path (`verify_payment`), in every context a payment
+  is checked in, against a stub RPC rather than a test override: a read that
+  fails is made again half a second later and one that keeps failing is
+  refused after two rounds, an empty record is read again 1.5 seconds later,
+  a payment to another payee is refused, more than the amount due is taken
+  and a wei less refused, and a merkle proof is refused before anything is
+  read.
 - **Relay serving can be turned off** (from ds.10). saorsa-core gives every
   node a MASQUE relay server, on which any peer can open a session and have
   the node send UDP for it to any address. `ANT_RELAY_SERVING=false` (or
