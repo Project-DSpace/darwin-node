@@ -223,9 +223,10 @@ never ran.
   approval is asked for only after that. `scripts/check-workflows.sh`, which
   the Build and Test workflows run, fails unless `.github/workflows` holds
   only build.yml, release.yml and test.yml, every action is pinned to a
-  commit, and release.yml keeps its tag trigger, empty default permissions,
+  commit, release.yml keeps its tag trigger, empty default permissions,
   key check, release environment, that order of jobs and the only write of
-  `:latest`.
+  `:latest`, and test.yml's test job runs every test: the library and
+  binaries, both vendored crates' own tests and every target in `tests/`.
 - **Three crates are vendored**, each with a `VENDORED.md` saying what it
   is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
   its only change; `vendor/webrtc` is webrtc 0.14.0, whose
@@ -233,9 +234,12 @@ never ran.
   and `vendor/ant-listings` is darwin-listings 0.3.1, unchanged: the
   envelope format, listings, their payment checks, the listings protocol
   and its change feeds. `[patch.crates-io]` puts the first two in place of the
-  crates.io releases. `vendor/ant-listings` is a workspace member, so its
-  own tests run under this repository's `Cargo.lock` in the Test workflow,
-  and the Build workflow checks its git objects against its `VENDORED.md`. saorsa-core and saorsa-transport are their crates.io
+  crates.io releases. `vendor/ant-listings` and `vendor/ant-protocol` are
+  workspace members, so their own tests run under this repository's
+  `Cargo.lock` in the Test workflow (`cargo test --locked -p ant-listings`,
+  `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml`),
+  and the Build workflow checks `vendor/ant-listings`' git objects against
+  its `VENDORED.md`. saorsa-core and saorsa-transport are their crates.io
   releases, as upstream's are.
 - **Release builds link self_encryption** (GPL-3.0 with MaidSafe's linking
   exception), which upstream's don't: `vendor/ant-listings` reads the data

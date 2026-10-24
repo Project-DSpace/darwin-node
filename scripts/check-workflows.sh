@@ -16,6 +16,10 @@
 # - the Test run it takes is from the push to main, or one run by hand that
 #   test.yml names "Test by hand": one without the listings cross-test,
 #   which runs only weekly or when a run by hand asks for it;
+# - test.yml's test job runs every test: the library and binaries, the
+#   vendored ant-listings' and ant-protocol's own tests, and every target in
+#   tests/ (each file, and each folder with a mod.rs), so the Test run a
+#   release waits for has run every pin;
 # - its publish job runs in the release environment and needs build and
 #   checks;
 # - its latest job needs checks and publish;
@@ -185,6 +189,22 @@ else
     if [[ "$(job listings-cross-test "${TEST}" | grep -E '^    if:' || true)" != "${expected_if}" ]]; then
         problem "test.yml's listings-cross-test job must run only weekly or when a run by hand asks for it (${expected_if#    })"
     fi
+
+    # The test job runs every test, so a pin counts once it is written: the
+    # library and binaries, the vendored crates' own tests under this lock,
+    # and every integration test target, found by the loop rather than
+    # listed, so a new file in tests/ runs without a workflow change.
+    test_job=$(job test "${TEST}")
+    for line in \
+        'run: cargo test --locked --features test-utils --lib --bins' \
+        'run: cargo test --locked -p ant-listings' \
+        'run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml' \
+        'for target in tests/*.rs tests/*/mod.rs; do' \
+        'cargo test --locked --features test-utils --test "$name" "${args[@]}" || failed+=("$name")'; do
+        if ! grep -qF -- "${line}" <<<"${test_job}"; then
+            problem "test.yml's test job no longer runs every test (missing: ${line})"
+        fi
+    done
 fi
 
 # Only release.yml's latest job names the image's :latest tag, outside
@@ -209,4 +229,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; only its latest job moves :latest."
+echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; test.yml's test job runs every test; only release.yml's latest job moves :latest."

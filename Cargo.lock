@@ -914,17 +914,22 @@ dependencies = [
 name = "ant-protocol"
 version = "5.0.0"
 dependencies = [
+ "alloy",
  "blake3",
  "bytes",
  "evmlib",
  "hex",
  "postcard",
+ "rand 0.8.8",
  "rmp-serde",
  "saorsa-core",
  "saorsa-pqc",
  "serde",
+ "serial_test",
  "tokio",
  "tracing",
+ "url",
+ "xor_name",
 ]
 
 [[package]]

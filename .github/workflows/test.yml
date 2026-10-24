@@ -1,4 +1,5 @@
-# Runs the test suite: the library and binaries, then each integration test.
+# Runs the test suite: the library and binaries, the vendored crates' own
+# tests, then each integration test.
 # Kept apart from build.yml so a failing test doesn't stop the image from
 # being built. A release waits for both: release.yml publishes only once the
 # tagged commit's newest Test run (from its push to main, or one run by hand
@@ -118,6 +119,14 @@ jobs:
       - name: Vendored ant-listings
         if: ${{ !cancelled() }}
         run: cargo test --locked -p ant-listings
+
+      # vendor/ant-protocol's own tests, under this repository's Cargo.lock
+      # too: the wire protocol and payment code the node is built from, with
+      # the dependencies the node is built with. Some of them start an Anvil
+      # chain.
+      - name: Vendored ant-protocol
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml
 
       # Run whether or not the library tests passed, as long as the tests
       # built, and one target at a time, so every target reports even if an

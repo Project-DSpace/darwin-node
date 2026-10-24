@@ -158,6 +158,27 @@ fresh
 edit "${TEST}" "${CROSS_IF}"$'\n' ''
 expect "the cross-test in every run" "listings-cross-test job must run only weekly or when a run by hand asks for it"
 
+# The Test run a release waits for runs every test.
+fresh
+edit "${TEST}" $'      - name: Vendored ant-protocol\n        if: ${{ !cancelled() }}\n        run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml\n' ''
+expect "the vendored ant-protocol's tests left out" \
+    "test job no longer runs every test (missing: run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml)"
+
+fresh
+edit "${TEST}" '        run: cargo test --locked -p ant-listings' '        run: "true"'
+expect "the vendored ant-listings' tests left out" \
+    "test job no longer runs every test (missing: run: cargo test --locked -p ant-listings)"
+
+fresh
+edit "${TEST}" 'for target in tests/*.rs tests/*/mod.rs; do' 'for target in tests/fork_pins.rs; do'
+expect "the integration tests listed by hand" \
+    "test job no longer runs every test (missing: for target in tests/*.rs tests/*/mod.rs; do)"
+
+fresh
+edit "${TEST}" 'run: cargo test --locked --features test-utils --lib --bins' 'run: cargo test --locked --lib'
+expect "the library tested without test-utils, and its binaries left out" \
+    "test job no longer runs every test (missing: run: cargo test --locked --features test-utils --lib --bins)"
+
 # Publishing and :latest wait for the checks.
 fresh
 edit "${RELEASE}" $'    environment: release\n' ''
