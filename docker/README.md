@@ -147,19 +147,27 @@ In the folder with `docker-compose.yml`:
   `http://127.0.0.1:12600/console` on the server (from elsewhere:
   `ssh -L 12600:127.0.0.1:12600 you@server`).
 - **Updates:** the nodes install signed releases themselves (hourly checks,
-  then up to 24 hours' delay). For a new image: `docker compose pull`, then
-  `docker compose up -d`.
+  then up to 24 hours' delay). The rest of the container, the node manager
+  among it, changes only with a new image: `docker compose pull`, then
+  `docker compose up -d`. Pull at least once if
+  `docker exec storage-node darwin-nodes --version` fails: your image still
+  runs Autonomi's node manager, which deletes a node's data when the disk is
+  nearly full ([When the disk fills](#when-the-disk-fills)), and the nodes'
+  own updates don't replace it.
 - **Stop:** `docker compose down` (data stays); `docker compose up -d` starts
   again. Otherwise keep it running: nodes offline for long are dropped and
   stop earning. Docker restarts it after a reboot.
 - **Change settings:** edit the file, run `docker compose up -d`.
   - More nodes take the next ports: forward and open those too.
-  - Fewer nodes: any [evicted](#when-the-disk-fills) go first, then the
-    highest ports. Their data moves to `retired/` and is deleted at a
-    container start 4 or more days later.
+  - Fewer nodes: the highest ports go first. Their data moves to `retired/`
+    and is deleted at a container start 4 or more days later.
   - New `PORT_START` or `BROWSER_PORT_START`: nodes keep their data; update
     your router and firewall.
   - A new `REWARDS_ADDRESS` applies to every node.
+- **Set-aside folders:** a node folder under `nodes/` that no registered
+  node has moves to `retired/unregistered/`, which the container never
+  deletes. It may hold a node's identity and data: delete it yourself once
+  you know it isn't needed.
 
 ## When the disk fills
 
@@ -167,12 +175,18 @@ In the folder with `docker-compose.yml`:
   may erase records far from it that nearer nodes hold, until 15% is free;
   while the network is small none are that far, so the disk keeps filling.
 - **At 1 GiB free or less**, `docker exec storage-node nodes status` warns,
-  naming the node that would go next. Nothing is logged.
-- **At 500 MiB or less**, the node manager evicts the node holding the least
-  data (never the last one): it deletes its data and logs `Evicted node`.
-- **Evicted nodes stay removed.** Free up space, run
-  `docker exec storage-node nodes clear-evicted`, then
-  `docker compose restart`. Or lower `NODE_COUNT`.
+  and at 500 MiB or less it reports the disk as critical. The node manager
+  deletes no node's data, however little space is left.
+- **At 500 MiB free**, nodes stop taking new data: they refuse to store a
+  record that would leave less. To store more, add disk or lower
+  `NODE_COUNT`.
+- **Older images** (where `docker exec storage-node darwin-nodes --version`
+  fails) run Autonomi's node manager, which at 500 MiB free evicts the node
+  holding the least data (never the last one): it deletes that node's data
+  and logs `Evicted node`. Pull the new image ([Updates](#day-to-day)). At
+  its first start, nodes evicted before are dismissed (`Dismissing node-2,
+  which an earlier node manager evicted ...`) and new nodes take their
+  places up to `NODE_COUNT`. `nodes clear-evicted` does nothing any more.
 
 ## Relaying
 
@@ -185,7 +199,8 @@ your router). To turn it off, add `ANT_RELAY_SERVING: "false"` under
 ## Licences
 
 In `/usr/share/doc/storage-node/` in the image (`docker exec storage-node ls
-/usr/share/doc/storage-node` lists them). `NOTICE` says what each program is
-and where its source is. `THIRD-PARTY-NOTICES.txt` has the licences of the code
-built into the node, including self_encryption, which the node links under
-GPL-3.0 with a linking exception.
+-R /usr/share/doc/storage-node` lists them). `NOTICE` says what each program
+is and where its source is. `THIRD-PARTY-NOTICES.txt` has the licences of the
+code built into the node, and `darwin-nodes/THIRD-PARTY-NOTICES.txt` those of
+the node manager, including self_encryption, which both link under GPL-3.0
+with a linking exception.
