@@ -65,7 +65,10 @@ summary is summary.json there. Exits 0 when every run passes.
 With the defaults a run takes about 30 minutes, most of it --observe-minutes.
 The standalone nodes run in testnet mode, which binds every interface; on a
 desktop whose firewall asks about that, --network-mode development keeps them
-on loopback.
+on loopback. A run during which the machine stood still (asleep, say) fails
+as not comparable; on Windows the harness asks the machine not to sleep
+while it runs. One run can be made again into the same --work folder after
+removing its own folder there: the verdict reads every run the folder holds.
 """
 
 import argparse
@@ -80,6 +83,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from pathlib import Path
 
@@ -94,12 +98,17 @@ RECORD_SIZES = [4096, 65536, 1048576, 4194304]
 
 # How far a mixed run's penalties (or refused PUTs) may exceed the all-old
 # run's before the run fails: by PENALTY_SLACK, or by PENALTY_RATIO of the
-# all-old count if that is more. Nodes dialling each other as the joiners
-# start time some connections out in every run, so counts vary between runs
-# of one release: in three runs of v0.23.0+ds.15, a pair of roles' count for
-# one reason varied by up to 3.
-PENALTY_SLACK = 4
-PENALTY_RATIO = 0.5
+# all-old count if that is more. Counts vary between runs of one release: a
+# possession check that times out on a busy machine charges its peer twice,
+# and in five runs of v0.23.0+ds.15 a pair of roles' count for one reason
+# varied by up to 9. A message one release can't read fails every exchange
+# of it, tens to hundreds in a run, and leaves decode failures besides.
+PENALTY_SLACK = 10
+PENALTY_RATIO = 1.0
+
+# A run fails when the machine stood still this long, asleep say: every
+# node's timers jump at once then, and the run can't be compared.
+STALL_LIMIT = 30
 
 # A message family a role received at least this often in the all-old run
 # must reach it in a mixed run too. Rarer ones come and go between runs of one
@@ -160,6 +169,42 @@ def utc_now():
 
 class HarnessError(Exception):
     pass
+
+
+class StallWatch:
+    """Notes the longest time the machine stood still while a run went on
+    (asleep, say), from a clock read every second."""
+
+    def __init__(self):
+        self.longest = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+
+    def _watch(self):
+        last = time.time()
+        while not self._stop.wait(1):
+            now = time.time()
+            self.longest = max(self.longest, now - last - 1)
+            last = now
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join()
+        return round(self.longest)
+
+
+def keep_awake():
+    """Asks Windows not to sleep while the harness runs: a desktop left alone
+    would otherwise sleep through a run. The request ends with the process."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        es_continuous, es_system_required = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | es_system_required)
+    except (AttributeError, OSError):
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -371,6 +416,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
     processes = []
     nodes = []
     timeline = {"started": utc_now().isoformat()}
+    stall = StallWatch()
     full_count = args.full if name == "full" else 0
     try:
         manifest_path = folder / "manifest.json"
@@ -457,6 +503,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
                               if path.is_dir())
     finally:
         stop_all(processes)
+        stalled = stall.stop()
     # What the analysis needs, so a finished run can be read again
     # (--analyze) without running it again.
     record = {
@@ -464,6 +511,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         "network": network_release.name,
         "joining": joiner_release.name,
         "window": [timeline["joiners"], timeline["ended"]],
+        "stalled_seconds": stalled,
         "devnet_peers": devnet_peers,
         "nodes": [{"name": node.name, "role": node.role, "release": node.release.name,
                    "ran": started_as(node.process.log_path), "peer_id": node.peer_id,
@@ -674,6 +722,7 @@ def analyze(run):
         "checks": checks,
         "full_evidence": full_evidence,
         "unanswered": unanswered,
+        "stalled_seconds": run.get("stalled_seconds", 0),
         "roles": {node["name"]: node["role"] for node in run["nodes"]},
         "ran": {role: sorted({node.get("ran") or started_as(folder / node["log"])
                               for node in run["nodes"] if node["role"] == role})
@@ -700,6 +749,9 @@ def verdicts(results, args):
     failures = []
     baseline = results.get("all-old")
     for name, result in results.items():
+        if result["stalled_seconds"] > STALL_LIMIT:
+            failures.append(f"{name}: the machine stood still for {result['stalled_seconds']} s "
+                            "during the run (asleep?), so it can't be compared: run it again")
         if result["decode_failures"]:
             failures.append(f"{name}: {len(result['decode_failures'])} message(s) didn't "
                             f"decode, first: {result['decode_failures'][0]}")
@@ -957,6 +1009,7 @@ def main():
         "all-new": (new, new),
         "full": (new, new),
     }
+    keep_awake()
     for name in runs:
         network_release, joiner_release = plans[name]
         run_one(name, network_release, joiner_release, args, harness, work / name)
@@ -964,7 +1017,10 @@ def main():
     (work / "releases.json").write_text(json.dumps(
         {release.name: {"version": release.version, "from": release.label,
                         "seams": release.seams} for release in releases}, indent=2))
-    return conclude(work, runs, args)
+    # Every run in the work folder: one run again into a folder whose other
+    # runs passed is measured against the same all-old run.
+    return conclude(work, [name for name in RUNS if (work / name / "run.json").exists()],
+                    args)
 
 
 def conclude(work, runs, args):
