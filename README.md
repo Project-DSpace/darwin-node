@@ -267,6 +267,17 @@ never ran.
   New connections over saorsa-core's rate per IP are only logged, and
   unpaid storage and quote requests aren't limited; see [Rate
   Limiting](#rate-limiting).
+- **Messages between nodes keep their bytes.** `tests/wire_format.rs` pins
+  the bytes of every replication message, and of every variant of the
+  replies, as ds.15 writes them, and fails when a message or a reply gains
+  a variant without a sample of its own. A release that changes messages
+  between nodes appends a new message type to `ReplicationMessageBody` and
+  sends it only to a peer known to read it: one that has sent that type
+  itself, or whose user agent names a release that reads it (an unknown
+  agent counts as old). It never adds a field to an existing message, nor a
+  variant to a reply older nodes receive; never counts silence, a decode
+  failure or a timeout on a new message type against a peer; and answers an
+  older requester within its 15 seconds.
 
 ---
 
