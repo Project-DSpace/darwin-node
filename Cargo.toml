@@ -22,6 +22,14 @@ path = "src/bin/ant-node/main.rs"
 name = "ant-devnet"
 path = "src/bin/ant-devnet/main.rs"
 
+# The client side of the mixed-version harness (scripts/test_mixed_versions.py):
+# paid uploads into a devnet, read back later. A test tool, built only with
+# test-utils, so no release or image carries it.
+[[bin]]
+name = "darwin-harness"
+path = "src/bin/darwin-harness/main.rs"
+required-features = ["test-utils"]
+
 [dependencies]
 # Global allocator. musl's default malloc is significantly slower than
 # glibc's under concurrent allocation churn, which matches the node's
