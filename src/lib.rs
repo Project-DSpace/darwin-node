@@ -59,6 +59,8 @@ pub mod payment;
 pub mod pointer;
 pub mod replication;
 pub mod storage;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_seams;
 pub mod upgrade;
 #[cfg(feature = "webrtc-direct")]
 mod web_rtc;

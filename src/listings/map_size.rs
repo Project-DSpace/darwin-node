@@ -59,7 +59,7 @@ const WINDOWS_MAP_HEADROOM: u64 = 32 * GIB;
 ///
 /// The result is page-aligned and never falls below [`MIN_MAP_SIZE`].
 pub fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
-    let available = fs2::available_space(db_dir)
+    let available = crate::storage::available_space(db_dir)
         .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
 
     // The MDB data file may not exist yet on first run, and that is the only reason to

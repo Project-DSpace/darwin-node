@@ -155,6 +155,17 @@ jobs:
             fi
           done
 
+      # The test seams (src/test_seams.rs), which let a test make a node's
+      # disk read as full, are compiled only with the test-utils feature: the
+      # binary operators run must hold none of their variables.
+      - name: Check the test seams are left out
+        shell: bash
+        run: |
+          if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then
+            echo "::error::target/release/ant-node holds a test seam (ANT_TEST_SEAM_*): it was built with test-utils"
+            exit 1
+          fi
+
       # The binary and its bootstrap file, plus what the image ships in
       # /usr/share/doc/storage-node/ (docker/Dockerfile): the project's licence
       # files, the third-party notices and the Rust standard library's notices

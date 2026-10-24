@@ -391,6 +391,21 @@ impl DiskRetention {
             if let Some(source) = source {
                 return source();
             }
+            if let Some(space) = crate::test_seams::free_space() {
+                return match space {
+                    Ok(space) => Some(DiskSpace {
+                        available: space.free,
+                        total: match space.total {
+                            Some(total) => total,
+                            None => fs2::total_space(&self.dir).ok()?,
+                        },
+                    }),
+                    Err(e) => {
+                        debug!("The free-space seam could not be read: {e}");
+                        None
+                    }
+                };
+            }
         }
         match fs2::statvfs(&self.dir) {
             Ok(stats) => Some(DiskSpace {

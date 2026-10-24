@@ -199,6 +199,13 @@ name = "poc_price_floor_live"
 path = "tests/poc_price_floor_live.rs"
 required-features = ["test-utils"]
 
+# The free-space seam reaches the node's free-space readings. Alone in its
+# process, as the seam is read from the environment.
+[[test]]
+name = "test_seams"
+path = "tests/test_seams.rs"
+required-features = ["test-utils"]
+
 [[test]]
 name = "webrtc_direct_devnet"
 path = "tests/webrtc_direct_devnet.rs"

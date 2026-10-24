@@ -278,6 +278,9 @@ never ran.
   variant to a reply older nodes receive; never counts silence, a decode
   failure or a timeout on a new message type against a peer; and answers an
   older requester within its 15 seconds.
+  Builds with the `test-utils` feature have test seams
+  (`src/test_seams.rs`), such as one that makes a node's disk read as full;
+  the Build workflow checks that the node it builds has none.
 
 ---
 

@@ -310,7 +310,7 @@ impl CapacityGuard {
 
     /// Query the filesystem and refresh the snapshot.
     fn measure(&self, snapshot: &mut CapacitySnapshot) -> Result<()> {
-        let available = fs2::available_space(&self.dir)
+        let available = super::available_space(&self.dir)
             .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
         snapshot.available = available;
         // Reservations survive: their bytes are not on the platter yet, so the fresh

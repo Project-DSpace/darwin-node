@@ -78,6 +78,18 @@ pub const GIB: u64 = 1024 * MIB;
 /// Default free disk space to keep unused on the storage partition.
 pub const DEFAULT_DISK_RESERVE: u64 = 500 * MIB;
 
+/// Free bytes on the partition holding `path`, as the node's disk checks read
+/// them: the chunk store's capacity check and the listing store's map size.
+/// In a `test-utils` build a test may set them instead
+/// ([`crate::test_seams::FREE_SPACE_FILE`]).
+pub(crate) fn available_space(path: &std::path::Path) -> std::io::Result<u64> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(space) = crate::test_seams::free_space() {
+        return space.map(|space| space.free);
+    }
+    fs2::available_space(path)
+}
+
 /// Statistics about storage operations.
 ///
 /// Counters other than `current_chunks` are cumulative for the lifetime of the
