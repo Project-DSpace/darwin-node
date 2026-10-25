@@ -4046,7 +4046,6 @@ async fn possession_check_charges(
     peer: PeerId,
     address: XorName,
     paid_quote_issuers: Option<Vec<PeerId>>,
-    stand_ins: Vec<PeerId>,
 ) -> bool {
     let p2p = checker.p2p_node.as_ref().expect("p2p");
     let before = p2p.peer_trust(&peer);
@@ -4054,24 +4053,23 @@ async fn possession_check_charges(
         .replication_engine
         .as_ref()
         .expect("engine")
-        .run_possession_check_now_with(address, vec![peer], paid_quote_issuers, stand_ins)
+        .run_possession_check_now_paid(address, vec![peer], paid_quote_issuers)
         .await;
     p2p.peer_trust(&peer) < before
 }
 
 /// The possession check after a write, driven through its own code with a
-/// peer that lacks the record:
+/// peer that lacks the record (stand-ins beyond the 9 nearest are not
+/// possession-checked at all, see `fresh::possession_checked`):
 ///
-/// - a stand-in beyond the 9 nearest (which a receiver that doesn't widen
-///   rightly refuses) is not charged for answering it lacks the record, while
-///   the same peer inside the 9 is;
+/// - a peer not marked full is charged for answering it lacks the record;
 /// - with a fresh "full" mark, the peer is not charged when its own quote is
 ///   not among the proof's paid quotes, and is charged when it is, when the
 ///   proof can't be read, once the mark has lapsed, and once it was seen
 ///   proving it holds the record.
 #[tokio::test]
 #[serial]
-async fn the_possession_check_spares_only_absent_stand_ins_and_unpaid_full_peers() {
+async fn the_possession_check_spares_only_unpaid_full_peers() {
     use ant_node::replication::full::{self, FULL_NOTICE_FRESHNESS};
 
     let harness = TestHarness::setup_small().await.expect("setup");
@@ -4084,7 +4082,7 @@ async fn the_possession_check_spares_only_absent_stand_ins_and_unpaid_full_peers
     let peer_b = *b.p2p_node.as_ref().expect("p2p b").peer_id();
     let peer_c = *c.p2p_node.as_ref().expect("p2p c").peer_id();
 
-    let content = b"possession-check lanes: stand-ins and full peers";
+    let content = b"possession-check lanes: full peers";
     let address = compute_address(content);
     a.ant_protocol
         .as_ref()
@@ -4096,24 +4094,20 @@ async fn the_possession_check_spares_only_absent_stand_ins_and_unpaid_full_peers
 
     // The cases not charged first, so a charge can't change how B answers
     // them. B lacks the record throughout.
-    assert!(
-        !possession_check_charges(a, peer_b, address, None, vec![peer_b]).await,
-        "a stand-in beyond the 9 nearest answering absent is not charged"
-    );
     // Full peers: B marked full in the checker's view, from a fresh notice.
     let view = full::view_for(&checker);
     view.marks
         .note_notice(peer_b, true, std::time::Instant::now());
     assert!(
-        !possession_check_charges(a, peer_b, address, Some(vec![peer_c]), Vec::new()).await,
+        !possession_check_charges(a, peer_b, address, Some(vec![peer_c])).await,
         "a full peer whose quote wasn't paid is not charged"
     );
     assert!(
-        possession_check_charges(a, peer_b, address, Some(vec![peer_b]), Vec::new()).await,
+        possession_check_charges(a, peer_b, address, Some(vec![peer_b])).await,
         "a full peer paid for the record is charged"
     );
     assert!(
-        possession_check_charges(a, peer_b, address, None, Vec::new()).await,
+        possession_check_charges(a, peer_b, address, None).await,
         "an unreadable proof charges"
     );
     let lapsed = std::time::Instant::now()
@@ -4121,22 +4115,22 @@ async fn the_possession_check_spares_only_absent_stand_ins_and_unpaid_full_peers
         .expect("an instant that long ago");
     view.marks.mark_for_test(peer_b, lapsed);
     assert!(
-        possession_check_charges(a, peer_b, address, Some(vec![peer_c]), Vec::new()).await,
+        possession_check_charges(a, peer_b, address, Some(vec![peer_c])).await,
         "a lapsed mark is no mark"
     );
     view.marks
         .note_notice(peer_b, true, std::time::Instant::now());
     view.seen.record(&peer_b, &address);
     assert!(
-        possession_check_charges(a, peer_b, address, Some(vec![peer_c]), Vec::new()).await,
+        possession_check_charges(a, peer_b, address, Some(vec![peer_c])).await,
         "a full peer once seen holding the record is charged"
     );
-    // No longer full, inside the 9 nearest: charged as before.
+    // No longer full: charged as before.
     view.marks
         .note_notice(peer_b, false, std::time::Instant::now());
     assert!(
-        possession_check_charges(a, peer_b, address, None, vec![peer_c]).await,
-        "a peer inside the 9 nearest answering absent is charged"
+        possession_check_charges(a, peer_b, address, None).await,
+        "a peer not marked full answering absent is charged"
     );
 
     harness.teardown().await.expect("teardown");
@@ -4214,6 +4208,90 @@ async fn the_fetch_lane_spares_only_a_fresh_full_source_that_never_held_the_key(
         fetch_charges(target, unmarked, source).await,
         "a source no longer full is charged"
     );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Full, not faulty, over each node's real quote path: with 4 of a chunk's 7
+/// nearest holding it and full, those 4 answer that it is already stored (a
+/// majority, so a client skips the chunk and pays nothing; the client's side
+/// is darwin-client's), and the 3 not full quote as before.
+#[tokio::test]
+#[serial]
+async fn four_full_holders_of_seven_answer_that_the_chunk_is_already_stored() {
+    use ant_node::ant_protocol::{ChunkQuoteRequest, ChunkQuoteResponse, DATA_TYPE_CHUNK};
+    use ant_node::storage::FullTrigger;
+
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let content = b"held by four full nodes of its seven nearest";
+    let address = compute_address(content);
+    let nearest: Vec<PeerId> = harness
+        .test_node(0)
+        .expect("node")
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&address, 7)
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .collect();
+    assert_eq!(nearest.len(), 7);
+    let group: Vec<usize> = nearest
+        .iter()
+        .map(|peer| node_index_for_peer(&harness, peer).expect("a node of the harness"))
+        .collect();
+    let protocol = |index: usize| {
+        harness
+            .test_node(index)
+            .expect("node")
+            .ant_protocol
+            .as_ref()
+            .expect("protocol")
+    };
+    for index in &group[..4] {
+        protocol(*index)
+            .storage()
+            .put(&address, content)
+            .await
+            .expect("put");
+        protocol(*index)
+            .storage()
+            .set_full_for_test(Some(FullTrigger::Bytes));
+    }
+
+    let mut already = 0;
+    for (rank, index) in group.iter().enumerate() {
+        let message = ChunkMessage {
+            request_id: 9,
+            body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+                address,
+                data_size: content.len() as u64,
+                data_type: DATA_TYPE_CHUNK,
+            }),
+        };
+        let reply = protocol(*index)
+            .try_handle_request(&message.encode().expect("encode"))
+            .await
+            .expect("handle")
+            .expect("answered");
+        match ChunkMessage::decode(&reply).expect("decode").body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                already_stored, ..
+            }) => {
+                assert_eq!(already_stored, rank < 4, "rank {rank}");
+                already += usize::from(already_stored);
+            }
+            other => panic!("rank {rank}: expected a quote, got {other:?}"),
+        }
+    }
+    assert_eq!(already, 4, "a majority of the 7 answer already stored");
+    for index in &group[..4] {
+        protocol(*index).storage().set_full_for_test(None);
+    }
 
     harness.teardown().await.expect("teardown");
 }

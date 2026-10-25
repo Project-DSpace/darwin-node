@@ -64,11 +64,6 @@ pub struct PossessionCheckEvent {
     /// when the proof couldn't be read: a full peer paid for the record is
     /// charged for not holding it (see [`crate::replication::full`]).
     pub paid_quote_issuers: Option<Vec<PeerId>>,
-    /// The peers of `peers` beyond the unwidened storage admission width (the
-    /// 9 nearest): stand-ins for peers marked full, which a receiver that
-    /// doesn't widen rightly refuses. One that answers it lacks the key is not
-    /// charged; any other failure is, as for every peer.
-    pub stand_ins: Vec<PeerId>,
 }
 
 /// Verdict of cryptographically probing a single peer for possession of a chunk.
@@ -147,7 +142,6 @@ pub(crate) async fn run_possession_check(
     key: XorName,
     peers: Vec<PeerId>,
     paid_quote_issuers: Option<&[PeerId]>,
-    stand_ins: &[PeerId],
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<ChunkStore>,
     config: &ReplicationConfig,
@@ -202,13 +196,6 @@ pub(crate) async fn run_possession_check(
             }
             ProbeOutcome::Failed(reason) => {
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
-                if stand_in_not_charged(reason, stand_ins.contains(&peer)) {
-                    debug!(
-                        "Possession check: stand-in {peer}, beyond the 9 nearest, lacks \
-                         {key_hex}; not charged, a receiver that doesn't widen refuses the offer"
-                    );
-                    continue;
-                }
                 let own_quote = full::own_quote(&peer, paid_quote_issuers);
                 report_possession_confirmed_failure(
                     &peer, &key, &key_hex, reason, own_quote, p2p_node,
@@ -230,14 +217,6 @@ pub(crate) async fn run_possession_check(
             }
         }
     }
-}
-
-/// Whether a failure is not charged because the peer is a stand-in beyond the
-/// unwidened storage admission width: only an answer that it lacks the key. A
-/// wrong digest, a malformed or refused reply still claims or breaks
-/// something, and is charged as from any peer.
-fn stand_in_not_charged(reason: PossessionFailureReason, stand_in: bool) -> bool {
-    stand_in && reason == PossessionFailureReason::AbsentKey
 }
 
 async fn clear_possession_bootstrap_claim(
@@ -542,28 +521,6 @@ fn interpret_audit_response(
 mod tests {
     use super::*;
     use crate::replication::config::{POSSESSION_CHECK_DELAY_MAX, POSSESSION_CHECK_DELAY_MIN};
-
-    /// A stand-in beyond the 9 nearest that answers it lacks the key is not
-    /// charged; any other failure of a stand-in is, and a peer inside the 9
-    /// is charged for every failure.
-    #[test]
-    fn only_a_stand_in_answering_absent_goes_uncharged() {
-        use PossessionFailureReason as R;
-        assert!(stand_in_not_charged(R::AbsentKey, true));
-        assert!(!stand_in_not_charged(R::AbsentKey, false));
-        for reason in [
-            R::ResponseDecode,
-            R::UnexpectedResponseType,
-            R::DigestChallengeIdMismatch,
-            R::DigestCountMismatch,
-            R::DigestMismatch,
-            R::BootstrapChallengeIdMismatch,
-            R::Rejected,
-        ] {
-            assert!(!stand_in_not_charged(reason, true), "{reason:?}");
-            assert!(!stand_in_not_charged(reason, false), "{reason:?}");
-        }
-    }
 
     const PEER_ID: [u8; 32] = [0x42; 32];
     const NONCE: [u8; 32] = [0x7a; 32];

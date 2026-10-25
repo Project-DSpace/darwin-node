@@ -636,6 +636,8 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     );
     // Two phases: an eligible candidate is selected first, and left out of
     // every hint; it is audited and erased only in a pass of a later epoch.
+    // The set is capped at what one pass may audit at most, and the ready
+    // keys this pass then doesn't try are given back below.
     let erasable = match ctx.erasure_epoch {
         Some(epoch) => {
             let gate = erasure::gate_for(ctx.self_id);
@@ -671,7 +673,20 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     stats.budget_deferred = audit_selection.deferred;
     stats.audits_attempted = audit_selection.candidates.len();
     stats.audit_requests = audit_selection.request_count;
+    // The ready keys, to give back those the pass doesn't try: deferred for
+    // lack of audit budget, or left when the pressure ends.
+    let ready_keys: Vec<XorName> = erasable.iter().map(|c| c.key).collect();
+    let give_back_untried = |tried: &HashSet<XorName>| {
+        if ctx.erasure_epoch.is_some() {
+            erasure::gate_for(ctx.self_id).release_untried(
+                erasure::ClockKind::Records,
+                &ready_keys,
+                tried,
+            );
+        }
+    };
     if audit_selection.candidates.is_empty() {
+        give_back_untried(&HashSet::new());
         return (stored_keys.len(), stats);
     }
 
@@ -696,6 +711,8 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         },
     )
     .await;
+    let tried: HashSet<XorName> = outcomes.iter().map(|(key, _)| *key).collect();
+    give_back_untried(&tried);
     let gate = ctx
         .erasure_epoch
         .map(|epoch| (erasure::gate_for(ctx.self_id), epoch));
@@ -1535,7 +1552,29 @@ async fn erase_if_still_eligible(
 
     let verdict = revalidate_record_prune_candidate(candidate, present_by_key, &inputs);
     let erased = match verdict {
-        PruneRevalidationOutcome::Delete => erase_stored_record(&candidate.key, ctx).await,
+        PruneRevalidationOutcome::Delete => {
+            let erased = erase_stored_record(&candidate.key, ctx).await;
+            if erased {
+                let proofs = erase_proof_counts(
+                    &candidate.key,
+                    &remote_close_group_peers(&groups.strict, ctx.self_id),
+                    present_by_key,
+                    &marked,
+                );
+                info!(
+                    erased_record = %hex::encode(candidate.key),
+                    proofs_not_full = proofs.not_full,
+                    proofs_full = proofs.full,
+                    proofs_needed = proofs.needed(groups.known_remote, ctx.config.close_group_size),
+                    group_not_full = proofs.group_not_full,
+                    group_full = proofs.group_full,
+                    "Erased an out-of-range record under disk pressure with {} proofs from peers \
+                     not marked full",
+                    proofs.not_full
+                );
+            }
+            erased
+        }
         PruneRevalidationOutcome::ClearedBackInRange => {
             ctx.paid_list.clear_record_out_of_range(&candidate.key);
             false
@@ -1671,6 +1710,53 @@ fn revalidate_record_prune_candidate(
     } else {
         PruneRevalidationOutcome::AuditFailed
     }
+}
+
+/// The proofs behind one erasure, for its log line: of the key's current
+/// strict close group (this node left out), how many members not marked full
+/// and how many marked full proved they hold it, and how many of each there
+/// are.
+struct EraseProofCounts {
+    not_full: usize,
+    full: usize,
+    group_not_full: usize,
+    group_full: usize,
+}
+
+impl EraseProofCounts {
+    /// The proofs the erasure needed (see [`erase_proofs_needed`]).
+    fn needed(&self, known_remote: usize, close_group_size: usize) -> usize {
+        erase_proofs_needed(self.group_not_full, known_remote, close_group_size)
+    }
+}
+
+fn erase_proof_counts(
+    key: &XorName,
+    group: &[PeerId],
+    present_by_key: &HashMap<XorName, HashSet<PeerId>>,
+    marked: &HashSet<PeerId>,
+) -> EraseProofCounts {
+    let proved = |peer: &PeerId| {
+        present_by_key
+            .get(key)
+            .is_some_and(|set| set.contains(peer))
+    };
+    let mut counts = EraseProofCounts {
+        not_full: 0,
+        full: 0,
+        group_not_full: 0,
+        group_full: 0,
+    };
+    for peer in group {
+        if marked.contains(peer) {
+            counts.group_full += 1;
+            counts.full += usize::from(proved(peer));
+        } else {
+            counts.group_not_full += 1;
+            counts.not_full += usize::from(proved(peer));
+        }
+    }
+    counts
 }
 
 fn build_peer_audit_challenges(

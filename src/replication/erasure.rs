@@ -18,7 +18,11 @@
 //!    node that said "present" doesn't say "not found" inside that window.
 //!
 //! A record that is no longer eligible leaves the set, and is hinted again.
-//! So does one whose possession check failed ([`ErasureGate::fail`]): its
+//! So does one the pass that found it ready didn't try, for lack of audit
+//! budget or because the pressure ended first
+//! ([`ErasureGate::release_untried`]): it is hinted until a later pass
+//! selects it again, so no key stays hidden longer than its own wait. So does
+//! one whose possession check failed ([`ErasureGate::fail`]): its
 //! close group lacks copies, and this node's hint is what lets the group
 //! fetch it back. It is then left unselected for [`RETRY_COOLDOWN_EPOCHS`],
 //! so it is hinted for at least a whole cycle before it is selected, hidden
@@ -80,20 +84,38 @@ pub const EPOCHS_BEFORE_ERASURE: u64 = 2;
 /// hides it and tries again.
 pub const RETRY_COOLDOWN_EPOCHS: u64 = EPOCHS_BEFORE_ERASURE + 1;
 
+/// One key being erased.
+#[derive(Debug, Clone, Copy)]
+struct Selected {
+    /// The sync epoch in which it was selected.
+    at: u64,
+    /// Whether it was selected again once the cooldown after a failed
+    /// possession check ended: tried again later, it doesn't keep a node from
+    /// being full.
+    retry: bool,
+}
+
 /// The keys a node is erasing, records and pointers apart, and the keys it
 /// lately answered "present" for.
 #[derive(Debug, Default)]
 pub struct ErasureGate {
-    /// Each record being erased, with the sync epoch in which it was selected.
-    records: Mutex<HashMap<XorName, u64>>,
+    /// Each record being erased.
+    records: Mutex<HashMap<XorName, Selected>>,
     /// Each pointer being erased, likewise.
-    pointers: Mutex<HashMap<XorName, u64>>,
+    pointers: Mutex<HashMap<XorName, Selected>>,
     /// Each record whose possession check failed, with the sync epoch it
     /// failed in: left out of the selection, so hinted, for
     /// [`RETRY_COOLDOWN_EPOCHS`].
     records_cooling: Mutex<HashMap<XorName, u64>>,
     /// Each pointer whose check failed, likewise.
     pointers_cooling: Mutex<HashMap<XorName, u64>>,
+    /// Each record found ready and given back untried
+    /// ([`Self::release_untried`]): hinted again, but still one the node may
+    /// erase, until a later pass selects it again or it is no longer
+    /// eligible. With whether it was a retry after a failed check.
+    records_given_back: Mutex<HashMap<XorName, bool>>,
+    /// Each pointer given back untried, likewise.
+    pointers_given_back: Mutex<HashMap<XorName, bool>>,
     /// When this node last answered "present" for each key.
     answered: Mutex<AnsweredPresent>,
 }
@@ -107,7 +129,7 @@ struct AnsweredPresent {
 }
 
 impl ErasureGate {
-    fn of(&self, kind: ClockKind) -> &Mutex<HashMap<XorName, u64>> {
+    fn of(&self, kind: ClockKind) -> &Mutex<HashMap<XorName, Selected>> {
         match kind {
             ClockKind::Records => &self.records,
             ClockKind::Pointers => &self.pointers,
@@ -118,6 +140,13 @@ impl ErasureGate {
         match kind {
             ClockKind::Records => &self.records_cooling,
             ClockKind::Pointers => &self.pointers_cooling,
+        }
+    }
+
+    fn given_back_of(&self, kind: ClockKind) -> &Mutex<HashMap<XorName, bool>> {
+        match kind {
+            ClockKind::Records => &self.records_given_back,
+            ClockKind::Pointers => &self.pointers_given_back,
         }
     }
 
@@ -133,39 +162,54 @@ impl ErasureGate {
     /// try them.
     ///
     /// Keys of `kind` no longer eligible leave the set. Eligible keys not yet
-    /// selected are selected, at most `max_new` of them, in order, except
-    /// those whose check failed fewer than [`RETRY_COOLDOWN_EPOCHS`] epochs
-    /// before ([`Self::fail`]), which stay hinted meanwhile. Returns the
-    /// eligible keys selected [`EPOCHS_BEFORE_ERASURE`] or more epochs before,
-    /// in order: those a whole cycle has passed without hinting, which the
-    /// pass may now check and erase.
+    /// selected are selected, in order, while the set of `kind` holds fewer
+    /// than `max_selected`, except those whose check failed fewer than
+    /// [`RETRY_COOLDOWN_EPOCHS`] epochs before ([`Self::fail`]), which stay
+    /// hinted meanwhile. Returns the eligible keys selected
+    /// [`EPOCHS_BEFORE_ERASURE`] or more epochs before, in order: those a
+    /// whole cycle has passed without hinting, which the pass may now check
+    /// and erase. The pass gives back, with [`Self::release_untried`], those
+    /// it then doesn't try.
     pub fn select(
         &self,
         kind: ClockKind,
         eligible: &[XorName],
         epoch: u64,
-        max_new: usize,
+        max_selected: usize,
     ) -> Vec<XorName> {
         let keep: HashSet<&XorName> = eligible.iter().collect();
         let mut cooling = self.cooling_of(kind).lock();
+        let mut cooled = HashSet::new();
         cooling.retain(|key, failed_at| {
-            keep.contains(key) && failed_at.saturating_add(RETRY_COOLDOWN_EPOCHS) > epoch
+            let eligible = keep.contains(key);
+            let cooling = failed_at.saturating_add(RETRY_COOLDOWN_EPOCHS) > epoch;
+            if eligible && !cooling {
+                cooled.insert(*key);
+            }
+            eligible && cooling
         });
+        let mut given_back = self.given_back_of(kind).lock();
+        given_back.retain(|key, _| keep.contains(key));
         let mut selected = self.of(kind).lock();
         selected.retain(|key, _| keep.contains(key));
         let mut ready = Vec::new();
-        let mut added = 0usize;
         for key in eligible {
             match selected.get(key) {
-                Some(at) => {
-                    if at.saturating_add(EPOCHS_BEFORE_ERASURE) <= epoch {
+                Some(entry) => {
+                    if entry.at.saturating_add(EPOCHS_BEFORE_ERASURE) <= epoch {
                         ready.push(*key);
                     }
                 }
                 None => {
-                    if added < max_new && !cooling.contains_key(key) {
-                        selected.insert(*key, epoch);
-                        added += 1;
+                    if selected.len() < max_selected && !cooling.contains_key(key) {
+                        let was_retry = given_back.remove(key).unwrap_or(false);
+                        selected.insert(
+                            *key,
+                            Selected {
+                                at: epoch,
+                                retry: was_retry || cooled.contains(key),
+                            },
+                        );
                     }
                 }
             }
@@ -173,9 +217,36 @@ impl ErasureGate {
         ready
     }
 
-    /// Forget `key` of `kind`: erased, or kept after all.
+    /// Forget `key` of `kind`: erased.
     pub fn release(&self, kind: ClockKind, key: &XorName) {
         self.of(kind).lock().remove(key);
+        self.given_back_of(kind).lock().remove(key);
+    }
+
+    /// Give back the keys of `kind` in `ready` (what [`Self::select`]
+    /// returned) that the pass didn't try, those not in `tried`: deferred for
+    /// lack of audit budget, or left when the pressure ended. They leave the
+    /// set, so they are hinted again until a later pass selects them, and no
+    /// key stays hidden longer than one wait however far the selection runs
+    /// ahead of what a pass can audit. They still count as keys the node may
+    /// erase ([`Self::not_yet_erased`]) until then. Returns how many were
+    /// given back.
+    pub fn release_untried(
+        &self,
+        kind: ClockKind,
+        ready: &[XorName],
+        tried: &HashSet<XorName>,
+    ) -> usize {
+        let mut given_back = self.given_back_of(kind).lock();
+        let mut selected = self.of(kind).lock();
+        let mut count = 0usize;
+        for key in ready.iter().filter(|key| !tried.contains(*key)) {
+            if let Some(entry) = selected.remove(key) {
+                given_back.insert(*key, entry.retry);
+                count += 1;
+            }
+        }
+        count
     }
 
     /// `key` of `kind` failed its possession check at sync epoch `epoch`: its
@@ -199,19 +270,26 @@ impl ErasureGate {
         self.records.lock().len() + self.pointers.lock().len()
     }
 
-    /// How many of the keys being erased, of both kinds, are still waiting at
-    /// `epoch` for their first erasure: selected fewer than
-    /// [`EPOCHS_BEFORE_ERASURE`] epochs before, so no pass has tried them yet.
-    /// A node with any is not full: it has copies it may still give up.
+    /// How many keys of both kinds are selected or given back untried and not
+    /// yet erased, other than those selected again after a failed possession
+    /// check: still in their wait, ready and kept (answered "present" lately,
+    /// or tried and kept), or deferred by a pass. A node with any is not
+    /// full: it has copies it may still give up. A key retried after a failed
+    /// check is tried again later, and doesn't keep a node from being full;
+    /// nor does an eligible key the set had no room for, since the set is
+    /// then full of keys that do.
     #[must_use]
-    pub fn waiting_at(&self, epoch: u64) -> usize {
-        let count = |map: &Mutex<HashMap<XorName, u64>>| {
-            map.lock()
-                .values()
-                .filter(|at| at.saturating_add(EPOCHS_BEFORE_ERASURE) > epoch)
-                .count()
+    pub fn not_yet_erased(&self) -> usize {
+        let selected = |map: &Mutex<HashMap<XorName, Selected>>| {
+            map.lock().values().filter(|entry| !entry.retry).count()
         };
-        count(&self.records) + count(&self.pointers)
+        let given_back = |map: &Mutex<HashMap<XorName, bool>>| {
+            map.lock().values().filter(|retry| !**retry).count()
+        };
+        selected(&self.records)
+            + selected(&self.pointers)
+            + given_back(&self.records_given_back)
+            + given_back(&self.pointers_given_back)
     }
 
     /// Note that this node answered "present" for `key` at `now`.
@@ -472,13 +550,16 @@ mod tests {
         assert!(gate.is_being_erased(&key(1)));
         // The same epoch again: still not ready.
         assert_eq!(gate.select(R, &eligible, 5, 10), Vec::<XorName>::new());
-        assert_eq!(gate.waiting_at(5), 3);
+        assert_eq!(gate.not_yet_erased(), 3);
         // The next: the cycle that started as it was selected may have hinted it.
         assert_eq!(gate.select(R, &eligible, 6, 10), Vec::<XorName>::new());
-        assert_eq!(gate.waiting_at(6), 3);
         // The one after: a whole cycle passed without hinting it.
         assert_eq!(gate.select(R, &eligible, 7, 10), eligible);
-        assert_eq!(gate.waiting_at(7), 0, "each is tried at 7");
+        assert_eq!(gate.not_yet_erased(), 3, "ready, not yet erased");
+        for key in &eligible {
+            gate.release(R, key);
+        }
+        assert_eq!(gate.not_yet_erased(), 0, "erased");
     }
 
     #[test]
@@ -519,14 +600,94 @@ mod tests {
     }
 
     #[test]
-    fn at_most_the_budget_is_selected_each_pass() {
+    fn the_set_never_holds_more_than_its_cap() {
         let gate = ErasureGate::default();
         let eligible: Vec<XorName> = (0..10).map(key).collect();
         gate.select(R, &eligible, 1, 4);
         assert_eq!(gate.selected_count(), 4);
         assert_eq!(gate.select(R, &eligible, 2, 4).len(), 0);
-        assert_eq!(gate.selected_count(), 8);
-        assert_eq!(gate.select(R, &eligible, 3, 4).len(), 4);
+        assert_eq!(gate.selected_count(), 4, "no room, none added");
+        assert_eq!(gate.select(R, &eligible, 3, 4), eligible[..4].to_vec());
+        // Two erased, so no longer eligible: room for two more.
+        gate.release(R, &key(0));
+        gate.release(R, &key(1));
+        gate.select(R, &eligible[2..], 3, 4);
+        assert_eq!(gate.selected_count(), 4);
+        assert!(gate.is_being_erased(&key(4)) && gate.is_being_erased(&key(5)));
+    }
+
+    /// N eligible keys, a pass able to audit only A < N of them: no more than
+    /// the cap is ever hidden, the keys a pass found ready but didn't try are
+    /// hinted again at once, and every key is tried in its turn.
+    #[test]
+    fn keys_a_pass_cannot_audit_are_hinted_again() {
+        const N: u8 = 100;
+        const A: usize = 7;
+        const CAP: usize = 16;
+        let gate = ErasureGate::default();
+        let mut eligible: Vec<XorName> = (0..N).map(key).collect();
+        let mut tried_ever = HashSet::new();
+        for epoch in 1..200u64 {
+            let ready = gate.select(R, &eligible, epoch, CAP);
+            assert!(gate.selected_of(R) <= CAP, "at most the cap hidden");
+            let hidden = eligible
+                .iter()
+                .filter(|key| gate.is_being_erased(key))
+                .count();
+            assert!(hidden <= CAP, "epoch {epoch}: {hidden} hidden");
+            // The pass audits the first A ready keys; each is erased.
+            let tried: HashSet<XorName> = ready.iter().take(A).copied().collect();
+            gate.release_untried(R, &ready, &tried);
+            for key in ready.iter().skip(A) {
+                assert!(!gate.is_being_erased(key), "deferred, hinted again");
+            }
+            if ready.len() > A {
+                assert!(gate.not_yet_erased() > 0, "deferred keys still owed");
+            }
+            for key in &tried {
+                gate.release(R, key);
+                tried_ever.insert(*key);
+            }
+            eligible.retain(|key| !tried.contains(key));
+        }
+        assert_eq!(tried_ever.len(), usize::from(N), "every key tried");
+        assert_eq!(gate.not_yet_erased(), 0);
+    }
+
+    /// A key ready but deferred, or kept after an answer of "present", keeps
+    /// the node from being full; one retried after a failed check doesn't;
+    /// with nothing left, the count is zero.
+    #[test]
+    fn what_keeps_a_node_from_being_full() {
+        let gate = ErasureGate::default();
+        let eligible = vec![key(1), key(2), key(3)];
+        gate.select(R, &eligible, 1, 10);
+        let ready = gate.select(R, &eligible, 3, 10);
+        assert_eq!(ready, eligible);
+        // key(1) tried and kept (answered "present"); key(2) failed; key(3)
+        // deferred for lack of budget.
+        let tried: HashSet<XorName> = [key(1), key(2)].into_iter().collect();
+        assert_eq!(gate.release_untried(R, &ready, &tried), 1);
+        gate.fail(R, &key(2), 3);
+        assert!(!gate.is_being_erased(&key(3)), "deferred: hinted");
+        assert_eq!(gate.not_yet_erased(), 2, "kept and deferred");
+        gate.release(R, &key(1));
+        assert_eq!(gate.not_yet_erased(), 1, "the deferred one");
+        // The deferred one leaves eligibility: nothing is owed.
+        gate.select(R, &[key(2)], 4, 10);
+        assert_eq!(gate.not_yet_erased(), 0, "key(2) cooling");
+        // key(2) is selected again after its cooldown: a retry, not owed.
+        gate.select(R, &[key(2)], 3 + RETRY_COOLDOWN_EPOCHS, 10);
+        assert!(gate.is_being_erased(&key(2)));
+        assert_eq!(gate.not_yet_erased(), 0, "a retry doesn't block full");
+        // Deferred as a retry, it stays a retry.
+        let ready = gate.select(R, &[key(2)], 5 + RETRY_COOLDOWN_EPOCHS, 10);
+        assert_eq!(ready, vec![key(2)]);
+        gate.release_untried(R, &ready, &HashSet::new());
+        assert_eq!(gate.not_yet_erased(), 0);
+        gate.select(R, &[key(2)], 6 + RETRY_COOLDOWN_EPOCHS, 10);
+        assert!(gate.is_being_erased(&key(2)));
+        assert_eq!(gate.not_yet_erased(), 0);
     }
 
     #[test]

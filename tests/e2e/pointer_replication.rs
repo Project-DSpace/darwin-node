@@ -1441,3 +1441,148 @@ async fn a_stand_in_for_full_peers_takes_a_pointer_hint() {
 
     harness.teardown().await.expect("teardown");
 }
+
+/// A node's answer to a quote request through its own request handler, as a
+/// client's quote arrives.
+async fn quote_through(
+    node: &TestNode,
+    address: XorName,
+    data_type: u32,
+    data_size: u64,
+) -> ant_node::ant_protocol::ChunkQuoteResponse {
+    use ant_node::ant_protocol::ChunkQuoteRequest;
+    let message = ChunkMessage {
+        request_id: 7,
+        body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+            address,
+            data_size,
+            data_type,
+        }),
+    };
+    let reply = node
+        .ant_protocol
+        .as_ref()
+        .expect("protocol")
+        .try_handle_request(&message.encode().expect("encode"))
+        .await
+        .expect("handle")
+        .expect("answered");
+    match ChunkMessage::decode(&reply).expect("decode").body {
+        ChunkMessageBody::QuoteResponse(response) => response,
+        other => panic!("expected a quote response, got {other:?}"),
+    }
+}
+
+/// A pointer update near full nodes, over each node's real quote path: with
+/// 3 of the 7 nearest full and not holding the pointer, only 4 quote, fewer
+/// than the 5 of 7 a pointer write needs, so a client stops before paying
+/// (the stop itself is client release 1b's); with the same 3 full but
+/// holding it, all 7 quote the update, and it goes through.
+#[tokio::test]
+#[serial]
+async fn a_pointer_update_near_full_nodes_is_quoted_only_by_those_that_can_take_it() {
+    use ant_node::ant_protocol::ChunkQuoteResponse;
+    use ant_node::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
+    use ant_node::storage::FullTrigger;
+
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let record = signed(&pk, &sk, 1, 1);
+    let nearest: Vec<PeerId> = harness
+        .test_node(0)
+        .expect("node")
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&record.address(), 7)
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .collect();
+    assert_eq!(nearest.len(), 7);
+    let index_of = |peer: &PeerId| {
+        (0..harness.node_count())
+            .find(|i| {
+                harness
+                    .test_node(*i)
+                    .is_some_and(|node| self::peer(node) == *peer)
+            })
+            .expect("a node of the harness")
+    };
+    let group: Vec<usize> = nearest.iter().map(index_of).collect();
+    let chunks = |index: usize| {
+        harness
+            .test_node(index)
+            .expect("node")
+            .ant_protocol
+            .as_ref()
+            .expect("protocol")
+            .storage()
+    };
+    let quoting = |answers: &[ChunkQuoteResponse]| {
+        answers
+            .iter()
+            .filter(|answer| matches!(answer, ChunkQuoteResponse::Success { .. }))
+            .count()
+    };
+    let ask_all = || async {
+        let mut answers = Vec::new();
+        for index in &group {
+            answers.push(
+                quote_through(
+                    harness.test_node(*index).expect("node"),
+                    record.address(),
+                    DATA_TYPE_POINTER,
+                    POINTER_WIRE_LEN as u64,
+                )
+                .await,
+            );
+        }
+        answers
+    };
+
+    // Held by the four not full; three full nodes that don't hold it.
+    for index in &group[3..] {
+        store(harness.test_node(*index).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("stored");
+    }
+    for index in &group[..3] {
+        chunks(*index).set_full_for_test(Some(FullTrigger::Bytes));
+    }
+    let answers = ask_all().await;
+    assert_eq!(
+        quoting(&answers),
+        4,
+        "only the 4 not full quote: {answers:?}"
+    );
+    for answer in &answers[..3] {
+        assert!(
+            matches!(answer, ChunkQuoteResponse::Error(_)),
+            "a full node that doesn't hold the pointer prices no new data: {answer:?}"
+        );
+    }
+
+    // The three full nodes now hold it: they quote its update too.
+    for index in &group[..3] {
+        store(harness.test_node(*index).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("stored");
+    }
+    let answers = ask_all().await;
+    assert_eq!(
+        quoting(&answers),
+        7,
+        "a full holder quotes an update of what it holds: {answers:?}"
+    );
+    for index in &group[..3] {
+        chunks(*index).set_full_for_test(None);
+    }
+
+    harness.teardown().await.expect("teardown");
+}

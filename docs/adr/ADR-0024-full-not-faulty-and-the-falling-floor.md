@@ -91,6 +91,12 @@ back. It is not selected again for 3 sync epochs (one whole cycle plus the two o
 two-phase wait), so it is hinted for at least a whole cycle before it is hidden and tried
 again.
 
+The selection holds at most 1,024 records and 1,024 pointers, what one pass may audit at
+most. A record found ready that the pass doesn't try, for lack of audit requests or because
+the pressure ended first, leaves the selection too and is hinted again until a later pass
+selects it, so no record stays unhinted for longer than its own wait however far the
+selection runs ahead of what a pass can audit.
+
 ### Out-of-range clocks that survive restarts
 
 Each held record's and pointer's out-of-range start time is kept in wall-clock seconds in
@@ -101,8 +107,9 @@ missing or unreadable table starts every clock now, as before.
 ### Full, not faulty
 
 A node is **full** when it is at the full line and its last prune passes, at the floor's
-last step, erased nothing and left nothing selected for erasure untried: a record
-whose possession check failed is tried again later, and doesn't keep a node from being
+last step, erased nothing and left nothing selected for erasure and not yet erased
+(in its wait, deferred by a pass, or kept after an answer of "present"): a record retried
+after a failed possession check is tried again later, and doesn't keep a node from being
 full. Then it:
 
 - prices no new data: a quote for data it doesn't hold is refused with the existing
@@ -116,7 +123,9 @@ full. Then it:
   format, real digests for held keys and the absent digest for others;
 - tells its peers with a one-way `FullNotice`, appended to the replication messages and
   sent only to peers whose user agent names the release that reads it, or that sent one
-  themselves, renewed every 10 minutes while it stays full;
+  themselves, renewed every 10 minutes while it stays full; a peer once found to read it
+  is remembered (at most 4,096) until it leaves the routing table, so a renewal still
+  reaches it while it is disconnected;
 - logs one line on entering ("Node full: since <unix seconds>") and one on leaving;
 - leaves "full" only with 256 MiB of free bytes above the line (and, where inodes are
   counted, 65,536 inodes above their line), so the state doesn't flap.
@@ -136,9 +145,11 @@ full. Then it:
   holds fewer than 7 not marked full, and 6 proofs are still needed from the 20: peers
   announcing themselves full never lower the bar. Only a routing table that knows fewer
   peers than the close group (a tiny network) lowers it, as before.
-- The possession check after a write doesn't charge a stand-in beyond the 9 nearest for
-  answering that it lacks the record: a receiver that doesn't widen (an older node, or one
-  without the same marks) rightly refused the offer. Any other failure is charged.
+- The possession check after a write probes only the 9 nearest, as before: stand-ins
+  beyond them are offered the record but not possession-checked, since a receiver that
+  doesn't widen (an older node, or one without the same marks) rightly refuses the offer.
+  Nothing is waived for them, and a stand-in that does take the record is, by intent, not
+  recorded as seen holding it.
 
 ### The one waiver of the unheld-chunk penalty (amends ADR-0022)
 

@@ -3,9 +3,9 @@
 //!
 //! A node is full when it is at the full line and its last prune passes, at
 //! the falling floor's last step, erased nothing and left nothing selected for
-//! erasure untried (see [`super::retention`], [`after_passes`]). A full
-//! node keeps serving and proving what it holds, prices no new data, refuses
-//! every new record, and tells its peers with a one-way "full" notice
+//! erasure and not yet erased (see [`super::retention`], [`after_passes`]).
+//! A full node keeps serving and proving what it holds, prices no new data,
+//! refuses every new record, and tells its peers with a one-way "full" notice
 //! ([`FullNotice`]), renewed while it stays full. Its audit and possession
 //! replies keep their format: real digests for the keys it holds, the absent
 //! digest for the keys it lacks.
@@ -159,12 +159,13 @@ pub fn widened_len<T>(nearest: &[T], base: usize, is_full: impl Fn(&T) -> bool) 
 }
 
 /// The peers marked full from their own notices, and the peers known to read
-/// the notice because they sent one.
+/// the notice: they sent one, or their user agent was once seen naming a
+/// release that reads it.
 #[derive(Debug, Default)]
 pub struct FullMarks {
     /// When each peer marked full last sent its notice.
     marks: Mutex<HashMap<PeerId, Instant>>,
-    /// Peers that sent a notice, full or not, so read the notice.
+    /// Peers known to read the notice, with when that was last seen.
     readers: Mutex<HashMap<PeerId, Instant>>,
 }
 
@@ -211,7 +212,15 @@ impl FullMarks {
         self.marked(now).into_iter().collect()
     }
 
-    /// Whether `peer` has sent a notice, and so reads one.
+    /// Note that `peer` reads the notice, from its user agent seen at `now`:
+    /// it stays a reader while disconnected, when its user agent can't be
+    /// read, until it leaves the routing table ([`Self::forget`]).
+    pub fn note_reader(&self, peer: PeerId, now: Instant) {
+        insert_bounded(&mut self.readers.lock(), peer, now, MAX_KNOWN_READERS);
+    }
+
+    /// Whether `peer` is known to read the notice: it sent one, or its user
+    /// agent was seen naming a release that reads it.
     #[must_use]
     pub fn sent_a_notice(&self, peer: &PeerId) -> bool {
         self.readers.lock().contains_key(peer)
@@ -719,12 +728,13 @@ pub const FULL_NOTICE_PEERS: usize = 2 * crate::replication::config::K_BUCKET_SI
 /// After a node's prune passes of one epoch, enter or leave "full".
 ///
 /// A node enters "full" at the line when the passes ran at the falling
-/// floor's last step, erased nothing (`erased`) and left no record selected
-/// for erasure waiting for its first try (`waiting`, see
-/// [`super::erasure::ErasureGate::waiting_at`]): nothing it may erase now is
+/// floor's last step, erased nothing (`erased`) and left no key selected for
+/// erasure and not yet erased (`not_yet_erased`, see
+/// [`super::erasure::ErasureGate::not_yet_erased`]): still in its wait,
+/// deferred, answered "present" lately or kept. Nothing it may erase now is
 /// left. Records still in their out-of-range wait aren't eligible, and one
-/// whose possession check failed is tried again later, so neither keeps a
-/// node from being full. It leaves only with
+/// retried after a failed possession check is tried again later, so neither
+/// keeps a node from being full. It leaves only with
 /// [`LEAVE_FULL_MARGIN`](crate::replication::retention::LEAVE_FULL_MARGIN) of
 /// room above the line. Returns the new state when it changed; the caller
 /// tells the node's peers.
@@ -732,7 +742,7 @@ pub fn after_passes(
     storage: &crate::storage::ChunkStore,
     retention: &crate::replication::retention::DiskRetention,
     erased: usize,
-    waiting: usize,
+    not_yet_erased: usize,
 ) -> Option<bool> {
     if storage.is_full() {
         return leave_if_room(storage, retention);
@@ -740,7 +750,7 @@ pub fn after_passes(
     let trigger = retention.at_the_line()?;
     if retention.step() != Some(crate::replication::retention::LAST_FLOOR_STEP)
         || erased > 0
-        || waiting > 0
+        || not_yet_erased > 0
     {
         return None;
     }
@@ -797,8 +807,11 @@ pub fn leave_if_room(
 /// Tell this node's nearest peers that read it whether it is full.
 ///
 /// Its [`FULL_NOTICE_PEERS`] nearest, each only if its user agent names a
-/// release that reads the notice, or it sent one itself. One-way. Returns how
-/// many were told.
+/// release that reads the notice, or it is already known to read it (it sent
+/// one, or its user agent did so before). A peer found to read it is
+/// remembered, so a renewal still reaches it while it is disconnected and its
+/// user agent can't be read (sending dials it). One-way. Returns how many
+/// were told.
 pub async fn send_full_notice(p2p_node: &saorsa_core::P2PNode, full: bool) -> usize {
     use crate::replication::config::REPLICATION_PROTOCOL_ID;
     use crate::replication::protocol::{ReplicationMessage, ReplicationMessageBody};
@@ -829,6 +842,7 @@ pub async fn send_full_notice(p2p_node: &saorsa_core::P2PNode, full: bool) -> us
         if !reads {
             continue;
         }
+        view.marks.note_reader(peer, Instant::now());
         if p2p_node
             .send_message(&peer, REPLICATION_PROTOCOL_ID, bytes.clone(), &[])
             .await
@@ -933,6 +947,24 @@ mod tests {
         marks.note_notice(a, false, now + freshness);
         assert!(!marks.is_marked(&a, now + freshness));
         assert!(marks.sent_a_notice(&a));
+    }
+
+    /// A peer whose user agent was once seen to read the notice stays a
+    /// reader without sending one, and isn't marked full by it; it stops
+    /// being one when it leaves the routing table.
+    #[test]
+    fn a_reader_seen_by_its_user_agent_is_remembered_until_forgotten() {
+        let marks = FullMarks::default();
+        let now = Instant::now();
+        assert!(!marks.sent_a_notice(&peer(1)));
+        marks.note_reader(peer(1), now);
+        assert!(marks.sent_a_notice(&peer(1)));
+        assert!(
+            !marks.is_marked(&peer(1), now),
+            "a reader isn't marked full"
+        );
+        marks.forget(&peer(1));
+        assert!(!marks.sent_a_notice(&peer(1)));
     }
 
     /// A peer that left the routing table loses its mark and its place among

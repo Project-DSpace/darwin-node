@@ -1240,8 +1240,7 @@ impl PointerReplication {
     /// back each round if they are dropped meanwhile. It still repairs those
     /// it holds: a newer state of a held pointer takes no new space.
     fn may_repair_address(&self, address: &XorName) -> bool {
-        self.store.state(address).is_some()
-            || self.chunks.capacity_verdict() != CapacityVerdict::Full
+        repairs_pointer(self.store.state(address).is_some(), &self.chunks)
     }
 
     /// Verify and fetch whatever is due now. Also the tests' way to drive it.
@@ -2120,7 +2119,8 @@ impl PointerReplication {
             candidates,
         );
         // Two phases: selected first and named in no hint, erased only in a
-        // pass of a later epoch.
+        // pass of a later epoch. The ready pointers this pass then doesn't
+        // try, left when the pressure ends, are given back below.
         let gate = erasure_epoch.map(|epoch| (super::erasure::gate_for(&self_id), epoch));
         let ordered = match &gate {
             Some((gate, epoch)) => {
@@ -2141,6 +2141,7 @@ impl PointerReplication {
             }
             None => ordered,
         };
+        let ready: Vec<XorName> = ordered.iter().map(|state| state.address).collect();
         let outcomes = retention::erase_while_under_pressure(
             disk_retention,
             ordered,
@@ -2157,6 +2158,10 @@ impl PointerReplication {
             },
         )
         .await;
+        if let Some((gate, _)) = &gate {
+            let tried: HashSet<XorName> = outcomes.iter().map(|(address, _)| *address).collect();
+            gate.release_untried(super::erasure::ClockKind::Pointers, &ready, &tried);
+        }
         for (address, erasure) in outcomes {
             match erasure {
                 PointerErasure::Erased => {
@@ -2406,6 +2411,14 @@ where
     None
 }
 
+/// Whether a node whose chunk store is `chunks` may look for a newer state of
+/// a pointer, `held` or not (see `PointerReplication::may_repair_address`):
+/// always for one it holds, and for another only while it isn't at the line
+/// or full.
+fn repairs_pointer(held: bool, chunks: &ChunkStore) -> bool {
+    held || chunks.capacity_verdict() != CapacityVerdict::Full
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -2437,6 +2450,31 @@ mod tests {
         let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[3; 32]);
         let target = PointerTarget::new(PointerTargetKind::Chunk, [target; 32]);
         Pointer::sign(&sk, &pk, counter, target).expect("sign")
+    }
+
+    /// A full node repairs a pointer it holds (a newer state takes no new
+    /// space) and doesn't fetch one it doesn't hold; once no longer full, it
+    /// fetches both.
+    #[tokio::test]
+    async fn a_full_node_repairs_a_held_pointer_and_fetches_no_unheld_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunks = ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: false,
+            disk_reserve: 0,
+        })
+        .await
+        .expect("chunk store");
+        assert!(repairs_pointer(true, &chunks));
+        assert!(repairs_pointer(false, &chunks));
+        chunks.set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+        assert!(repairs_pointer(true, &chunks), "a held pointer is repaired");
+        assert!(
+            !repairs_pointer(false, &chunks),
+            "an unheld pointer isn't fetched"
+        );
+        chunks.set_full_for_test(None);
+        assert!(repairs_pointer(false, &chunks), "no longer full");
     }
 
     #[tokio::test(start_paused = true)]

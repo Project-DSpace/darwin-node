@@ -134,8 +134,11 @@ pub(crate) async fn send_fresh_offers(
     // The stand-ins: past the unwidened storage admission width (9 nearest,
     // the node itself counted), where a receiver that doesn't widen (an
     // older node, or one without the same marks) rightly refuses the offer.
-    // The possession check doesn't charge them for not holding the record.
-    let stand_ins = stand_ins_of(&widened, ctx.config.close_group_size);
+    // They are offered the record but not possession-checked, as no peer
+    // past the 9 nearest was before: nothing is waived for them, and one
+    // that does take the record is, by intent, not recorded as seen holding
+    // it.
+    let checked_peers = possession_checked(&widened, &self_id, ctx.config.close_group_size);
     let target_peers: Vec<PeerId> = widened
         .into_iter()
         .filter(|peer| *peer != self_id)
@@ -219,28 +222,34 @@ pub(crate) async fn send_fresh_offers(
     );
 
     // Schedule the delayed possession check (ADR-0003) for the responsible
-    // close-group peers. A closed receiver (engine shutting down) is ignored.
-    if !target_peers.is_empty() {
+    // close-group peers, the stand-ins left out. A closed receiver (engine
+    // shutting down) is ignored.
+    if !checked_peers.is_empty() {
         ctx.dispatched.fetch_add(1, Ordering::Relaxed);
         let _ = ctx.possession_check_tx.send(PossessionCheckEvent {
             key: *key,
-            peers: target_peers,
+            peers: checked_peers,
             paid_quote_issuers,
-            stand_ins,
         });
     }
 }
 
 /// The peers of `widened`, a key's close group widened past the peers marked
-/// full (nearest first, this node included), beyond the unwidened storage
-/// admission width: the stand-ins for full peers, which a receiver that
-/// doesn't widen refuses.
-fn stand_ins_of(widened: &[PeerId], close_group_size: usize) -> Vec<PeerId> {
+/// full (nearest first, this node included), that the possession check
+/// probes: those inside the unwidened storage admission width, this node
+/// left out. The stand-ins beyond it, which a receiver that doesn't widen
+/// refuses, are offered the record but not checked.
+fn possession_checked(
+    widened: &[PeerId],
+    self_id: &PeerId,
+    close_group_size: usize,
+) -> Vec<PeerId> {
     widened
         .iter()
-        .skip(crate::replication::config::storage_admission_width(
+        .take(crate::replication::config::storage_admission_width(
             close_group_size,
         ))
+        .filter(|peer| *peer != self_id)
         .copied()
         .collect()
 }
@@ -302,13 +311,22 @@ mod tests {
     use super::*;
 
     /// Ranks 1 to 9 of the widened group are inside every receiver's
-    /// admission width; ranks 10 and beyond are stand-ins.
+    /// admission width and are possession-checked; ranks 10 and beyond are
+    /// stand-ins, offered the record but not checked. The node itself is
+    /// never checked.
     #[test]
-    fn the_stand_ins_are_the_peers_past_the_nine_nearest() {
+    fn only_the_nine_nearest_are_possession_checked_and_stand_ins_are_not() {
         let peers: Vec<PeerId> = (1..=12u8).map(|n| PeerId::from_bytes([n; 32])).collect();
-        assert_eq!(stand_ins_of(&peers, 7), peers[9..].to_vec());
-        assert_eq!(stand_ins_of(&peers[..9], 7), Vec::<PeerId>::new());
-        assert_eq!(stand_ins_of(&peers[..7], 7), Vec::<PeerId>::new());
+        let outside = PeerId::from_bytes([0xEE; 32]);
+        assert_eq!(possession_checked(&peers, &outside, 7), peers[..9].to_vec());
+        assert_eq!(
+            possession_checked(&peers[..7], &outside, 7),
+            peers[..7].to_vec()
+        );
+        // This node at rank 3: the other eight of the nine nearest.
+        let mut expected = peers[..9].to_vec();
+        expected.remove(2);
+        assert_eq!(possession_checked(&peers, &peers[2], 7), expected);
     }
 
     /// The permit is released with the last handle to the encoded offer, not

@@ -2213,25 +2213,10 @@ impl ReplicationEngine {
         peers: Vec<PeerId>,
         paid_quote_issuers: Option<Vec<PeerId>>,
     ) {
-        self.run_possession_check_now_with(key, peers, paid_quote_issuers, Vec::new())
-            .await;
-    }
-
-    /// Test-only: [`Self::run_possession_check_now_paid`] with `stand_ins`,
-    /// the peers of `peers` beyond the unwidened storage admission width.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub async fn run_possession_check_now_with(
-        &self,
-        key: XorName,
-        peers: Vec<PeerId>,
-        paid_quote_issuers: Option<Vec<PeerId>>,
-        stand_ins: Vec<PeerId>,
-    ) {
         possession::run_possession_check(
             key,
             peers,
             paid_quote_issuers.as_deref(),
-            &stand_ins,
             &self.p2p_node,
             &self.storage,
             &self.config,
@@ -2874,7 +2859,6 @@ impl ReplicationEngine {
                                         event.key,
                                         event.peers,
                                         event.paid_quote_issuers.as_deref(),
-                                        &event.stand_ins,
                                         &p2p,
                                         &storage,
                                         &config,
@@ -3917,8 +3901,10 @@ impl ReplicationEngine {
                     () = shutdown.cancelled() => break,
                     erased = passes => erased,
                 };
-                let waiting = erasure_gate.waiting_at(epoch);
-                if let Some(full) = full::after_passes(&storage, &disk_retention, erased, waiting) {
+                let not_yet_erased = erasure_gate.not_yet_erased();
+                if let Some(full) =
+                    full::after_passes(&storage, &disk_retention, erased, not_yet_erased)
+                {
                     full::send_full_notice(&p2p, full).await;
                 }
                 if let Some(clocks) = &clocks {

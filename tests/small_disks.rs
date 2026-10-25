@@ -24,6 +24,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use ant_node::replication::erasure::{ClockKind, ErasureGate};
 use ant_node::replication::full;
 use ant_node::replication::retention::{
     step_clamp, DiskRetention, FLOOR_STEPS, LAST_FLOOR_STEP, LEAVE_FULL_INODE_MARGIN,
@@ -33,6 +34,7 @@ use ant_node::storage::{
     ChunkStore, ChunkStoreConfig, FullTrigger, XorName, DEFAULT_DISK_RESERVE, GIB, MIB,
 };
 use ant_node::test_seams::FREE_SPACE_FILE;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -213,10 +215,30 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
                 assert_eq!(full::after_passes(&node.store, &node.retention, 0, 3), None);
                 assert!(!node.store.is_full(), "{what}");
             }
+            // A key found ready but deferred for lack of audit budget, hinted
+            // again meanwhile, still keeps the node from being full.
+            let gate = ErasureGate::default();
+            let deferred = [0xD7; 32];
+            gate.select(ClockKind::Records, &[deferred], 1, 1024);
+            let ready = gate.select(ClockKind::Records, &[deferred], 3, 1024);
+            assert_eq!(ready, vec![deferred]);
+            gate.release_untried(ClockKind::Records, &ready, &HashSet::new());
+            assert!(!gate.is_being_erased(&deferred));
+            for node in &nodes {
+                assert_eq!(
+                    full::after_passes(&node.store, &node.retention, 0, gate.not_yet_erased()),
+                    None,
+                    "{what}"
+                );
+                assert!(!node.store.is_full(), "{what}");
+            }
+            // Once it is no longer eligible, nothing is owed.
+            gate.select(ClockKind::Records, &[], 4, 1024);
+            assert_eq!(gate.not_yet_erased(), 0);
             // Passes at the last step that found nothing: full.
             for node in &nodes {
                 assert_eq!(
-                    full::after_passes(&node.store, &node.retention, 0, 0),
+                    full::after_passes(&node.store, &node.retention, 0, gate.not_yet_erased()),
                     Some(true),
                     "{what}"
                 );
