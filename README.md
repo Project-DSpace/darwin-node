@@ -226,7 +226,10 @@ never ran.
   of retired folders reaches, ds.15's included, so nothing deletes them.
   Every node gets the image marker, the commit the image is built from, in
   `ANT_IMAGE_VERSION`, from the manager's environment only. The smoke test
-  checks all of it: on a nearly full 1.5 GB disk nothing is evicted or
+  checks all of it: a node that exits as one does after installing an
+  upgrade is started again at once on its new binary, and one that is
+  killed is started again after a crash, each with its id, port and
+  identity; on a nearly full 1.5 GB disk nothing is evicted or
   deleted, a `/data` written by ds.15's image keeps every node's id, port,
   data and identity, and ds.15's image started again on a `/data` this
   image wrote keeps every folder set aside. `tests/darwin_image.rs` pins

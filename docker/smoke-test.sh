@@ -15,7 +15,11 @@
 # start and join, and each names DARWIN's token and vault and only its RPC's
 # host when it starts; every node gets the image marker, which the registry
 # never holds; browser addresses are published on the fixed
-# ports; a restart keeps node identities and starts the nodes again; the
+# ports; a node that exits with code 0 once its binary reports another
+# version, as after installing an upgrade, is started again at once on the
+# new binary, with the new version recorded, and a node that is killed is
+# started again after a crash, each with its id, port, identity and image
+# marker; a restart keeps node identities and starts the nodes again; the
 # previous image's /data/node-<port> layout is taken over with identities
 # kept; lowering NODE_COUNT retires a node; retired data is deleted at a start
 # 4 or more days after its retirement, however long it sat unchanged before;
@@ -75,14 +79,33 @@ wait_for() { # container pattern [count] [seconds]
 peer_ids() { sudo sh -c "cat $1/nodes/node-*/webrtc-direct.multiaddr" 2>/dev/null | sed 's#.*/p2p/##' | sort | tr '\n' ' '; }
 registry() { sudo jq -r "$2" "$1/manager/ant/node_registry.json"; }
 # The image marker in the environment of each node process in a container,
-# one line a node.
+# one line a node. Read as the nodes' user (PUID): a process's environment is
+# readable by its own user, and by root only with CAP_SYS_PTRACE, which
+# containers don't get by default.
 node_markers() {
-    docker exec "$1" sh -c 'for pid in $(pgrep -x ant-node); do tr "\0" "\n" < /proc/$pid/environ | grep "^ANT_IMAGE_VERSION=" || echo none; done'
+    docker exec -u "$(id -u):$(id -g)" "$1" \
+        sh -c 'for pid in $(pgrep -x ant-node); do tr "\0" "\n" < /proc/$pid/environ | grep "^ANT_IMAGE_VERSION=" || echo none; done'
 }
 has_marker() { # container nodes
     local markers
     markers=$(node_markers "$1")
     [[ "$(grep -c . <<<"$markers")" == "$2" && "$(sort -u <<<"$markers")" == "ANT_IMAGE_VERSION=$MARKER" ]]
+}
+# A field of a node's entry in `nodes status --json`: .status, .pid, .version.
+node_field() { # container node_id field
+    docker exec "$1" nodes status --json | jq -r ".nodes[] | select(.node_id == $2) | $3"
+}
+# Waits until the manager reports a node running in a process other than
+# `pid`, and its browser address file is back.
+restarted() { # container work node_id pid
+    for _ in $(seq 1 45); do
+        if [[ "$(node_field "$1" "$3" .status)" == running && "$(node_field "$1" "$3" .pid)" != "$4" ]] \
+            && sudo test -s "$2/nodes/node-$3/webrtc-direct.multiaddr"; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
 }
 # A file put in each node folder under a /data, to see that none is deleted,
 # and how many of them are there.
@@ -170,6 +193,61 @@ jq -e '(.nodes | length) == 3 and all(.nodes[]; (.node_id | type) == "number" an
     || fail "the manager's /api/v1/nodes/status changed shape: $api_nodes"
 ids=$(peer_ids "$WORK/smoke")
 echo "peer ids: $ids"
+
+echo "== a node that exits with code 0 once its binary reports another version, as after installing an upgrade, is started again at once with its id, port and identity"
+# The manager runs every node with --stop-on-upgrade: a node that installs an
+# upgrade replaces the binary in its folder and exits with code 0 (on Linux),
+# and the manager starts it again on the new binary, recording the new
+# version. Here node-2's binary is replaced, as an upgrade does, by a script
+# that reports another version and runs the image's node, and the node is
+# stopped with SIGTERM, on which it exits with code 0.
+image_node_version=$(docker exec smoke /opt/ant/ant-node --version | awk '{print $NF}')
+upgraded_version="$image_node_version-smoke"
+printf '#!/bin/sh\nif [ "$1" = --version ]; then echo "ant-node %s"; exit 0; fi\nexec /opt/ant/ant-node "$@"\n' \
+    "$upgraded_version" > "$WORK/upgraded-ant-node"
+port=$(registry "$WORK/smoke" '.nodes["2"].node_port')
+pid=$(node_field smoke 2 .pid) || fail "nodes status --json did not answer"
+[[ "$pid" =~ ^[0-9]+$ ]] || fail "the manager reports no process for node-2: $pid"
+sudo install -m 755 -o "$(id -u)" -g "$(id -g)" "$WORK/upgraded-ant-node" "$WORK/smoke/nodes/node-2/ant-node.new"
+sudo mv -f "$WORK/smoke/nodes/node-2/ant-node.new" "$WORK/smoke/nodes/node-2/ant-node"
+sudo rm -f "$WORK/smoke/nodes/node-2/webrtc-direct.multiaddr"
+docker exec smoke kill -TERM "$pid"
+wait_for smoke '^\[manager\].*node 2: exited with code Some\(0\) and its binary is now .* treating this as an auto-upgrade restart' 1 120 \
+    || fail "node-2 did not exit with code 0 on SIGTERM, or was not started again as an upgrade"
+restarted smoke "$WORK/smoke" 2 "$pid" || fail "node-2 is not running again after its upgrade: $(docker exec smoke nodes status --json | jq -c .nodes)"
+pid=$(node_field smoke 2 .pid) || fail "nodes status --json did not answer"
+docker exec smoke sh -c "tr '\0' ' ' < /proc/$pid/cmdline" | grep -q '^/opt/ant/ant-node ' \
+    || fail "node-2 was not started again on its new binary: $(docker exec smoke sh -c "tr '\0' ' ' < /proc/$pid/cmdline")"
+[[ "$(node_field smoke 2 .version)" == "$upgraded_version" && "$(registry "$WORK/smoke" '.nodes["2"].version')" == "$upgraded_version" ]] \
+    || fail "node-2's new version $upgraded_version was not recorded: $(node_field smoke 2 .version), registry $(registry "$WORK/smoke" '.nodes["2"].version')"
+[[ "$(registry "$WORK/smoke" '.nodes["2"].node_port')" == "$port" ]] || fail "node-2 lost its port on its upgrade"
+[[ "$(peer_ids "$WORK/smoke")" == "$ids" ]] || fail "identities changed on node-2's upgrade: $ids -> $(peer_ids "$WORK/smoke")"
+(( $(count smoke '^\[manager\].*node 2: .*(as a crash|after crash)') == 0 )) \
+    || fail "node-2's upgrade was taken for a crash: $(docker logs smoke 2>&1 | grep -E '^\[manager\].*node 2: ' | tail -5)"
+# Back to the image's binary the same way, so the cases below run on it: the
+# manager records the image's version again.
+docker exec -u "$(id -u):$(id -g)" smoke sh -c \
+    'cp /opt/ant/ant-node /data/nodes/node-2/ant-node.new && mv -f /data/nodes/node-2/ant-node.new /data/nodes/node-2/ant-node'
+sudo rm -f "$WORK/smoke/nodes/node-2/webrtc-direct.multiaddr"
+docker exec smoke kill -TERM "$pid"
+wait_for smoke '^\[manager\].*node 2: exited with code Some\(0\) and its binary is now .* treating this as an auto-upgrade restart' 2 120 \
+    || fail "node-2 was not started again on the image's binary"
+restarted smoke "$WORK/smoke" 2 "$pid" || fail "node-2 is not running again on the image's binary"
+[[ "$(registry "$WORK/smoke" '.nodes["2"].version')" == "$image_node_version" ]] \
+    || fail "node-2's version is $(registry "$WORK/smoke" '.nodes["2"].version'), not the image's $image_node_version"
+[[ "$(peer_ids "$WORK/smoke")" == "$ids" ]] || fail "identities changed on node-2's second restart"
+
+echo "== a node that is killed is started again after a crash, with its id, port and identity"
+port=$(registry "$WORK/smoke" '.nodes["3"].node_port')
+pid=$(node_field smoke 3 .pid) || fail "nodes status --json did not answer"
+[[ "$pid" =~ ^[0-9]+$ ]] || fail "the manager reports no process for node-3: $pid"
+sudo rm -f "$WORK/smoke/nodes/node-3/webrtc-direct.multiaddr"
+docker exec smoke kill -KILL "$pid"
+wait_for smoke '^\[manager\].*node 3: restarting after crash \(attempt 1\)' 1 60 || fail "node-3 was not restarted after it was killed"
+restarted smoke "$WORK/smoke" 3 "$pid" || fail "node-3 is not running again after it was killed: $(docker exec smoke nodes status --json | jq -c .nodes)"
+[[ "$(registry "$WORK/smoke" '.nodes["3"].node_port')" == "$port" ]] || fail "node-3 lost its port when it was restarted"
+[[ "$(peer_ids "$WORK/smoke")" == "$ids" ]] || fail "identities changed when node-3 was restarted: $ids -> $(peer_ids "$WORK/smoke")"
+has_marker smoke 3 || fail "not every node the manager started again has the image marker: $(node_markers smoke | tr '\n' ' ')"
 
 echo "== restart keeps identities and starts the nodes again"
 docker restart -t 120 smoke >/dev/null

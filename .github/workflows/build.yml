@@ -352,7 +352,9 @@ jobs:
 
       # Runs the image on a small isolated network (never the live one): its
       # network settings and node manager, joining, the token and vault and
-      # the image marker every node gets, browser addresses, restarts, taking
+      # the image marker every node gets, browser addresses, a node started
+      # again on its new binary when it exits after installing an upgrade,
+      # and after a crash, container restarts, taking
       # over the previous image's layout, retiring nodes and keeping their
       # data 3 days, setting unregistered folders aside for good, clean stops,
       # going back to the image before, which keeps every folder set aside, a
