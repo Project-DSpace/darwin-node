@@ -284,21 +284,14 @@ mod tests {
                     let mut buffer = vec![0u8; 4096];
                     let _ = socket.read(&mut buffer).await;
                     let reply = format!(
-                        "HTTP/1.1 200 OK
-content-type: application/json
-content-length: {}
-
-{body}",
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = socket.write_all(reply.as_bytes()).await;
                     let _ = socket.shutdown().await;
                 }
             });
-            let error = payment_chain_id(&url)
-                .await
-                .expect_err(body)
-                .to_string();
+            let error = payment_chain_id(&url).await.expect_err(body).to_string();
             assert!(!error.contains("dummy"), "{body}: {error}");
             assert!(!error.contains(url.as_str()), "{body}: {error}");
         }
