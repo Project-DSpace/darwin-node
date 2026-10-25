@@ -256,8 +256,11 @@ never ran.
   `:latest`, test.yml's test job runs every test: the library and
   binaries, both vendored crates' own tests and every target in `tests/`,
   and build.yml builds the image's node manager with `--locked` from the
-  pinned darwin-client commit, checks the binary, and gives the image its
-  marker.
+  pinned darwin-client commit, once it has checked that the commit is on
+  darwin-client's main, checks the binary, and gives the image its marker.
+  A darwin-client change the image needs lands on darwin-client's main
+  first, merged with its commits kept; the pin then names the commit as it
+  is there.
 - **Three crates are vendored**, each with a `VENDORED.md` saying what it
   is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
   its only change; `vendor/webrtc` is webrtc 0.14.0, whose

@@ -27,9 +27,9 @@
 #   run after a failed need and no step can skip a check;
 # - build.yml's manager job builds the image's node manager, darwin-nodes,
 #   with --locked from the darwin-client commit docker/manager-revision pins,
-#   and checks the binary for Autonomi's addresses and the reset and
-#   log-forwarding routes; its image job needs that job and passes the image
-#   marker;
+#   once it has checked that commit is on darwin-client's main, and checks
+#   the binary for Autonomi's addresses and the reset and log-forwarding
+#   routes; its image job needs that job and passes the image marker;
 # - nothing but release.yml's latest job names the image's :latest tag.
 #
 # A release runs release.yml as it is at the tagged commit, so this can't
@@ -229,6 +229,16 @@ else
             problem "build.yml's manager job must build darwin-nodes with --locked from the commit docker/manager-revision pins, and check the binary (missing: ${line})"
         fi
     done
+    # Only from a commit on darwin-client's main, with main's history to
+    # check it against: a commit only on a branch is lost if the branch is
+    # squashed or rebased into main.
+    for line in \
+        'git -C darwin-client fetch -q --filter=blob:none origin +refs/heads/main:refs/remotes/origin/main' \
+        'if ! git -C darwin-client merge-base --is-ancestor "$revision" refs/remotes/origin/main; then'; do
+        if ! grep -qF -- "${line}" <<<"${manager}"; then
+            problem "build.yml's manager job must check that the commit docker/manager-revision pins is on darwin-client's main (missing: ${line})"
+        fi
+    done
     # The image takes that build, and the commit it is built from as the
     # image marker every node gets.
     if ! needs image "${BUILD}" | grep -qx manager; then
@@ -261,4 +271,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, checks it, and gives the image its marker; only release.yml's latest job moves :latest."
+echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, and gives the image its marker; only release.yml's latest job moves :latest."

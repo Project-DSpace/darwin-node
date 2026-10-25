@@ -199,11 +199,21 @@ jobs:
   # as the node binary is above. darwin-client's tests pin what it leaves out
   # (no reset, no download source, no log forwarding, no eviction); this job
   # checks the binary the image ships.
+  #
+  # The pinned commit must be on darwin-client's main: a commit only on a
+  # branch is lost if that branch is squashed or rebased into main, and
+  # GitHub stops serving it once it is garbage-collected. A darwin-client
+  # change the image needs therefore lands on darwin-client's main first,
+  # merged with its commits kept; then docker/manager-revision and
+  # docker/NOTICE name the commit as it is there, in one darwin-node commit.
   manager:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # main's whole history without file contents (a blobless fetch), to
+      # check the pin is on it; the checkout then fetches the pinned
+      # commit's files.
       - name: Check out the pinned darwin-client
         shell: bash
         run: |
@@ -213,8 +223,13 @@ jobs:
             exit 1
           fi
           git init -q darwin-client
-          git -C darwin-client fetch -q --depth 1 "$repository" "$revision"
-          git -C darwin-client checkout -q FETCH_HEAD
+          git -C darwin-client remote add origin "$repository"
+          git -C darwin-client fetch -q --filter=blob:none origin +refs/heads/main:refs/remotes/origin/main
+          if ! git -C darwin-client merge-base --is-ancestor "$revision" refs/remotes/origin/main; then
+            echo "::error::docker/manager-revision pins $revision, which is not on darwin-client's main: land it there, merged with its commits kept, then pin the commit as it is on main"
+            exit 1
+          fi
+          git -C darwin-client checkout -q "$revision"
           echo "REVISION=$revision" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain

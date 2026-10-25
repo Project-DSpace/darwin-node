@@ -262,6 +262,18 @@ edit "${BUILD}" 'for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v
 expect "the manager's binary checked for less" "build.yml's manager job must build darwin-nodes with --locked"
 
 fresh
+edit "${BUILD}" 'if ! git -C darwin-client merge-base --is-ancestor "$revision" refs/remotes/origin/main; then' \
+    'if false; then'
+expect "the manager built from a commit not checked to be on main" \
+    "build.yml's manager job must check that the commit docker/manager-revision pins is on darwin-client's main"
+
+fresh
+edit "${BUILD}" 'git -C darwin-client fetch -q --filter=blob:none origin +refs/heads/main:refs/remotes/origin/main' \
+    'git -C darwin-client fetch -q --depth 1 origin "$revision"'
+expect "the pin checked without main's history" \
+    "build.yml's manager job must check that the commit docker/manager-revision pins is on darwin-client's main"
+
+fresh
 edit "${BUILD}" '    needs: [linux-x64, manager]' '    needs: linux-x64'
 expect "the image without the manager's build" "build.yml's image job must need the manager job"
 
