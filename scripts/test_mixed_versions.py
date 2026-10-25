@@ -1574,6 +1574,16 @@ def sync_lines(result):
                  f"charged for: {len(sync.get('busy_charged', []))}; hint sets built: "
                  f"{sum(builds.values())}, at most {max(builds.values(), default=0)} in one "
                  "exchange")
+    # A responder keeps repair proofs only for pages a later request showed
+    # arrived, so its one-page exchanges give it none: audits per exchange
+    # measure what that costs, run against run.
+    audits = sum(value for counters in (result.get("audits") or {}).values()
+                 for key, value in counters.items()
+                 if key.startswith(("responsible_audit_", "subtree_audit_")))
+    exchanges = len(paged) + len(sync.get("single", []))
+    per_exchange = f"{audits / exchanges:.3f}" if exchanges else "no exchanges"
+    lines.append(f"  audits made: {audits} over {exchanges} exchange(s), per exchange: "
+                 f"{per_exchange}")
     rollback = result.get("rollback")
     if rollback:
         rolled = rollback["peer_id"]
