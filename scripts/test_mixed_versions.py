@@ -42,11 +42,13 @@ with may come to --new-reason-allowance against them, and no more. The
 devnet's nodes answer no replication, so every release finds them silent:
 penalties on them are reported, not compared. So are the penalties for not
 holding a record whose PUT the node refused; the refused PUTs are compared
-instead, the same way. The penalties one release's nodes charge the
-other's are reported by reason. And the message shapes: each role received
-every message family it received at least SHAPE_FLOOR times in every
-all-old run, and a family that only this tree knows (--new-only-family)
-reached nodes of this tree and no others.
+instead, the same way. The report and summary.json list every count so
+measured, with the highest all-old count, the excess over it and the limit,
+within the limit or not, so a small excess shows before the canary. The
+penalties one release's nodes charge the other's are reported by reason. And
+the message shapes: each role received every message family it received at
+least SHAPE_FLOOR times in every all-old run, and a family that only this
+tree knows (--new-only-family) reached nodes of this tree and no others.
 
 The test-only seams (src/test_seams.rs) are compiled only into builds with the
 `test-utils` feature, which both releases are built with here. The free-space
@@ -814,6 +816,55 @@ def against(bases):
     return f"at most {max(bases)} in the {len(bases)} all-old runs ({', '.join(map(str, bases))})"
 
 
+def is_measured(name, baselines):
+    """Whether a run is measured against the all-old runs: when there is
+    one, every run but those and the full run."""
+    return bool(baselines) and not is_baseline(name) and name != "full"
+
+
+def comparisons(result, baselines, args):
+    """Every count of a run measured against the all-old runs, passing or
+    not: each pair of roles and reason it charged the incumbents or the
+    joiners with ("penalties"), each reason no all-old run charged a role
+    with, counted over every observer ("new reason"), and each role's
+    refused paid PUTs ("refused PUTs"). Each gives the run's count, the
+    all-old runs' counts, the highest of them (0 for a new reason), the
+    excess over it, and the most the run may count; a count over its limit
+    fails the run."""
+    def entry(kind, observer, target, reason, count, bases, most):
+        return {"kind": kind, "observer": observer, "target": target, "reason": reason,
+                "count": count, "all_old": bases, "highest": max(bases),
+                "excess": count - max(bases), "limit": most}
+
+    # The reasons the all-old runs charged each role with, from any
+    # observer: one they never did is a new failure reason.
+    known = {(target, reason) for baseline in baselines
+             for (_, target, reason) in baseline["penalties"]}
+    entries = []
+    new_reasons = {}
+    for key, (count, _) in sorted(result["penalties"].items()):
+        observer, target, reason = key
+        # The devnet's nodes run no replication, so every release's nodes
+        # find them silent: penalties on them, and on the client, are
+        # reported, not compared.
+        if target not in ("incumbent", "joiner"):
+            continue
+        if (target, reason) not in known:
+            new_reasons[(target, reason)] = new_reasons.get((target, reason), 0) + count
+            continue
+        bases = [baseline["penalties"].get(key, (0, 0.0))[0] for baseline in baselines]
+        entries.append(entry("penalties", observer, target, reason, count, bases,
+                             limit(bases, args)))
+    for (target, reason), count in sorted(new_reasons.items()):
+        entries.append(entry("new reason", None, target, reason, count, [0] * len(baselines),
+                             args.new_reason_allowance))
+    for role in ("incumbent", "joiner"):
+        bases = [baseline["refusals"].get(role, 0) for baseline in baselines]
+        entries.append(entry("refused PUTs", None, role, None, result["refusals"].get(role, 0),
+                             bases, limit(bases, args)))
+    return entries
+
+
 def verdicts(results, args):
     """Every failure, as text; empty when every run passed."""
     failures = []
@@ -852,37 +903,22 @@ def verdicts(results, args):
             for family in ("neighbor_sync_request", "neighbor_sync_response"):
                 if families.get(family, 0) == 0:
                     failures.append(f"{name}: the {role}s received no {family}")
-        if not baselines or is_baseline(name) or name == "full":
+        if not is_measured(name, baselines):
             continue
-        # The reasons the all-old runs charged each role with, from any
-        # observer: one they never did is a new failure reason.
-        known = {(target, reason) for baseline in baselines
-                 for (_, target, reason) in baseline["penalties"]}
-        new_reasons = {}
-        for key, (count, _) in sorted(result["penalties"].items()):
-            observer, target, reason = key
-            # The devnet's nodes run no replication, so every release's
-            # nodes find them silent: penalties on them, and on the client,
-            # are reported, not compared.
-            if target not in ("incumbent", "joiner"):
+        for compared in comparisons(result, baselines, args):
+            count, target, reason = compared["count"], compared["target"], compared["reason"]
+            if count <= compared["limit"]:
                 continue
-            if (target, reason) not in known:
-                new_reasons[(target, reason)] = new_reasons.get((target, reason), 0) + count
-                continue
-            bases = [baseline["penalties"].get(key, (0, 0.0))[0] for baseline in baselines]
-            if count > limit(bases, args):
-                failures.append(f"{name}: {count} {reason} penalties by {observer}s on "
-                                f"{target}s, against {against(bases)}")
-        for (target, reason), count in sorted(new_reasons.items()):
-            if count > args.new_reason_allowance:
+            if compared["kind"] == "penalties":
+                failures.append(f"{name}: {count} {reason} penalties by "
+                                f"{compared['observer']}s on {target}s, against "
+                                f"{against(compared['all_old'])}")
+            elif compared["kind"] == "new reason":
                 failures.append(f"{name}: {count} {reason} penalties on {target}s, a new "
                                 f"failure reason: no all-old run charged {target}s with it")
-        for role in ("incumbent", "joiner"):
-            count = result["refusals"].get(role, 0)
-            bases = [baseline["refusals"].get(role, 0) for baseline in baselines]
-            if count > limit(bases, args):
-                failures.append(f"{name}: the {role}s refused {count} paid PUTs, against "
-                                f"{against(bases)}")
+            else:
+                failures.append(f"{name}: the {target}s refused {count} paid PUTs, against "
+                                f"{against(compared['all_old'])}")
         for role in ("incumbent", "joiner"):
             befores = [received_families(baseline, role) for baseline in baselines]
             now = received_families(result, role)
@@ -921,7 +957,10 @@ def report(results, args):
                      f"{ratio}.")
     if baselines:
         lines.append(f"A reason no all-old run charged a role with may come to "
-                     f"{args.new_reason_allowance} against it.")
+                     f"{args.new_reason_allowance} against it. Each mixed run lists every "
+                     f"count measured, with the highest all-old count, the excess over it "
+                     f"and the limit, within the limit or not.")
+    baseline_results = [results[name] for name in baselines]
     for name, result in results.items():
         lines.append(f"\n== {name} ==")
         for role, ran in result["ran"].items():
@@ -936,6 +975,21 @@ def report(results, args):
         refusals = ", ".join(f"{role}s {count}" for role, count in
                              sorted(result["refusals"].items()))
         lines.append(f"paid PUTs refused: {refusals or 'none'}")
+        if is_measured(name, baseline_results):
+            lines.append("measured against the all-old runs (observer -> target, reason: "
+                         "count, highest all-old, excess, limit):")
+            for compared in comparisons(result, baseline_results, args):
+                if compared["kind"] == "penalties":
+                    what = (f"{compared['observer']:>9} -> {compared['target']:<9} "
+                            f"{compared['reason']:<19}")
+                elif compared["kind"] == "new reason":
+                    what = (f"{'any':>9} -> {compared['target']:<9} "
+                            f"{compared['reason'] + ' (new)':<19}")
+                else:
+                    what = f"{'':>9}    {compared['target']:<9} {'refused PUTs':<19}"
+                over = " OVER" if compared["count"] > compared["limit"] else ""
+                lines.append(f"  {what} {compared['count']:>5} {compared['highest']:>5} "
+                             f"{compared['excess']:>+6} {compared['limit']:>5}{over}")
         if result["penalties_on_refusals"]:
             lines.append("penalties for not holding a record whose PUT the node refused:")
             for key, (count, weight) in sorted(result["penalties_on_refusals"].items()):
@@ -1002,6 +1056,14 @@ def summary_json(results, failures, releases, args):
             "stored": [bool(record.get("stored")) for record in result["records"]],
             "full_evidence": result["full_evidence"],
         }
+    baselines = [result for name, result in results.items() if is_baseline(name)]
+    runs = {}
+    for name, result in results.items():
+        runs[name] = plain(result)
+        # Every count measured against the all-old runs, within its limit or
+        # not, so a small excess shows before the canary.
+        if is_measured(name, baselines):
+            runs[name]["comparisons"] = comparisons(result, baselines, args)
     return {
         "releases": releases,
         "measured_against": [name for name in results if is_baseline(name)],
@@ -1009,7 +1071,7 @@ def summary_json(results, failures, releases, args):
                        "penalty_ratio": args.penalty_ratio,
                        "new_reason_allowance": args.new_reason_allowance,
                        "shape_floor": SHAPE_FLOOR, "stall_limit": STALL_LIMIT},
-        "runs": {name: plain(result) for name, result in results.items()},
+        "runs": runs,
         "failures": failures,
         "passed": not failures,
     }

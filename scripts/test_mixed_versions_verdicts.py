@@ -2,8 +2,10 @@
 """Tests the mixed-version harness's verdicts (scripts/test_mixed_versions.py)
 on made-up results: what a mixed run's penalties, refused PUTs and message
 families are measured against, with one all-old run and with several, and
-what counts as a new failure reason. The Test workflow runs it; run it by hand
-with `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
+what counts as a new failure reason; and that the report and summary.json
+list every count measured, with its excess and limit, within the limit or
+not. The Test workflow runs it; run it by hand with
+`python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
 """
 
 import argparse
@@ -34,7 +36,8 @@ def result(penalties=None, refusals=None, families=None):
     return {
         "stalled_seconds": 0, "decode_failures": [], "audits": {}, "records": [],
         "checks": [], "full_evidence": {}, "traffic": traffic, "roles": roles,
-        "releases": {},
+        "releases": {}, "ran": {}, "unanswered": {}, "penalties_on_refusals": {},
+        "penalties_on_full": {}, "between_releases": {},
         "penalties": {key: (count, float(count)) for key, count in (penalties or {}).items()},
         "refusals": refusals or {},
     }
@@ -61,6 +64,96 @@ def expect(name, results, args, failing):
         print(f"FAILED: {name}: {failures}")
     else:
         print(f"ok: {name}")
+
+
+def expect_equal(name, found, wanted):
+    if found != wanted:
+        FAILED.append(name)
+        print(f"FAILED: {name}:")
+        print(f"  found  {found}")
+        print(f"  wanted {wanted}")
+    else:
+        print(f"ok: {name}")
+
+
+def measured(kind, target, reason, count, all_old, limit, observer=None):
+    """One entry of comparisons(), as it should be."""
+    return {"kind": kind, "observer": observer, "target": target, "reason": reason,
+            "count": count, "all_old": all_old, "highest": max(all_old),
+            "excess": count - max(all_old), "limit": limit}
+
+
+def compared_lines(text):
+    """The report's lines of counts measured against the all-old runs, by
+    the run they are in, each split into words."""
+    runs, run, listing = {}, None, False
+    for line in text.splitlines():
+        if line.startswith("== "):
+            run, listing = line.strip("= "), False
+        elif line.startswith("measured against the all-old runs"):
+            listing = True
+            runs[run] = []
+        elif listing and line.startswith("  "):
+            runs[run].append(line.split())
+        else:
+            listing = False
+    return runs
+
+
+def listed(args):
+    """What the report and summary.json say of the counts each run measured
+    against the all-old runs, with two of them, every kind of count present,
+    one within the slack and one over it."""
+    two = {"all-old": result({INCUMBENTS_FAIL: 2, JOINERS_TIME_OUT: 8}, {"incumbent": 4}),
+           "all-old-2": result({INCUMBENTS_FAIL: 9, JOINERS_TIME_OUT: 6}, {"incumbent": 1})}
+    allowance = harness.NEW_REASON_ALLOWANCE
+    slack = harness.PENALTY_SLACK
+    results = {**two,
+               "new-hosts-old": result(
+                   {INCUMBENTS_FAIL: 12, JOINERS_TIME_OUT: 3,
+                    ("joiner", "joiner", "dht_identity_exchange_failed"): allowance - 1,
+                    ("incumbent", "joiner", "dht_identity_exchange_failed"): 1,
+                    ("joiner", "devnet", "application_failure"): 400},
+                   {"incumbent": 5}),
+               "old-hosts-new": result({INCUMBENTS_FAIL: 10 + slack}),
+               "full": result({INCUMBENTS_FAIL: 90})}
+    baselines = [results["all-old"], results["all-old-2"]]
+    expect_equal("every count measured is listed, within the limit or not, with the highest "
+                 "all-old count, the excess and the limit; penalties on the devnet are not",
+                 harness.comparisons(results["new-hosts-old"], baselines, args),
+                 [measured("penalties", "incumbent", "application_failure", 12, [2, 9],
+                           9 + slack, observer="incumbent"),
+                  measured("penalties", "joiner", "connection_timeout", 3, [8, 6], 8 + slack,
+                           observer="joiner"),
+                  measured("new reason", "joiner", "dht_identity_exchange_failed", allowance,
+                           [0, 0], allowance),
+                  measured("refused PUTs", "incumbent", None, 5, [4, 1], 4 + slack),
+                  measured("refused PUTs", "joiner", None, 0, [0, 0], slack)])
+
+    text = harness.report(results, args)
+    lines = compared_lines(text)
+    expect_equal("the report lists the counts of the mixed runs only",
+                 sorted(lines), ["new-hosts-old", "old-hosts-new"])
+    expect_equal("the report lists each count, the highest all-old count, the excess and the "
+                 "limit, a count under the highest with a negative excess",
+                 [line[-4:] for line in lines.get("new-hosts-old", [])],
+                 [["12", "9", "+3", str(9 + slack)], ["3", "8", "-5", str(8 + slack)],
+                  [str(allowance), "0", f"+{allowance}", str(allowance)],
+                  ["5", "4", "+1", str(4 + slack)], ["0", "0", "+0", str(slack)]])
+    expect_equal("the report marks a count over its limit",
+                 [line[-5:] for line in lines.get("old-hosts-new", [])][:1],
+                 [[str(10 + slack), "9", f"+{1 + slack}", str(9 + slack), "OVER"]])
+    expect_equal("the report names a new reason as new, counted over every observer",
+                 [line[:4] for line in lines.get("new-hosts-old", []) if "(new)" in line],
+                 [["any", "->", "joiner", "dht_identity_exchange_failed"]])
+
+    summary = harness.summary_json(results, harness.verdicts(results, args), {}, args)
+    expect_equal("summary.json records the same counts for each mixed run, and none for the "
+                 "all-old runs and the full run",
+                 {name: run.get("comparisons") for name, run in summary["runs"].items()},
+                 {"all-old": None, "all-old-2": None, "full": None,
+                  "new-hosts-old": harness.comparisons(results["new-hosts-old"], baselines, args),
+                  "old-hosts-new": harness.comparisons(results["old-hosts-new"], baselines, args)})
 
 
 def main():
@@ -134,6 +227,8 @@ def main():
            {**two, "all-old-3": result({INCUMBENTS_FAIL: 90}),
             "full": result({INCUMBENTS_FAIL: 90})},
            options(), [])
+
+    listed(options())
 
     names = ["all-old", "all-old-2", "all-old-12", "all-old-1", "all-old-x", "new-hosts-old"]
     baselines = [name for name in names if harness.is_baseline(name)]
