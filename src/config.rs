@@ -166,6 +166,15 @@ pub struct NodeConfig {
     pub image_version: Option<String>,
 }
 
+/// The most browser sessions one listener can hold: saorsa-transport's
+/// bound on pending associations (`MAX_PENDING_ASSOCIATIONS`), above which
+/// its listener refuses to bind. A node refuses a higher
+/// `webrtc_direct.max_connections` at start, naming this ceiling; a default
+/// above it would stop every node that offers browser access from starting,
+/// before it could upgrade itself. `tests/fork_pins.rs` checks the ceiling
+/// against the transport, so a transport upgrade that moves it shows.
+pub const WEBRTC_DIRECT_SESSION_CEILING: usize = 256;
+
 /// Configuration for the ADR-0015 WebRTC Direct browser listener.
 ///
 /// This listener is deliberately separate from the native Saorsa QUIC port.
@@ -270,20 +279,32 @@ fn default_webrtc_direct_bind() -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
 }
 
+// Browser sessions: 128, measured 2026-10-25 (scripts/measure_browser_sessions.py,
+// on Linux): a session costs a node about 207 KiB resident while idle
+// and about 868 KiB while its data lane reads records. 128 reading sessions
+// then take about 108 MiB, within twice the node's 64 MiB byte budget for
+// browser reads, and under the transport's ceiling of 256
+// (WEBRTC_DIRECT_SESSION_CEILING). An operator can lower it in a node config
+// file (docker/README.md).
 const fn default_webrtc_direct_max_connections() -> usize {
-    32
+    128
 }
 
+// Sessions from one address: 7, for people who share one (a carrier's NAT, a
+// household, an office). The most the per-address rule allows with two
+// channels a session while concurrent requests stay at 16: 7 x 2 < 16.
 const fn default_webrtc_direct_max_connections_per_ip() -> usize {
-    4
+    7
 }
 
 const fn default_webrtc_direct_max_channels_per_connection() -> usize {
     2
 }
 
+// Channels across the listener: two for every session, a browser's control
+// and data lanes.
 const fn default_webrtc_direct_max_channels() -> usize {
-    32
+    256
 }
 
 const fn default_webrtc_direct_max_concurrent_requests() -> usize {

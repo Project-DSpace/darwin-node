@@ -188,16 +188,18 @@ limits are not shared with browser traffic. The defaults are:
 
 | Setting | Default | Scope |
 |---|---:|---|
-| `max_connections` | 32 | listener |
-| `max_connections_per_ip` | 4 | IPv4 address or IPv6 /64 |
+| `max_connections` | 128 (at most 256) | listener |
+| `max_connections_per_ip` | 7 | IPv4 address or IPv6 /64 |
 | `max_channels_per_connection` | 2 | association |
-| `max_channels` | 32 | listener and channel-handler tasks |
+| `max_channels` | 256 | listener and channel-handler tasks |
 | `max_concurrent_requests` | 16 | listener work slots |
 | `max_requests_per_second` | 256 | listener work token bucket |
 | `max_requests_per_second_per_ip` | 32 | source-prefix work token bucket |
 | `max_requests_per_second_per_connection` | 16 | association work token bucket |
 | `max_in_flight_bytes` | 64 MiB | listener frame memory |
 | `max_in_flight_bytes_per_ip` | 16 MiB | source-prefix frame memory |
+| `new_sessions_burst_per_ip` | 12 | IPv4 address or IPv6 /64 |
+| `new_sessions_per_minute_per_ip` | 6 | IPv4 address or IPv6 /64, once the burst is spent |
 
 JSON request headers have a fixed 64 KiB protocol limit shared with the browser
 client; it accommodates paid quotes with full signed commitments and is not

@@ -80,7 +80,7 @@ pub use client::{
     compute_address, hex_node_id_to_encoded_peer_id, peer_id_to_xor_name, xor_distance, DataChunk,
     XorName,
 };
-pub use config::{NodeConfig, StorageConfig, WebRtcDirectConfig};
+pub use config::{NodeConfig, StorageConfig, WebRtcDirectConfig, WEBRTC_DIRECT_SESSION_CEILING};
 pub use devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 pub use error::{Error, Result};
 pub use event::{NodeEvent, NodeEventsChannel};
@@ -91,6 +91,8 @@ pub use pointer::{
 };
 pub use replication::{config::ReplicationConfig, ReplicationEngine};
 pub use storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
+#[cfg(feature = "webrtc-direct")]
+pub use web_rtc::{check_browser_listener, WebRtcRefusals};
 
 /// Re-exports from `saorsa-core` so downstream crates (e.g. `ant-client`)
 /// can depend on `ant-node` alone without a direct `saorsa-core` dependency.

@@ -1,8 +1,10 @@
 //! Values this fork sets on purpose, each of which a merge from upstream could
 //! quietly put back: the repository nodes upgrade from and the key its
 //! releases are signed with, the bootstrap peers that ship (none), the
-//! allowance of new browser sessions per source, and the penalty for not
-//! holding a close-group chunk, which nothing can withhold. And how the
+//! allowance of new browser sessions per source, browser limits a starting
+//! node accepts and binds, within the most sessions the transport holds
+//! (`browser_listener` below), and the penalty for not holding a close-group
+//! chunk, which nothing can withhold. And how the
 //! payment check reads the chain (`payment_reads` below), which a release
 //! that rewrites the read path must keep: the node's own RPC is read first,
 //! then, if that is one of Robinhood Chain's public RPCs, the others; a failed
@@ -180,6 +182,63 @@ fn a_browser_source_opens_12_sessions_then_6_a_minute() {
             config.new_sessions_per_minute_per_ip, NEW_SESSIONS_PER_MINUTE,
             "{from}"
         );
+    }
+}
+
+/// The browser listener's defaults, which every operator runs unless their
+/// node config file lowers them. A default the node refused would stop every
+/// node that offers browser access from starting, before it could upgrade
+/// itself out of the fault.
+#[cfg(feature = "webrtc-direct")]
+mod browser_listener {
+    use ant_node::config::{NodeConfig, WEBRTC_DIRECT_SESSION_CEILING};
+    use saorsa_transport::webrtc_direct::{
+        WebRtcAdmissionLimits, WebRtcCertificate, WebRtcDirectListener,
+    };
+
+    #[tokio::test]
+    async fn the_default_config_passes_the_nodes_check_and_binds_a_listener() {
+        let config = NodeConfig::default().webrtc_direct;
+        let bound = ant_node::check_browser_listener(&config, "127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("the default browser limits pass the check and bind");
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), 0);
+    }
+
+    /// The ceiling the node holds `max_connections` to is the transport's: a
+    /// listener binds with it and refuses one more, and so does the node. A
+    /// transport upgrade that moves it fails here, so the ceiling is checked
+    /// again at every bump.
+    #[tokio::test]
+    async fn the_session_ceiling_is_the_transports() {
+        assert_eq!(WEBRTC_DIRECT_SESSION_CEILING, 256);
+        for (sessions, binds) in [
+            (WEBRTC_DIRECT_SESSION_CEILING, true),
+            (WEBRTC_DIRECT_SESSION_CEILING + 1, false),
+        ] {
+            let listener = WebRtcDirectListener::bind_with_limits(
+                "127.0.0.1:0".parse().unwrap(),
+                WebRtcCertificate::generate().unwrap(),
+                WebRtcAdmissionLimits {
+                    max_connections: sessions,
+                    max_connections_per_ip: 1,
+                },
+            )
+            .await;
+            assert_eq!(listener.is_ok(), binds, "a listener of {sessions} sessions");
+            if let Ok(listener) = listener {
+                listener.close().await.unwrap();
+            }
+        }
+        let mut config = NodeConfig::default().webrtc_direct;
+        config.max_connections = WEBRTC_DIRECT_SESSION_CEILING + 1;
+        config.max_channels = config.max_channels.max(2 * config.max_connections);
+        let error = ant_node::check_browser_listener(&config, "127.0.0.1:0".parse().unwrap())
+            .await
+            .expect_err("a node refuses more sessions than the transport holds")
+            .to_string();
+        assert!(error.contains("at most 256"), "{error}");
     }
 }
 

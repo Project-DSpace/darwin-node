@@ -14,7 +14,7 @@ use crate::ant_protocol::{
 };
 use crate::browser::{browser_payment_network, BrowserEndpoint, BrowserPaymentNetwork};
 use crate::codec::{encode_exact, ExactEncodeError};
-use crate::config::WebRtcDirectConfig;
+use crate::config::{WebRtcDirectConfig, WEBRTC_DIRECT_SESSION_CEILING};
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
@@ -38,8 +38,8 @@ use saorsa_transport::webrtc::{
     WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use saorsa_transport::webrtc_direct::{
-    WebRtcAdmissionLimits, WebRtcDataChannel, WebRtcDiagnostics, WebRtcDiagnosticsSnapshot,
-    WebRtcDirectConnection, WebRtcDirectListener,
+    WebRtcAdmissionLimits, WebRtcCertificate, WebRtcDataChannel, WebRtcDiagnostics,
+    WebRtcDiagnosticsSnapshot, WebRtcDirectConnection, WebRtcDirectListener,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -81,6 +81,9 @@ const REQUEST_RATE_ERROR: &str = "request rate limit exceeded";
 const SOURCE_SESSION_RATE_ERROR: &str = "too many new sessions from this source";
 const GLOBAL_BYTE_CAPACITY_ERROR: &str = "global in-flight byte capacity exhausted";
 const SOURCE_BYTE_CAPACITY_ERROR: &str = "source in-flight byte capacity exhausted";
+/// How often the listener logs its refusals, cumulative since start: the
+/// cadence of the node's traffic summaries.
+const REFUSAL_SUMMARY_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Filename containing the node's canonical browser bootstrap address.
 ///
@@ -321,14 +324,133 @@ struct SourceAdmissionState {
     sources: HashMap<IpAddr, SourceEntry>,
 }
 
+/// Browsers turned away since the listener started, by the limit that was
+/// reached.
+#[derive(Default)]
+struct Refusals {
+    sessions_node: AtomicU64,
+    sessions_address: AtomicU64,
+    sessions_address_rate: AtomicU64,
+    channels_session: AtomicU64,
+    channels_node: AtomicU64,
+    requests_node: AtomicU64,
+    request_rate_node: AtomicU64,
+    request_rate_address: AtomicU64,
+    request_rate_session: AtomicU64,
+    bytes_node: Arc<AtomicU64>,
+    bytes_address: Arc<AtomicU64>,
+}
+
+impl Refusals {
+    fn snapshot(&self, transport_sessions: u64) -> WebRtcRefusals {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        WebRtcRefusals {
+            transport_sessions,
+            sessions_node: load(&self.sessions_node),
+            sessions_address: load(&self.sessions_address),
+            sessions_address_rate: load(&self.sessions_address_rate),
+            channels_session: load(&self.channels_session),
+            channels_node: load(&self.channels_node),
+            requests_node: load(&self.requests_node),
+            request_rate_node: load(&self.request_rate_node),
+            request_rate_address: load(&self.request_rate_address),
+            request_rate_session: load(&self.request_rate_session),
+            bytes_node: load(&self.bytes_node),
+            bytes_address: load(&self.bytes_address),
+        }
+    }
+
+    fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Browsers a listener turned away since it started, by the limit reached:
+/// the node's own (`_node`), or one IPv4 address's or IPv6 /64's share of it
+/// (`_address`), or one session's (`_session`). The listener logs them every
+/// five minutes, target `ant_node::web_rtc::refusals`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WebRtcRefusals {
+    /// Connectivity checks the transport answered with a STUN 486: every
+    /// session slot or pending entry in use, or the address's sessions at
+    /// `max_connections_per_ip`. The transport doesn't count them apart.
+    pub transport_sessions: u64,
+    /// Sessions refused at `max_connections`.
+    pub sessions_node: u64,
+    /// Sessions refused at `max_connections_per_ip`.
+    pub sessions_address: u64,
+    /// Sessions refused by the address's new-session rate.
+    pub sessions_address_rate: u64,
+    /// Channels refused at `max_channels_per_connection`.
+    pub channels_session: u64,
+    /// Channels refused at `max_channels`.
+    pub channels_node: u64,
+    /// Requests refused at `max_concurrent_requests`.
+    pub requests_node: u64,
+    /// Requests refused by `max_requests_per_second`.
+    pub request_rate_node: u64,
+    /// Requests refused by `max_requests_per_second_per_ip`.
+    pub request_rate_address: u64,
+    /// Requests refused by `max_requests_per_second_per_connection`.
+    pub request_rate_session: u64,
+    /// Byte reservations refused at `max_in_flight_bytes`.
+    pub bytes_node: u64,
+    /// Byte reservations refused at `max_in_flight_bytes_per_ip`.
+    pub bytes_address: u64,
+}
+
+impl WebRtcRefusals {
+    /// Every refusal, at whichever limit.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.transport_sessions
+            + self.sessions_node
+            + self.per_address()
+            + self.channels_node
+            + self.requests_node
+            + self.request_rate_node
+            + self.bytes_node
+    }
+
+    /// Refusals at one address's or one session's share.
+    #[must_use]
+    pub const fn per_address(&self) -> u64 {
+        self.sessions_address
+            + self.sessions_address_rate
+            + self.channels_session
+            + self.request_rate_address
+            + self.request_rate_session
+            + self.bytes_address
+    }
+}
+
+/// Log the refusals, cumulative since start, as the traffic summaries log
+/// their counts: one INFO line with flat snake-case keys.
+fn log_refusals(refusals: &WebRtcRefusals) {
+    info!(
+        target: "ant_node::web_rtc::refusals",
+        total = refusals.total(),
+        per_address = refusals.per_address(),
+        transport_sessions = refusals.transport_sessions,
+        sessions_node = refusals.sessions_node,
+        sessions_address = refusals.sessions_address,
+        sessions_address_rate = refusals.sessions_address_rate,
+        channels_session = refusals.channels_session,
+        channels_node = refusals.channels_node,
+        requests_node = refusals.requests_node,
+        request_rate_node = refusals.request_rate_node,
+        request_rate_address = refusals.request_rate_address,
+        request_rate_session = refusals.request_rate_session,
+        bytes_node = refusals.bytes_node,
+        bytes_address = refusals.bytes_address,
+        "browser refusals (cumulative)"
+    );
+}
+
 /// Admission and accounting shared by every association on one listener.
 struct ListenerResources {
     running: AtomicBool,
-    connection_rejections: AtomicU64,
-    channel_rejections: AtomicU64,
-    request_rejections: AtomicU64,
-    rate_rejections: AtomicU64,
-    byte_rejections: Arc<AtomicU64>,
+    refusals: Refusals,
     listener_errors: AtomicU64,
     connection_errors: AtomicU64,
     channel_errors: AtomicU64,
@@ -352,29 +474,26 @@ struct ListenerResources {
 
 impl ListenerResources {
     fn new(config: &WebRtcDirectConfig) -> Arc<Self> {
-        let byte_rejections = Arc::new(AtomicU64::new(0));
+        let refusals = Refusals::default();
+        let node_byte_refusals = Arc::clone(&refusals.bytes_node);
         Arc::new(Self {
             running: AtomicBool::new(false),
-            connection_rejections: AtomicU64::new(0),
-            channel_rejections: AtomicU64::new(0),
-            request_rejections: AtomicU64::new(0),
-            rate_rejections: AtomicU64::new(0),
+            refusals,
             listener_errors: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             channel_errors: AtomicU64::new(0),
             task_failures: AtomicU64::new(0),
-            byte_rejections: Arc::clone(&byte_rejections),
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
             channel_limit: Arc::new(Semaphore::new(config.max_channels)),
             request_limit: Arc::new(Semaphore::new(config.max_concurrent_requests)),
-            bulk_responses: Arc::new(Semaphore::new(bulk_response_slots(
+            bulk_responses: Arc::new(Semaphore::new(bulk_response_bytes(
                 config.max_in_flight_bytes,
             ))),
             request_tasks: Mutex::new(TaskTracker::new()),
             global_request_rate: Mutex::new(RequestRateBucket::new(config.max_requests_per_second)),
             global_bytes: Arc::new(ByteBudget::with_rejections(
                 config.max_in_flight_bytes,
-                byte_rejections,
+                node_byte_refusals,
             )),
             source_state: Mutex::new(SourceAdmissionState::default()),
             max_connections_per_ip: config.max_connections_per_ip,
@@ -394,8 +513,13 @@ impl ListenerResources {
         self: &Arc<Self>,
         remote_addr: SocketAddr,
     ) -> ServerResult<ConnectionAdmission> {
-        self.admit_connection(remote_addr).inspect_err(|_| {
-            self.connection_rejections.fetch_add(1, Ordering::Relaxed);
+        self.admit_connection(remote_addr).inspect_err(|error| {
+            let refusals = &self.refusals;
+            Refusals::count(match error.as_str() {
+                SOURCE_CONNECTION_CAPACITY_ERROR => &refusals.sessions_address,
+                SOURCE_SESSION_RATE_ERROR => &refusals.sessions_address_rate,
+                _ => &refusals.sessions_node,
+            });
         })
     }
 
@@ -436,7 +560,7 @@ impl ListenerResources {
                     now,
                 ),
                 quota: Arc::new(SourceQuota {
-                    bulk_responses: Arc::new(Semaphore::new(bulk_response_slots(
+                    bulk_responses: Arc::new(Semaphore::new(bulk_response_bytes(
                         self.max_in_flight_bytes_per_ip,
                     ))),
                     request_rate: Mutex::new(RequestRateBucket::new(
@@ -444,7 +568,7 @@ impl ListenerResources {
                     )),
                     bytes: Arc::new(ByteBudget::with_rejections(
                         self.max_in_flight_bytes_per_ip,
-                        Arc::clone(&self.byte_rejections),
+                        Arc::clone(&self.refusals.bytes_address),
                     )),
                 }),
             });
@@ -514,22 +638,25 @@ struct ConnectionResources {
 
 impl ConnectionResources {
     fn try_admit_request(&self) -> ServerResult<OwnedSemaphorePermit> {
+        let refusals = &self.listener.refusals;
         let permit = Arc::clone(&self.listener.request_limit)
             .try_acquire_owned()
             .map_err(|_| {
-                self.listener
-                    .request_rejections
-                    .fetch_add(1, Ordering::Relaxed);
+                Refusals::count(&refusals.requests_node);
                 REQUEST_CAPACITY_ERROR.to_string()
             })?;
         let now = Instant::now();
-        if !self.source.request_rate.lock().allow(now)
-            || !self.request_rate.lock().allow(now)
-            || !self.listener.global_request_rate.lock().allow(now)
-        {
-            self.listener
-                .rate_rejections
-                .fetch_add(1, Ordering::Relaxed);
+        let refused_by = if !self.source.request_rate.lock().allow(now) {
+            Some(&refusals.request_rate_address)
+        } else if !self.request_rate.lock().allow(now) {
+            Some(&refusals.request_rate_session)
+        } else if !self.listener.global_request_rate.lock().allow(now) {
+            Some(&refusals.request_rate_node)
+        } else {
+            None
+        };
+        if let Some(counter) = refused_by {
+            Refusals::count(counter);
             return Err(REQUEST_RATE_ERROR.to_string());
         }
         Ok(permit)
@@ -587,6 +714,8 @@ pub struct WebRtcServerSnapshot {
     pub in_flight_bytes: usize,
     /// Configured frame-memory capacity.
     pub max_in_flight_bytes: usize,
+    /// Browsers turned away, by the limit reached.
+    pub refusals: WebRtcRefusals,
     /// Application connection admissions denied by capacity policy.
     pub connection_rejections: u64,
     /// `DataChannels` rejected by global or per-connection capacity policy.
@@ -621,6 +750,7 @@ impl WebRtcServerDiagnostics {
     pub fn snapshot(&self) -> WebRtcServerSnapshot {
         let resources = &self.resources;
         let transport = self.transport.snapshot();
+        let refusals = resources.refusals.snapshot(transport.rejected_connections);
         WebRtcServerSnapshot {
             local_addr: self.local_addr,
             running: resources.running.load(Ordering::Acquire) && transport.running,
@@ -642,11 +772,16 @@ impl WebRtcServerDiagnostics {
             max_concurrent_requests: self.config.max_concurrent_requests,
             in_flight_bytes: resources.global_bytes.in_use.load(Ordering::Acquire),
             max_in_flight_bytes: self.config.max_in_flight_bytes,
-            connection_rejections: resources.connection_rejections.load(Ordering::Relaxed),
-            channel_rejections: resources.channel_rejections.load(Ordering::Relaxed),
-            request_rejections: resources.request_rejections.load(Ordering::Relaxed),
-            rate_rejections: resources.rate_rejections.load(Ordering::Relaxed),
-            byte_rejections: resources.byte_rejections.load(Ordering::Relaxed),
+            refusals,
+            connection_rejections: refusals.sessions_node
+                + refusals.sessions_address
+                + refusals.sessions_address_rate,
+            channel_rejections: refusals.channels_session + refusals.channels_node,
+            request_rejections: refusals.requests_node,
+            rate_rejections: refusals.request_rate_node
+                + refusals.request_rate_address
+                + refusals.request_rate_session,
+            byte_rejections: refusals.bytes_node + refusals.bytes_address,
             listener_errors: resources.listener_errors.load(Ordering::Relaxed),
             connection_errors: resources.connection_errors.load(Ordering::Relaxed),
             channel_errors: resources.channel_errors.load(Ordering::Relaxed),
@@ -691,16 +826,7 @@ pub async fn spawn(
     let certificate_sha256 = certificate
         .sha256_digest()
         .map_err(|error| Error::Startup(error.to_string()))?;
-    let listener = WebRtcDirectListener::bind_with_limits(
-        config.bind,
-        certificate,
-        WebRtcAdmissionLimits {
-            max_connections: config.max_connections,
-            max_connections_per_ip: config.max_connections_per_ip,
-        },
-    )
-    .await
-    .map_err(|error| Error::Startup(format!("failed to bind WebRTC Direct listener: {error}")))?;
+    let listener = bind_listener(config, config.bind, certificate).await?;
     let local_addr = listener.local_addr();
     let identity = Arc::clone(p2p.transport().node_identity());
     let state = Arc::new(ServerState {
@@ -735,9 +861,11 @@ pub async fn spawn(
     info!(bind = %local_addr, certificate = %certificate_path.display(),
         "ADR-0015 WebRTC Direct listening");
     let root_dir = root_dir.to_path_buf();
+    let summary_diagnostics = diagnostics.clone();
     let task = tokio::spawn(async move {
-        // Both futures are owned by the listener task. Address publication cannot
-        // block accepting sessions, and shutdown cancels a pending publication.
+        // The futures are owned by the listener task. Address publication cannot
+        // block accepting sessions, and shutdown cancels a pending publication
+        // and the refusal summaries.
         tokio::join!(
             serve_webrtc(
                 listener,
@@ -746,6 +874,22 @@ pub async fn spawn(
                 shutdown.clone(),
                 run_guard
             ),
+            async {
+                let summaries = async {
+                    let mut interval = tokio::time::interval_at(
+                        tokio::time::Instant::now() + REFUSAL_SUMMARY_INTERVAL,
+                        REFUSAL_SUMMARY_INTERVAL,
+                    );
+                    loop {
+                        interval.tick().await;
+                        log_refusals(&summary_diagnostics.snapshot().refusals);
+                    }
+                };
+                tokio::select! {
+                    () = shutdown.cancelled() => {},
+                    () = summaries => {},
+                }
+            },
             async {
                 let refresh = async {
                     let mut interval = tokio::time::interval(ADDRESS_REFRESH_INTERVAL);
@@ -823,7 +967,56 @@ async fn persist_browser_endpoint(root_dir: &Path, endpoint: &BrowserEndpoint) -
     })
 }
 
+/// Bind a browser listener at `bind` under `config`'s session limits.
+async fn bind_listener(
+    config: &WebRtcDirectConfig,
+    bind: SocketAddr,
+    certificate: WebRtcCertificate,
+) -> Result<WebRtcDirectListener> {
+    WebRtcDirectListener::bind_with_limits(
+        bind,
+        certificate,
+        WebRtcAdmissionLimits {
+            max_connections: config.max_connections,
+            max_connections_per_ip: config.max_connections_per_ip,
+        },
+    )
+    .await
+    .map_err(|error| Error::Startup(format!("failed to bind WebRTC Direct listener: {error}")))
+}
+
+/// Check a `[webrtc_direct]` config as a starting node does, then bind a
+/// browser listener with its limits at `bind`, close it, and return the
+/// address it bound. A config this refuses stops a node that offers browser
+/// access from starting.
+///
+/// # Errors
+///
+/// Returns an error for a config a starting node refuses, or when the
+/// listener can't bind.
+pub async fn check_browser_listener(
+    config: &WebRtcDirectConfig,
+    bind: SocketAddr,
+) -> Result<SocketAddr> {
+    validate_webrtc_config(config)?;
+    let certificate =
+        WebRtcCertificate::generate().map_err(|error| Error::Startup(error.to_string()))?;
+    let listener = bind_listener(config, bind, certificate).await?;
+    let bound = listener.local_addr();
+    listener
+        .close()
+        .await
+        .map_err(|error| Error::Startup(format!("failed to close the listener: {error}")))?;
+    Ok(bound)
+}
+
 fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
+    if config.max_connections > WEBRTC_DIRECT_SESSION_CEILING {
+        return Err(Error::Config(format!(
+            "webrtc_direct.max_connections must be at most {WEBRTC_DIRECT_SESSION_CEILING}, \
+             the most browser sessions saorsa-transport's listener holds"
+        )));
+    }
     for (name, value) in [
         ("max_connections", config.max_connections),
         ("max_connections_per_ip", config.max_connections_per_ip),
@@ -1142,6 +1335,44 @@ async fn wait_for_first_data_channel<T>(
     }
 }
 
+/// What becomes of a browser's new channel.
+enum ChannelAdmission {
+    /// It runs, holding a place in the node's channel pool.
+    Admit(OwnedSemaphorePermit),
+    /// Only it is refused; the session and its open channels go on.
+    RefuseChannel,
+    /// It is refused, and the session, which has no other channel, ends.
+    EndSession,
+}
+
+/// Admit a new channel on a session with `open` channels already. At the
+/// session's own limit, or with the node's pool used up, only the new
+/// channel is refused: a reset channel's handler may still be retiring, and
+/// a healthy sibling channel (a browser's control lane, say) must not be
+/// closed with it. A session whose first channel finds the pool used up has
+/// nothing left, and ends.
+fn admit_channel(
+    open: usize,
+    max_per_session: usize,
+    listener: &ListenerResources,
+) -> ChannelAdmission {
+    if open >= max_per_session {
+        Refusals::count(&listener.refusals.channels_session);
+        return ChannelAdmission::RefuseChannel;
+    }
+    match Arc::clone(&listener.channel_limit).try_acquire_owned() {
+        Ok(permit) => ChannelAdmission::Admit(permit),
+        Err(_) => {
+            Refusals::count(&listener.refusals.channels_node);
+            if open == 0 {
+                ChannelAdmission::EndSession
+            } else {
+                ChannelAdmission::RefuseChannel
+            }
+        }
+    }
+}
+
 async fn start_data_channel_task(
     channel: WebRtcDataChannel,
     channel_tasks: &mut JoinSet<()>,
@@ -1150,28 +1381,21 @@ async fn start_data_channel_task(
     channel_shutdown: &CancellationToken,
     remote_addr: SocketAddr,
 ) -> ServerResult<()> {
-    if channel_tasks.len() >= state.config.max_channels_per_connection {
-        resources
-            .listener
-            .channel_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = channel.close().await {
-            debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
+    let channel_permit = match admit_channel(
+        channel_tasks.len(),
+        state.config.max_channels_per_connection,
+        &resources.listener,
+    ) {
+        ChannelAdmission::Admit(permit) => permit,
+        refused => {
+            if let Err(error) = channel.close().await {
+                debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
+            }
+            return match refused {
+                ChannelAdmission::EndSession => Err(CHANNEL_CAPACITY_ERROR.to_string()),
+                _ => Ok(()),
+            };
         }
-        // A reset channel's handler may still be scheduled for retirement.
-        // Reject only this excess stream, never its healthy sibling association.
-        return Ok(());
-    }
-    let Ok(channel_permit) = Arc::clone(&resources.listener.channel_limit).try_acquire_owned()
-    else {
-        resources
-            .listener
-            .channel_rejections
-            .fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = channel.close().await {
-            debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
-        }
-        return Err(CHANNEL_CAPACITY_ERROR.to_string());
     };
     let channel_state = Arc::clone(state);
     let channel_resources = Arc::clone(resources);
@@ -1386,19 +1610,62 @@ struct CompletedRequest {
     _resources: Arc<ConnectionResources>,
 }
 
-// A GET may hold record bytes, encoded plaintext and ciphertext together.
-// This queue complements exact byte accounting; it never raises those limits.
-fn bulk_response_slots(bytes: usize) -> usize {
-    (bytes / (3 * ant_protocol::MAX_WIRE_MESSAGE_SIZE + 2 * MAX_BROWSER_HEADER_BYTES)).max(1)
+/// A GET response's bytes on the wire for a record of `record` bytes: the
+/// record, plus at most what any small response takes, never more than a
+/// wire message.
+fn get_wire_bytes(record: usize) -> usize {
+    record
+        .saturating_add(SMALL_BINARY_RESPONSE_BYTES)
+        .min(ant_protocol::MAX_WIRE_MESSAGE_SIZE)
 }
 
-fn request_is_get(request: &Request, content: &[u8]) -> bool {
-    matches!(request.body, RequestBody::GetChunk { .. })
-        || (matches!(request.body, RequestBody::ChunkProtocol)
-            // A canonical binary GET is small. Avoid decoding/copying PUTs just
-            // to classify scheduling; the ordinary decoder still validates all.
-            && content.len() <= 128
-            && ChunkMessage::decode(content).is_ok_and(|message| matches!(message.body, ChunkMessageBody::GetRequest(_))))
+/// What one GET of a record of `record` bytes can hold at once: the record
+/// bytes, the encoded plaintext and the ciphertext, and two frame headers.
+/// Its largest, for a record of unknown size, is a full wire message three
+/// times over.
+fn get_response_bytes(record: usize) -> usize {
+    3 * get_wire_bytes(record) + 2 * MAX_BROWSER_HEADER_BYTES
+}
+
+// GETs queue for these bytes before preparing their responses, each taking
+// what its own record needs. The pool holds as many worst-case GETs as fit
+// `budget`, so as many bytes as when every GET was counted at the worst
+// case; GETs of small records then run side by side. It complements exact
+// byte accounting and never raises those limits.
+fn bulk_response_bytes(budget: usize) -> usize {
+    let worst = get_response_bytes(usize::MAX);
+    (budget / worst).max(1) * worst
+}
+
+/// The record a request reads: `None` for a request that isn't a GET,
+/// `Some(None)` for a GET whose address doesn't parse.
+fn get_record(request: &Request, content: &[u8]) -> Option<Option<[u8; 32]>> {
+    match &request.body {
+        RequestBody::GetChunk { address } => Some(decode_32_byte_hex(address).ok()),
+        // A canonical binary GET is small. Avoid decoding/copying PUTs just
+        // to classify scheduling; the ordinary decoder still validates all.
+        RequestBody::ChunkProtocol if content.len() <= 128 => {
+            match ChunkMessage::decode(content).map(|message| message.body) {
+                Ok(ChunkMessageBody::GetRequest(get)) => Some(Some(get.address)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The length of the record at `address` as stored: what a GET of it will
+/// read. Nothing for a record the node doesn't hold; a full chunk when the
+/// store can't say.
+async fn stored_record_len(state: &ServerState, address: Option<[u8; 32]>) -> usize {
+    let (Some(protocol), Some(address)) = (state.ant_protocol.as_ref(), address) else {
+        return 0;
+    };
+    match protocol.storage().stored_len(&address).await {
+        Ok(Some(len)) => usize::try_from(len).map_or(MAX_CHUNK_SIZE, |len| len.min(MAX_CHUNK_SIZE)),
+        Ok(None) => 0,
+        Err(_) => MAX_CHUNK_SIZE,
+    }
 }
 
 async fn start_request(
@@ -1415,22 +1682,28 @@ async fn start_request(
             _in_flight_bytes: in_flight_bytes,
         } = admitted;
         // Reserve enough preparation capacity for one complete response to
-        // make progress under the existing byte limits. Acquire source first:
-        // queued work from one source cannot occupy every global bulk slot.
-        let bulk_permits = if request_is_get(&request, &content) {
-            let source = Arc::clone(&resources.source.bulk_responses)
-                .acquire_owned()
-                .await
-                .map_err(|_| "bulk response admission closed".to_string())?;
-            let global = Arc::clone(&resources.listener.bulk_responses)
-                .acquire_owned()
-                .await
-                .map_err(|_| "bulk response admission closed".to_string())?;
-            Some((source, global))
-        } else {
-            None
+        // make progress under the existing byte limits: what its record
+        // takes, read from the stored file's length. Acquire source first:
+        // queued work from one source cannot occupy the global pool.
+        let (bulk_permits, record_len) = match get_record(&request, &content) {
+            Some(address) => {
+                let record_len = stored_record_len(&state, address).await;
+                let bytes = u32::try_from(get_response_bytes(record_len))
+                    .map_err(|_| "GET response size overflows its admission".to_string())?;
+                let source = Arc::clone(&resources.source.bulk_responses)
+                    .acquire_many_owned(bytes)
+                    .await
+                    .map_err(|_| "bulk response admission closed".to_string())?;
+                let global = Arc::clone(&resources.listener.bulk_responses)
+                    .acquire_many_owned(bytes)
+                    .await
+                    .map_err(|_| "bulk response admission closed".to_string())?;
+                (Some((source, global)), Some(record_len))
+            }
+            None => (None, None),
         };
-        let (response, content) = process_request(request, content, &state, &resources).await?;
+        let (response, content) =
+            process_request(request, content, record_len, &state, &resources).await?;
         Ok(CompletedRequest {
             _bulk_permits: bulk_permits,
             response,
@@ -1696,9 +1969,12 @@ async fn write_framed_pq_payload(channel: &WebRtcDataChannel, payload: &[u8]) ->
     Ok(())
 }
 
+/// `record_len` is the stored length of the record a GET reads, which bounds
+/// what its response reserves; `None` for other requests.
 async fn process_request(
     request: Request,
     content: Vec<u8>,
+    record_len: Option<usize>,
     state: &ServerState,
     resources: &ConnectionResources,
 ) -> ServerResult<(Response, Option<TrackedBytes>)> {
@@ -1735,7 +2011,7 @@ async fn process_request(
             let message = ChunkMessage::decode(&content)
                 .map_err(|error| public_error("invalid_request", error))?;
             drop(content);
-            let response_limit = binary_response_limit(&message.body)?;
+            let response_limit = binary_response_limit(&message.body, record_len)?;
             reservation.resize(reservation.source.amount.max(2 * response_limit))?;
             let response = handle_ant_message(protocol, message).await?;
             let bytes = encode_binary_response(&response, response_limit)?;
@@ -1763,7 +2039,7 @@ async fn process_request(
             .await
         }
         RequestBody::GetChunk { address } => {
-            process_get_chunk(request.request_id, address, state, resources).await
+            process_get_chunk(request.request_id, address, record_len, state, resources).await
         }
         RequestBody::QuoteChunk { address, size } => {
             Ok(process_quote_chunk(request.request_id, address, size, state).await)
@@ -1786,19 +2062,27 @@ async fn process_request(
 
 // PUT acknowledgements and signed quotes contain no chunk payload. 64 KiB
 // covers the ML-DSA public key/signature, quote and signed commitment, including
-// worst-case MessagePack integer encoding. GET alone needs a full wire buffer.
+// worst-case MessagePack integer encoding. GET alone needs its record's bytes
+// beside it, up to a full wire buffer.
 //
 // A pointer read returns one record of `POINTER_WIRE_LEN` bytes, so it is small
-// too and needs no bulk slot (see `request_is_get`).
+// too and needs no bulk bytes (see `get_record`).
 const SMALL_BINARY_RESPONSE_BYTES: usize = 64 * 1024;
 const _: () = assert!(
     ant_protocol::pointer::POINTER_WIRE_LEN < SMALL_BINARY_RESPONSE_BYTES / 2,
     "a pointer read must fit the small response bound with room for its envelope"
 );
 
-fn binary_response_limit(body: &ChunkMessageBody) -> ServerResult<usize> {
+/// The most bytes a response to `body` may encode to. A GET's depends on its
+/// record's stored length, `record_len`, when known.
+fn binary_response_limit(
+    body: &ChunkMessageBody,
+    record_len: Option<usize>,
+) -> ServerResult<usize> {
     match body {
-        ChunkMessageBody::GetRequest(_) => Ok(ant_protocol::MAX_WIRE_MESSAGE_SIZE),
+        ChunkMessageBody::GetRequest(_) => {
+            Ok(record_len.map_or(ant_protocol::MAX_WIRE_MESSAGE_SIZE, get_wire_bytes))
+        }
         ChunkMessageBody::PutRequest(_)
         | ChunkMessageBody::QuoteRequest(_)
         | ChunkMessageBody::QuoteRequestV2(_)
@@ -1952,6 +2236,7 @@ fn browser_node_from_dht(
 async fn process_get_chunk(
     request_id: u64,
     address: String,
+    record_len: Option<usize>,
     state: &ServerState,
     resources: &ConnectionResources,
 ) -> ServerResult<(Response, Option<TrackedBytes>)> {
@@ -1973,9 +2258,11 @@ async fn process_get_chunk(
     };
 
     // The storage API allocates its returned Vec internally, so reserve the
-    // largest permitted chunk before awaiting it. This closes the interval in
-    // which many concurrent GETs could materialize unaccounted full chunks.
-    let mut content_reservation = resources.try_reserve_bytes(MAX_CHUNK_SIZE)?;
+    // record's stored length (the largest permitted chunk when unknown) before
+    // awaiting it. This closes the interval in which many concurrent GETs
+    // could materialize unaccounted chunks.
+    let mut content_reservation =
+        resources.try_reserve_bytes(record_len.unwrap_or(MAX_CHUNK_SIZE))?;
     let response = match ant_protocol
         .storage()
         .get_or_quarantine(&address_bytes)
@@ -2485,6 +2772,141 @@ mod tests {
         assert!(config.max_in_flight_bytes_per_ip < config.max_in_flight_bytes);
     }
 
+    /// The defaults hold the relations browser access is sized by: at most
+    /// the transport's sessions, a channel pool for two lanes per session,
+    /// and room for a session's lanes within one address's share.
+    #[test]
+    fn default_browser_limits_hold_their_relations() {
+        let config = WebRtcDirectConfig::default();
+        assert!(config.max_connections <= WEBRTC_DIRECT_SESSION_CEILING);
+        assert!(config.max_channels_per_connection >= 2);
+        assert!(config.max_channels >= 2 * config.max_connections);
+        assert!(config.max_channels >= config.max_connections * config.max_channels_per_connection);
+    }
+
+    #[test]
+    fn sessions_above_the_transports_ceiling_are_refused_with_it_named() {
+        let mut config = WebRtcDirectConfig {
+            max_connections: WEBRTC_DIRECT_SESSION_CEILING,
+            ..WebRtcDirectConfig::default()
+        };
+        config.max_channels = config.max_channels.max(2 * WEBRTC_DIRECT_SESSION_CEILING);
+        validate_webrtc_config(&config).expect("the ceiling itself");
+        config.max_connections = WEBRTC_DIRECT_SESSION_CEILING + 1;
+        let error = validate_webrtc_config(&config)
+            .expect_err("above the ceiling")
+            .to_string();
+        assert!(
+            error.contains("max_connections") && error.contains("at most 256"),
+            "{error}"
+        );
+    }
+
+    /// A new channel is refused alone, at the session's limit or with the
+    /// node's pool used up, unless it is the session's first.
+    #[test]
+    fn a_used_up_channel_pool_refuses_only_the_extra_channel() {
+        let config = WebRtcDirectConfig {
+            max_channels: 3,
+            max_channels_per_connection: 2,
+            max_connections: 2,
+            max_connections_per_ip: 1,
+            max_concurrent_requests: 3,
+            ..WebRtcDirectConfig::default()
+        };
+        validate_webrtc_config(&config).expect("valid");
+        let listener = ListenerResources::new(&config);
+        let mut held = Vec::new();
+        for open in [0, 1, 0] {
+            match admit_channel(open, 2, &listener) {
+                ChannelAdmission::Admit(permit) => held.push(permit),
+                _ => panic!("a free pool admits"),
+            }
+        }
+        assert!(matches!(
+            admit_channel(2, 2, &listener),
+            ChannelAdmission::RefuseChannel
+        ));
+        assert!(matches!(
+            admit_channel(1, 2, &listener),
+            ChannelAdmission::RefuseChannel
+        ));
+        assert!(matches!(
+            admit_channel(0, 2, &listener),
+            ChannelAdmission::EndSession
+        ));
+        let refusals = listener.refusals.snapshot(0);
+        assert_eq!(refusals.channels_session, 1);
+        assert_eq!(refusals.channels_node, 2);
+        assert_eq!(refusals.per_address(), 1);
+        assert_eq!(refusals.total(), 3);
+        held.pop();
+        assert!(matches!(
+            admit_channel(1, 2, &listener),
+            ChannelAdmission::Admit(_)
+        ));
+    }
+
+    /// Every refusal is counted against the limit that was reached.
+    #[test]
+    fn refusals_are_counted_by_the_limit_reached() {
+        let config = WebRtcDirectConfig {
+            max_connections: 3,
+            max_connections_per_ip: 1,
+            max_concurrent_requests: 3,
+            max_requests_per_second: 3,
+            max_requests_per_second_per_ip: 2,
+            max_requests_per_second_per_connection: 1,
+            max_in_flight_bytes: 100,
+            max_in_flight_bytes_per_ip: 60,
+            new_sessions_burst_per_ip: 1,
+            new_sessions_per_minute_per_ip: 1,
+            ..WebRtcDirectConfig::default()
+        };
+        validate_webrtc_config(&config).expect("valid");
+        let listener = ListenerResources::new(&config);
+        let first = listener
+            .try_admit_connection("192.0.2.1:1".parse().unwrap())
+            .expect("first session");
+        assert!(listener
+            .try_admit_connection("192.0.2.1:2".parse().unwrap())
+            .is_err());
+        drop(first);
+        assert!(listener
+            .try_admit_connection("192.0.2.1:3".parse().unwrap())
+            .is_err());
+        let second = listener
+            .try_admit_connection("192.0.2.2:1".parse().unwrap())
+            .expect("another address");
+        let third = listener
+            .try_admit_connection("192.0.2.3:1".parse().unwrap())
+            .expect("a third address");
+        let fourth = listener
+            .try_admit_connection("192.0.2.4:1".parse().unwrap())
+            .expect("a fourth address");
+        assert!(listener
+            .try_admit_connection("192.0.2.5:1".parse().unwrap())
+            .is_err());
+
+        let _permit = second.context.try_admit_request().expect("a request");
+        assert!(second.context.try_admit_request().is_err());
+        let _reserved = second.context.try_reserve_bytes(60).expect("its share");
+        assert!(second.context.try_reserve_bytes(1).is_err());
+        let _other = third.context.try_reserve_bytes(40).expect("the rest");
+        assert!(fourth.context.try_reserve_bytes(1).is_err());
+
+        let refusals = listener.refusals.snapshot(7);
+        assert_eq!(refusals.transport_sessions, 7);
+        assert_eq!(refusals.sessions_address, 1);
+        assert_eq!(refusals.sessions_address_rate, 1);
+        assert_eq!(refusals.sessions_node, 1);
+        assert_eq!(refusals.request_rate_session, 1);
+        assert_eq!(refusals.bytes_address, 1);
+        assert_eq!(refusals.bytes_node, 1);
+        assert_eq!(refusals.per_address(), 4);
+        assert_eq!(refusals.total(), 7 + 6);
+    }
+
     #[test]
     fn rejects_resource_limits_that_let_one_ip_exhaust_a_global_pool() {
         let mut config = WebRtcDirectConfig::default();
@@ -2909,11 +3331,11 @@ mod tests {
             vec![0xff; 16 * 1024],
         ));
         assert_eq!(
-            binary_response_limit(&get).expect("pointer GET admitted"),
+            binary_response_limit(&get, None).expect("pointer GET admitted"),
             SMALL_BINARY_RESPONSE_BYTES
         );
         assert_eq!(
-            binary_response_limit(&put).expect("pointer PUT admitted"),
+            binary_response_limit(&put, None).expect("pointer PUT admitted"),
             SMALL_BINARY_RESPONSE_BYTES
         );
 
@@ -2937,8 +3359,8 @@ mod tests {
         assert!(encode_binary_response(&stored, SMALL_BINARY_RESPONSE_BYTES).is_ok());
 
         // Replies are never admitted as requests.
-        assert!(binary_response_limit(&record.body).is_err());
-        assert!(binary_response_limit(&stored.body).is_err());
+        assert!(binary_response_limit(&record.body, None).is_err());
+        assert!(binary_response_limit(&stored.body, None).is_err());
     }
 
     #[test]
@@ -2951,14 +3373,68 @@ mod tests {
                 content: vec![0xff; MAX_CHUNK_SIZE],
             }),
         };
-        let bytes = encode_binary_response(
-            &response,
-            binary_response_limit(&request).expect("GET bound"),
-        )
-        .expect("maximum GET");
-        assert_eq!(bytes, response.encode().expect("shared wire encoding"));
+        for record_len in [None, Some(MAX_CHUNK_SIZE)] {
+            let bytes = encode_binary_response(
+                &response,
+                binary_response_limit(&request, record_len).expect("GET bound"),
+            )
+            .expect("maximum GET");
+            assert_eq!(bytes, response.encode().expect("shared wire encoding"));
+        }
         assert!(encode_binary_response(&response, SMALL_BINARY_RESPONSE_BYTES).is_err());
-        assert!(binary_response_limit(&response.body).is_err());
+        assert!(binary_response_limit(&response.body, None).is_err());
+    }
+
+    /// A GET is bounded by its own record: its response fits, and so does
+    /// any error the node answers in its place, while a larger record's
+    /// doesn't.
+    #[test]
+    fn a_get_is_bounded_by_its_record() {
+        let request = ChunkMessageBody::GetRequest(ant_protocol::ChunkGetRequest::new([0xff; 32]));
+        let answer = |content: Vec<u8>| ChunkMessage {
+            request_id: u64::MAX,
+            body: ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success {
+                address: [0xff; 32],
+                content,
+            }),
+        };
+        for record_len in [0, 1, 4096, 65_536, MAX_CHUNK_SIZE] {
+            let limit = binary_response_limit(&request, Some(record_len)).expect("GET bound");
+            assert!(limit <= ant_protocol::MAX_WIRE_MESSAGE_SIZE);
+            assert!(encode_binary_response(&answer(vec![0xff; record_len]), limit).is_ok());
+            let error = ChunkMessage {
+                request_id: u64::MAX,
+                body: ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Error(
+                    ant_protocol::ProtocolError::StorageFailed("x".repeat(4096)),
+                )),
+            };
+            assert!(encode_binary_response(&error, limit).is_ok());
+            assert!(get_response_bytes(record_len) <= get_response_bytes(usize::MAX));
+        }
+        let small = binary_response_limit(&request, Some(4096)).expect("GET bound");
+        assert!(encode_binary_response(&answer(vec![0xff; 4096 + small]), small).is_err());
+    }
+
+    /// The pool GETs queue for holds as many bytes as when every GET was
+    /// counted at the worst case, at least one worst-case GET, and admits
+    /// far more small GETs side by side than full ones.
+    #[test]
+    fn gets_queue_for_their_own_records_bytes() {
+        let worst = 3 * ant_protocol::MAX_WIRE_MESSAGE_SIZE + 2 * MAX_BROWSER_HEADER_BYTES;
+        assert_eq!(get_response_bytes(usize::MAX), worst);
+        assert_eq!(
+            get_response_bytes(ant_protocol::MAX_WIRE_MESSAGE_SIZE),
+            worst
+        );
+        for budget in [1, worst - 1, worst, 16 << 20, 64 << 20, (64 << 20) + worst] {
+            let pool = bulk_response_bytes(budget);
+            assert_eq!(pool, (budget / worst).max(1) * worst, "budget {budget}");
+            assert!(pool >= worst);
+        }
+        let pool = bulk_response_bytes(64 << 20);
+        assert_eq!(pool / worst, 4);
+        assert_eq!(pool / get_response_bytes(MAX_CHUNK_SIZE), 4);
+        assert!(pool / get_response_bytes(4096) >= 150);
     }
 
     #[test]

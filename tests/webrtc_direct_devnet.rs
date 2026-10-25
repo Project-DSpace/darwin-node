@@ -1001,6 +1001,193 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     Ok(())
 }
 
+/// Prove a browser's address to a listener as its first connectivity check
+/// does: the check, the listener's check back, the answer to it, and the
+/// check again. Then wait for the listener's verdict on that check: `None`
+/// when it admits it (its answer is a success), or the STUN error code and
+/// reason it refuses it with.
+async fn connectivity_check(
+    socket: &tokio::net::UdpSocket,
+    listener: std::net::SocketAddr,
+    password: &str,
+) -> Result<Option<(u16, Vec<u8>)>, Box<dyn Error>> {
+    use std::time::Duration;
+    use webrtc_stack::stun::{
+        agent::TransactionId,
+        attributes::{ATTR_ICE_CONTROLLING, ATTR_PRIORITY, ATTR_USERNAME},
+        error_code::ErrorCodeAttribute,
+        fingerprint::FINGERPRINT,
+        integrity::MessageIntegrity,
+        message::{Getter, Message, Setter, BINDING_ERROR, BINDING_REQUEST, BINDING_SUCCESS},
+        textattrs::Username,
+        xoraddr::XorMappedAddress,
+    };
+
+    async fn receive(socket: &tokio::net::UdpSocket) -> Result<Message, Box<dyn Error>> {
+        let mut buffer = [0u8; 2048];
+        let (length, _) = socket.recv_from(&mut buffer).await?;
+        let mut message = Message::new();
+        message.unmarshal_binary(&buffer[..length])?;
+        Ok(message)
+    }
+
+    let server = format!(
+        "{}{password}",
+        saorsa_transport::webrtc_direct::ICE_CREDENTIAL_PREFIX_V2
+    );
+    let mut check = Message::new();
+    check.build(&[
+        Box::new(TransactionId::new()),
+        Box::new(BINDING_REQUEST),
+        Box::new(Username::new(
+            ATTR_USERNAME,
+            format!("{server}:browserClientUfrag"),
+        )),
+    ])?;
+    check.add(ATTR_ICE_CONTROLLING, &1u64.to_be_bytes());
+    check.add(ATTR_PRIORITY, &1u32.to_be_bytes());
+    MessageIntegrity::new_short_term_integrity(server).add_to(&mut check)?;
+    FINGERPRINT.add_to(&mut check)?;
+    socket.send_to(&check.raw, listener).await?;
+
+    let challenge = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut message = receive(socket).await?;
+            if message.typ == BINDING_REQUEST
+                && MessageIntegrity::new_short_term_integrity(password.to_string())
+                    .check(&mut message)
+                    .is_ok()
+            {
+                return Ok::<_, Box<dyn Error>>(message);
+            }
+        }
+    })
+    .await??;
+    let source = socket.local_addr()?;
+    let mut answer = Message::new();
+    answer.build(&[
+        Box::new(challenge.transaction_id),
+        Box::new(BINDING_SUCCESS),
+        Box::new(XorMappedAddress {
+            ip: source.ip(),
+            port: source.port(),
+        }),
+        Box::new(MessageIntegrity::new_short_term_integrity(
+            password.to_string(),
+        )),
+        Box::new(FINGERPRINT),
+    ])?;
+    socket.send_to(&answer.raw, listener).await?;
+    socket.send_to(&check.raw, listener).await?;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message = receive(socket).await?;
+            if message.transaction_id != check.transaction_id {
+                continue;
+            }
+            if message.typ == BINDING_SUCCESS {
+                return Ok(None);
+            }
+            if message.typ == BINDING_ERROR {
+                let mut error = ErrorCodeAttribute::default();
+                error.get_from(&message)?;
+                return Ok(Some((error.code.0, error.reason)));
+            }
+        }
+    })
+    .await?
+}
+
+/// A listener at its session limit answers a new browser's connectivity
+/// check with a STUN 486 (Allocation Quota Reached) within about a second,
+/// rather than leaving the browser to wait out its ICE timeout, both when
+/// the browser's address holds its share of sessions and when the node
+/// holds all it may. It counts each refusal, and its sessions go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn a_full_listener_refuses_a_new_browser_within_a_second() -> Result<(), Box<dyn Error>> {
+    use std::time::{Duration, Instant};
+
+    let rpc =
+        MockChainRpc::new(json!({"jsonrpc":"2.0", "id":1, "result":"0x7a69"}).to_string()).await?;
+    let temp = tempfile::tempdir()?;
+    let mut config = DevnetConfig::minimal();
+    config.node_count = 2;
+    config.bootstrap_count = 1;
+    config.base_port = 0;
+    config.webrtc_direct = true;
+    config.data_dir = temp.path().join("full-listener-devnet");
+    config.spawn_delay = Duration::from_millis(20);
+    config.evm_network = Some(rpc.network());
+    config.webrtc_direct_limits = Some(ant_node::WebRtcDirectConfig {
+        max_connections: 2,
+        max_connections_per_ip: 1,
+        ..ant_node::WebRtcDirectConfig::default()
+    });
+    let mut devnet = Devnet::new(config).await?;
+    devnet.start().await?;
+    let endpoint = devnet.browser_endpoints().remove(0).endpoint;
+    let parsed = endpoint.parse().map_err(io::Error::other)?;
+    let listener = parsed.socket_addr().map_err(io::Error::other)?;
+
+    let result: Result<(), Box<dyn Error>> = async {
+        // A browser at 127.0.0.1 holds that address's one session.
+        let mut client = BrowserRpcClient::connect(&endpoint).await?;
+        let hello = json!({"version": BROWSER_PROTOCOL_VERSION, "request_id": 1, "type": "hello"});
+        client.rpc(hello.clone(), &[]).await?;
+
+        // Another browser at the same address is refused for its address.
+        let same = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let asked = Instant::now();
+        let refusal = connectivity_check(&same, listener, "sameAddressPassword0123456").await?;
+        let took = asked.elapsed();
+        assert_eq!(
+            refusal,
+            Some((486, b"Source Quota Reached".to_vec())),
+            "a second browser from one address"
+        );
+        assert!(took < Duration::from_secs(1), "refused after {took:?}");
+
+        // A browser at another address takes the node's last session.
+        let other = tokio::net::UdpSocket::bind("127.0.0.2:0").await?;
+        assert_eq!(
+            connectivity_check(&other, listener, "otherAddressPassword012345").await?,
+            None,
+            "the node's last session"
+        );
+
+        // With every session taken, a third address is refused for the node.
+        let third = tokio::net::UdpSocket::bind("127.0.0.3:0").await?;
+        let asked = Instant::now();
+        let refusal = connectivity_check(&third, listener, "thirdAddressPassword012345").await?;
+        let took = asked.elapsed();
+        assert_eq!(
+            refusal,
+            Some((486, b"Insufficient Capacity".to_vec())),
+            "a browser at a full node"
+        );
+        assert!(took < Duration::from_secs(1), "refused after {took:?}");
+
+        let refused = devnet
+            .browser_listener_diagnostics()
+            .into_iter()
+            .find(|snapshot| snapshot.local_addr == listener)
+            .ok_or_else(|| io::Error::other("missing listener diagnostics"))?;
+        assert_eq!(refused.transport.rejected_connections, 2);
+        assert_eq!(refused.refusals.transport_sessions, 2);
+        assert!(refused.refusals.total() >= 2);
+
+        // The first browser's session goes on.
+        client.rpc(hello, &[]).await?;
+        client.close().await?;
+        Ok(())
+    }
+    .await;
+    devnet.shutdown().await?;
+    result
+}
+
 struct BrowserRpcClient {
     client: WebRtcDirectClient,
     pq_session: PqSession,

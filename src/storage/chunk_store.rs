@@ -1620,6 +1620,32 @@ impl ChunkStore {
         self.read_file(address).await
     }
 
+    /// The length of a chunk's file, from its metadata, without reading it:
+    /// what a read of it will return. `None` when there is no file. A reader
+    /// reserves this much before the read, rather than a full chunk.
+    ///
+    /// Reads metadata only. It neither verifies the chunk nor changes what the
+    /// store claims or holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] when the metadata can't be read.
+    pub async fn stored_len(&self, address: &XorName) -> Result<Option<u64>> {
+        let path = self.chunk_path(address);
+        self.blocking_tracker
+            .spawn_blocking(move || match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+                Ok(_) => Ok(None),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(Error::Storage(format!(
+                    "Failed to read the length of chunk file {}: {e}",
+                    path.display()
+                ))),
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Chunk store length task failed: {e}")))?
+    }
+
     /// Queue keys whose raw bytes were found not to hash to them, for
     /// [`Self::run_corrupt_rechecks`] to take out of service.
     ///
