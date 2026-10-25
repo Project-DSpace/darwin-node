@@ -146,7 +146,11 @@ echo "== the image's node manager: darwin-nodes from the pinned commit, with its
 [[ "$MANAGER_REVISION" =~ ^[0-9a-f]{40}$ ]] || fail "docker/manager-revision does not end with a commit: $MANAGER_REVISION"
 version=$(docker run --rm --entrypoint darwin-nodes "$IMAGE" --version) || fail "the image has no darwin-nodes"
 echo "$version"
-[[ "$version" == "darwin-nodes "*"commit ${MANAGER_REVISION:0:7}" ]] || fail "darwin-nodes is not built from ${MANAGER_REVISION:0:7}: $version"
+# The commit darwin-client's build script records: 7 characters, or more
+# where 7 would be ambiguous in the checkout it was built from.
+manager_commit=${version##*commit }
+[[ "$version" == "darwin-nodes "*"commit $manager_commit" && "$manager_commit" =~ ^[0-9a-f]{7,40}$ \
+    && "$MANAGER_REVISION" == "$manager_commit"* ]] || fail "darwin-nodes is not built from $MANAGER_REVISION: $version"
 docker run --rm --entrypoint sh "$IMAGE" -c '! command -v ant' >/dev/null || fail "the image still has Autonomi's ant"
 docker run --rm --entrypoint sh "$IMAGE" -c 'cd /usr/share/doc/storage-node/darwin-nodes &&
     for f in LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html; do test -s "$f" || exit 1; done' \

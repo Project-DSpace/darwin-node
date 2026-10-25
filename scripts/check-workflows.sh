@@ -29,8 +29,10 @@
 # - build.yml's manager job builds the image's node manager, darwin-nodes,
 #   with --locked from the darwin-client commit docker/manager-revision pins,
 #   once it has checked that commit is on darwin-client's main, and checks
-#   the binary for Autonomi's addresses and the reset and log-forwarding
-#   routes; its image job needs that job and passes the image marker;
+#   that the binary names that commit (the leading 7 or more characters
+#   ant-cli's build script records) and holds none of Autonomi's addresses
+#   and the reset and log-forwarding routes; its image job needs that job
+#   and passes the image marker;
 # - build.yml's linux-x64 job, which builds the image's node, and
 #   release.yml's build job, which builds the node releases install, build it
 #   with exactly `cargo build --release --locked --bin ant-node`, so no
@@ -226,12 +228,15 @@ if [[ ! -f "${BUILD}" ]]; then
 else
     # The image's node manager is built from the darwin-client commit
     # docker/manager-revision pins, with that commit's own lockfile, and the
-    # binary the image ships is checked for what darwin-client's tests say it
-    # leaves out.
+    # binary the image ships is checked for the commit it names (as many of
+    # its leading characters as git needed, 7 or more) and for what
+    # darwin-client's tests say it leaves out.
     manager=$(job manager "${BUILD}")
     for line in \
         '{ read -r repository; read -r revision; } < docker/manager-revision' \
         'run: cargo build --release --locked -p ant-cli --bin darwin-nodes' \
+        'commit=${version##*commit }' \
+        'if [[ ! "$commit" =~ ^[0-9a-f]{7,40}$ || "$REVISION" != "$commit"* ]]; then' \
         'for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v1/logs/forward; do'; do
         if ! grep -qF -- "${line}" <<<"${manager}"; then
             problem "build.yml's manager job must build darwin-nodes with --locked from the commit docker/manager-revision pins, and check the binary (missing: ${line})"

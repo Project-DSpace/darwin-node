@@ -255,16 +255,18 @@ jobs:
         run: cargo build --release --locked -p ant-cli --bin darwin-nodes
 
       # The binary names the pinned commit (ant-cli's build script records the
-      # checkout's), and holds no Autonomi download or log address and none of
-      # the reset and log-forwarding routes the darwin CLI's own daemon serves.
+      # checkout's: 7 characters, or more where 7 would be ambiguous), and
+      # holds no Autonomi download or log address and none of the reset and
+      # log-forwarding routes the darwin CLI's own daemon serves.
       - name: Check the manager
         shell: bash
         working-directory: darwin-client
         run: |
           version=$(target/release/darwin-nodes --version)
           echo "$version"
-          if [[ "$version" != *"commit ${REVISION:0:7}" ]]; then
-            echo "::error::darwin-nodes --version doesn't name commit ${REVISION:0:7}"
+          commit=${version##*commit }
+          if [[ ! "$commit" =~ ^[0-9a-f]{7,40}$ || "$REVISION" != "$commit"* ]]; then
+            echo "::error::darwin-nodes --version doesn't name commit $REVISION: ${version//$'\n'/; }"
             exit 1
           fi
           for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v1/logs/forward; do
