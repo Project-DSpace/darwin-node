@@ -165,9 +165,9 @@ In the folder with `docker-compose.yml`:
     your router and firewall.
   - A new `REWARDS_ADDRESS` applies to every node.
 - **Set-aside folders:** a node folder under `nodes/` that no registered
-  node has moves to `retired/unregistered/`, which the container never
-  deletes. It may hold a node's identity and data: delete it yourself once
-  you know it isn't needed.
+  node has moves to `unregistered/`, beside `retired/`, which no image
+  deletes, the images before this one included. It may hold a node's
+  identity and data: delete it yourself once you know it isn't needed.
 
 ## When the disk fills
 

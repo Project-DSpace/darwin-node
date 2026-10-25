@@ -329,6 +329,11 @@ fn the_image_marker_reaches_the_nodes_only_from_the_managers_environment() {
     );
 }
 
+/// The entrypoint's sweep of retired folders. The images up to ds.15's run
+/// the same command at every start, so a folder kept in `$RETIRED` is gone
+/// 3 days after it last changed once an operator goes back to one of them.
+const SWEEP: &str = r#"find "$RETIRED" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +"#;
+
 /// Words that delete files or data, or take a node out of the registry.
 /// Moves (`mv`), plain writes and redirections are not counted: they move a
 /// folder aside or write a file whole, as the erasure census of the node's
@@ -365,13 +370,15 @@ const DELETIONS: &[Deletion] = &[
     },
     Deletion {
         file: "docker/entrypoint.sh",
-        command: r#"find "$RETIRED" -mindepth 1 -maxdepth 1 ! -name unregistered -mtime +3 -exec rm -rf {} +"#,
+        command: SWEEP,
         count: 1,
         reason: "The sweep of retired folders: the data and logs of nodes retired when the \
                  operator lowered NODE_COUNT, and the logs of nodes an earlier manager evicted, \
                  each dated when retired and deleted at a start more than 3 days later, so a \
-                 lowered NODE_COUNT can be undone within 3 days. It never reaches \
-                 retired/unregistered, where folders no node is registered for are kept for good.",
+                 lowered NODE_COUNT can be undone within 3 days. It is the command of every \
+                 earlier image too, so an image started on the same /data sweeps the same \
+                 folders; folders no node is registered for are kept beside them, in \
+                 /data/unregistered, which no image's sweep reaches.",
     },
     Deletion {
         file: "docker/entrypoint.sh",

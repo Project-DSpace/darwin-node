@@ -22,7 +22,7 @@ REGISTRY=$STATE/node_registry.json
 NODES=/data/nodes                    # node-<id>: one node's data (its --root-dir)
 LOGS=/data/logs                      # node-<id>/logs: one node's daily log files
 RETIRED=/data/retired                # nodes removed by lowering NODE_COUNT, kept 3 days
-UNREGISTERED=$RETIRED/unregistered   # node folders no node is registered for, never deleted
+UNREGISTERED=/data/unregistered      # node folders no node is registered for, never deleted
 MIN_FREE_PER_NODE=$((20 * 1024 ** 3)) # Autonomi's recommended minimum disk per node
 
 fail() { echo "$*" >&2; exit 1; }
@@ -154,8 +154,10 @@ fi
 # container, so a stale one could match an unrelated process.
 rm -f "$STATE/daemon.pid" "$STATE/daemon.port" "$NODES"/node-*/node.pid
 # Folders retired by lowering NODE_COUNT are deleted 3 days after their
-# retirement. Unregistered folders are never deleted here.
-find "$RETIRED" -mindepth 1 -maxdepth 1 ! -name unregistered -mtime +3 -exec rm -rf {} +
+# retirement. Earlier images sweep $RETIRED with this same command, so
+# folders set aside as unregistered are kept beside it, in $UNREGISTERED,
+# where no image's sweep reaches them.
+find "$RETIRED" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +
 
 # Nodes keep the data they hold while the disk has room, so a disk they have
 # filled is normal: the space their own data takes counts as theirs.
@@ -263,8 +265,9 @@ done
 
 # Node folders no registered node has (taken over from the old layout beyond
 # NODE_COUNT, or left from a node an earlier manager evicted) are set aside in
-# $UNREGISTERED, which nothing here ever deletes: such a folder can hold a
-# node's identity and data, and only the operator knows whether it is needed.
+# $UNREGISTERED, which neither this image nor an earlier one deletes: such a
+# folder can hold a node's identity and data, and only the operator knows
+# whether it is needed.
 for dir in "$NODES"/node-*; do
     [[ -d "$dir" ]] || continue
     id=${dir##*/node-}

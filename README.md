@@ -222,13 +222,16 @@ never ran.
   arguments. At its first start the entrypoint dismisses, once, the nodes
   `ant` evicted, whose data is gone, and new nodes take their places up to
   `NODE_COUNT`; node folders no registered node has move to
-  `retired/unregistered/`, which nothing deletes. Every node gets the image marker, the commit the image is
-  built from, in `ANT_IMAGE_VERSION`, from the manager's environment only.
-  The smoke test checks all of it: on a nearly full 1.5 GB disk nothing is
-  evicted or deleted, and a `/data` written by ds.15's image keeps every
-  node's id, port, data and identity. `tests/darwin_image.rs` pins the
-  manager's install, the registry's place, the marker's path, and every
-  deletion the image's scripts make, each with its reason.
+  `/data/unregistered/`, beside `/data/retired/`, which no image's sweep
+  of retired folders reaches, ds.15's included, so nothing deletes them.
+  Every node gets the image marker, the commit the image is built from, in
+  `ANT_IMAGE_VERSION`, from the manager's environment only. The smoke test
+  checks all of it: on a nearly full 1.5 GB disk nothing is evicted or
+  deleted, a `/data` written by ds.15's image keeps every node's id, port,
+  data and identity, and ds.15's image started again on a `/data` this
+  image wrote keeps every folder set aside. `tests/darwin_image.rs` pins
+  the manager's install, the registry's place, the marker's path, and
+  every deletion the image's scripts make, each with its reason.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
   releases without credentials, and orders `+ds.N` builds by their number,

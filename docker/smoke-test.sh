@@ -19,9 +19,11 @@
 # previous image's /data/node-<port> layout is taken over with identities
 # kept; lowering NODE_COUNT retires a node; retired data is deleted at a start
 # 4 or more days after its retirement, however long it sat unchanged before;
-# node folders no node is registered for are set aside in retired/unregistered,
-# which is never deleted; changing PORT_START moves the
-# nodes with identities kept; docker stop is clean and timely;
+# node folders no node is registered for are set aside in /data/unregistered,
+# beside /data/retired, which is never deleted; changing PORT_START moves the
+# nodes with identities kept; docker stop is clean and timely; the release
+# before, started on a /data this image wrote, keeps what this image set
+# aside;
 # on a nearly full disk the node manager reports the disk as critical and
 # nothing is evicted or deleted, and `nodes clear-evicted` does nothing; a
 # /data written by the release before, whose node manager was Autonomi's
@@ -49,7 +51,7 @@ COMMON=(--network host --stop-timeout 120 -e ANT_NETWORK_MODE=testnet -e REWARDS
 PREVIOUS_IMAGE=ghcr.io/project-dspace/storage-node:20fbb745d06909a5adee55bcd9fc9113e466ce16@sha256:edd2e1623fa31176f37c99ff6d3e0f40743fba0680f86dc2eac59b5b974e0208
 # The darwin-client commit the image's node manager is built from.
 MANAGER_REVISION=$(tail -n 1 "$(dirname "${BASH_SOURCE[0]}")/manager-revision")
-CONTAINERS="seed smoke full previous upgraded evicting dismissing noexec rpc relay"
+CONTAINERS="seed smoke rollback full previous upgraded evicting dismissing noexec rpc relay"
 
 fail() {
     echo "FAILED: $*"
@@ -194,9 +196,9 @@ sudo touch -d '84 hours ago' "$WORK/smoke/retired/recent-node-9"
 # node-7, a node folder no node is registered for, is set aside at this
 # start; old-node-6 was set aside at a start 5 days ago, and unregistered
 # itself last changed then.
-sudo mkdir -p "$WORK/smoke/nodes/node-7" "$WORK/smoke/retired/unregistered/old-node-6"
-sudo sh -c "echo kept > $WORK/smoke/nodes/node-7/smoke-kept; echo kept > $WORK/smoke/retired/unregistered/old-node-6/smoke-kept"
-sudo touch -d '5 days ago' "$WORK/smoke/retired/unregistered/old-node-6" "$WORK/smoke/retired/unregistered"
+sudo mkdir -p "$WORK/smoke/nodes/node-7" "$WORK/smoke/unregistered/old-node-6"
+sudo sh -c "echo kept > $WORK/smoke/nodes/node-7/smoke-kept; echo kept > $WORK/smoke/unregistered/old-node-6/smoke-kept"
+sudo touch -d '5 days ago' "$WORK/smoke/unregistered/old-node-6" "$WORK/smoke/unregistered"
 # node-3's folder, unchanged for 5 days, keeps its 3 days once retired. Its
 # process file is gone first, so nothing before the move changes the folder.
 sudo rm -f "$WORK/smoke/nodes/node-3/node.pid"
@@ -208,14 +210,14 @@ wait_for smoke 'Running 2 node' 1 60 || fail "2 nodes did not start"
 sudo sh -c "ls -d $WORK/smoke/retired/*-node-3" >/dev/null || fail "node-3's data was not kept in /data/retired"
 sudo test ! -e "$WORK/smoke/retired/old-node-8" || fail "data retired 5 days ago was not deleted at start"
 sudo test -d "$WORK/smoke/retired/recent-node-9" || fail "data retired 84 hours ago was deleted at start"
-sudo sh -c "cat $WORK/smoke/retired/unregistered/*-node-7/smoke-kept" >/dev/null \
-    || fail "node-7's folder was not kept in /data/retired/unregistered"
-sudo test -f "$WORK/smoke/retired/unregistered/old-node-6/smoke-kept" || fail "a folder set aside 5 days ago was deleted"
+sudo sh -c "cat $WORK/smoke/unregistered/*-node-7/smoke-kept" >/dev/null \
+    || fail "node-7's folder was not kept in /data/unregistered"
+sudo test -f "$WORK/smoke/unregistered/old-node-6/smoke-kept" || fail "a folder set aside 5 days ago was deleted"
 
 echo "== changing PORT_START moves the nodes, identities kept"
 docker stop -t 120 smoke >/dev/null && docker rm smoke >/dev/null
 ids=$(peer_ids "$WORK/smoke")
-sudo touch -d '5 days ago' "$WORK/smoke/retired/unregistered" "$WORK/smoke/retired/unregistered"/*-node-7
+sudo touch -d '5 days ago' "$WORK/smoke/unregistered" "$WORK/smoke/unregistered"/*-node-7
 run_smoke 2 10920
 wait_for smoke 'Moving node-2 from UDP port 10911 to 10921' 1 60 || fail "nodes were not moved to the new ports"
 wait_for smoke 'Running 2 node' 1 60 || fail "moved nodes did not start"
@@ -223,8 +225,8 @@ wait_for smoke 'Running 2 node' 1 60 || fail "moved nodes did not start"
 # before that, is still within its 3 days.
 sudo sh -c "ls -d $WORK/smoke/retired/*-node-3" >/dev/null \
     || fail "node-3's data, retired at the last start, was deleted at this one"
-(( $(sudo sh -c "cat $WORK/smoke/retired/unregistered/*/smoke-kept" | grep -c '^kept$') == 2 )) \
-    || fail "a folder set aside in /data/retired/unregistered was deleted"
+(( $(sudo sh -c "cat $WORK/smoke/unregistered/*/smoke-kept" | grep -c '^kept$') == 2 )) \
+    || fail "a folder set aside in /data/unregistered was deleted"
 [[ "$(registry "$WORK/smoke" '[.nodes[].node_port] | sort | join(",")')" == "10920,10921" ]] || fail "ports not changed"
 [[ "$(peer_ids "$WORK/smoke")" == "$ids" ]] || fail "identities changed when moving ports"
 wait_for smoke '\[node-[0-9]+\].*Successfully connected to [1-9]' 2 || fail "moved nodes did not rejoin the seed"
@@ -236,6 +238,21 @@ echo "stopped in ${took}s, exit code $code"
 (( took < 100 )) || fail "stopping took ${took}s"
 [[ "$code" == 0 ]] || fail "container exited with code $code"
 (( $(count smoke 'Stopping nodes') >= 1 )) || fail "nodes were not stopped by the entrypoint"
+
+echo "== the release before, started on this /data, keeps what this image set aside"
+# Going back to the image before, whose node manager is Autonomi's: its start
+# deletes what /data/retired has held for more than 3 days. The folders this
+# image set aside, wherever it keeps them, are 5 days old first.
+set_aside=$(sudo find "$WORK/smoke" -mindepth 2 -maxdepth 3 -type d -name '*-node-7' ! -path "$WORK/smoke/nodes/*")
+[[ -n "$set_aside" && "$(wc -l <<<"$set_aside")" == 1 ]] || fail "node-7's set-aside folder is not in one place: $set_aside"
+sudo touch -d '5 days ago' "$set_aside" "$(dirname "$set_aside")/old-node-6" "$(dirname "$set_aside")"
+docker pull -q "$PREVIOUS_IMAGE" >/dev/null || fail "could not pull $PREVIOUS_IMAGE"
+docker run -d --name rollback "${COMMON[@]}" -e MANAGER_PORT=12609 -e NODE_COUNT=2 -e PORT_START=10920 \
+    -e BROWSER_PORT_START=11910 -e PUBLIC_IP=$IP -e BOOTSTRAP_PEERS="$IP:10900" -v "$WORK/smoke:/data" "$PREVIOUS_IMAGE" >/dev/null
+wait_for rollback 'Running 2 node' 1 60 || fail "the release before did not start the nodes on a /data this image wrote"
+sudo test -f "$set_aside/smoke-kept" || fail "the release before deleted $set_aside, which this image set aside"
+sudo test -f "$(dirname "$set_aside")/old-node-6/smoke-kept" || fail "the release before deleted a folder this image kept set aside"
+docker stop -t 120 rollback >/dev/null && docker rm rollback >/dev/null
 
 echo "== a nearly full 1.5 GB disk: the node manager reports it, and nothing is evicted or deleted"
 docker run -d --name full "${COMMON[@]}" -e MANAGER_PORT=12603 --tmpfs /data:rw,exec,size=1500m -e NODE_COUNT=3 -e PORT_START=10930 \
@@ -316,8 +333,8 @@ done
 (( $(marked_folders "$WORK/previous") == 3 )) || fail "a node's data folder was deleted on the move"
 [[ "$(sudo find "$WORK/previous/manager" -name node_registry.json)" == "$WORK/previous/manager/ant/node_registry.json" ]] \
     || fail "the registry was not read in place"
-[[ -z "$(sudo find "$WORK/previous/retired" -mindepth 1 ! -path "$WORK/previous/retired/unregistered")" ]] \
-    || fail "the move retired or set aside something: $(sudo find "$WORK/previous/retired" -mindepth 1)"
+[[ -z "$(sudo find "$WORK/previous/retired" "$WORK/previous/unregistered" -mindepth 1 2>&1)" ]] \
+    || fail "the move retired or set aside something: $(sudo find "$WORK/previous/retired" "$WORK/previous/unregistered" -mindepth 1 2>&1)"
 (( $(count upgraded 'Retiring|Setting aside|Dismissing|Taking over|Moving node') == 0 )) \
     || fail "the move retired, set aside, dismissed or moved a node"
 has_marker upgraded 3 || fail "not every node has the image marker after the move: $(node_markers upgraded | tr '\n' ' ')"
