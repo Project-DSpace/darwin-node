@@ -2013,7 +2013,8 @@ async fn process_request(
             drop(content);
             let response_limit = binary_response_limit(&message.body, record_len)?;
             reservation.resize(reservation.source.amount.max(2 * response_limit))?;
-            let response = handle_ant_message(protocol, message).await?;
+            let response =
+                within_admission(handle_ant_message(protocol, message).await?, record_len);
             let bytes = encode_binary_response(&response, response_limit)?;
             drop(response);
             reservation.resize(bytes.len())?;
@@ -2091,6 +2092,35 @@ fn binary_response_limit(
         | ChunkMessageBody::PointerGetRequest(_)
         | ChunkMessageBody::PointerPutRequest(_) => Ok(SMALL_BINARY_RESPONSE_BYTES),
         _ => Err("unsupported chunk protocol request".to_string()),
+    }
+}
+
+/// A GET's answer as its admission allows: one holding a record longer than
+/// the length read when the GET was admitted, a record stored meanwhile (by
+/// replication, say), is answered as the miss it was at admission, which
+/// the browser tries again, so the answer stays within the bytes reserved
+/// for it. Every other answer as it is.
+fn within_admission(response: ChunkMessage, record_len: Option<usize>) -> ChunkMessage {
+    match (&response.body, record_len) {
+        (
+            ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success {
+                address,
+                content,
+            }),
+            Some(admitted),
+        ) if content.len() > admitted => {
+            debug!(
+                "A browser GET of {} found a record stored after it was admitted; answering it as a miss",
+                hex::encode(address)
+            );
+            ChunkMessage {
+                request_id: response.request_id,
+                body: ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::NotFound {
+                    address: *address,
+                }),
+            }
+        }
+        _ => response,
     }
 }
 
@@ -3413,6 +3443,46 @@ mod tests {
         }
         let small = binary_response_limit(&request, Some(4096)).expect("GET bound");
         assert!(encode_binary_response(&answer(vec![0xff; 4096 + small]), small).is_err());
+    }
+
+    /// A record stored between a GET's admission and its read, longer than
+    /// the length admitted, is answered as the miss it was at admission,
+    /// within the GET's bound; a record within its admission is answered
+    /// as read.
+    #[test]
+    fn a_record_stored_after_a_get_was_admitted_is_answered_as_a_miss() {
+        let request = ChunkMessageBody::GetRequest(ant_protocol::ChunkGetRequest::new([0xab; 32]));
+        let answer = |content: Vec<u8>| ChunkMessage {
+            request_id: 7,
+            body: ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success {
+                address: [0xab; 32],
+                content,
+            }),
+        };
+        // Not held at admission: a full chunk stored meanwhile.
+        let limit = binary_response_limit(&request, Some(0)).expect("GET bound");
+        assert!(encode_binary_response(&answer(vec![0xff; MAX_CHUNK_SIZE]), limit).is_err());
+        let answered = within_admission(answer(vec![0xff; MAX_CHUNK_SIZE]), Some(0));
+        assert_eq!(answered.request_id, 7);
+        assert!(matches!(
+            answered.body,
+            ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::NotFound { address })
+                if address == [0xab; 32]
+        ));
+        assert!(encode_binary_response(&answered, limit).is_ok());
+
+        // Held at admission, and as long as admitted: answered as read.
+        let answered = within_admission(answer(vec![0xff; 4096]), Some(4096));
+        assert!(matches!(
+            answered.body,
+            ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success { .. })
+        ));
+        // Not a GET's answer, or no admitted length: as it is.
+        let answered = within_admission(answer(vec![0xff; 4096]), None);
+        assert!(matches!(
+            answered.body,
+            ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success { .. })
+        ));
     }
 
     /// The pool GETs queue for holds as many bytes as when every GET was
