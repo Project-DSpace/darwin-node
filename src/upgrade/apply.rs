@@ -9,6 +9,7 @@
 
 use crate::error::{Error, Result};
 use crate::logging::{debug, error, info, warn};
+use crate::storage::{MIB, OLD_MANAGER_LINE};
 use crate::upgrade::binary_cache::BinaryCache;
 use crate::upgrade::traffic::{self, UpgradeFetch};
 use crate::upgrade::{signature, UpgradeInfo, UpgradeResult};
@@ -23,9 +24,25 @@ use tar::Archive;
 /// Maximum allowed upgrade archive size (200 MiB).
 pub(super) const MAX_ARCHIVE_SIZE_BYTES: usize = 200 * 1024 * 1024;
 
-/// The free space an upgrade needs before it starts: the archive, and the
-/// binary twice, extracted and as the backup of the running one. An archive
-/// whose size the release doesn't give counts as the largest one downloaded.
+/// The room an upgrade keeps above [`OLD_MANAGER_LINE`] once its own writes
+/// are made, for the node's other writes meanwhile. With a release's sizes
+/// (an upgrade needing about 140 MiB), a node at the full line (1 GiB free)
+/// still upgrades: 500 + 256 + 140 MiB is under 1 GiB.
+pub const UPGRADE_SPACE_MARGIN: u64 = 256 * MIB;
+
+/// Whether `available` free bytes leave room for an upgrade needing `needed`:
+/// after its writes, the disk stays [`UPGRADE_SPACE_MARGIN`] above the old
+/// node manager's line.
+fn room_for(needed: u64, available: u64) -> bool {
+    available
+        >= OLD_MANAGER_LINE
+            .saturating_add(UPGRADE_SPACE_MARGIN)
+            .saturating_add(needed)
+}
+
+/// The free space an upgrade's own writes take: the archive, and the binary
+/// twice, extracted and as the backup of the running one. An archive whose
+/// size the release doesn't give counts as the largest one downloaded.
 fn space_needed(archive_size: Option<u64>, binary_len: u64) -> u64 {
     archive_size
         .unwrap_or(MAX_ARCHIVE_SIZE_BYTES as u64)
@@ -36,6 +53,13 @@ fn space_needed(archive_size: Option<u64>, binary_len: u64) -> u64 {
 /// read.
 fn binary_len(binary: &Path) -> u64 {
     fs::metadata(binary).map_or(MAX_ARCHIVE_SIZE_BYTES as u64, |meta| meta.len())
+}
+
+/// A node's turn to apply an upgrade on its machine
+/// ([`AutoApplyUpgrader::room_to_apply`]); the next node's comes when it is
+/// dropped.
+pub struct ApplyTurn {
+    _lock: Option<File>,
 }
 
 /// Exit code that signals the service manager to restart the process.
@@ -100,6 +124,59 @@ impl AutoApplyUpgrader {
     #[must_use]
     pub fn current_version(&self) -> &Version {
         &self.current_version
+    }
+
+    /// Wait for this machine's turn to apply an upgrade, then check that the
+    /// disk holding `binary_dir` has room for one needing `needed` bytes (see
+    /// [`UPGRADE_SPACE_MARGIN`]). The turn is held until it is dropped, so it
+    /// is kept until the upgrade's writes are made and its temporary files
+    /// gone.
+    ///
+    /// The turn is a file lock in the shared upgrade cache's folder, or in
+    /// `binary_dir` when there is no cache, so the nodes sharing either
+    /// apply one at a time. Nodes in different containers sharing neither,
+    /// on one disk, are kept apart only by the margin. A lock that can't be
+    /// taken, or free space that can't be read, doesn't stop the upgrade.
+    ///
+    /// # Errors
+    ///
+    /// [`UpgradeResult::NotEnoughSpace`] when the disk has no room for it.
+    pub async fn room_to_apply(
+        &self,
+        needed: u64,
+        binary_dir: &Path,
+    ) -> std::result::Result<ApplyTurn, UpgradeResult> {
+        let lock_path = self.binary_cache.as_ref().map_or_else(
+            || binary_dir.join(".ant-node-upgrade-apply.lock"),
+            |cache| cache.cache_dir().join("upgrade-apply.lock"),
+        );
+        let lock = tokio::task::spawn_blocking(move || -> std::io::Result<File> {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)?;
+            fs2::FileExt::lock_exclusive(&file)?;
+            Ok(file)
+        })
+        .await;
+        let lock = match lock {
+            Ok(Ok(file)) => Some(file),
+            Ok(Err(e)) => {
+                warn!("Could not take the upgrade turn's lock, applying without it: {e}");
+                None
+            }
+            Err(e) => {
+                warn!("The upgrade turn's lock task failed, applying without it: {e}");
+                None
+            }
+        };
+        if let Ok(available) = crate::storage::available_space(binary_dir) {
+            if !room_for(needed, available) {
+                return Err(UpgradeResult::NotEnoughSpace { needed, available });
+            }
+        }
+        Ok(ApplyTurn { _lock: lock })
     }
 
     /// Get the path to the currently running binary.
@@ -193,13 +270,14 @@ impl AutoApplyUpgrader {
             .ok_or_else(|| Error::Upgrade("Cannot determine binary directory".to_string()))?;
 
         // The upgrade's own writes come first: a disk that can't take them
-        // skips this cycle, before anything is downloaded or written.
+        // and stay clear of the old manager's line skips this cycle, before
+        // anything is downloaded or written. The nodes of a machine apply
+        // one at a time, each reading the free space the one before left.
         let needed = space_needed(info.archive_size, binary_len(&current_binary));
-        if let Ok(available) = crate::storage::available_space(binary_dir) {
-            if available < needed {
-                return Ok(UpgradeResult::NotEnoughSpace { needed, available });
-            }
-        }
+        let _turn = match self.room_to_apply(needed, binary_dir).await {
+            Ok(turn) => turn,
+            Err(skipped) => return Ok(skipped),
+        };
 
         // Create temp directory for upgrade.
         //
@@ -934,9 +1012,22 @@ mod ds_ordering;
 
 #[cfg(test)]
 mod space_tests {
-    use super::{space_needed, MAX_ARCHIVE_SIZE_BYTES};
+    use super::{room_for, space_needed, MAX_ARCHIVE_SIZE_BYTES};
+    use crate::storage::{DEFAULT_DISK_RESERVE, MIB};
 
-    const MIB: u64 = 1024 * 1024;
+    /// A release's sizes: a 20 MiB archive and a 60 MiB binary.
+    const RELEASE: u64 = 140 * MIB;
+
+    #[test]
+    fn an_upgrade_leaves_the_disk_clear_of_the_old_managers_line() {
+        // A node at the full line upgrades.
+        assert!(room_for(RELEASE, DEFAULT_DISK_RESERVE));
+        // Short of 500 + 256 MiB above its own writes, it doesn't.
+        assert!(room_for(RELEASE, 896 * MIB));
+        assert!(!room_for(RELEASE, 896 * MIB - 1));
+        assert!(!room_for(RELEASE, 600 * MIB));
+        assert!(!room_for(u64::MAX, u64::MAX - 1));
+    }
 
     #[test]
     fn an_upgrade_needs_the_archive_and_twice_the_binary() {

@@ -117,6 +117,12 @@ impl BinaryCache {
         }
     }
 
+    /// The cache's folder, shared by the nodes of a machine.
+    #[must_use]
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
     /// Path of the cached archive for `version`.
     #[must_use]
     pub fn cached_archive_path(&self, version: &str) -> PathBuf {

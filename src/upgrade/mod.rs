@@ -16,7 +16,7 @@ mod rollout;
 mod signature;
 pub(crate) mod traffic;
 
-pub use apply::{AutoApplyUpgrader, RESTART_EXIT_CODE};
+pub use apply::{ApplyTurn, AutoApplyUpgrader, RESTART_EXIT_CODE, UPGRADE_SPACE_MARGIN};
 pub use binary_cache::BinaryCache;
 pub use cache_dir::upgrade_cache_dir;
 pub use monitor::{find_platform_asset, version_from_tag, Asset, GitHubRelease, UpgradeMonitor};

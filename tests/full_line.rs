@@ -22,10 +22,12 @@ use ant_node::listings::ListingService;
 use ant_node::log_files::{FreeSpace, LineFormat, LogFiles, TagLevels};
 use ant_node::replication::paid_list::PaidList;
 use ant_node::storage::{
-    ChunkStore, ChunkStoreConfig, SpaceReading, DEFAULT_DISK_RESERVE, GIB, MIB,
+    ChunkStore, ChunkStoreConfig, SpaceReading, DEFAULT_DISK_RESERVE, GIB, MIB, OLD_MANAGER_LINE,
 };
 use ant_node::test_seams::FREE_SPACE_FILE;
-use ant_node::upgrade::{AutoApplyUpgrader, UpgradeInfo, UpgradeResult};
+use ant_node::upgrade::{
+    AutoApplyUpgrader, BinaryCache, UpgradeInfo, UpgradeResult, UPGRADE_SPACE_MARGIN,
+};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,9 +37,6 @@ use tracing_subscriber::prelude::*;
 
 /// The partition's size.
 const PARTITION: u64 = 4 * GIB;
-
-/// Where the node manager of images before darwin-nodes deleted a node's data.
-const OLD_MANAGER_LINE: u64 = 500 * MIB;
 
 /// How often the partition's free space is published to the seam.
 const PUBLISH_EVERY: Duration = Duration::from_millis(5);
@@ -379,8 +378,17 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
         );
     }
 
-    // The upgrade's check lets it through at the line: it reaches its
-    // download, which fails here, having no release to fetch.
+    // The upgrade's check lets it through with room for its writes above
+    // the old manager's line and the margin: it reaches its download, which
+    // fails here, having no release to fetch. Its "binary" is this test's,
+    // far larger than a release's, so the disk is given room for that (a
+    // release's sizes at the line are in the unit tests and below).
+    let test_binary = std::fs::metadata(AutoApplyUpgrader::current_binary_path().unwrap())
+        .unwrap()
+        .len();
+    partition
+        .fill_to(OLD_MANAGER_LINE + UPGRADE_SPACE_MARGIN + ARCHIVE + 2 * test_binary + 64 * MIB);
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let upgrade = UpgradeInfo {
         version: semver::Version::parse("0.23.0+ds.99").unwrap(),
         download_url: "not a url".to_string(),
@@ -435,6 +443,73 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
             assert!(needed > available, "{needed} > {available}");
         }
         other => panic!("a short disk must skip the upgrade: {other:?}"),
+    }
+
+    // Four nodes of one machine upgrading at once at the full line take
+    // turns, each reading the free space the one before left; each upgrade
+    // that goes through keeps its writes, as a cached archive and a backup
+    // stay. Those the disk has no more room for are refused, and the disk
+    // stays clear of the old manager's line.
+    partition.fill_to(DEFAULT_DISK_RESERVE);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The lowest free space from here on: the disk was taken to 50 MiB on
+    // purpose above.
+    partition.lowest.store(u64::MAX, Ordering::SeqCst);
+    let cache_dir = dir.path().join("upgrade-cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let upgrades: Vec<_> = (0..4)
+        .map(|n| {
+            let (cache_dir, root) = (cache_dir.clone(), root.clone());
+            tokio::spawn(async move {
+                let upgrader =
+                    AutoApplyUpgrader::new().with_binary_cache(BinaryCache::new(cache_dir));
+                match upgrader.room_to_apply(ARCHIVE + 2 * BINARY, &root).await {
+                    Ok(turn) => {
+                        let writes = root.join(format!("upgrade-{n}"));
+                        std::fs::write(
+                            &writes,
+                            vec![0u8; usize::try_from(ARCHIVE + 2 * BINARY).unwrap()],
+                        )
+                        .unwrap();
+                        // The partition sees the writes before the turn passes.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        drop(turn);
+                        Some(writes)
+                    }
+                    Err(UpgradeResult::NotEnoughSpace { .. }) => None,
+                    Err(other) => panic!("an upgrade's turn: {other:?}"),
+                }
+            })
+        })
+        .collect();
+    let mut applied = Vec::new();
+    for upgrade in upgrades {
+        applied.extend(upgrade.await.unwrap());
+    }
+    assert!(!applied.is_empty(), "a node at the full line upgrades");
+    assert!(applied.len() < 4, "the disk took four upgrades at the line");
+    let lowest = partition.lowest();
+    assert!(
+        lowest > OLD_MANAGER_LINE,
+        "free space fell to {} MiB with upgrades at once",
+        lowest / MIB
+    );
+    for writes in applied {
+        std::fs::remove_file(writes).unwrap();
+    }
+
+    // 600 MiB free has no room for an upgrade above the old manager's line.
+    partition.fill_to(600 * MIB);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    match AutoApplyUpgrader::new()
+        .room_to_apply(ARCHIVE + 2 * BINARY, &root)
+        .await
+    {
+        Err(UpgradeResult::NotEnoughSpace { available, .. }) => {
+            assert!(available <= 600 * MIB, "{available}");
+        }
+        Err(other) => panic!("600 MiB free must skip the upgrade: {other:?}"),
+        Ok(_) => panic!("600 MiB free must skip the upgrade"),
     }
 
     // Space returns: each writer says what it dropped.
