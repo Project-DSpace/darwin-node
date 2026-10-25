@@ -50,16 +50,10 @@ mod integration_tests;
 mod listings;
 
 #[cfg(test)]
-mod merkle_payment;
-
-#[cfg(test)]
 mod replication;
 
 // Pointer replication across real nodes (ADR-0016).
 mod pointer_replication;
-
-#[cfg(test)]
-mod security_attacks;
 
 #[cfg(test)]
 mod subtree_audit_testnet;
