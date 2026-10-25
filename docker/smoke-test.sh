@@ -28,12 +28,14 @@
 # nodes with identities kept; docker stop is clean and timely; the release
 # before, started on a /data this image wrote, keeps what this image set
 # aside;
-# on a nearly full disk the node manager reports the disk as critical and
-# nothing is evicted or deleted, and `nodes clear-evicted` does nothing; a
-# /data written by the release before, whose node manager was Autonomi's
-# `ant` 0.3.9, keeps every node's id, port, data and identity, with nothing
-# retired; nodes that manager evicted are dismissed once, and NODE_COUNT is
-# made up with new nodes; a data folder mounted noexec is refused;
+# on a nearly full disk the node manager reports the disk as critical, giving
+# each health check the level, partition and summary the server watchdog
+# reads, and nothing is evicted or deleted, and `nodes clear-evicted` does
+# nothing; a /data written by the release before, whose node manager was
+# Autonomi's `ant` 0.3.9, keeps every node's id, port, data and identity, with
+# nothing retired; nodes that manager evicted are dismissed once, and
+# NODE_COUNT is made up with new nodes; a data folder mounted noexec is
+# refused;
 # production mode warns above 2 nodes; the old PublicNode RPC_URL is pointed
 # out; an RPC_URL of only spaces leaves the image's RPCs in place;
 # ANT_RELAY_SERVING=false reaches every node and switches its relay server
@@ -352,12 +354,24 @@ in_full "fallocate -l $((avail - 300 * 1024 * 1024)) /data/filler"
 # Autonomi's manager evicted a node at each such reading, 2 of these 3
 # within 3 minutes. Four more readings after that.
 health() { in_full "curl -fsS http://127.0.0.1:12603/api/v1/health" || true; }
+overall() { jq -r '.overall // empty' <<<"$1" 2>/dev/null || true; }
+reading=
 for _ in $(seq 1 45); do
-    [[ "$(health | jq -r '.overall // empty')" == critical ]] && break
+    reading=$(health)
+    [[ "$(overall "$reading")" == critical ]] && break
     sleep 2
 done
-[[ "$(health | jq -r '.overall // empty')" == critical ]] || fail "the node manager did not report the nearly full disk: $(health)"
-echo "health: $(health | jq -c '[.checks[] | {level, summary}]')"
+[[ "$(overall "$reading")" == critical ]] || fail "the node manager did not report the nearly full disk: $reading"
+# The server watchdog reads each check's level, partition (or "-") and
+# summary, keeps the checks whose level isn't "green", and raises its critical
+# alert only on the level "critical". The reading that reports the disk as
+# critical gives them, in those names.
+jq -e '(.checks | type == "array" and length > 0)
+    and all(.checks[]; (.level | type == "string") and (.summary | type == "string")
+        and ((.partition | type) as $t | $t == "string" or $t == "null"))
+    and any(.checks[]; .level == "critical")' <<<"$reading" >/dev/null 2>&1 \
+    || fail "the health checks lack the level, partition and summary the watchdog reads: $reading"
+echo "health: $(jq -c '[.checks[] | {level, partition, summary}]' <<<"$reading")"
 sleep 120
 [[ "$(registry_full)" == "$nodes_before" ]] || fail "the registry changed on the nearly full disk: $(registry_full)"
 (( $(in_full 'cat /data/nodes/node-*/smoke-kept 2>/dev/null' | grep -c '^kept$' || true) == 3 )) \

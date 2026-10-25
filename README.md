@@ -230,9 +230,10 @@ never ran.
   upgrade is started again at once on its new binary, and one that is
   killed is started again after a crash, each with its id, port and
   identity; on a nearly full 1.5 GB disk nothing is evicted or
-  deleted, a `/data` written by ds.15's image keeps every node's id, port,
-  data and identity, and ds.15's image started again on a `/data` this
-  image wrote keeps every folder set aside. `tests/darwin_image.rs` pins
+  deleted, and the manager's health report keeps the fields the server
+  watchdog reads; a `/data` written by ds.15's image keeps every node's id,
+  port, data and identity; and ds.15's image started again on a `/data`
+  this image wrote keeps every folder set aside. `tests/darwin_image.rs` pins
   the manager's install, the registry's place, the marker's path, every
   deletion and every move the image's scripts make, each with its reason,
   and the set-aside folders' place beyond every sweep.
