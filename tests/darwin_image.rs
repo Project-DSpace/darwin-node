@@ -357,6 +357,24 @@ fn an_operators_node_config_reaches_every_node() {
         repo_text("docker/README.md").contains(&format!(":{MOUNTED}:ro")),
         "docker/README.md doesn't say where to mount the file"
     );
+    // A missing host file mounted with the short syntax arrives as an empty
+    // directory: refused with what to do, and anything else that isn't a
+    // regular file refused too, never read as no file.
+    let script = repo_text("docker/entrypoint.sh");
+    assert!(
+        script.contains(r#"if [[ -d "$NODE_CONFIG" ]]; then"#),
+        "the entrypoint doesn't refuse a directory at {MOUNTED}"
+    );
+    assert!(
+        script.contains(
+            "is a directory; create node.toml next to docker-compose.yml before mounting it"
+        ),
+        "the entrypoint doesn't say to create node.toml before mounting it"
+    );
+    assert!(
+        script.contains(r#"[[ -f "$NODE_CONFIG" ]] || fail"#),
+        "the entrypoint doesn't require a regular file at {MOUNTED}"
+    );
     assert!(
         repo_text("src/bin/ant-node/cli.rs").contains(r#"#[arg(long, short, env = "ANT_CONFIG")]"#),
         "the node doesn't read its config file from ANT_CONFIG"

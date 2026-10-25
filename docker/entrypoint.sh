@@ -94,8 +94,14 @@ fi
 # its [webrtc_direct] can be lowered there. The settings this script passes
 # to the nodes (ports, rewards address, RPC, bootstrap peers and the rest)
 # still take precedence over the file's.
+# Docker makes a missing host file mounted with the short syntax an empty
+# directory: that is refused with what to do, never read as no file, which
+# would drop the operator's limits without a word.
 NODE_CONFIG=/etc/storage-node/node.toml
-if [[ -e "$NODE_CONFIG" ]]; then
+if [[ -d "$NODE_CONFIG" ]]; then
+    fail "$NODE_CONFIG is a directory; create node.toml next to docker-compose.yml before mounting it"
+elif [[ -e "$NODE_CONFIG" ]]; then
+    [[ -f "$NODE_CONFIG" ]] || fail "$NODE_CONFIG must be a regular file"
     as_user test -r "$NODE_CONFIG" || fail "$NODE_CONFIG must be readable by user $PUID"
     export ANT_CONFIG="$NODE_CONFIG"
     echo "Nodes read $NODE_CONFIG"
