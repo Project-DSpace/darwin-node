@@ -234,6 +234,11 @@ pub struct DevnetConfig {
 
     /// First UDP port in the WebRTC Direct node range (0 = allocate).
     pub webrtc_direct_base_port: u16,
+
+    /// The browser listeners' limits, as a node config file's
+    /// `[webrtc_direct]` sets them (`None`: the defaults). The devnet still
+    /// picks each listener's address and certificate, and turns it on.
+    pub webrtc_direct_limits: Option<crate::config::WebRtcDirectConfig>,
 }
 
 impl Default for DevnetConfig {
@@ -258,6 +263,7 @@ impl Default for DevnetConfig {
             advertise_ip: None,
             webrtc_direct: false,
             webrtc_direct_base_port: 0,
+            webrtc_direct_limits: None,
         }
     }
 }
@@ -1067,7 +1073,8 @@ impl Devnet {
                 enabled: true,
                 bind: SocketAddr::from((bind_ip, port)),
                 advertised_addr: Some(SocketAddr::from((advertised_ip, port))),
-                ..WebRtcDirectConfig::default()
+                certificate_path: None,
+                ..self.config.webrtc_direct_limits.clone().unwrap_or_default()
             };
 
             let p2p = node.p2p_node.clone().ok_or_else(|| {

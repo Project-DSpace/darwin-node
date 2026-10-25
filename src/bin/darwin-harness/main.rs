@@ -10,9 +10,15 @@
 //! later reads each record back from the nodes nearest it. Both write what
 //! they saw as JSON, for the harness to compare across runs.
 //!
+//! `darwin-harness browser-node` and `browser-load` measure what browser
+//! sessions cost a node (`scripts/measure_browser_sessions.py`).
+//!
 //! Built only with the `test-utils` feature: a test tool, never released.
 
 #![allow(clippy::too_many_lines)]
+
+#[cfg(feature = "webrtc-direct")]
+mod browser;
 
 use ant_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
@@ -79,6 +85,44 @@ enum Command {
         #[arg(long)]
         uploads: PathBuf,
         /// Where to write what each node answered, as JSON.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Run a two-node devnet whose first node serves browsers, with records
+    /// stored on it, until standard input closes.
+    #[cfg(feature = "webrtc-direct")]
+    BrowserNode {
+        /// A node config file: its `[webrtc_direct]` limits apply to the
+        /// listeners (the defaults without it).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// The records to store on the node, as `SIZExCOUNT,...`.
+        #[arg(long, default_value = "4194304x16,65536x16,4096x16")]
+        records: String,
+        /// Written once the node is ready: its process, endpoint and records.
+        #[arg(long)]
+        ready: PathBuf,
+        /// The listener's counters, one line of JSON a second.
+        #[arg(long)]
+        snapshots: Option<PathBuf>,
+    },
+    /// Open browser sessions to a `browser-node`, read records over them,
+    /// and close them, each step on a line of standard input.
+    #[cfg(feature = "webrtc-direct")]
+    BrowserLoad {
+        /// What `browser-node` wrote.
+        #[arg(long)]
+        ready: PathBuf,
+        /// How many sessions.
+        #[arg(long)]
+        sessions: usize,
+        /// How long to read for.
+        #[arg(long, default_value_t = 30)]
+        get_seconds: u64,
+        /// Reads a second across every session.
+        #[arg(long, default_value_t = 200)]
+        max_rate: u32,
+        /// Where to write the summary, as JSON.
         #[arg(long)]
         out: PathBuf,
     },
@@ -181,6 +225,21 @@ async fn main() -> Result<()> {
             client.shutdown().await.ok();
             write_json(&out, &result?)
         }
+        #[cfg(feature = "webrtc-direct")]
+        Command::BrowserNode {
+            config,
+            records,
+            ready,
+            snapshots,
+        } => browser::node(config, &records, &ready, snapshots).await,
+        #[cfg(feature = "webrtc-direct")]
+        Command::BrowserLoad {
+            ready,
+            sessions,
+            get_seconds,
+            max_rate,
+            out,
+        } => browser::load(&ready, sessions, get_seconds, max_rate, &out).await,
     }
 }
 
