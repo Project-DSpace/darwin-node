@@ -6549,11 +6549,16 @@ async fn handle_fresh_offer(
     // check (passing results only, so freed space is detected promptly), and the
     // store path keeps its own check as defence-in-depth.
     if let Err(e) = ctx.storage.check_capacity() {
-        info!(
-            target: "ant_node::storage::disk_precheck",
-            key = %hex::encode(key),
-            "Rejecting fresh replication offer before payment verification: {e}"
-        );
+        // One line every few minutes: at the full line every offer is refused.
+        static REFUSED: crate::logging::Repeats = crate::logging::Repeats::new();
+        if let Some(held_back) = REFUSED.admit() {
+            info!(
+                target: "ant_node::storage::disk_precheck",
+                key = %hex::encode(key),
+                held_back,
+                "Rejecting fresh replication offer before payment verification: {e}"
+            );
+        }
         send_replication_response(
             source,
             p2p_node,
@@ -9337,10 +9342,16 @@ async fn execute_single_fetch(
                         // valid source must serve identical content, so trying
                         // the next one cannot cure a local error — it only
                         // re-downloads the same chunk into the same store.
-                        warn!(
-                            "Failed to store fetched record {}: {e}",
-                            hex::encode(resp_key)
-                        );
+                        // One line every few minutes, as a full disk fails
+                        // every write.
+                        static FAILED: crate::logging::Repeats = crate::logging::Repeats::new();
+                        if let Some(held_back) = FAILED.admit() {
+                            warn!(
+                                held_back,
+                                "Failed to store fetched record {}: {e}",
+                                hex::encode(resp_key)
+                            );
+                        }
                         return FetchOutcome {
                             key,
                             result: FetchResult::LocalWriteFailed,

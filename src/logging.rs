@@ -112,6 +112,107 @@ impl Level {
     pub const TRACE: Self = Self;
 }
 
+// ---- Lines that repeat ----
+
+/// How often a line that repeats is logged at most: the cadence of the node's
+/// traffic summary lines.
+pub const REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Lets one line through each [`REPEAT_INTERVAL`] and counts the rest.
+///
+/// For lines that repeat with every request while the disk is at its full
+/// line, such as a refused write. The line that goes through says how many
+/// like it were held back since the one before.
+pub struct Repeats {
+    state: std::sync::Mutex<RepeatsState>,
+}
+
+struct RepeatsState {
+    last: Option<std::time::Instant>,
+    held_back: u64,
+}
+
+impl Repeats {
+    /// A line not yet logged.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(RepeatsState {
+                last: None,
+                held_back: 0,
+            }),
+        }
+    }
+
+    /// `Some(n)` if the line is to be logged now, `n` being how many were
+    /// held back since the last one logged; `None` if it is held back.
+    pub fn admit(&self) -> Option<u64> {
+        self.admit_at(std::time::Instant::now(), REPEAT_INTERVAL)
+    }
+
+    fn admit_at(&self, now: std::time::Instant, interval: std::time::Duration) -> Option<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = state
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= interval);
+        if due {
+            state.last = Some(now);
+            Some(std::mem::take(&mut state.held_back))
+        } else {
+            state.held_back = state.held_back.saturating_add(1);
+            None
+        }
+    }
+}
+
+impl Default for Repeats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod repeats_tests {
+    use super::Repeats;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn one_line_goes_through_an_interval_saying_how_many_were_held_back() {
+        let repeats = Repeats::new();
+        let start = Instant::now();
+        let interval = Duration::from_secs(300);
+        assert_eq!(
+            repeats.admit_at(start, interval),
+            Some(0),
+            "the first goes through"
+        );
+        for second in 1..=299 {
+            assert_eq!(
+                repeats.admit_at(start + Duration::from_secs(second), interval),
+                None
+            );
+        }
+        assert_eq!(
+            repeats.admit_at(start + interval, interval),
+            Some(299),
+            "the next interval's first says how many were held back"
+        );
+        assert_eq!(
+            repeats.admit_at(start + interval * 3, interval),
+            Some(0),
+            "none since"
+        );
+    }
+
+    #[test]
+    fn repeats_are_logged_once_every_five_minutes() {
+        assert_eq!(super::REPEAT_INTERVAL, Duration::from_secs(300));
+    }
+}
+
 // ---- Build-info stamp for JSON logs ----
 
 /// JSON tail spliced onto every event: `,"node_version":"…","node_commit":"…"}`.

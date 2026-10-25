@@ -819,11 +819,16 @@ impl AntProtocol {
         //    so detects freed space promptly. The store path keeps its own
         //    check as defence-in-depth.
         if let Err(e) = self.storage.check_capacity() {
-            info!(
-                target: "ant_node::storage::disk_precheck",
-                addr = %addr_hex,
-                "Rejecting PUT before payment verification: {e}"
-            );
+            // One line every few minutes: at the full line every PUT is refused.
+            static REFUSED: crate::logging::Repeats = crate::logging::Repeats::new();
+            if let Some(held_back) = REFUSED.admit() {
+                info!(
+                    target: "ant_node::storage::disk_precheck",
+                    addr = %addr_hex,
+                    held_back,
+                    "Rejecting PUT before payment verification: {e}"
+                );
+            }
             return ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
         }
 
@@ -926,7 +931,11 @@ impl AntProtocol {
                 ChunkPutResponse::Success { address }
             }
             Err(e) => {
-                warn!("Failed to store chunk {addr_hex}: {e}");
+                // One line every few minutes, as a full disk fails every write.
+                static FAILED: crate::logging::Repeats = crate::logging::Repeats::new();
+                if let Some(held_back) = FAILED.admit() {
+                    warn!(held_back, "Failed to store chunk {addr_hex}: {e}");
+                }
                 ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
             }
         }
