@@ -75,8 +75,13 @@ pub const MIB: u64 = 1024 * 1024;
 /// Bytes in one GiB.
 pub const GIB: u64 = 1024 * MIB;
 
-/// Default free disk space to keep unused on the storage partition.
-pub const DEFAULT_DISK_RESERVE: u64 = 500 * MIB;
+/// The full line: the free space a node keeps unused on its storage
+/// partition unless its configuration sets another (`disk_reserve_mb`).
+///
+/// At or below it, the node stores no new chunk or pointer. It is the warning
+/// level of the node manager that images before darwin-nodes ran, which
+/// deleted a node's data at 500 MiB free; nodes up to ds.15 kept 500 MiB.
+pub const DEFAULT_DISK_RESERVE: u64 = GIB;
 
 /// Free bytes on the partition holding `path`, as the node's disk checks read
 /// them: the chunk store's capacity check and the listing store's map size.

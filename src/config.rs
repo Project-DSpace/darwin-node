@@ -740,10 +740,12 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_verify_on_read")]
     pub verify_on_read: bool,
 
-    /// Minimum free disk space (in MiB) to preserve on the storage partition.
+    /// Minimum free disk space (in MiB) to preserve on the storage partition:
+    /// the node's full line.
     ///
     /// Writes are refused when available space drops below this threshold,
-    /// preventing the node from filling the disk completely.  Default: 500 MiB.
+    /// preventing the node from filling the disk completely. Default: 1024 MiB
+    /// (1 GiB).
     #[serde(default = "default_disk_reserve_mb")]
     pub disk_reserve_mb: u64,
 }
@@ -758,9 +760,9 @@ impl Default for StorageConfig {
     }
 }
 
-/// Default: 500 MiB — matches `DEFAULT_DISK_RESERVE` in `storage`.
+/// Default: 1 GiB, in MiB — matches `DEFAULT_DISK_RESERVE` in `storage`.
 const fn default_disk_reserve_mb() -> u64 {
-    500
+    crate::storage::DEFAULT_DISK_RESERVE / crate::storage::MIB
 }
 
 const fn default_storage_enabled() -> bool {
@@ -951,6 +953,24 @@ rewards_address = "0x0000000000000000000000000000000000000001"
 
     use super::*;
     use serial_test::serial;
+
+    /// A node takes new data down to 1 GiB free unless its config file sets
+    /// another line, which is honoured.
+    #[test]
+    fn the_full_line_is_1_gib_unless_a_config_file_sets_another() {
+        assert_eq!(crate::storage::DEFAULT_DISK_RESERVE, 1024 * 1024 * 1024);
+        assert_eq!(StorageConfig::default().disk_reserve_mb, 1024);
+        assert_eq!(NodeConfig::default().storage.disk_reserve_mb, 1024);
+        assert_eq!(
+            crate::storage::ChunkStoreConfig::default().disk_reserve,
+            crate::storage::DEFAULT_DISK_RESERVE
+        );
+        let empty: NodeConfig = toml::from_str("").expect("an empty config");
+        assert_eq!(empty.storage.disk_reserve_mb, 1024);
+        let own: NodeConfig =
+            toml::from_str("[storage]\ndisk_reserve_mb = 500").expect("an operator's line");
+        assert_eq!(own.storage.disk_reserve_mb, 500);
+    }
 
     #[test]
     fn test_default_config_has_cache_capacity() {
