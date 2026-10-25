@@ -207,6 +207,28 @@ your router). To turn it off, add `ANT_RELAY_SERVING: "false"` under
 `environment:` and run `docker compose up -d`; each node then logs
 `Relay serving is off`. Storing and earning don't change.
 
+## Your own node settings
+
+Each node also serves browsers (WebRTC Direct, on its own UDP port), within
+limits on sessions, channels, requests and bytes in flight. To lower any of
+them, write the values you want in a node config file, for example
+`node.toml` next to `docker-compose.yml`:
+
+```toml
+[webrtc_direct]
+max_connections = 64          # browser sessions per node (default 128)
+max_connections_per_ip = 4    # sessions from one IPv4 address or IPv6 /64 (default 7)
+```
+
+mount it under `volumes:` as `- ./node.toml:/etc/storage-node/node.toml:ro`,
+and run `docker compose up -d`; the log says `Nodes read
+/etc/storage-node/node.toml`. Every node reads the file at start. The settings
+the image passes itself (ports, rewards address, RPC, bootstrap peers,
+`ANT_RELAY_SERVING`) still take precedence over the file's. A value the node
+refuses (more than 256 sessions, say, the most the transport holds) stops it
+at start with a message naming the setting. Each node logs its browser refusals, by the limit reached, every
+five minutes (`browser refusals (cumulative)`).
+
 ## Licences
 
 In `/usr/share/doc/storage-node/` in the image (`docker exec storage-node ls

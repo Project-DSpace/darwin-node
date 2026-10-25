@@ -166,8 +166,9 @@ pub struct Cli {
     )]
     pub network_mode: CliNetworkMode,
 
-    /// Path to configuration file.
-    #[arg(long, short)]
+    /// Path to configuration file. The storage-node image passes an
+    /// operator's own file to every node in `ANT_CONFIG`.
+    #[arg(long, short, env = "ANT_CONFIG")]
     pub config: Option<PathBuf>,
 
     /// The image marker: the darwin-node commit of the storage-node image this
@@ -584,6 +585,42 @@ mod tests {
                 "{id} must be read from {variable}"
             );
         }
+    }
+
+    /// The storage-node image passes an operator's node config file to every
+    /// node in this variable (docker/entrypoint.sh), so an operator can
+    /// lower any `[webrtc_direct]` limit; settings the image passes in their
+    /// own variables or flags still take precedence over the file's.
+    #[test]
+    fn a_config_file_is_read_from_the_images_variable() -> Result<(), Box<dyn std::error::Error>> {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let arg = command.get_arguments().find(|arg| arg.get_id() == "config");
+        assert_eq!(
+            arg.and_then(clap::Arg::get_env),
+            Some(std::ffi::OsStr::new("ANT_CONFIG"))
+        );
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("node.toml");
+        std::fs::write(
+            &path,
+            "[webrtc_direct]\nmax_connections = 16\nmax_connections_per_ip = 2\nbind = \"0.0.0.0:7000\"\n",
+        )?;
+        let path = path.to_str().ok_or("temp path is not UTF-8")?;
+        let cli = Cli::try_parse_from([
+            "ant-node",
+            "--config",
+            path,
+            "--webrtc-direct-port",
+            "45000",
+        ])?;
+        let (config, _) = cli.into_config()?;
+        assert_eq!(config.webrtc_direct.max_connections, 16);
+        assert_eq!(config.webrtc_direct.max_connections_per_ip, 2);
+        assert_eq!(config.webrtc_direct.bind.port(), 45_000);
+        Ok(())
     }
 
     /// The node manager in the image passes `--evm-network arbitrum-one` to

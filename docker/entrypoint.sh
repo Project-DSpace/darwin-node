@@ -89,6 +89,18 @@ elif [[ "$relay_serving" != true && "$relay_serving" != false ]]; then
     fail "ANT_RELAY_SERVING must be true or false"
 fi
 
+# An operator's own node config file, mounted read-only at $NODE_CONFIG,
+# reaches every node in ANT_CONFIG (the node's --config). Any browser limit in
+# its [webrtc_direct] can be lowered there. The settings this script passes
+# to the nodes (ports, rewards address, RPC, bootstrap peers and the rest)
+# still take precedence over the file's.
+NODE_CONFIG=/etc/storage-node/node.toml
+if [[ -e "$NODE_CONFIG" ]]; then
+    as_user test -r "$NODE_CONFIG" || fail "$NODE_CONFIG must be readable by user $PUID"
+    export ANT_CONFIG="$NODE_CONFIG"
+    echo "Nodes read $NODE_CONFIG"
+fi
+
 # The image marker: the darwin-node commit this image was built from
 # (docker/Dockerfile). Every node gets it in ANT_IMAGE_VERSION, so a node can
 # tell that the manager it runs under deletes no node's data. It reaches the

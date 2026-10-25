@@ -332,6 +332,37 @@ fn the_image_marker_reaches_the_nodes_only_from_the_managers_environment() {
     );
 }
 
+/// An operator's node config file, mounted at the documented place, reaches
+/// every node from the manager's environment, so an operator can lower any
+/// browser limit. The node reads `ANT_CONFIG` as its `--config`
+/// (src/bin/ant-node/cli.rs).
+#[test]
+fn an_operators_node_config_reaches_every_node() {
+    const MOUNTED: &str = "/etc/storage-node/node.toml";
+    let entrypoint = shell_commands(&repo_text("docker/entrypoint.sh"));
+    assert!(
+        entrypoint
+            .iter()
+            .any(|c| *c == format!("NODE_CONFIG={MOUNTED}")),
+        "the entrypoint doesn't look for the operator's file at {MOUNTED}"
+    );
+    assert!(
+        entrypoint
+            .iter()
+            .any(|c| c.starts_with("export ")
+                && words(c).iter().any(|w| w == "ANT_CONFIG=$NODE_CONFIG")),
+        "the entrypoint doesn't export the operator's file to the manager and its nodes"
+    );
+    assert!(
+        repo_text("docker/README.md").contains(&format!(":{MOUNTED}:ro")),
+        "docker/README.md doesn't say where to mount the file"
+    );
+    assert!(
+        repo_text("src/bin/ant-node/cli.rs").contains(r#"#[arg(long, short, env = "ANT_CONFIG")]"#),
+        "the node doesn't read its config file from ANT_CONFIG"
+    );
+}
+
 /// The entrypoint's sweep of retired folders. The images up to ds.15's run
 /// the same command at every start, so a folder kept in `$RETIRED` is gone
 /// 3 days after it last changed once an operator goes back to one of them.
