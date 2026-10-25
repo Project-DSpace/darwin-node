@@ -272,14 +272,16 @@ never ran.
   `cargo build --release --locked --bin ant-node`, and check it for test
   seams before packaging it.
 - **Three crates are vendored**, each with a `VENDORED.md` saying what it
-  is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
-  its only change; `vendor/webrtc` is webrtc 0.14.0, whose
-  `RTCDtlsTransport::stop()` cancels a DTLS handshake still in progress;
-  and `vendor/ant-listings` is darwin-listings 0.3.1, unchanged: the
-  envelope format, listings, their payment checks, the listings protocol
-  and its change feeds. `[patch.crates-io]` puts the first two in place of the
-  crates.io releases. `vendor/ant-listings` and `vendor/ant-protocol` are
-  workspace members, so their own tests run under this repository's
+  is: `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
+  `VENDORED.md` lists, `PRICE_MULTIPLIER` and the functions that price a
+  record by its size, which nothing uses yet; `vendor/webrtc` is webrtc
+  0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
+  in progress; and `vendor/ant-listings` is darwin-listings 0.3.1,
+  unchanged: the envelope format, listings, their payment checks, the
+  listings protocol and its change feeds. `[patch.crates-io]` puts the
+  first two in place of the crates.io releases. `vendor/ant-listings` and
+  `vendor/ant-protocol` are workspace members, so their own tests run
+  under this repository's
   `Cargo.lock` in the Test workflow (`cargo test --locked -p ant-listings`,
   `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml`),
   and the Build workflow checks `vendor/ant-listings`' git objects against
