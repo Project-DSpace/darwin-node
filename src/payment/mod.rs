@@ -43,6 +43,7 @@ pub mod metrics;
 pub mod pricing;
 pub mod proof;
 pub mod quote;
+pub(crate) mod settlement;
 pub mod single_node;
 pub(crate) mod traffic;
 mod verifier;
@@ -56,6 +57,7 @@ pub use proof::{
     serialize_single_node_proof, PaymentProof, ProofType,
 };
 pub use quote::{wire_ml_dsa_signer, QuoteGenerator, XorName};
+pub use settlement::{CLIENT_STORE_WAIT, PUT_PAYMENT_DEADLINE};
 // Wire-side signature verification lives in ant-protocol. Re-exported here
 // so `ant_node::payment::verify_*` keeps working for downstream callers.
 pub use ant_protocol::payment::verify::{

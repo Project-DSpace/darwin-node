@@ -39,6 +39,7 @@ use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::listings::ListingService;
 use crate::logging::{debug, info, warn};
+use crate::payment::settlement::Lane;
 use crate::payment::{
     PaymentVerifier, QuoteGenerator, VerificationContext, BATCH_PAYMENTS_REFUSED,
 };
@@ -401,6 +402,9 @@ impl AntProtocol {
     /// Record and serve listings with `listings`.
     #[must_use]
     pub fn with_listing_service(mut self, listings: Arc<ListingService>) -> Self {
+        // An envelope's payment is found through the payment check's reads,
+        // so the receipts the check read for a PUT serve its envelope too.
+        listings.attach_payment_reads(self.payment_verifier.payment_reads());
         self.listings = Some(listings);
         self
     }
@@ -945,7 +949,12 @@ impl AntProtocol {
             return Ok(None);
         };
         listings
-            .listing_for_put(address, &request.content, request.payment_proof.as_deref())
+            .listing_for_put(
+                address,
+                &request.content,
+                request.payment_proof.as_deref(),
+                Lane::Put,
+            )
             .await
             .map_err(|message| ChunkPutResponse::Error(ProtocolError::PaymentFailed(message)))
     }

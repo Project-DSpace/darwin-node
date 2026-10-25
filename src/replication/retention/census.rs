@@ -1861,22 +1861,31 @@ fn the_merkle_payment_code_is_not_reached() {
     );
 }
 
-/// The payment vault is read only by the payment check's two reads, each
-/// through `read_payment`, which tries the node's RPC and then the chain's
-/// other public RPCs.
+/// The payment vault is read only by the payment check's two reads: its
+/// records, through the pool of the payment reads (`SettlementReads`), and
+/// the merkle record, through `read_payment`. Each tries the node's RPC and
+/// then the chain's other public RPCs.
 #[test]
 fn the_payment_vault_is_read_only_through_the_rpc_fallback() {
     const VAULT: &[(Option<&str>, &str)] = &[
         (None, "IPaymentVault"),
         (None, "PaymentVaultHandler"),
         (Some("payment_vault"), "get_*"),
+        (None, "COMPLETED_PAYMENTS_SELECTOR"),
     ];
     const REVIEWED: &[Reviewed] = &[
-        // completedPayments, through read_payment.
+        // completedPayments' selector, defined once, and used in the one
+        // request every record read sends through the payment reads' pool.
         (
-            "src/payment/verifier.rs",
-            "PaymentVerifier::completed_payment_settlement",
-            "IPaymentVault",
+            "src/payment/settlement.rs",
+            "<module>",
+            "COMPLETED_PAYMENTS_SELECTOR",
+            1,
+        ),
+        (
+            "src/payment/settlement.rs",
+            "record_request",
+            "COMPLETED_PAYMENTS_SELECTOR",
             1,
         ),
         // completedMerklePayments, through read_payment; nothing calls it.
@@ -1891,10 +1900,11 @@ fn the_payment_vault_is_read_only_through_the_rpc_fallback() {
     assert!(
         report.is_empty(),
         "\nThe payment vault is read somewhere new.\n\n{report}\n\
-         A payment check reads the vault through PaymentVerifier::read_payment, which \
-         tries the node's RPC and then the chain's other public RPCs, so that one busy \
-         provider does not make the node refuse a paid chunk. Read the vault through \
-         read_payment, and list the read here.\n"
+         A payment check reads the vault's records through the payment reads' pool \
+         (src/payment/settlement.rs), and the merkle record through \
+         PaymentVerifier::read_payment; each tries the node's RPC and then the chain's \
+         other public RPCs, so that one busy provider does not make the node refuse a \
+         paid chunk. Read the vault through them, and list the read here.\n"
     );
 }
 
@@ -1929,7 +1939,7 @@ fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
         // The payment check's list: the node's RPC, then the chain's other public ones.
         (
             "src/payment/verifier.rs",
-            "PaymentVerifier::payment_rpc_urls",
+            "PaymentVerifier::network_rpc_urls",
             "rpc_url",
             1,
         ),
@@ -1938,7 +1948,7 @@ fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
     assert!(
         report.is_empty(),
         "\nThe node's RPC address is taken somewhere new.\n\n{report}\n\
-         Payments are read through PaymentVerifier::payment_rpc_urls, the node's RPC and \
+         Payments are read through PaymentVerifier::network_rpc_urls, the node's RPC and \
          then the chain's other public RPCs, and listings' payments through \
          listings_rpc_urls. A read through the configured RPC alone fails whenever that \
          provider is busy. Build the list from it instead, and list the call here.\n"

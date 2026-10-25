@@ -11,11 +11,17 @@ use crate::payment::pricing::{calculate_price, derive_records_stored_from_price}
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type, ProofType,
 };
+use crate::payment::settlement::{
+    Answered, Lane, Settlement, SettlementReads, EMPTY_PAYMENT_RECHECK_DELAY, PAYMENT_READ_BACKOFF,
+    PAYMENT_READ_ROUNDS,
+};
 use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::storage::ChunkStore;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
-use evmlib::common::{Amount, QuoteHash};
+use evmlib::common::Amount;
+#[cfg(any(test, feature = "test-utils"))]
+use evmlib::common::QuoteHash;
 use evmlib::contract::payment_vault;
 use evmlib::merkle_batch_payment::{OnChainPaymentInfo, PoolHash};
 use evmlib::Network as EvmNetwork;
@@ -64,27 +70,6 @@ pub const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 524_288;
 
 const PAID_QUOTE_PAYMENT_MULTIPLIER: u64 = 3;
 const PAYMENT_VERIFY_SLOW_LOG_MS: u128 = 500;
-
-/// Rounds of an on-chain payment read before the check fails. Each round
-/// tries the node's RPC and then the chain's other public RPCs
-/// ([`crate::listings::listings_rpc_urls`]), so a provider that answers
-/// `-32005 the network is busy` or drops a call doesn't make the node refuse
-/// a chunk that was paid for.
-const PAYMENT_READ_ROUNDS: u32 = 2;
-
-/// The pause before each later round of a payment read.
-const PAYMENT_READ_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// The pause before payment records that read empty are read once more.
-///
-/// A client pays and sends the chunk at once. The RPC this node reads through
-/// can be a block or two behind the one the client paid through, and then
-/// answers with the record as it was before the payment: no amount and no
-/// rewards address, which the check refuses as a redirected payment. Read
-/// again a moment later, the payment is there. Long enough for an RPC a few of
-/// Robinhood Chain's blocks behind to catch up; short, because a store nobody
-/// paid for waits it out too before it is refused, once.
-const EMPTY_PAYMENT_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Number of nearest DHT peers accepted for paid-quote issuer locality.
 ///
@@ -332,9 +317,48 @@ enum CandidateSettlement {
     /// Paid as quoted: the settled amount.
     Paid(Amount),
     /// Its payment record read empty, with no amount and no rewards address,
-    /// so the RPC may not have seen the payment's block yet. The error the
-    /// check gives it.
-    ReadEmpty(Error),
+    /// so the RPC may not have seen the payment's block yet: the error the
+    /// check gives it, and the RPC that answered, by its place in the node's
+    /// list, so the record is read again at the next.
+    ReadEmpty { error: Error, rpc: usize },
+}
+
+/// The transactions a payment proof names, whose receipts fill the payment
+/// facts once, when the first quote of the proof that needs a fact has none.
+struct ProofReceipts<'a> {
+    tx_hashes: &'a [[u8; 32]],
+    read: bool,
+}
+
+impl<'a> ProofReceipts<'a> {
+    const fn new(tx_hashes: &'a [[u8; 32]]) -> Self {
+        Self {
+            tx_hashes,
+            read: false,
+        }
+    }
+
+    /// Fill the payment facts from the receipts, the first time only.
+    /// Returns whether they were read now.
+    async fn read_once(&mut self, reads: &Arc<SettlementReads>, lane: Lane) -> bool {
+        if self.read || self.tx_hashes.is_empty() {
+            return false;
+        }
+        self.read = true;
+        reads.fill_from_receipts(self.tx_hashes, lane).await;
+        true
+    }
+}
+
+/// The lane a payment check reads in: a client's store waits on its answer,
+/// nothing else does.
+fn lane_of(context: VerificationContext) -> Lane {
+    match context {
+        VerificationContext::ClientPut => Lane::Put,
+        VerificationContext::FreshReplication | VerificationContext::PaidListAdmission => {
+            Lane::Background
+        }
+    }
 }
 
 fn median_quote_index(quote_count: usize) -> usize {
@@ -818,6 +842,10 @@ pub struct PaymentVerifier {
     /// Incremented only on first emission for a pool, so it measures
     /// settlements sampled rather than chunks admitted.
     merkle_parity_emissions: std::sync::atomic::AtomicUsize,
+    /// Reads of the vault's payment records: the cache of payment facts in
+    /// front of the per-quote read, and the pooled connections to the RPCs.
+    /// Shared with the listings, which read envelopes' payments through it.
+    reads: Arc<SettlementReads>,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -915,6 +943,9 @@ impl PaymentVerifier {
 
         let cache_capacity = config.cache_capacity;
         info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm=always-on, pool_cache={DEFAULT_POOL_CACHE_CAPACITY})");
+        let mut vault = [0u8; 20];
+        vault.copy_from_slice(config.evm.network.payment_vault_address().as_slice());
+        let reads = SettlementReads::new(vault, Self::network_rpc_urls(&config.evm.network));
 
         // Loud warning if a production binary was accidentally built with
         // `test-utils`: that feature flips the live-DHT payment-check
@@ -957,8 +988,16 @@ impl PaymentVerifier {
                     .unwrap_or(NonZeroUsize::MIN),
             )),
             merkle_parity_emissions: std::sync::atomic::AtomicUsize::new(0),
+            reads,
             config,
         }
+    }
+
+    /// The reads of the vault's payment records this verifier makes, for the
+    /// listings to read envelopes' payments through, from the same cache and
+    /// connections.
+    pub(crate) fn payment_reads(&self) -> Arc<SettlementReads> {
+        Arc::clone(&self.reads)
     }
 
     /// Attach the ADR-0004 monetized-pin sender (the replication engine's
@@ -1100,6 +1139,7 @@ impl PaymentVerifier {
     /// how a read moves from one to the next.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_payment_rpc_urls_for_tests(&self, urls: Vec<reqwest::Url>) {
+        self.reads.set_rpcs_for_tests(urls.clone());
         *self.test_payment_rpc_urls_override.write() = Some(urls);
     }
 
@@ -1335,10 +1375,15 @@ impl PaymentVerifier {
                                     parsed.tx_hashes.len()
                                 );
                             }
+                            // Their receipts may spare the per-quote reads;
+                            // they never stand in for them.
+                            let tx_hashes: Vec<[u8; 32]> =
+                                parsed.tx_hashes.iter().map(|tx_hash| tx_hash.0).collect();
 
                             self.verify_evm_payment(
                                 target,
                                 &parsed.proof_of_payment,
+                                &tx_hashes,
                                 &parsed.commitment_sidecars,
                                 context,
                             )
@@ -1514,10 +1559,17 @@ impl PaymentVerifier {
     /// K-closeness check, and on-chain settlement are the authority. A
     /// one-quote proof is valid when that single quote passes these checks and
     /// was paid 3x.
+    ///
+    /// The settlement comes from the vault's record for the quote's hash. The
+    /// receipts of `tx_hashes`, the transactions the proof names, may hold it
+    /// already as a payment fact, which can only accept: a quote they don't
+    /// pay is read from the vault, which every refusal comes from (see
+    /// [`SettlementReads`]).
     async fn verify_evm_payment(
         &self,
         target: &PaymentTarget,
         payment: &ProofOfPayment,
+        tx_hashes: &[[u8; 32]],
         commitment_sidecars: &[Vec<u8>],
         context: VerificationContext,
     ) -> Result<()> {
@@ -1558,14 +1610,19 @@ impl PaymentVerifier {
         // gossip-lottery audit path.
         let mut paid_peer: Option<[u8; 32]> = None;
 
-        // Candidates whose payment record read empty, read once more below if
-        // no candidate verifies.
+        // Candidates whose payment record read empty, with the RPC that read
+        // it, read once more below if no candidate verifies.
         let mut read_empty = Vec::new();
+        let lane = lane_of(context);
+        let mut receipts = ProofReceipts::new(tx_hashes);
 
         for candidate in candidates {
             let paid_price = candidate.quote.price;
             let candidate_peer = *candidate.encoded_peer_id.as_bytes();
-            match self.verify_legacy_median_candidate(target, candidate).await {
+            match self
+                .verify_legacy_median_candidate(target, candidate, &mut receipts, lane)
+                .await
+            {
                 Ok(CandidateSettlement::Paid(settled_amount)) => {
                     verified_paid_quote = Some((paid_price, settled_amount));
                     // First settlement-verified median candidate wins the paid
@@ -1577,9 +1634,9 @@ impl PaymentVerifier {
                     paid_peer = Some(candidate_peer);
                     break;
                 }
-                Ok(CandidateSettlement::ReadEmpty(err)) => {
-                    failures.push(err.to_string());
-                    read_empty.push(candidate);
+                Ok(CandidateSettlement::ReadEmpty { error, rpc }) => {
+                    failures.push(error.to_string());
+                    read_empty.push((candidate, rpc));
                 }
                 Err(err) => failures.push(err.to_string()),
             }
@@ -1589,6 +1646,8 @@ impl PaymentVerifier {
         // payment's block yet: an empty record is read once more, after one
         // pause, before the store is refused. Not before the other candidates
         // have been tried, so a paid one is never held up by an unpaid one.
+        // The read again is a read of its own, on a fresh connection, at the
+        // RPC after the one that answered empty.
         if verified_paid_quote.is_none() && !read_empty.is_empty() {
             debug!(
                 "{} payment record(s) for {} read empty; reading them again in {:?}",
@@ -1597,16 +1656,11 @@ impl PaymentVerifier {
                 EMPTY_PAYMENT_RECHECK_DELAY
             );
             tokio::time::sleep(EMPTY_PAYMENT_RECHECK_DELAY).await;
-            for candidate in read_empty {
+            for (candidate, rpc) in read_empty {
                 let paid_price = candidate.quote.price;
                 let candidate_peer = *candidate.encoded_peer_id.as_bytes();
-                let settled = match self
-                    .completed_payment_settlement(candidate.quote.hash())
-                    .await
-                {
-                    Ok((amount, recorded)) => {
-                        Self::check_median_settlement(candidate, amount, recorded)
-                    }
+                let settled = match self.settlement_again(candidate, lane, rpc).await {
+                    Ok(settlement) => Self::check_median_settlement(candidate, settlement),
                     Err(err) => Err(err),
                 };
                 match settled {
@@ -1730,6 +1784,8 @@ impl PaymentVerifier {
         &self,
         target: &PaymentTarget,
         candidate: LegacyMedianCandidate<'_>,
+        receipts: &mut ProofReceipts<'_>,
+        lane: Lane,
     ) -> Result<CandidateSettlement> {
         // The two checks take different addresses. The quote must name what was
         // paid for; the issuer must be close to what the network routes. A
@@ -1743,15 +1799,119 @@ impl PaymentVerifier {
 
         Self::validate_paid_quote_signature(candidate).await?;
 
-        let (on_chain_amount, recorded_rewards_prefix) = self
-            .completed_payment_settlement(candidate.quote.hash())
-            .await?;
-        let read_empty = on_chain_amount.is_zero() && recorded_rewards_prefix == Some([0u8; 16]);
-        match Self::check_median_settlement(candidate, on_chain_amount, recorded_rewards_prefix) {
-            Ok(settled_amount) => Ok(CandidateSettlement::Paid(settled_amount)),
-            Err(err) if read_empty => Ok(CandidateSettlement::ReadEmpty(err)),
-            Err(err) => Err(err),
+        self.settle(candidate, receipts, lane).await
+    }
+
+    /// Whether the vault holds a payment for `candidate`'s quote that pays
+    /// what the candidate needs.
+    ///
+    /// A payment fact that pays it settles it without a read. The receipts of
+    /// the proof's transactions are read for facts once, the first time a
+    /// quote has none. Anything else, no fact or a fact that doesn't pay it,
+    /// goes to the per-quote read of the vault's record, and only that read
+    /// refuses: the facts can only accept. A record that reads empty comes
+    /// back as [`CandidateSettlement::ReadEmpty`], to be read again.
+    ///
+    /// The amount needed is the candidate's `expected_amount`, so a check
+    /// that needs a different amount reads the paid amount through this same
+    /// path, and a quote with no fact is read, never taken as unpaid.
+    async fn settle(
+        &self,
+        candidate: LegacyMedianCandidate<'_>,
+        receipts: &mut ProofReceipts<'_>,
+        lane: Lane,
+    ) -> Result<CandidateSettlement> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(settlement) = self.test_settlement(candidate) {
+            return Self::classify(
+                candidate,
+                &Answered {
+                    value: settlement,
+                    rpc: 0,
+                },
+            );
         }
+
+        let quote_hash = candidate.quote.hash().0;
+        if let Some(amount) = self.paid_by_fact(candidate, &quote_hash) {
+            return Ok(CandidateSettlement::Paid(amount));
+        }
+        if receipts.read_once(&self.reads, lane).await {
+            if let Some(amount) = self.paid_by_fact(candidate, &quote_hash) {
+                return Ok(CandidateSettlement::Paid(amount));
+            }
+        }
+        let answered = self
+            .reads
+            .settlement(quote_hash, lane)
+            .await
+            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
+        Self::classify(candidate, &answered)
+    }
+
+    /// The amount a payment fact for `quote_hash` paid, if there is one and
+    /// it pays what `candidate` needs. Never a refusal.
+    fn paid_by_fact(
+        &self,
+        candidate: LegacyMedianCandidate<'_>,
+        quote_hash: &[u8; 32],
+    ) -> Option<Amount> {
+        let fact = self.reads.fact(quote_hash)?;
+        Self::check_median_settlement(candidate, fact).ok()
+    }
+
+    /// What a record read says of `candidate`: paid, empty (to be read again
+    /// at the RPC after the one that answered), or refused.
+    fn classify(
+        candidate: LegacyMedianCandidate<'_>,
+        answered: &Answered<Settlement>,
+    ) -> Result<CandidateSettlement> {
+        let empty = answered.value.is_empty();
+        match Self::check_median_settlement(candidate, answered.value) {
+            Ok(settled_amount) => Ok(CandidateSettlement::Paid(settled_amount)),
+            Err(error) if empty => Ok(CandidateSettlement::ReadEmpty {
+                error,
+                rpc: answered.rpc,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The record of `candidate`'s quote read once more, after it read empty
+    /// at RPC `rpc`: a read of its own, at the next RPC, on a fresh
+    /// connection.
+    async fn settlement_again(
+        &self,
+        candidate: LegacyMedianCandidate<'_>,
+        lane: Lane,
+        rpc: usize,
+    ) -> Result<Settlement> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(settlement) = self.test_settlement(candidate) {
+            return Ok(settlement);
+        }
+        self.reads
+            .settlement_again(candidate.quote.hash().0, lane, rpc)
+            .await
+            .map(|answered| answered.value)
+            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))
+    }
+
+    /// Tests only: the settlement a test set for `candidate`'s quote, in
+    /// place of the vault's record. A test that sets no payee means the
+    /// quote's own.
+    #[cfg(any(test, feature = "test-utils"))]
+    fn test_settlement(&self, candidate: LegacyMedianCandidate<'_>) -> Option<Settlement> {
+        let (amount, recorded) = self
+            .test_completed_payments_override
+            .read()
+            .get(&candidate.quote.hash())
+            .copied()?;
+        Some(Settlement {
+            amount,
+            payee_prefix: recorded
+                .unwrap_or_else(|| Self::rewards_address_prefix(&candidate.quote.rewards_address)),
+        })
     }
 
     /// Whether the settlement recorded for a candidate's quote pays its quote:
@@ -1759,9 +1919,9 @@ impl PaymentVerifier {
     /// amount. Returns the settled amount.
     fn check_median_settlement(
         candidate: LegacyMedianCandidate<'_>,
-        on_chain_amount: Amount,
-        recorded_rewards_prefix: Option<[u8; 16]>,
+        settlement: Settlement,
     ) -> Result<Amount> {
+        let on_chain_amount = settlement.amount;
         // ADR-0004 Amendment 2: the settlement must be RECORDED FOR THE QUOTE'S
         // rewards address, not merely under its quote hash. The vault stores
         // whatever `(rewardsAddress, amount)` the payer supplied for the hash,
@@ -1770,17 +1930,17 @@ impl PaymentVerifier {
         // as "paid" without ever being compensated. Honest clients build the
         // payment from the quote itself, so this never rejects a legit upload.
         // The vault packs the payee as `bytes16`, so the comparison is on the
-        // leading 16 bytes (128 bits — far beyond grinding range).
-        if let Some(recorded) = recorded_rewards_prefix {
-            let expected = Self::rewards_address_prefix(&candidate.quote.rewards_address);
-            if recorded != expected {
-                return Err(Error::Payment(format!(
-                    "Median-priced quote settlement for peer {:?} was redirected: recorded rewards address prefix {} does not match the quote's {}",
-                    candidate.encoded_peer_id,
-                    hex::encode(recorded),
-                    hex::encode(expected)
-                )));
-            }
+        // leading 16 bytes (128 bits — far beyond grinding range). Every
+        // settlement carries the payee: one read without it is no record.
+        let recorded = settlement.payee_prefix;
+        let expected = Self::rewards_address_prefix(&candidate.quote.rewards_address);
+        if recorded != expected {
+            return Err(Error::Payment(format!(
+                "Median-priced quote settlement for peer {:?} was redirected: recorded rewards address prefix {} does not match the quote's {}",
+                candidate.encoded_peer_id,
+                hex::encode(recorded),
+                hex::encode(expected)
+            )));
         }
         if on_chain_amount >= candidate.expected_amount {
             return Ok(on_chain_amount);
@@ -2095,47 +2255,6 @@ impl PaymentVerifier {
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))?
     }
 
-    /// Look up the on-chain settlement recorded for `quote_hash`: the settled
-    /// amount and the `bytes16` rewards-address prefix it was recorded for.
-    /// The prefix is `None` only on the test-override path (meaning "matches
-    /// the quote"); the production contract read always returns the recorded
-    /// prefix so the caller's redirect check always applies.
-    async fn completed_payment_settlement(
-        &self,
-        quote_hash: QuoteHash,
-    ) -> Result<(Amount, Option<[u8; 16]>)> {
-        #[cfg(any(test, feature = "test-utils"))]
-        {
-            let completed_payment_override = {
-                self.test_completed_payments_override
-                    .read()
-                    .get(&quote_hash)
-                    .copied()
-            };
-            if let Some((amount, recorded)) = completed_payment_override {
-                return Ok((amount, recorded));
-            }
-        }
-
-        let vault_address = *self.config.evm.network.payment_vault_address();
-        let result = self
-            .read_payment(
-                super::traffic::EvmRpcCall::CompletedPayments,
-                |url| async move {
-                    let provider = evmlib::utils::http_provider(url);
-                    payment_vault::interface::IPaymentVault::new(vault_address, provider)
-                        .completedPayments(quote_hash)
-                        .call()
-                        .await
-                        .map_err(|e| e.to_string())
-                },
-            )
-            .await
-            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
-
-        Ok((Amount::from(result.amount), Some(result.rewardsAddress.0)))
-    }
-
     /// The RPCs a payment is read through: the node's own, then, if it is one
     /// of Robinhood Chain's public RPCs, the others.
     fn payment_rpc_urls(&self) -> Vec<reqwest::Url> {
@@ -2143,7 +2262,13 @@ impl PaymentVerifier {
         if let Some(urls) = self.test_payment_rpc_urls_override.read().as_ref() {
             return urls.clone();
         }
-        let own = self.config.evm.network.rpc_url();
+        Self::network_rpc_urls(&self.config.evm.network)
+    }
+
+    /// The RPCs payments on `network` are read through: its own, then, if it
+    /// is one of Robinhood Chain's public RPCs, the others.
+    fn network_rpc_urls(network: &EvmNetwork) -> Vec<reqwest::Url> {
+        let own = network.rpc_url();
         let mut urls: Vec<reqwest::Url> = crate::listings::listings_rpc_urls(own.as_str())
             .iter()
             .filter_map(|url| url.parse().ok())
@@ -4379,10 +4504,17 @@ mod tests {
         );
         let quote_hash = QuoteHash::from([0x42_u8; 32]);
         let settlement = verifier
-            .completed_payment_settlement(quote_hash)
+            .reads
+            .settlement(quote_hash.0, Lane::Put)
             .await
             .expect("the second round reads the record");
-        assert_eq!(settlement, (Amount::from(amount), Some(rewards_prefix)));
+        assert_eq!(
+            settlement.value,
+            Settlement {
+                amount: Amount::from(amount),
+                payee_prefix: rewards_prefix,
+            }
+        );
 
         let requests = requests.lock().clone();
         assert_eq!(
@@ -9481,3 +9613,6 @@ mod tests {
         assert!(map2.is_empty(), "an unparseable sidecar must be skipped");
     }
 }
+
+#[cfg(test)]
+mod settlement_tests;

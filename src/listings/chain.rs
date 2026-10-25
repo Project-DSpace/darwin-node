@@ -659,8 +659,9 @@ fn guess_block(time: u64, (low, low_time): (u64, u64), (high, high_time): (u64, 
     low.saturating_add(offset).clamp(low + 1, high - 1)
 }
 
-/// A JSON-RPC receipt for `tx_hash`.
-fn parse_receipt(tx_hash: [u8; 32], receipt: &Value) -> Result<PaymentReceipt> {
+/// A JSON-RPC receipt for `tx_hash`. The payment check reads receipts this
+/// way too.
+pub fn parse_receipt(tx_hash: [u8; 32], receipt: &Value) -> Result<PaymentReceipt> {
     let block_number = receipt["blockNumber"]
         .as_str()
         .ok_or_else(|| malformed("receipt has no block number"))
@@ -674,6 +675,66 @@ fn parse_receipt(tx_hash: [u8; 32], receipt: &Value) -> Result<PaymentReceipt> {
             .map(|logs| logs.iter().filter_map(parse_log).collect())
             .unwrap_or_default(),
     })
+}
+
+/// A payment the vault recorded, as its `DataPaymentMade` log in a receipt
+/// shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultPayment {
+    /// The hash of the quote paid for.
+    pub quote_hash: [u8; 32],
+    /// The address paid.
+    pub payee: [u8; 20],
+    /// The amount paid, never zero.
+    pub amount: u128,
+}
+
+impl VaultPayment {
+    /// The leading 16 bytes of the payee, as the vault's record for the quote
+    /// holds it.
+    pub fn payee_prefix(&self) -> [u8; 16] {
+        let mut prefix = [0u8; 16];
+        prefix.copy_from_slice(&self.payee[..16]);
+        prefix
+    }
+}
+
+/// The payments the vault at `vault` recorded in `receipt`: one for each of
+/// its `DataPaymentMade` logs, and none unless the transaction succeeded.
+///
+/// The vault emits the event only when it writes a quote's payment record,
+/// and it writes each record once, so a payment found here is what the
+/// vault's record for the quote holds: the payee and the amount. A log from
+/// any other contract counts for nothing, nor does one shaped otherwise than
+/// the event (four topics: the event, the payee, the amount, the quote hash),
+/// nor an amount the record can't hold (zero, or wider than 128 bits).
+pub fn vault_payments(receipt: &PaymentReceipt, vault: &[u8; 20]) -> Vec<VaultPayment> {
+    if !receipt.success {
+        return Vec::new();
+    }
+    receipt
+        .logs
+        .iter()
+        .filter(|log| log.address == *vault)
+        .filter_map(|log| match log.topics.as_slice() {
+            [event, payee, amount, quote_hash] if *event == DATA_PAYMENT_MADE_TOPIC => {
+                // An address topic is the address, right-aligned in 32 bytes.
+                let (padding, address) = payee.split_at(12);
+                let (high, low) = amount.split_at(16);
+                if padding.iter().any(|byte| *byte != 0) || high.iter().any(|byte| *byte != 0) {
+                    return None;
+                }
+                let amount = u128::from_be_bytes(low.try_into().ok()?);
+                let payee: [u8; 20] = address.try_into().ok()?;
+                (amount != 0).then_some(VaultPayment {
+                    quote_hash: *quote_hash,
+                    payee,
+                    amount,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// One receipt log, or `None` if it is malformed.
@@ -699,11 +760,11 @@ fn parse_vault_log(log: &Value) -> Option<VaultLog> {
     })
 }
 
-fn quantity(number: u64) -> String {
+pub fn quantity(number: u64) -> String {
     format!("0x{number:x}")
 }
 
-fn parse_u64(hex: &str) -> Result<u64> {
+pub fn parse_u64(hex: &str) -> Result<u64> {
     u64::from_str_radix(hex.trim_start_matches("0x"), 16)
         .map_err(|e| malformed(&format!("bad quantity {hex}: {e}")))
 }

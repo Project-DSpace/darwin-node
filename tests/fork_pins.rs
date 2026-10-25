@@ -9,7 +9,11 @@
 //! read moves on to the next RPC at once and is made again in a second round,
 //! while an answer, even an empty record, ends the read; an empty record is
 //! read once more; a payment to another payee is refused, an overpayment
-//! taken, and a merkle proof refused before anything is read. And the bytes of
+//! taken, and a merkle proof refused before anything is read. A receipt of a
+//! transaction the proof names can settle a quote it shows paid in full to
+//! the quote's payee, with no read of the record, and can do nothing else: it
+//! never refuses, so a receipt that doesn't pay the quote leaves the record
+//! read to decide. And the bytes of
 //! the payment proofs nodes pass each other in fresh offers and paid notices,
 //! and of the quotes inside them, with each quote's hash
 //! (`payment_encodings` below).
@@ -262,12 +266,12 @@ mod payment_reads {
 
     /// A payment read that fails is made again in a second round, half a
     /// second later (`PAYMENT_READ_ROUNDS`, `PAYMENT_READ_BACKOFF` in
-    /// src/payment/verifier.rs). A node with one RPC reads twice in all.
+    /// src/payment/settlement.rs). A node with one RPC reads twice in all.
     const READ_ROUNDS: usize = 2;
     const READ_BACKOFF: Duration = Duration::from_millis(500);
 
     /// A payment record that reads empty is read once more, 1.5 s later
-    /// (`EMPTY_PAYMENT_RECHECK_DELAY`).
+    /// (`EMPTY_PAYMENT_RECHECK_DELAY` in src/payment/settlement.rs).
     const EMPTY_RECHECK: Duration = Duration::from_millis(1500);
 
     /// The vault and token the verifier is told of. Any addresses will do: the
@@ -455,6 +459,7 @@ mod payment_reads {
     struct Bundle {
         xorname: [u8; 32],
         proof: Vec<u8>,
+        quotes: Vec<(EncodedPeerId, PaymentQuote)>,
         median: PaymentQuote,
         median_peer: [u8; 32],
         required: u128,
@@ -471,6 +476,26 @@ mod payment_reads {
             let mut prefix = [0u8; 16];
             prefix.copy_from_slice(&self.median.rewards_address.as_slice()[..16]);
             prefix
+        }
+
+        /// The paid quote's rewards address.
+        fn median_payee(&self) -> [u8; 20] {
+            self.median.rewards_address.as_slice().try_into().unwrap()
+        }
+
+        /// The proof a client sends, naming `tx_hashes`.
+        fn proof_naming(&self, tx_hashes: &[[u8; 32]]) -> Vec<u8> {
+            serialize_single_node_proof(&PaymentProof {
+                proof_of_payment: ProofOfPayment {
+                    peer_quotes: self.quotes.clone(),
+                },
+                tx_hashes: tx_hashes
+                    .iter()
+                    .map(|tx_hash| evmlib::common::TxHash::from(*tx_hash))
+                    .collect(),
+                commitment_sidecars: Vec::new(),
+            })
+            .unwrap()
         }
     }
 
@@ -507,7 +532,7 @@ mod payment_reads {
         let required = u128::try_from(median.price * Amount::from(3u64)).unwrap();
         let proof = serialize_single_node_proof(&PaymentProof {
             proof_of_payment: ProofOfPayment {
-                peer_quotes: quotes,
+                peer_quotes: quotes.clone(),
             },
             tx_hashes: Vec::new(),
             commitment_sidecars: Vec::new(),
@@ -516,6 +541,7 @@ mod payment_reads {
         Bundle {
             xorname,
             proof,
+            quotes,
             median,
             median_peer: *median_peer.as_bytes(),
             required,
@@ -1047,6 +1073,274 @@ mod payment_reads {
                         "{context:?}: the next round waits {READ_BACKOFF:?}: {calls:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A transaction a provider below knows: its receipt's status and the
+    /// vault payment logs it shows, each `(emitter, payee, amount)` for the
+    /// bundle's quote.
+    struct Receipt {
+        success: bool,
+        logs: Vec<([u8; 20], [u8; 20], u128)>,
+    }
+
+    /// The vault's address, as its logs carry it.
+    fn vault_address() -> [u8; 20] {
+        hex::decode(VAULT.trim_start_matches("0x"))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    /// `keccak256("DataPaymentMade(address,uint256,bytes32)")`.
+    const DATA_PAYMENT_MADE: &str =
+        "0xf998960b1c6f0e0e89b7bbe6b6fbf3e03e6f08eee5b8430877d8adb8e149d580";
+
+    /// The receipt of transaction `0x77…77` paying `bundle`'s quote as
+    /// `receipt` says, as JSON.
+    fn receipt_json(bundle: &Bundle, receipt: &Receipt) -> serde_json::Value {
+        let logs: Vec<serde_json::Value> = receipt
+            .logs
+            .iter()
+            .enumerate()
+            .map(|(index, (emitter, payee, amount))| {
+                serde_json::json!({
+                    "address": format!("0x{}", hex::encode(emitter)),
+                    "topics": [
+                        DATA_PAYMENT_MADE,
+                        format!("0x{}{}", "00".repeat(12), hex::encode(payee)),
+                        format!("0x{amount:064x}"),
+                        format!("0x{}", bundle.quote_hash()),
+                    ],
+                    "data": "0x",
+                    "logIndex": format!("0x{index:x}"),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "transactionHash": format!("0x{}", "77".repeat(32)),
+            "status": if receipt.success { "0x1" } else { "0x0" },
+            "blockNumber": "0x64",
+            "logs": logs,
+        })
+    }
+
+    /// A count of calls a provider got.
+    type Counted = Arc<Mutex<usize>>;
+
+    /// A provider that answers receipt reads with `receipt` and record reads
+    /// with `record`, and counts each.
+    async fn chain_provider(
+        receipt: serde_json::Value,
+        record: Answer,
+    ) -> (String, Counted, Counted) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (receipts, records): (Counted, Counted) = Default::default();
+        let (receipts_seen, records_seen) = (Arc::clone(&receipts), Arc::clone(&records));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (receipt, receipts, records) = (
+                    receipt.clone(),
+                    Arc::clone(&receipts_seen),
+                    Arc::clone(&records_seen),
+                );
+                tokio::spawn(async move {
+                    while let Some(body) = read_http_body(&mut socket).await {
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let calls = match &request {
+                            serde_json::Value::Array(calls) => calls.clone(),
+                            call => vec![call.clone()],
+                        };
+                        let answers: Vec<serde_json::Value> = calls
+                            .iter()
+                            .map(|call| {
+                                let result = match call["method"].as_str().unwrap_or_default() {
+                                    "eth_getTransactionReceipt" => {
+                                        *receipts.lock().unwrap() += 1;
+                                        receipt.clone()
+                                    }
+                                    "eth_call" => {
+                                        *records.lock().unwrap() += 1;
+                                        let Answer::Record(prefix, amount) = record else {
+                                            panic!("the record answers");
+                                        };
+                                        serde_json::json!(record_words(prefix, amount))
+                                    }
+                                    other => panic!("asked for {other}"),
+                                };
+                                serde_json::json!({ "jsonrpc": "2.0", "id": call["id"],
+                                    "result": result })
+                            })
+                            .collect();
+                        let response = if request.is_array() {
+                            serde_json::Value::from(answers)
+                        } else {
+                            answers.into_iter().next().unwrap()
+                        };
+                        let body = response.to_string();
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if socket.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, receipts, records)
+    }
+
+    /// What a check of a proof naming one transaction came to, its receipt
+    /// as `receipt` says and the vault's record as `record`: the outcome, and
+    /// how many receipt and record reads it made.
+    async fn check_naming(
+        seed: u8,
+        context: VerificationContext,
+        receipt: fn(&Bundle) -> Receipt,
+        record: fn(&Bundle) -> Answer,
+    ) -> (Result<PaymentStatus, String>, usize, usize) {
+        let bundle = bundle(seed);
+        let (url, receipts, records) =
+            chain_provider(receipt_json(&bundle, &receipt(&bundle)), record(&bundle)).await;
+        let verifier = verifier(
+            &Provider {
+                url,
+                calls: Arc::default(),
+                other_methods: Arc::default(),
+            },
+            &bundle,
+        );
+        let outcome = verifier
+            .verify_payment(
+                &bundle.xorname,
+                Some(&bundle.proof_naming(&[[0x77; 32]])),
+                context,
+            )
+            .await
+            .map_err(|e| e.to_string());
+        let receipt_reads = *receipts.lock().unwrap();
+        let record_reads = *records.lock().unwrap();
+        (outcome, receipt_reads, record_reads)
+    }
+
+    /// The receipt of a payment of the quote to its payee, `times` the
+    /// amount due.
+    fn paying(bundle: &Bundle, times: u128) -> Receipt {
+        Receipt {
+            success: true,
+            logs: vec![(
+                vault_address(),
+                bundle.median_payee(),
+                bundle.required * times,
+            )],
+        }
+    }
+
+    /// What a receipt shows paid, and the receipt.
+    type PaidCase = (&'static str, fn(&Bundle) -> Receipt);
+
+    /// A receipt of a transaction the proof names, showing the vault's
+    /// payment of the quote to its payee, of at least the amount due,
+    /// settles it with no read of the record, in every context.
+    #[tokio::test]
+    async fn a_receipt_showing_the_quote_paid_settles_it_without_a_record_read() {
+        let receipts: [PaidCase; 2] = [
+            ("the amount due", |bundle| paying(bundle, 1)),
+            ("10 x the amount due", |bundle| paying(bundle, 10)),
+        ];
+        for (paid, receipt) in receipts {
+            for context in CONTEXTS {
+                let (outcome, receipt_reads, record_reads) = check_naming(
+                    0xC0,
+                    context,
+                    receipt,
+                    // Read, the record would refuse: nothing is read.
+                    |_| Answer::Record([0u8; 16], 0),
+                )
+                .await;
+                let case = format!("{context:?}, {paid}");
+                assert_eq!(outcome, Ok(PaymentStatus::PaymentVerified), "{case}");
+                assert_eq!((receipt_reads, record_reads), (1, 0), "{case}");
+            }
+        }
+    }
+
+    /// What the receipt names, what the record holds, and whether the
+    /// payment then verifies, with how many reads of the record.
+    type FactCase = (
+        &'static str,
+        fn(&Bundle) -> Receipt,
+        fn(&Bundle) -> Answer,
+        bool,
+        usize,
+    );
+
+    /// A receipt that doesn't pay the quote in full to its payee, of a
+    /// transaction that reverted, or with another contract's log shaped as
+    /// the vault's, settles nothing: the record read decides, and only it
+    /// refuses. A record that pays the quote verifies it; one that doesn't
+    /// is refused, an empty one after it is read once more.
+    #[tokio::test]
+    async fn a_receipt_that_doesnt_pay_the_quote_leaves_the_record_read_to_decide() {
+        let cases: [FactCase; 4] = [
+            (
+                "a payment to another payee",
+                |bundle| Receipt {
+                    success: true,
+                    logs: vec![(vault_address(), [0xEE; 20], bundle.required * 10)],
+                },
+                |bundle| Answer::Record([0xEE; 16], bundle.required * 10),
+                false,
+                1,
+            ),
+            (
+                "a wei too little",
+                |bundle| Receipt {
+                    success: true,
+                    logs: vec![(vault_address(), bundle.median_payee(), bundle.required - 1)],
+                },
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.required - 1),
+                false,
+                1,
+            ),
+            (
+                "a reverted transaction showing a payment",
+                |bundle| Receipt {
+                    success: false,
+                    logs: vec![(vault_address(), bundle.median_payee(), bundle.required)],
+                },
+                |_| Answer::Record([0u8; 16], 0),
+                false,
+                2,
+            ),
+            (
+                "another contract's log, the quote paid elsewhere",
+                |bundle| Receipt {
+                    success: true,
+                    logs: vec![([0x99; 20], bundle.median_payee(), bundle.required)],
+                },
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.required),
+                true,
+                1,
+            ),
+        ];
+        for (name, receipt, record, verified, reads) in cases {
+            for context in CONTEXTS {
+                let (outcome, receipt_reads, record_reads) =
+                    check_naming(0xD0, context, receipt, record).await;
+                let case = format!("{context:?}, {name}");
+                if verified {
+                    assert_eq!(outcome, Ok(PaymentStatus::PaymentVerified), "{case}");
+                } else {
+                    assert!(outcome.is_err(), "{case}: {outcome:?}");
+                }
+                assert_eq!(receipt_reads, 1, "{case}");
+                assert_eq!(record_reads, reads, "{case}: the record read decides");
             }
         }
     }

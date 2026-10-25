@@ -66,6 +66,7 @@ use super::store::{FeedWatcher, ListingStore};
 use crate::ant_protocol::{XorName, CLOSE_GROUP_SIZE};
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
+use crate::payment::settlement::{Lane, SettlementReads, EMPTY_PAYMENT_RECHECK_DELAY};
 use crate::storage::ChunkStore;
 use ::ant_protocol::evm::PaymentQuote;
 use ::ant_protocol::payment::proof::deserialize_single_node_proof;
@@ -145,10 +146,11 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 /// thousands of envelopes together.
 const MAX_REPAIRS: usize = 16;
 
-/// The most distinct transactions of a payment proof read to find an
-/// envelope's payment. A proof pays an envelope in one transaction, or a few,
-/// but can name thousands.
-const MAX_PROOF_TXS: usize = 4;
+/// The most distinct transactions of a payment proof whose receipts are read:
+/// to find an envelope's payment, and to fill the payment check's cache of
+/// payment facts. A proof pays in one transaction, or a few, but can name
+/// thousands.
+pub const MAX_PROOF_TXS: usize = 4;
 
 /// How long after starting the node checks its listings against its chunks,
 /// so the check doesn't compete with joining the network.
@@ -167,6 +169,10 @@ pub struct ListingService {
     store: ListingStore,
     chunks: Arc<ChunkStore>,
     chain: Chain,
+    /// The reads an envelope's payment is found through when it is stored:
+    /// the payment check's, once attached, so the receipts that check read
+    /// serve here too ([`Self::attach_payment_reads`]).
+    payment_reads: RwLock<Arc<SettlementReads>>,
     vault: [u8; 20],
     /// The block the vault was deployed in, where known: a copy showing an
     /// earlier block paid something else.
@@ -370,10 +376,16 @@ impl ListingService {
         let watches = Arc::new(Mutex::new(Watches::default()));
         let (pushes_tx, pushes_rx) = mpsc::unbounded_channel();
         store.watch_feed(Self::feed_watcher(Arc::clone(&watches), pushes_tx));
+        let rpc_urls = listings_rpc_urls(&rpc_url);
+        let payment_reads = SettlementReads::new(
+            vault,
+            rpc_urls.iter().filter_map(|url| url.parse().ok()).collect(),
+        );
         let service = Arc::new(Self {
             store,
             chunks: Arc::clone(&chunks),
-            chain: Chain::with_rpcs(listings_rpc_urls(&rpc_url))?,
+            chain: Chain::with_rpcs(rpc_urls)?,
+            payment_reads: RwLock::new(payment_reads),
             vault,
             vault_deployment_block,
             p2p: RwLock::new(None),
@@ -425,6 +437,19 @@ impl ListingService {
         *self.p2p.write() = Some(node);
     }
 
+    /// Find stored envelopes' payments through `reads`, the payment check's,
+    /// so a receipt the check has just read serves here too. Only reads of
+    /// the same vault through the same RPCs as this service's are taken, as
+    /// on a node, where both come from its payment settings.
+    pub(crate) fn attach_payment_reads(&self, reads: Arc<SettlementReads>) {
+        let own = Arc::clone(&self.payment_reads.read());
+        if reads.reads_like(&own) {
+            *self.payment_reads.write() = reads;
+        } else {
+            debug!("The payment check reads another vault or other RPCs; listings keep their own");
+        }
+    }
+
     /// Tests only: the block the service takes the payment vault to have
     /// been deployed in, if any.
     #[cfg(test)]
@@ -440,20 +465,22 @@ impl ListingService {
         &self.requests
     }
 
-    /// For a client PUT: the listing to record if `content` is an envelope,
-    /// found from the payment proof that came with it, with only the payment
-    /// fields the envelope shows. `Ok(None)` for any other chunk.
+    /// For a client PUT, in [`Lane::Put`], or a fresh offer, in
+    /// [`Lane::Background`]: the listing to record if `content` is an
+    /// envelope, found from the payment proof that came with it, with only
+    /// the payment fields the envelope shows. `Ok(None)` for any other chunk.
     ///
     /// # Errors
     ///
     /// Returns a message for the client if `content` is a malformed envelope,
     /// of an unknown version, or its payment can't be found. The PUT is then
     /// refused, so the client can retry with the right proof.
-    pub async fn listing_for_put(
+    pub(crate) async fn listing_for_put(
         &self,
         address: &XorName,
         content: &[u8],
         proof: Option<&[u8]>,
+        lane: Lane,
     ) -> std::result::Result<Option<Listing>, String> {
         if !is_envelope(content) {
             return Ok(None);
@@ -465,16 +492,21 @@ impl ListingService {
             .check_new_upload()
             .map_err(|e| format!("invalid envelope: {e}"))?;
         let proof = proof.ok_or("an envelope needs its payment proof")?;
-        let payment = self.find_payment(address, proof).await?;
+        let payment = self.find_payment(address, proof, lane).await?;
         Ok(Some(Listing::new(&envelope, &payment, unix_now())))
     }
 
     /// The full payment for `address` in a single-node payment proof, looked
-    /// for in the proof's first [`MAX_PROOF_TXS`] distinct transactions.
+    /// for in the proof's first [`MAX_PROOF_TXS`] distinct transactions. Their
+    /// receipts come through the payment check's reads, kept or read. A
+    /// receipt the RPC didn't know is read once more, after
+    /// [`EMPTY_PAYMENT_RECHECK_DELAY`], on a fresh connection at the next RPC,
+    /// before the envelope is refused.
     async fn find_payment(
         &self,
         address: &XorName,
         proof: &[u8],
+        lane: Lane,
     ) -> std::result::Result<Payment, String> {
         if detect_proof_type(proof) != Some(ProofType::SingleNode) {
             return Err("an envelope must be paid with a single-node payment".into());
@@ -487,35 +519,87 @@ impl ListingService {
             .map(|(_, quote)| quote)
             .collect();
 
+        let reads = Arc::clone(&self.payment_reads.read());
         let mut seen = HashSet::new();
-        let tx_hashes = proof
+        let tx_hashes: Vec<[u8; 32]> = proof
             .tx_hashes
             .iter()
             .map(|tx_hash| tx_hash.0)
             .filter(|tx_hash| seen.insert(*tx_hash))
-            .take(MAX_PROOF_TXS);
+            .take(MAX_PROOF_TXS)
+            .collect();
+        // Transactions the RPC didn't know, with the RPC that said so.
+        let mut unknown = Vec::new();
         for tx_hash in tx_hashes {
-            let payment = self
-                .chain
-                .payment(&tx_hash)
+            let receipt = reads
+                .receipt(tx_hash, lane, true)
                 .await
                 .map_err(|e| format!("could not read the payment from the chain: {e}"))?;
-            let Some((receipt, timestamp)) = payment else {
+            let Some(found) = receipt.value else {
                 debug!(
                     "Envelope payment {} not found on chain",
                     hex::encode(tx_hash)
                 );
+                unknown.push((tx_hash, receipt.rpc));
                 continue;
             };
-            match find_payment(address, &quotes, &receipt, timestamp, &self.vault) {
-                Ok(payment) => return Ok(payment),
-                Err(e) => debug!(
-                    "Transaction {} does not pay for this envelope: {e}",
-                    hex::encode(tx_hash)
-                ),
+            if let Some(payment) = self
+                .payment_in(&reads, address, &quotes, &found, lane)
+                .await?
+            {
+                return Ok(payment);
+            }
+        }
+        if !unknown.is_empty() {
+            tokio::time::sleep(EMPTY_PAYMENT_RECHECK_DELAY).await;
+            for (tx_hash, rpc) in unknown {
+                let receipt = reads
+                    .receipt_again(tx_hash, lane, rpc)
+                    .await
+                    .map_err(|e| format!("could not read the payment from the chain: {e}"))?;
+                let Some(found) = receipt.value else {
+                    debug!(
+                        "Envelope payment {} still not found on chain",
+                        hex::encode(tx_hash)
+                    );
+                    continue;
+                };
+                if let Some(payment) = self
+                    .payment_in(&reads, address, &quotes, &found, lane)
+                    .await?
+                {
+                    return Ok(payment);
+                }
             }
         }
         Err("none of the proof's transactions pays for this envelope".into())
+    }
+
+    /// The payment for `address` in `receipt`, by one of `quotes`, with the
+    /// time of its block; `None` if the transaction doesn't pay for it.
+    async fn payment_in(
+        &self,
+        reads: &Arc<SettlementReads>,
+        address: &XorName,
+        quotes: &[PaymentQuote],
+        receipt: &ant_listings::PaymentReceipt,
+        lane: Lane,
+    ) -> std::result::Result<Option<Payment>, String> {
+        let timestamp = reads
+            .block_timestamp(receipt.block_number, lane)
+            .await
+            .map_err(|e| format!("could not read the payment from the chain: {e}"))?
+            .ok_or("could not read the payment from the chain: the receipt's block is missing")?;
+        match find_payment(address, quotes, receipt, timestamp, &self.vault) {
+            Ok(payment) => Ok(Some(payment)),
+            Err(e) => {
+                debug!(
+                    "Transaction {} does not pay for this envelope: {e}",
+                    hex::encode(receipt.tx_hash)
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// For a fresh replication offer just stored, which carries the upload's
@@ -545,7 +629,10 @@ impl ListingService {
         if matches!(self.store.contains(address).await, Ok(true)) {
             return;
         }
-        match self.listing_for_put(&address, content, Some(proof)).await {
+        match self
+            .listing_for_put(&address, content, Some(proof), Lane::Background)
+            .await
+        {
             Ok(Some(listing)) => {
                 self.record(listing).await;
             }
@@ -2512,7 +2599,7 @@ pub(super) mod tests {
         let (listings, _) = service(&dir).await;
         assert_eq!(
             listings
-                .listing_for_put(&[1; 32], b"ordinary chunk bytes", None)
+                .listing_for_put(&[1; 32], b"ordinary chunk bytes", None, Lane::Put)
                 .await,
             Ok(None)
         );
@@ -2524,17 +2611,17 @@ pub(super) mod tests {
         let (listings, _) = service(&dir).await;
         let a = envelope(1);
         assert!(listings
-            .listing_for_put(&a.address(), &a.to_bytes(), None)
+            .listing_for_put(&a.address(), &a.to_bytes(), None, Lane::Put)
             .await
             .is_err());
         assert!(listings
-            .listing_for_put(&a.address(), &a.to_bytes(), Some(&[0xff, 1, 2]))
+            .listing_for_put(&a.address(), &a.to_bytes(), Some(&[0xff, 1, 2]), Lane::Put)
             .await
             .is_err());
         let mut broken = a.to_bytes();
         broken.truncate(12);
         assert!(listings
-            .listing_for_put(&a.address(), &broken, None)
+            .listing_for_put(&a.address(), &broken, None, Lane::Put)
             .await
             .is_err());
     }
@@ -2548,7 +2635,7 @@ pub(super) mod tests {
         unknown.extend_from_slice(&[3, 0x3f, 0, 0]);
         unknown.extend_from_slice(&map);
         let error = listings
-            .listing_for_put(&[1; 32], &unknown, None)
+            .listing_for_put(&[1; 32], &unknown, None, Lane::Put)
             .await
             .unwrap_err();
         assert!(error.contains("invalid envelope"), "{error}");
@@ -2561,7 +2648,7 @@ pub(super) mod tests {
         v1.extend_from_slice(&map);
         assert!(Envelope::from_bytes(&v1).is_ok());
         let error = listings
-            .listing_for_put(&[1; 32], &v1, None)
+            .listing_for_put(&[1; 32], &v1, None, Lane::Put)
             .await
             .unwrap_err();
         assert!(error.contains("invalid envelope"), "{error}");
@@ -2631,7 +2718,12 @@ pub(super) mod tests {
 
         let proof = single_node_proof(&quote, [0x77; 32]);
         let listing = listings
-            .listing_for_put(&listed.address(), &listed.to_bytes(), Some(&proof))
+            .listing_for_put(
+                &listed.address(),
+                &listed.to_bytes(),
+                Some(&proof),
+                Lane::Put,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -2656,7 +2748,12 @@ pub(super) mod tests {
         // as its data map is withheld.
         let proof = single_node_proof(&private_quote, [0x78; 32]);
         let listing = listings
-            .listing_for_put(&private.address(), &private.to_bytes(), Some(&proof))
+            .listing_for_put(
+                &private.address(),
+                &private.to_bytes(),
+                Some(&proof),
+                Lane::Put,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -2673,7 +2770,12 @@ pub(super) mod tests {
         // retries, though nothing of the payment would be recorded.
         let proof = single_node_proof(&private_quote, [0x77; 32]);
         assert!(listings
-            .listing_for_put(&private.address(), &private.to_bytes(), Some(&proof))
+            .listing_for_put(
+                &private.address(),
+                &private.to_bytes(),
+                Some(&proof),
+                Lane::Put
+            )
             .await
             .is_err());
     }
@@ -3423,7 +3525,8 @@ pub(super) mod tests {
         let dir = TempDir::new().unwrap();
         let (listings, _) = service_on(&dir, &url).await;
 
-        // Thousands of hashes, the paying one last: refused after a few.
+        // Thousands of hashes, the paying one last: refused after a few, each
+        // of them, unknown to the chain, read once more after the pause.
         let mut tx_hashes: Vec<[u8; 32]> = (0..2000u32)
             .map(|i| {
                 let mut tx_hash = [0u8; 32];
@@ -3434,16 +3537,29 @@ pub(super) mod tests {
         tx_hashes.push([0x77; 32]);
         let proof = proof_naming(&quote, &tx_hashes);
         assert!(listings
-            .listing_for_put(&listed.address(), &listed.to_bytes(), Some(&proof))
+            .listing_for_put(
+                &listed.address(),
+                &listed.to_bytes(),
+                Some(&proof),
+                Lane::Put
+            )
             .await
             .is_err());
-        assert_eq!(calls_to(&chain, "eth_getTransactionReceipt"), MAX_PROOF_TXS);
+        assert_eq!(
+            calls_to(&chain, "eth_getTransactionReceipt"),
+            2 * MAX_PROOF_TXS
+        );
 
         // A hash named again is read once.
         chain.lock().calls.clear();
         let proof = proof_naming(&quote, &[[1; 32], [1; 32], [1; 32], [1; 32], [0x77; 32]]);
         assert!(listings
-            .listing_for_put(&listed.address(), &listed.to_bytes(), Some(&proof))
+            .listing_for_put(
+                &listed.address(),
+                &listed.to_bytes(),
+                Some(&proof),
+                Lane::Put
+            )
             .await
             .unwrap()
             .is_some());
@@ -3468,7 +3584,9 @@ pub(super) mod tests {
         }
         let offers = Arc::clone(&listings);
         wait_until(async || offers.fresh_offers.lock().is_empty()).await;
-        assert_eq!(calls_to(&chain, "eth_getTransactionReceipt"), 1);
+        // Read, and read once more after the pause, as the chain didn't know
+        // the transaction.
+        assert_eq!(calls_to(&chain, "eth_getTransactionReceipt"), 2);
         assert!(!listings.store.contains(unlisted.address()).await.unwrap());
     }
 
@@ -4834,6 +4952,7 @@ pub(super) mod tests {
                     &envelope.address(),
                     &envelope.to_bytes(),
                     Some(&single_node_proof(quote, *tx_hash)),
+                    Lane::Put,
                 )
                 .await
                 .unwrap()
