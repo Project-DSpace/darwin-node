@@ -208,8 +208,10 @@ pub struct WebRtcDirectConfig {
     /// Maximum simultaneously accepted browser sessions from one IPv4 address or IPv6 /64.
     ///
     /// This must be lower than [`Self::max_connections`] so one public source
-    /// cannot occupy every listener slot.
-    pub max_connections_per_ip: usize,
+    /// cannot occupy every listener slot. When a config file doesn't set it,
+    /// it follows the file's other limits: see [`Self::connections_per_ip`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_connections_per_ip: Option<usize>,
 
     /// Maximum simultaneously active `DataChannels` on one browser session.
     pub max_channels_per_connection: usize,
@@ -259,7 +261,7 @@ impl Default for WebRtcDirectConfig {
             advertised_addr: None,
             certificate_path: None,
             max_connections: default_webrtc_direct_max_connections(),
-            max_connections_per_ip: default_webrtc_direct_max_connections_per_ip(),
+            max_connections_per_ip: None,
             max_channels_per_connection: default_webrtc_direct_max_channels_per_connection(),
             max_channels: default_webrtc_direct_max_channels(),
             max_concurrent_requests: default_webrtc_direct_max_concurrent_requests(),
@@ -290,11 +292,39 @@ const fn default_webrtc_direct_max_connections() -> usize {
     128
 }
 
-// Sessions from one address: 7, for people who share one (a carrier's NAT, a
-// household, an office). The most the per-address rule allows with two
-// channels a session while concurrent requests stay at 16: 7 x 2 < 16.
-const fn default_webrtc_direct_max_connections_per_ip() -> usize {
-    7
+/// Sessions from one address, by default: 7.
+///
+/// For people who share one (a carrier's NAT, a household, an office). The
+/// most the per-address rule allows with two channels a session while
+/// concurrent requests stay at 16: 7 x 2 < 16.
+pub const DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP: usize = 7;
+
+impl WebRtcDirectConfig {
+    /// The browser sessions one address may hold: the file's
+    /// `max_connections_per_ip` if it sets one, else
+    /// [`DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP`], lowered as far as the
+    /// other limits need (below `max_connections`, and times the channels a
+    /// session below `max_channels` and `max_concurrent_requests`), and at
+    /// least one. A file written for an older release's lower default, with
+    /// one of those limits lowered, then still holds; one that sets this
+    /// itself is taken as written.
+    #[must_use]
+    pub fn connections_per_ip(&self) -> usize {
+        if let Some(set) = self.max_connections_per_ip {
+            return set;
+        }
+        let below = |limit: usize| {
+            limit
+                .saturating_sub(1)
+                .checked_div(self.max_channels_per_connection)
+                .unwrap_or(DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP)
+        };
+        DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP
+            .min(self.max_connections.saturating_sub(1))
+            .min(below(self.max_concurrent_requests))
+            .min(below(self.max_channels))
+            .max(1)
+    }
 }
 
 const fn default_webrtc_direct_max_channels_per_connection() -> usize {

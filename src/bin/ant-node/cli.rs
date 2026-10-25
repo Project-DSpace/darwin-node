@@ -618,7 +618,7 @@ mod tests {
         ])?;
         let (config, _) = cli.into_config()?;
         assert_eq!(config.webrtc_direct.max_connections, 16);
-        assert_eq!(config.webrtc_direct.max_connections_per_ip, 2);
+        assert_eq!(config.webrtc_direct.max_connections_per_ip, Some(2));
         assert_eq!(config.webrtc_direct.bind.port(), 45_000);
         Ok(())
     }

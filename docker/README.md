@@ -229,11 +229,14 @@ refuses (more than 256 sessions, say, the most the transport holds) stops
 every node at start with a message naming the setting. Lowered values must
 still keep these relations, which the defaults (in brackets) keep:
 
-- `max_connections_per_ip` (7) below `max_connections` (128). Lowering
-  `max_connections` to 7 or less needs `max_connections_per_ip` lowered too.
+- `max_connections_per_ip` (7) below `max_connections` (128).
 - `max_connections_per_ip` times `max_channels_per_connection` (2) below
-  `max_channels` (256), and below `max_concurrent_requests` (16). Lowering
-  `max_concurrent_requests` to 14 or less needs one of the two lowered.
+  `max_channels` (256), and below `max_concurrent_requests` (16).
+
+When the file doesn't set `max_connections_per_ip`, it follows the others:
+7, or less where a lowered `max_connections`, `max_channels` or
+`max_concurrent_requests` needs it (at least 1), and the log says so. One the
+file sets is taken as written, and refused if it breaks a relation.
 - `max_requests_per_second_per_connection` (16) no more than
   `max_requests_per_second_per_ip` (32), and that below
   `max_requests_per_second` (256).

@@ -14,7 +14,9 @@ use crate::ant_protocol::{
 };
 use crate::browser::{browser_payment_network, BrowserEndpoint, BrowserPaymentNetwork};
 use crate::codec::{encode_exact, ExactEncodeError};
-use crate::config::{WebRtcDirectConfig, WEBRTC_DIRECT_SESSION_CEILING};
+use crate::config::{
+    WebRtcDirectConfig, DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP, WEBRTC_DIRECT_SESSION_CEILING,
+};
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
@@ -496,7 +498,7 @@ impl ListenerResources {
                 node_byte_refusals,
             )),
             source_state: Mutex::new(SourceAdmissionState::default()),
-            max_connections_per_ip: config.max_connections_per_ip,
+            max_connections_per_ip: config.connections_per_ip(),
             max_requests_per_second_per_ip: config.max_requests_per_second_per_ip,
             max_requests_per_second_per_connection: config.max_requests_per_second_per_connection,
             max_in_flight_bytes_per_ip: config.max_in_flight_bytes_per_ip,
@@ -978,7 +980,7 @@ async fn bind_listener(
         certificate,
         WebRtcAdmissionLimits {
             max_connections: config.max_connections,
-            max_connections_per_ip: config.max_connections_per_ip,
+            max_connections_per_ip: config.connections_per_ip(),
         },
     )
     .await
@@ -1011,6 +1013,14 @@ pub async fn check_browser_listener(
 }
 
 fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
+    if config.max_connections_per_ip.is_none()
+        && config.connections_per_ip() < DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP
+    {
+        info!(
+            "webrtc_direct.max_connections_per_ip is not set: {} sessions from one address,              lowered from {DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP} to fit the file's              other browser limits",
+            config.connections_per_ip()
+        );
+    }
     if config.max_connections > WEBRTC_DIRECT_SESSION_CEILING {
         return Err(Error::Config(format!(
             "webrtc_direct.max_connections must be at most {WEBRTC_DIRECT_SESSION_CEILING}, \
@@ -1019,7 +1029,7 @@ fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
     }
     for (name, value) in [
         ("max_connections", config.max_connections),
-        ("max_connections_per_ip", config.max_connections_per_ip),
+        ("max_connections_per_ip", config.connections_per_ip()),
         (
             "max_channels_per_connection",
             config.max_channels_per_connection,
@@ -1056,13 +1066,13 @@ fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
             )));
         }
     }
-    if config.max_connections_per_ip >= config.max_connections {
+    if config.connections_per_ip() >= config.max_connections {
         return Err(Error::Config(
             "webrtc_direct.max_connections_per_ip must be lower than max_connections".to_string(),
         ));
     }
     let source_channel_ceiling = config
-        .max_connections_per_ip
+        .connections_per_ip()
         .checked_mul(config.max_channels_per_connection)
         .ok_or_else(|| {
             Error::Config("webrtc_direct per-IP DataChannel ceiling overflows usize".to_string())
@@ -2725,7 +2735,7 @@ mod tests {
     fn diagnostics_report_capacity_rate_and_byte_pressure_without_leaking_slots() {
         let config = WebRtcDirectConfig {
             max_connections: 2,
-            max_connections_per_ip: 1,
+            max_connections_per_ip: Some(1),
             max_concurrent_requests: 1,
             max_requests_per_second_per_connection: 1,
             max_in_flight_bytes: 8,
@@ -2794,8 +2804,8 @@ mod tests {
         validate_webrtc_config(&config).expect("default resource limits");
 
         let source_channel_ceiling =
-            config.max_connections_per_ip * config.max_channels_per_connection;
-        assert!(config.max_connections_per_ip < config.max_connections);
+            config.connections_per_ip() * config.max_channels_per_connection;
+        assert!(config.connections_per_ip() < config.max_connections);
         assert!(source_channel_ceiling < config.max_channels);
         assert!(source_channel_ceiling < config.max_concurrent_requests);
         assert!(config.max_requests_per_second_per_ip < config.max_requests_per_second);
@@ -2840,7 +2850,7 @@ mod tests {
             max_channels: 3,
             max_channels_per_connection: 2,
             max_connections: 2,
-            max_connections_per_ip: 1,
+            max_connections_per_ip: Some(1),
             max_concurrent_requests: 3,
             ..WebRtcDirectConfig::default()
         };
@@ -2882,7 +2892,7 @@ mod tests {
     fn refusals_are_counted_by_the_limit_reached() {
         let config = WebRtcDirectConfig {
             max_connections: 3,
-            max_connections_per_ip: 1,
+            max_connections_per_ip: Some(1),
             max_concurrent_requests: 3,
             max_requests_per_second: 3,
             max_requests_per_second_per_ip: 2,
@@ -2937,14 +2947,67 @@ mod tests {
         assert_eq!(refusals.total(), 7 + 6);
     }
 
+    /// A node config file valid under ds.15's per-address default of 4,
+    /// which lowers one of the other browser limits without setting
+    /// `max_connections_per_ip`, is still valid: the default follows the
+    /// file's other limits, so a node that upgraded itself still starts.
+    #[test]
+    fn a_file_valid_under_the_old_per_address_default_still_validates() {
+        const DS15_PER_IP: usize = 4;
+        let lowered: [(&str, std::ops::RangeInclusive<usize>); 3] = [
+            ("max_concurrent_requests", 9..=16),
+            ("max_connections", 5..=8),
+            ("max_channels", 9..=14),
+        ];
+        for (name, values) in lowered {
+            for value in values {
+                let file = format!("{name} = {value}");
+                let config: WebRtcDirectConfig = toml::from_str(&file).expect("parses");
+                assert_eq!(config.max_connections_per_ip, None);
+                let ds15 = WebRtcDirectConfig {
+                    max_connections_per_ip: Some(DS15_PER_IP),
+                    ..config.clone()
+                };
+                validate_webrtc_config(&ds15).expect("valid under ds.15's default");
+                validate_webrtc_config(&config).unwrap_or_else(|error| panic!("{file}: {error}"));
+                assert!(config.connections_per_ip() >= 1);
+                assert!(
+                    config.connections_per_ip() <= DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP
+                );
+            }
+        }
+        let untouched: WebRtcDirectConfig = toml::from_str("").expect("parses");
+        assert_eq!(
+            untouched.connections_per_ip(),
+            DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP
+        );
+    }
+
+    /// A per-address limit the file sets is never lowered: one the other
+    /// limits can't hold is refused, as before.
+    #[test]
+    fn a_per_address_limit_the_file_sets_is_kept_and_refused_if_too_high() {
+        let config: WebRtcDirectConfig = toml::from_str(
+            "max_connections_per_ip = 7
+max_concurrent_requests = 12",
+        )
+        .expect("parses");
+        assert_eq!(config.connections_per_ip(), 7);
+        let error = validate_webrtc_config(&config)
+            .expect_err("7 x 2 is not below 12")
+            .to_string();
+        assert!(error.contains("max_concurrent_requests"), "{error}");
+    }
+
     #[test]
     fn rejects_resource_limits_that_let_one_ip_exhaust_a_global_pool() {
         let mut config = WebRtcDirectConfig::default();
-        config.max_connections_per_ip = config.max_connections;
+        config.max_connections_per_ip = Some(config.max_connections);
         assert!(validate_webrtc_config(&config).is_err());
 
         let mut config = WebRtcDirectConfig::default();
-        config.max_channels = config.max_connections_per_ip * config.max_channels_per_connection;
+        config.max_connections_per_ip = Some(config.connections_per_ip());
+        config.max_channels = config.connections_per_ip() * config.max_channels_per_connection;
         assert!(validate_webrtc_config(&config).is_err());
 
         let mut config = WebRtcDirectConfig::default();
@@ -3003,7 +3066,7 @@ mod tests {
         let honest: SocketAddr = "203.0.113.2:2000".parse().expect("honest address");
         let mut attacker_admissions = Vec::new();
 
-        for port in 0..config.max_connections_per_ip {
+        for port in 0..config.connections_per_ip() {
             let mut address = attacker;
             address.set_port(u16::try_from(port + 1).expect("test port"));
             attacker_admissions.push(
@@ -3012,7 +3075,7 @@ mod tests {
                     .expect("source share remains"),
             );
         }
-        assert_eq!(attacker_admissions.len(), config.max_connections_per_ip);
+        assert_eq!(attacker_admissions.len(), config.connections_per_ip());
         assert_eq!(
             resources.try_admit_connection(attacker).err().as_deref(),
             Some(SOURCE_CONNECTION_CAPACITY_ERROR)
@@ -3037,14 +3100,14 @@ mod tests {
         let mut admissions = vec![resources
             .try_admit_connection(v4)
             .expect("first connection")];
-        for _ in 1..config.max_connections_per_ip {
+        for _ in 1..config.connections_per_ip() {
             admissions.push(
                 resources
                     .try_admit_connection(mapped)
                     .expect("mapped source share"),
             );
         }
-        assert_eq!(admissions.len(), config.max_connections_per_ip);
+        assert_eq!(admissions.len(), config.connections_per_ip());
         assert_eq!(
             resources.try_admit_connection(mapped).err().as_deref(),
             Some(SOURCE_CONNECTION_CAPACITY_ERROR)
@@ -3056,7 +3119,7 @@ mod tests {
         let config = WebRtcDirectConfig::default();
         let resources = ListenerResources::new(&config);
         let mut admissions = Vec::new();
-        for host in 1..=config.max_connections_per_ip {
+        for host in 1..=config.connections_per_ip() {
             let addr = format!("[2001:db8:1234:5678::{host:x}]:1000")
                 .parse()
                 .expect("IPv6 host");

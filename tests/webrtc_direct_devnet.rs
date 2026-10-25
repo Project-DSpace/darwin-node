@@ -1122,7 +1122,7 @@ async fn a_full_listener_refuses_a_new_browser_within_a_second() -> Result<(), B
     config.evm_network = Some(rpc.network());
     config.webrtc_direct_limits = Some(ant_node::WebRtcDirectConfig {
         max_connections: 2,
-        max_connections_per_ip: 1,
+        max_connections_per_ip: Some(1),
         ..ant_node::WebRtcDirectConfig::default()
     });
     let mut devnet = Devnet::new(config).await?;
