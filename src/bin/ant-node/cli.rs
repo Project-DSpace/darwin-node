@@ -138,17 +138,22 @@ pub struct Cli {
     pub log_format: CliLogFormat,
 
     /// Directory for log file output.
-    /// When set, logs are written to files in this directory instead of stdout.
-    /// Files rotate daily and are named ant-node.YYYY-MM-DD.log.
+    /// When set, logs are written to files in this directory instead of stdout,
+    /// named for the UTC time each was started (ant-node.YYYY-MM-DDTHH-MM-SS.log).
+    /// A new file starts at 50 MiB or each hour, whichever comes first, and the
+    /// oldest are deleted to keep the directory's log files to 500 MiB in all.
+    /// At the full line (`disk_reserve_mb`) the oldest go first, then only
+    /// warnings and errors are written, into room freed that way.
     #[cfg(feature = "logging")]
     #[arg(long, env = "ANT_LOG_DIR")]
     pub log_dir: Option<PathBuf>,
 
-    /// Maximum number of rotated log files to retain (only used with --log-dir).
-    /// Oldest files are deleted when this limit is reached. Rotation is daily.
+    /// Maximum number of log files to keep, the current one included (only used
+    /// with --log-dir). The oldest are deleted beyond it. Without it, only the
+    /// 500 MiB limit applies. Files start at 50 MiB or each hour, not daily.
     #[cfg(feature = "logging")]
-    #[arg(long, default_value = "7", env = "ANT_LOG_MAX_FILES")]
-    pub log_max_files: usize,
+    #[arg(long, env = "ANT_LOG_MAX_FILES")]
+    pub log_max_files: Option<usize>,
 
     /// Network mode (production, testnet, or development).
     /// Testnet mode uses relaxed IP diversity limits suitable for

@@ -75,6 +75,51 @@ const CHUNK_NAME_LEN: usize = XORNAME_LEN * 2;
 /// How often to re-query available disk space, in seconds.
 const DISK_CHECK_INTERVAL_SECS: u64 = 5;
 
+/// How old a reading of free space may be when something other than a write
+/// asks for it: the node's log files, through [`full_line_reading`]. The
+/// capacity guard's own interval.
+pub(crate) const FULL_LINE_READING_MAX_AGE: Duration =
+    Duration::from_secs(DISK_CHECK_INTERVAL_SECS);
+
+/// The capacity guard of the chunk store opened last in this process, which
+/// [`full_line_reading`] reads. A node opens one store, so it is that node's.
+static FULL_LINE_GUARD: std::sync::Mutex<Option<std::sync::Weak<CapacityGuard>>> =
+    std::sync::Mutex::new(None);
+
+/// The free space on the storage partition and the full line, from the
+/// capacity guard of the chunk store opened last in this process.
+///
+/// The free space is the free bytes less what that store has written or
+/// reserved since its last measurement. The guard queries the filesystem
+/// again first when that measurement is older than `max_age`, so a caller
+/// asking for every log line makes at most one query per `max_age`.
+///
+/// `None` when no store is open, or when the query fails.
+#[must_use]
+pub fn full_line_reading(max_age: Duration) -> Option<SpaceReading> {
+    let guard = FULL_LINE_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)?;
+    guard.reading(max_age)
+}
+
+/// One reading of the storage partition's free space, as
+/// [`full_line_reading`] gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceReading {
+    /// Free bytes, less what the chunk store has written or reserved since
+    /// the filesystem was last queried.
+    pub free: u64,
+    /// The full line: the free space the store keeps unused, below which it
+    /// takes no write.
+    pub line: u64,
+    /// Which query of the filesystem this reading comes from: it changes
+    /// every time the guard queries the filesystem again.
+    pub measurement: u64,
+}
+
 /// Allocation granularity assumed when charging a pending write against free space.
 ///
 /// Every filesystem we support allocates in units of at least 4 KiB, so a write of
@@ -245,6 +290,9 @@ struct CapacitySnapshot {
     /// reservations at that moment would hand the same bytes out twice. That is precisely
     /// the over-admission the reservation exists to prevent.
     in_flight: u64,
+    /// How many measurements have been taken: tells a reader of
+    /// [`SpaceReading`] which one it has.
+    measurements: u64,
 }
 
 /// Size-aware free-space predicate with a short-lived cache.
@@ -283,8 +331,24 @@ impl CapacityGuard {
                 available: 0,
                 written_since: 0,
                 in_flight: 0,
+                measurements: 0,
             }),
         }
+    }
+
+    /// The free space and the line, measuring again first if the last
+    /// measurement is older than `max_age` (see [`full_line_reading`]).
+    fn reading(&self, max_age: Duration) -> Option<SpaceReading> {
+        let mut snapshot = self.snapshot.lock();
+        let fresh = snapshot.measured_at.is_some_and(|t| t.elapsed() < max_age);
+        if !fresh {
+            self.measure(&mut snapshot).ok()?;
+        }
+        Some(SpaceReading {
+            free: snapshot.free_estimate(),
+            line: self.reserve,
+            measurement: snapshot.measurements,
+        })
     }
 
     /// Bytes actually consumed on disk by a payload of `len` bytes.
@@ -317,6 +381,7 @@ impl CapacityGuard {
         // measurement does not include them.
         snapshot.written_since = 0;
         snapshot.measured_at = Some(Instant::now());
+        snapshot.measurements = snapshot.measurements.wrapping_add(1);
         Ok(())
     }
 
@@ -864,6 +929,9 @@ impl ChunkStore {
         );
 
         let capacity = Arc::new(CapacityGuard::new(chunks_dir.clone(), config.disk_reserve));
+        *FULL_LINE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&capacity));
 
         Ok(Self {
             config,
@@ -1908,6 +1976,13 @@ impl ChunkStore {
             Some(_) => crate::storage::CapacityVerdict::Writable,
             None => crate::storage::CapacityVerdict::Unknown,
         }
+    }
+
+    /// The free space on this store's partition and its full line, as
+    /// [`full_line_reading`] gives them for the store opened last.
+    #[must_use]
+    pub fn space_reading(&self, max_age: Duration) -> Option<SpaceReading> {
+        self.capacity.reading(max_age)
     }
 
     /// Reject work early when the disk cannot take `bytes` more.

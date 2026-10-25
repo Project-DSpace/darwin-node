@@ -181,8 +181,13 @@ In the folder with `docker-compose.yml`:
   and at 500 MiB or less it reports the disk as critical. The node manager
   deletes no node's data, however little space is left.
 - **At 1 GiB free**, nodes stop taking new data: they refuse to store a
-  record that would leave less (nodes up to ds.15 did so at 500 MiB). To
-  store more, add disk or lower `NODE_COUNT`.
+  record that would leave less (nodes up to ds.15 did so at 500 MiB). Their
+  logs give way there too: each node deletes its oldest log files first,
+  then writes only warnings and errors into the room that frees, and nothing
+  once none are left to delete; when the disk has room again it logs how
+  many lines it dropped. To store more, add disk or lower `NODE_COUNT`.
+- **Logs:** each node's files in `logs/node-<id>/logs/` start anew at 50 MiB
+  or each hour and take at most 500 MiB in all, the oldest deleted first.
 - **Older images** (where `docker exec storage-node darwin-nodes --version`
   fails) run Autonomi's node manager, which at 500 MiB free evicts the node
   holding the least data (never the last one): it deletes that node's data

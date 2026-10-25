@@ -60,8 +60,9 @@ pub(crate) mod legacy_artifacts;
 pub(crate) mod traffic;
 
 pub use crate::ant_protocol::XorName;
+pub(crate) use chunk_store::FULL_LINE_READING_MAX_AGE;
+pub use chunk_store::{full_line_reading, ChunkStore, ChunkStoreConfig, SpaceReading};
 pub(crate) use chunk_store::{rename_with_retry, Reservation};
-pub use chunk_store::{ChunkStore, ChunkStoreConfig};
 // Crate-private, as it was before the two stores became one: `CapacityVerdict` was
 // `pub(crate)` on the old store and has no caller outside this crate.
 pub(crate) use chunk_store::CapacityVerdict;
@@ -78,9 +79,10 @@ pub const GIB: u64 = 1024 * MIB;
 /// The full line: the free space a node keeps unused on its storage
 /// partition unless its configuration sets another (`disk_reserve_mb`).
 ///
-/// At or below it, the node stores no new chunk or pointer. It is the warning
-/// level of the node manager that images before darwin-nodes ran, which
-/// deleted a node's data at 500 MiB free; nodes up to ds.15 kept 500 MiB.
+/// At or below it, the node stores no new chunk or pointer, and its log files
+/// give way (`crate::log_files`). It is the warning level of the node manager
+/// that images before darwin-nodes ran, which deleted a node's data at
+/// 500 MiB free; nodes up to ds.15 kept 500 MiB.
 pub const DEFAULT_DISK_RESERVE: u64 = GIB;
 
 /// Free bytes on the partition holding `path`, as the node's disk checks read

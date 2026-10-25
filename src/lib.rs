@@ -53,6 +53,8 @@ pub mod devnet;
 pub mod error;
 pub mod event;
 pub mod listings;
+#[cfg(feature = "logging")]
+pub mod log_files;
 pub mod logging;
 pub mod node;
 pub mod payment;

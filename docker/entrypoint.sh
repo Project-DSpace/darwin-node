@@ -20,7 +20,7 @@ set -euo pipefail
 STATE=/data/manager/ant              # the manager's registry and process files
 REGISTRY=$STATE/node_registry.json
 NODES=/data/nodes                    # node-<id>: one node's data (its --root-dir)
-LOGS=/data/logs                      # node-<id>/logs: one node's daily log files
+LOGS=/data/logs                      # node-<id>/logs: one node's log files
 RETIRED=/data/retired                # nodes removed by lowering NODE_COUNT, kept 3 days
 UNREGISTERED=/data/unregistered      # node folders no node is registered for, never deleted
 MIN_FREE_PER_NODE=$((20 * 1024 ** 3)) # Autonomi's recommended minimum disk per node
@@ -308,9 +308,10 @@ sleep 2
 kill -0 "$manager_pid" 2>/dev/null || fail "The node manager failed to start (is MANAGER_PORT $MANAGER_PORT already in use?); see $LOGS/manager.*.log"
 
 
-# Stream the newest log file of every node (they rotate daily) and of the
-# manager to the container log, checking for new files every 10 seconds.
-# Files that existed before this start are streamed from where they ended.
+# Stream the newest log file of every node (a new one starts each hour or at
+# 50 MiB; daily up to ds.15) and of the manager to the container log,
+# checking for new files every 10 seconds. Files that existed before this
+# start are streamed from where they ended.
 follow_logs() {
     declare -A tails following
     while :; do

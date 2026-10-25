@@ -752,8 +752,8 @@ pub struct StorageConfig {
     /// the node's full line.
     ///
     /// Writes are refused when available space drops below this threshold,
-    /// preventing the node from filling the disk completely. Default: 1024 MiB
-    /// (1 GiB).
+    /// preventing the node from filling the disk completely, and the node's
+    /// log files give way at it. Default: 1024 MiB (1 GiB).
     #[serde(default = "default_disk_reserve_mb")]
     pub disk_reserve_mb: u64,
 }
