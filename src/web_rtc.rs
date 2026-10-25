@@ -1017,7 +1017,9 @@ fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
         && config.connections_per_ip() < DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP
     {
         info!(
-            "webrtc_direct.max_connections_per_ip is not set: {} sessions from one address,              lowered from {DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP} to fit the file's              other browser limits",
+            "webrtc_direct.max_connections_per_ip is not set: {} sessions from one address, \
+             lowered from {DEFAULT_WEBRTC_DIRECT_MAX_CONNECTIONS_PER_IP} to fit the file's \
+             other browser limits",
             config.connections_per_ip()
         );
     }
