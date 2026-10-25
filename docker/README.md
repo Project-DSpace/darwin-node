@@ -225,9 +225,22 @@ and run `docker compose up -d`; the log says `Nodes read
 /etc/storage-node/node.toml`. Every node reads the file at start. The settings
 the image passes itself (ports, rewards address, RPC, bootstrap peers,
 `ANT_RELAY_SERVING`) still take precedence over the file's. A value the node
-refuses (more than 256 sessions, say, the most the transport holds) stops it
-at start with a message naming the setting. Each node logs its browser refusals, by the limit reached, every
-five minutes (`browser refusals (cumulative)`).
+refuses (more than 256 sessions, say, the most the transport holds) stops
+every node at start with a message naming the setting. Lowered values must
+still keep these relations, which the defaults (in brackets) keep:
+
+- `max_connections_per_ip` (7) below `max_connections` (128). Lowering
+  `max_connections` to 7 or less needs `max_connections_per_ip` lowered too.
+- `max_connections_per_ip` times `max_channels_per_connection` (2) below
+  `max_channels` (256), and below `max_concurrent_requests` (16). Lowering
+  `max_concurrent_requests` to 14 or less needs one of the two lowered.
+- `max_requests_per_second_per_connection` (16) no more than
+  `max_requests_per_second_per_ip` (32), and that below
+  `max_requests_per_second` (256).
+- `max_in_flight_bytes_per_ip` (16 MiB) below `max_in_flight_bytes` (64 MiB).
+
+Each node logs its browser refusals, by the limit reached, every five minutes
+(`browser refusals (cumulative)`).
 
 ## Licences
 
