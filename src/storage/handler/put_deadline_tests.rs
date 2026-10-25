@@ -2,21 +2,22 @@
 //! for it, whatever the RPCs do: through the chunk handler, its payment read
 //! from a chain served over JSON-RPC on 127.0.0.1
 //! (`payment::settlement::mock`). With a first RPC that takes calls and
-//! never answers, a single PUT, an envelope PUT and a whole 64-chunk wave
-//! verify within the client's wait; with every RPC stalled, the node still
-//! answers before the client gives up, and a later try passes once the
-//! chain answers.
+//! never answers, a single PUT and an envelope PUT verify within the
+//! client's wait, and a whole 64-chunk wave within the PUT's own deadline;
+//! with every RPC stalled, the node still answers before the client gives
+//! up, and a later try passes once the chain answers.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
 use crate::payment::metrics::QuotingMetricsTracker;
-use crate::payment::settlement::mock::{self, Bundle, Chain, Spec};
+use crate::payment::settlement::mock::{self, Act, Bundle, Chain, Spec};
 use crate::payment::CLIENT_STORE_WAIT;
 use crate::storage::ChunkStoreConfig;
 use ant_listings::self_encryption::{ChunkInfo, DataMap, XorName as SeXorName};
 use ant_listings::{Envelope, Metadata, ShownFields};
 use evmlib::RewardsAddress;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 
 /// A chunk handler whose payment check reads the chain through `providers`,
@@ -179,7 +180,9 @@ async fn a_wave_of_puts_verifies_within_the_clients_wait_when_the_first_rpc_neve
     .await;
     for (verified, took) in checks {
         assert!(verified, "a chunk of the wave was refused");
-        assert!(took < CLIENT_STORE_WAIT, "{took:?}");
+        // Within the deadline the PUT puts on its check, not just the
+        // client's wait: a check past it would be refused.
+        assert!(took < PUT_PAYMENT_DEADLINE, "{took:?}");
     }
     assert_eq!(
         stalled.receipt_reads().len(),
@@ -205,8 +208,20 @@ async fn with_every_rpc_stalled_a_put_is_answered_before_the_client_gives_up() {
     let chain = Chain::shared();
     let (content, bundle) = chunk(4);
     chain.lock().pay(mock::tx(4), vec![bundle.entry()]);
-    let one = mock::provider(&chain, Spec::stalled()).await;
-    let two = mock::provider(&chain, Spec::stalled()).await;
+    // Both stall every request until `answering` is set, then answer.
+    let answering = Arc::new(AtomicBool::new(false));
+    let spec = || {
+        let answering = Arc::clone(&answering);
+        Spec::acting(move |_| {
+            if answering.load(Ordering::SeqCst) {
+                Act::Answer
+            } else {
+                Act::Stall
+            }
+        })
+    };
+    let one = mock::provider(&chain, spec()).await;
+    let two = mock::provider(&chain, spec()).await;
     let dir = TempDir::new().unwrap();
     let handler = handler(&[&one, &two], &dir, true).await;
 
@@ -218,6 +233,18 @@ async fn with_every_rpc_stalled_a_put_is_answered_before_the_client_gives_up() {
     };
     assert!(message.contains("did not finish"), "{message}");
     assert!(took >= PUT_PAYMENT_DEADLINE, "{took:?}");
+    assert!(took < CLIENT_STORE_WAIT, "{took:?}");
+
+    // The chain answers again: the client's next try, with the same proof,
+    // passes within the client's wait.
+    answering.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    let response = put(&handler, &content, &bundle, mock::tx(4)).await;
+    let took = started.elapsed();
+    assert!(
+        matches!(response, ChunkPutResponse::Success { .. }),
+        "{response:?}"
+    );
     assert!(took < CLIENT_STORE_WAIT, "{took:?}");
 }
 
