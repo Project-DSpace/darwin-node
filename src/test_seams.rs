@@ -10,8 +10,14 @@
 //! builds holds no seam's variable. Every seam's variable starts with
 //! [`PREFIX`].
 //!
-//! A seam for a value the node doesn't have yet (the size of a neighbour-sync
-//! page, how long a "full" notice stays fresh) is added here with that value.
+//! A seam for a value the node doesn't have yet is added here in the change
+//! that brings the value, with the harness's runs that set it: the size of a
+//! neighbour-sync page, for a run whose lists take more than one page, and how
+//! long a "full" notice stays fresh, for a run in which a node's mark as full
+//! lapses. Each is compiled only with `test-utils` and named under
+//! [`PREFIX`], so the Build workflow's check covers it, and the harness
+//! refuses such a run with a binary that lacks the seam, as it refuses the
+//! `full` run without [`FREE_SPACE_FILE`].
 
 use std::io;
 use std::path::Path;
