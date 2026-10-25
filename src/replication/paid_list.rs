@@ -65,6 +65,9 @@ pub struct PaidList {
     /// is dropped, so [`Self::wait_idle`] waits on the blocking tasks
     /// themselves before the environment may be reopened.
     blocking_tracker: TaskTracker,
+    /// Tests only: fail the next insert, as a failed write would.
+    #[cfg(test)]
+    fail_next_insert: std::sync::atomic::AtomicBool,
 }
 
 impl PaidList {
@@ -123,6 +126,8 @@ impl PaidList {
             record_out_of_range: RwLock::new(HashMap::new()),
             paid_prune_cursor: RwLock::new(0),
             blocking_tracker: TaskTracker::new(),
+            #[cfg(test)]
+            fail_next_insert: std::sync::atomic::AtomicBool::new(false),
         };
 
         let count = paid_list.count()?;
@@ -139,6 +144,15 @@ impl PaidList {
     ///
     /// Returns an error if the LMDB write transaction fails.
     pub async fn insert(&self, key: &XorName) -> Result<bool> {
+        #[cfg(test)]
+        if self
+            .fail_next_insert
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Storage(
+                "Failed to commit paid-list insert: failed for a test".to_string(),
+            ));
+        }
         // Fast-path: avoid write transaction if key already present.
         if self.contains(key)? {
             trace!("Paid-list key {} already present", hex::encode(key));
@@ -223,6 +237,13 @@ impl PaidList {
         }
 
         Ok(existed)
+    }
+
+    /// Tests only: fail the next [`Self::insert`], as a failed write would.
+    #[cfg(test)]
+    pub(crate) fn fail_next_insert_for_tests(&self) {
+        self.fail_next_insert
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Check whether a key is in the paid-for set.

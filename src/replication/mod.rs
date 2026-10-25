@@ -1828,6 +1828,8 @@ pub struct ReplicationEngine {
     paid_notify_admission_semaphore: Arc<Semaphore>,
     /// Per-source paid-notify counts for flood-fair admission.
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Paid notifies being handled, by key: one at a time per key.
+    paid_notify_flights: Arc<PaidNotifyFlights>,
     /// Resource controls for the HEAVY subtree-audit round 1: its own
     /// tight admission pool (so a burst of full-subtree hashing can't starve the
     /// light audits), a per-peer rate cooldown, and single-use round-1 → round-2
@@ -1978,6 +1980,7 @@ impl ReplicationEngine {
             paid_notify_worker_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_WORKER_LIMIT)),
             paid_notify_admission_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_MAX_OUTSTANDING)),
             paid_notify_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            paid_notify_flights: Arc::new(PaidNotifyFlights::default()),
             subtree_round1: SubtreeRound1Limiter::new(
                 config.subtree_round1_responder_cooldown,
                 config.subtree_round1_max_concurrent,
@@ -3112,6 +3115,7 @@ impl ReplicationEngine {
         let paid_notify_worker_semaphore = Arc::clone(&self.paid_notify_worker_semaphore);
         let paid_notify_admission_semaphore = Arc::clone(&self.paid_notify_admission_semaphore);
         let paid_notify_responder_inflight = Arc::clone(&self.paid_notify_responder_inflight);
+        let paid_notify_flights = Arc::clone(&self.paid_notify_flights);
         let detached_task_tracker = self.detached_task_tracker.clone();
         let subtree_round1 = self.subtree_round1.clone();
 
@@ -3164,6 +3168,7 @@ impl ReplicationEngine {
             paid_notify_worker_semaphore,
             paid_notify_admission_semaphore,
             paid_notify_responder_inflight,
+            paid_notify_flights,
             pointers: self.pointers.clone(),
             listings: self.listings.clone(),
             shutdown: shutdown.clone(),
@@ -4637,6 +4642,7 @@ struct ReplicationMessageHandlerContext {
     paid_notify_worker_semaphore: Arc<Semaphore>,
     paid_notify_admission_semaphore: Arc<Semaphore>,
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    paid_notify_flights: Arc<PaidNotifyFlights>,
     /// Pointer replication, when this node stores pointers.
     pointers: Option<Arc<pointer::PointerReplication>>,
     /// Listings, recorded from fresh offers' payment proofs.
@@ -6707,6 +6713,17 @@ async fn dispatch_paid_notify(
     ctx: &ReplicationMessageHandlerContext,
     received_at: Instant,
 ) -> Result<()> {
+    // Already known: nothing to admit, verify or write.
+    if paid_notify_key_known(&ctx.paid_list, &notify.key) {
+        debug!(
+            responder_class = "paid_notify",
+            source = %source,
+            key = %hex::encode(notify.key),
+            "Paid notify dropped before admission: the key is already in the paid list"
+        );
+        return Ok(());
+    }
+
     let admission = match admit_bounded_responder(
         &ctx.paid_notify_admission_semaphore,
         &ctx.paid_notify_responder_inflight,
@@ -6747,6 +6764,16 @@ async fn dispatch_paid_notify(
     let queue_max_age = ctx.config.neighbor_sync_interval_max;
     ctx.detached_task_tracker.clone().spawn(async move {
         let _admission = admission;
+        // One notify of a key at a time, waited for before taking a worker.
+        let Some(_turn) =
+            paid_notify_turn(&ctx.paid_notify_flights, &ctx.paid_list, &notify.key).await
+        else {
+            debug!(
+                "Paid notify for {} from {source} done: the notify before it recorded the key",
+                hex::encode(notify.key)
+            );
+            return;
+        };
         // Closed by `shutdown()`, so this is the prompt exit path for notifies
         // still queued behind a worker when the engine stops.
         let Ok(_worker) = worker_semaphore.acquire_owned().await else {
@@ -6780,6 +6807,97 @@ async fn dispatch_paid_notify(
     Ok(())
 }
 
+/// Whether a paid notify's key is already known: in this node's paid list,
+/// by one local database read. A failed read counts as not known.
+///
+/// Only the paid list decides. The payment check's cache spares a notify's
+/// chain read but is never a reason to drop one, so a key it holds that the
+/// paid list doesn't, because the paid-list write failed or the store that
+/// would have led to it failed, is still recorded by the next notify.
+fn paid_notify_key_known(paid_list: &PaidList, key: &XorName) -> bool {
+    matches!(paid_list.contains(key), Ok(true))
+}
+
+/// The paid notifies being handled, by key, so a key is handled by one
+/// notify at a time.
+#[derive(Default)]
+struct PaidNotifyFlights(Mutex<HashMap<XorName, tokio::sync::watch::Receiver<()>>>);
+
+/// A notify's place among the notifies of its key.
+enum PaidNotifyEntry {
+    /// No other notify of the key was being handled: this one is, while the
+    /// leader lasts.
+    Leader(PaidNotifyLeader),
+    /// Another was: this one waits for it to finish.
+    Follower(tokio::sync::watch::Receiver<()>),
+}
+
+/// The notify handling a key; dropped, it lets those waiting on it go.
+struct PaidNotifyLeader {
+    flights: Arc<PaidNotifyFlights>,
+    key: XorName,
+    receiver: tokio::sync::watch::Receiver<()>,
+    _sender: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for PaidNotifyLeader {
+    fn drop(&mut self) {
+        let mut flights = self.flights.0.lock();
+        if flights
+            .get(&self.key)
+            .is_some_and(|receiver| receiver.same_channel(&self.receiver))
+        {
+            flights.remove(&self.key);
+        }
+        // The sender drops after this, which wakes every follower.
+    }
+}
+
+impl PaidNotifyFlights {
+    fn enter(self: &Arc<Self>, key: XorName) -> PaidNotifyEntry {
+        let mut flights = self.0.lock();
+        if let Some(receiver) = flights.get(&key) {
+            return PaidNotifyEntry::Follower(receiver.clone());
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(());
+        flights.insert(key, receiver.clone());
+        PaidNotifyEntry::Leader(PaidNotifyLeader {
+            flights: Arc::clone(self),
+            key,
+            receiver,
+            _sender: sender,
+        })
+    }
+}
+
+/// A paid notify's turn to handle its key.
+enum PaidNotifyTurn {
+    /// The first notify of the key: others wait while this lasts.
+    First { _leader: PaidNotifyLeader },
+    /// One that waited for another, which finished without the key reaching
+    /// the paid list: its write, or its payment check, failed.
+    After,
+}
+
+/// Wait for this notify's turn at `key`: at once when no other notify of the
+/// key is being handled, otherwise when that one finishes, whether it
+/// succeeded, failed or was dropped. A notify that waited checks the paid
+/// list again then: `None` if the key is there, and nothing is left to do;
+/// otherwise it handles the key itself, never taking on the other's failure.
+async fn paid_notify_turn(
+    flights: &Arc<PaidNotifyFlights>,
+    paid_list: &PaidList,
+    key: &XorName,
+) -> Option<PaidNotifyTurn> {
+    match flights.enter(*key) {
+        PaidNotifyEntry::Leader(leader) => Some(PaidNotifyTurn::First { _leader: leader }),
+        PaidNotifyEntry::Follower(mut leader) => {
+            while leader.changed().await.is_ok() {}
+            (!paid_notify_key_known(paid_list, key)).then_some(PaidNotifyTurn::After)
+        }
+    }
+}
+
 async fn handle_paid_notify(
     _source: &PeerId,
     notify: &protocol::PaidNotify,
@@ -6808,6 +6926,18 @@ async fn handle_paid_notify(
         return Ok(());
     }
 
+    record_paid_notify(notify, paid_list, payment_verifier, shutdown).await
+}
+
+/// Verify a paid notify's proof, for a key this node tracks, and record the
+/// key in the paid list. A key the payment check has already verified costs
+/// no chain read.
+async fn record_paid_notify(
+    notify: &protocol::PaidNotify,
+    paid_list: &Arc<PaidList>,
+    payment_verifier: &Arc<PaymentVerifier>,
+    shutdown: &CancellationToken,
+) -> Result<()> {
     // Gap 1: Validate PoP via PaymentVerifier. PaidNotify admits fresh
     // paid-list metadata, so local paid-list close-group membership was checked
     // above before proof work. The verifier then runs the same payment proof
@@ -10523,6 +10653,9 @@ async fn rebuild_and_rotate_commitment(
     info!("Storage commitment rotated: hash={hash} key_count={key_count} pointers={pointer_count}");
     Ok(())
 }
+
+#[cfg(test)]
+mod paid_notify_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
