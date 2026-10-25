@@ -2,10 +2,12 @@
 """Tests the mixed-version harness's verdicts (scripts/test_mixed_versions.py)
 on made-up results: what a mixed run's penalties, refused PUTs and message
 families are measured against, with one all-old run and with several, and
-what counts as a new failure reason; and that the report and summary.json
-list every count measured, with its excess and limit, within the limit or
-not. The Test workflow runs it; run it by hand with
-`python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
+what counts as a new failure reason; what the paged run must show of its
+neighbour sync, and that no run pages to a node of the previous release;
+and that the report and summary.json list every count measured, with its
+excess and limit, within the limit or not. The Test workflow runs it; run it
+by hand with `python3 scripts/test_mixed_versions_verdicts.py`. It runs no
+node.
 """
 
 import argparse
@@ -22,13 +24,15 @@ INCUMBENTS_FAIL = ("incumbent", "incumbent", "application_failure")
 JOINERS_TIME_OUT = ("joiner", "joiner", "connection_timeout")
 
 
-def result(penalties=None, refusals=None, families=None):
+def result(penalties=None, refusals=None, families=None, sync=None, single_sync=True):
     """One run's analysis as verdicts() reads it: `penalties` by (observer,
-    target, reason), `refusals` by role, and the message families each role
-    received, by role; every role gets neighbour sync."""
+    target, reason), `refusals` by role, the message families each role
+    received, by role, and its neighbour sync as the logs show it; every role
+    gets neighbour sync, in single messages unless `single_sync` is false."""
     traffic, roles = {}, {}
     for role in ("incumbent", "joiner"):
-        received = {"neighbor_sync_request": 1, "neighbor_sync_response": 1}
+        received = ({"neighbor_sync_request": 1, "neighbor_sync_response": 1}
+                    if single_sync else {})
         received.update((families or {}).get(role, {}))
         traffic[f"{role}-00"] = {f"{family}_rx_count": count
                                  for family, count in received.items()}
@@ -40,7 +44,29 @@ def result(penalties=None, refusals=None, families=None):
         "penalties_on_full": {}, "between_releases": {},
         "penalties": {key: (count, float(count)) for key, count in (penalties or {}).items()},
         "refusals": refusals or {},
+        "sync": sync or {"paged": [], "single": [], "builds": {}, "served": {}, "busy": 0},
     }
+
+
+def exchange(pages=2, peer_release="new"):
+    """A paged exchange as the requester's log shows it, each list over
+    `pages` pages both ways."""
+    found = {"from": "joiner-00", "release": "new", "peer_release": peer_release,
+             "end": "Complete", "pages_sent": pages * 2, "pages_received": pages * 2}
+    for kind in ("replica", "paid"):
+        for way in ("sent", "received"):
+            found[f"{kind}_pages_{way}"] = pages
+    return found
+
+
+def paged_sync(exchanges=None, builds=None, served=None):
+    """A paged run's neighbour sync: by default, one exchange with each list
+    over two pages, its responder's hints built once and its four pages
+    served in order."""
+    return {"paged": [exchange()] if exchanges is None else exchanges, "single": [],
+            "builds": {"joiner-01 a 7": 1} if builds is None else builds,
+            "served": {"joiner-01 a 7": [0, 1, 2, 3]} if served is None else served,
+            "busy": 0}
 
 
 def options(**overrides):
@@ -227,6 +253,45 @@ def main():
            {**two, "all-old-3": result({INCUMBENTS_FAIL: 90}),
             "full": result({INCUMBENTS_FAIL: 90})},
            options(), [])
+
+    expect("a paged run with lists over more than one page, hints built once and pages in "
+           "order passes",
+           {"paged": result(sync=paged_sync())}, options(), [])
+    expect("a paged run whose nodes read only pages still received neighbour sync",
+           {"paged": result(sync=paged_sync(), single_sync=False, families={
+               role: {"neighbor_sync_page_request": 3, "neighbor_sync_page_response": 3}
+               for role in ("incumbent", "joiner")})},
+           options(), [])
+    expect("a paged run in which no exchange took more than one page for each list fails",
+           {"paged": result(sync=paged_sync(exchanges=[exchange(pages=1)]))},
+           options(), ["no exchange took more than one page for each list"])
+    expect("a responder that built its hints twice in one exchange fails the paged run",
+           {"paged": result(sync=paged_sync(builds={"joiner-01 a 7": 2}))},
+           options(), ["built its hints 2 times in one exchange",
+                       "no responder served more than one page"])
+    expect("pages served out of order fail the paged run",
+           {"paged": result(sync=paged_sync(served={"joiner-01 a 7": [0, 2, 1]}))},
+           options(), ["pages served out of order", "no responder served more than one page"])
+    expect("a paged run in which no responder served more than one page from one build fails",
+           {"paged": result(sync=paged_sync(served={"joiner-01 a 7": [0]}))},
+           options(), ["no responder served more than one page"])
+    expect("a node that paged its hints to a node of the previous release fails the run",
+           {**two, "new-hosts-old": result(sync=paged_sync(
+               exchanges=[exchange(peer_release="old")]))},
+           options(), ["paged its hints to a node of the previous release"])
+    expect("pages between nodes of this tree, in a mixed run, pass",
+           {**two, "new-hosts-old": result(sync=paged_sync())}, options(), [])
+    expect("the paged run is not measured against the all-old runs",
+           {**two, "paged": result({INCUMBENTS_FAIL: 90}, sync=paged_sync())},
+           options(), [])
+    page_report = harness.report({"paged": result(sync=paged_sync())}, options())
+    expect_equal("the report gives the paged and single exchanges by release, and the most "
+                 "pages one took",
+                 [line for line in page_report.splitlines()
+                  if "new -> new" in line or "most pages" in line],
+                 ["        new -> new           1     0",
+                  "  most pages in an exchange: 4 sent, 4 received; 1 exchange(s) took more "
+                  "than one page for each list both ways"])
 
     listed(options())
 

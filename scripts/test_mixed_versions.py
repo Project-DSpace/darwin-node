@@ -22,6 +22,9 @@ The runs (`--runs`):
   all-new        this tree throughout (not run unless asked for)
   full           this tree throughout, with --full joiners whose disk reads as
                  full through the free-space seam (run when --full is given)
+  paged          this tree throughout, its neighbour-sync pages --page-bytes
+                 of keys through the page-size seam, so that the few records
+                 of a run take more than one page (run when --paged is given)
 
 Every run must show, over the time from the joiners' start to the last read:
 no message that failed to decode, in any node's log; no audit failed for a
@@ -29,7 +32,9 @@ reply that didn't decode; every record stored by a majority of its close
 group, and still held at the end by a majority of the nodes that stored it
 (a node that joins later gets a record only by repair, which waits for the
 record to age, so the nodes nearest it now are counted but not required);
-and every standalone node received neighbour sync.
+and every standalone node received neighbour sync, in single messages or
+in pages. And no node paged its hints to a node of the previous release,
+which can't read pages.
 
 Each mixed run must also show no penalty heavier than the all-old runs': the
 penalties (saorsa-core's trust events that lower a peer's score) that the
@@ -50,9 +55,19 @@ the message shapes: each role received every message family it received at
 least SHAPE_FLOOR times in every all-old run, and a family that only this
 tree knows (--new-only-family) reached nodes of this tree and no others.
 
+The paged run must show, besides: an exchange in which each node's replica
+hints and paid hints took more than one page, both ways; every exchange's
+pages served from the hints its responder built at the first page, built
+once; and each exchange's pages served in order, the next only after the
+last.
+
 The test-only seams (src/test_seams.rs) are compiled only into builds with the
 `test-utils` feature, which both releases are built with here. The free-space
-seam makes a node's disk read as full (the `full` run).
+seam makes a node's disk read as full (the `full` run). The page-size seam
+makes a sync page small, and the paging-release seam has a node page to every
+peer of this fork's releases (the `paged` run): this tree's nodes announce the
+last release's version until the release is cut, so without it they would
+page to no one. The harness refuses a run with a binary that lacks its seams.
 
 Usage, from the repository root (needs cargo, git, Python 3.8+, and Foundry's
 `anvil` on PATH):
@@ -60,6 +75,7 @@ Usage, from the repository root (needs cargo, git, Python 3.8+, and Foundry's
   python3 scripts/test_mixed_versions.py
   python3 scripts/test_mixed_versions.py --old-ref v0.23.0+ds.15 --observe-minutes 25
   python3 scripts/test_mixed_versions.py --old-bin path/to/old --new-bin path/to/new
+  python3 scripts/test_mixed_versions.py --runs paged --observe-minutes 10
 
 The previous release is the newest v*+ds.* tag before HEAD, built from an
 export of the tree at that tag under target/mv/ with its own target folder,
@@ -151,6 +167,29 @@ CLIENT_TIMEOUT = 1800
 # The seam whose name, found in a binary, shows it was built with test-utils.
 FREE_SPACE_SEAM = "ANT_TEST_SEAM_FREE_SPACE_FILE"
 
+# The seams the paged run sets: the bytes of keys on one neighbour-sync page,
+# and the first release, as its +ds number, whose nodes a node pages to.
+PAGE_SEAM = "ANT_TEST_SEAM_SYNC_PAGE_BYTES"
+PAGES_FROM_SEAM = "ANT_TEST_SEAM_SYNC_PAGES_FROM_RELEASE"
+
+# Bytes of keys on a page in the paged run: two keys, so that each list of a
+# run's records takes more than one page.
+PAGE_BYTES = 64
+
+# The message families of paged neighbour sync, and the single-message family
+# each takes the place of between two nodes that read pages.
+PAGE_FAMILIES = {"neighbor_sync_page_request": "neighbor_sync_request",
+                 "neighbor_sync_page_response": "neighbor_sync_response"}
+
+# The lines a node logs for each exchange it starts, paged or single; for the
+# hints it builds as a responder at an exchange's first page; for each page
+# it serves; and for each page it answers busy.
+PAGED_EXCHANGE_LINE = "Neighbor-sync paged exchange"
+SINGLE_EXCHANGE_LINE = "Neighbor-sync single exchange"
+HINT_SET_LINE = "Neighbor-sync hint set built"
+PAGE_SERVED_LINE = "Neighbor-sync page served"
+BUSY_LINE = "Neighbor-sync page answered busy"
+
 # What each node logs: info, and debug for the code whose debug lines name
 # messages that didn't decode (src/replication, the chunk handler, listings).
 LOG_FILTER = ("info,ant_node::replication=debug,ant_node::storage::handler=debug,"
@@ -184,7 +223,7 @@ UNANSWERED_KIND = {"Sync with": "neighbour sync", "Verification request to": "ve
 # A possession check a peer failed: the peer and the key.
 POSSESSION_FAILED = re.compile(r"Possession check: ([0-9a-f]{64}) failed to prove possession "
                                r"for ([0-9a-f]{64})")
-RUNS = ("all-old", "new-hosts-old", "old-hosts-new", "all-new", "full")
+RUNS = ("all-old", "new-hosts-old", "old-hosts-new", "all-new", "full", "paged")
 # The all-old runs: all-old, and all-old-2 on when there are more.
 BASELINE_RUN = re.compile(r"all-old(?:-([2-9]|[1-9][0-9]+))?")
 
@@ -323,7 +362,9 @@ class Release:
                 raise HarnessError(f"{binary} is missing")
         self.version = subprocess.run([str(self.node), "--version"], capture_output=True,
                                       text=True).stdout.strip()
-        self.seams = FREE_SPACE_SEAM.encode() in self.node.read_bytes()
+        binary = self.node.read_bytes()
+        self.seams = FREE_SPACE_SEAM.encode() in binary
+        self.page_seams = all(seam.encode() in binary for seam in (PAGE_SEAM, PAGES_FROM_SEAM))
 
     def __str__(self):
         return f"{self.name}: {self.version}, {self.label}"
@@ -449,6 +490,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
     timeline = {"started": utc_now().isoformat()}
     stall = StallWatch()
     full_count = args.full if name == "full" else 0
+    paged = name == "paged"
     try:
         manifest_path = folder / "manifest.json"
         devnet_data = folder / "devnet"
@@ -470,6 +512,11 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
             root = folder / "nodes" / node_name
             root.mkdir(parents=True)
             node_env = dict(env)
+            if paged:
+                # Small pages, and pages to every node of this fork's releases:
+                # every node of the run is this tree's.
+                node_env[PAGE_SEAM] = str(args.page_bytes)
+                node_env[PAGES_FROM_SEAM] = "0"
             if full:
                 seam = folder / "seams" / f"{node_name}.free"
                 seam.parent.mkdir(exist_ok=True)
@@ -549,6 +596,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
                    "full": node.full, "log": node.process.log_path.name} for node in nodes],
         "uploads": [path.name for path in uploads],
         "checks": [path.name for path in checks],
+        "page_bytes": args.page_bytes if paged else None,
     }
     (folder / "run.json").write_text(json.dumps(record, indent=2))
     return folder
@@ -691,11 +739,13 @@ def analyze(run):
     between_releases = {}
     traffic = {}
     audits = {}
+    sync = {"paged": [], "single": [], "builds": {}, "served": {}, "busy": 0}
     for source, role, release, path in sources:
         traffic_groups = {}
         audit_groups = {}
         possession_failed = None
         for _, text in read_log(path, window):
+            note_sync(sync, source, release, text, releases)
             failed = POSSESSION_FAILED.search(text)
             if failed:
                 possession_failed = (failed.group(1), failed.group(2))
@@ -765,6 +815,7 @@ def analyze(run):
         "checks": checks,
         "full_evidence": full_evidence,
         "unanswered": unanswered,
+        "sync": sync,
         "stalled_seconds": run.get("stalled_seconds", 0),
         "roles": {node["name"]: node["role"] for node in run["nodes"]},
         "ran": {role: sorted({node.get("ran") or started_as(folder / node["log"])
@@ -774,8 +825,41 @@ def analyze(run):
     }
 
 
+def note_sync(sync, source, release, text, releases):
+    """Notes a neighbour-sync line of `source`'s log in `sync`: an exchange it
+    started, paged or single, with the release of the peer it was with; a
+    hint set it built, and a page it served, as a responder, by the
+    requester and the exchange's number; or a page it answered busy."""
+    if PAGED_EXCHANGE_LINE in text or SINGLE_EXCHANGE_LINE in text:
+        found = fields(text)
+        exchange = {"from": source, "release": release,
+                    "peer_release": releases.get(found.get("peer", ""), "other")}
+        for key, value in found.items():
+            exchange[key] = int(value) if value.isdigit() else value
+        sync["paged" if PAGED_EXCHANGE_LINE in text else "single"].append(exchange)
+    elif HINT_SET_LINE in text:
+        found = fields(text)
+        key = f"{source} {found.get('source', '?')} {found.get('cycle', '?')}"
+        sync["builds"][key] = sync["builds"].get(key, 0) + 1
+    elif PAGE_SERVED_LINE in text:
+        found = fields(text)
+        key = f"{source} {found.get('source', '?')} {found.get('cycle', '?')}"
+        page = found.get("page", "")
+        sync["served"].setdefault(key, []).append(int(page) if page.isdigit() else -1)
+    elif BUSY_LINE in text:
+        sync["busy"] += 1
+
+
+def multi_page(exchange):
+    """Whether an exchange took more than one page for each list, both ways."""
+    return all(exchange.get(f"{kind}_pages_{way}", 0) >= 2
+               for kind in ("replica", "paid") for way in ("sent", "received"))
+
+
 def received_families(result, role):
-    """The message families the nodes of `role` received, with counts."""
+    """The message families the nodes of `role` received, with counts. A page
+    family counts towards the single-message family it takes the place of
+    too, so a node that read pages from its peers received neighbour sync."""
     families = {}
     for name, counters in result["traffic"].items():
         if result["roles"].get(name) != role:
@@ -784,6 +868,9 @@ def received_families(result, role):
             if key.endswith("_rx_count"):
                 family = key[:-len("_rx_count")]
                 families[family] = families.get(family, 0) + value
+                if family in PAGE_FAMILIES:
+                    single = PAGE_FAMILIES[family]
+                    families[single] = families.get(single, 0) + value
     return families
 
 
@@ -818,8 +905,40 @@ def against(bases):
 
 def is_measured(name, baselines):
     """Whether a run is measured against the all-old runs: when there is
-    one, every run but those and the full run."""
-    return bool(baselines) and not is_baseline(name) and name != "full"
+    one, every run but those, the full run and the paged run."""
+    return bool(baselines) and not is_baseline(name) and name not in ("full", "paged")
+
+
+def sync_failures(name, result):
+    """What fails a run in its neighbour sync: a node paging to a node of the
+    previous release; and, in the paged run, no exchange taking more than one
+    page for each list both ways, hints built more than once in an exchange,
+    or an exchange's pages served out of order."""
+    failures = []
+    sync = result.get("sync") or {}
+    for exchange in sync.get("paged", []):
+        if exchange.get("peer_release") == "old":
+            failures.append(f"{name}: {exchange['from']} paged its hints to a node of the "
+                            "previous release, which can't read pages")
+    if name != "paged":
+        return failures
+    if not any(multi_page(exchange) for exchange in sync.get("paged", [])):
+        failures.append(f"{name}: no exchange took more than one page for each list, both "
+                        "ways: no paging happened at this page size")
+    for key, count in sorted(sync.get("builds", {}).items()):
+        if count > 1:
+            failures.append(f"{name}: {key}: the responder built its hints {count} times in "
+                            "one exchange, not once")
+    served_from_one = 0
+    for key, pages in sorted(sync.get("served", {}).items()):
+        if pages != list(range(len(pages))):
+            failures.append(f"{name}: {key}: pages served out of order: {pages[:20]}")
+        elif len(pages) > 1 and sync.get("builds", {}).get(key) == 1:
+            served_from_one += 1
+    if served_from_one == 0:
+        failures.append(f"{name}: no responder served more than one page from hints built "
+                        "once")
+    return failures
 
 
 def comparisons(result, baselines, args):
@@ -903,6 +1022,7 @@ def verdicts(results, args):
             for family in ("neighbor_sync_request", "neighbor_sync_response"):
                 if families.get(family, 0) == 0:
                     failures.append(f"{name}: the {role}s received no {family}")
+        failures += sync_failures(name, result)
         if not is_measured(name, baselines):
             continue
         for compared in comparisons(result, baselines, args):
@@ -1011,6 +1131,7 @@ def report(results, args):
             shown = ", ".join(f"{family} {count}" for family, count in sorted(families.items())
                               if count)
             lines.append(f"{role}s received: {shown}")
+        lines.extend(sync_lines(result))
         kept = [record["held_by_storers"] for record in result["checks"]]
         near = [record["held_by_close_group"] for record in result["checks"]]
         stored = sum(1 for record in result["records"] if record.get("stored"))
@@ -1025,6 +1146,34 @@ def report(results, args):
         counted = ", ".join(f"{key} {value}" for key, value in sorted(audits.items()) if value)
         lines.append(f"audit outcomes: {counted or 'none counted yet'}")
     return "\n".join(lines)
+
+
+def sync_lines(result):
+    """The report's lines on neighbour sync: exchanges paged and single, by the
+    releases of the two nodes, the most pages one took, busy answers, and how
+    many times a responder built its hints in one exchange."""
+    sync = result.get("sync") or {}
+    lines = ["neighbour-sync exchanges (requester's release -> peer's: paged, single):"]
+    pairs = {}
+    for form in ("paged", "single"):
+        for exchange in sync.get(form, []):
+            pair = (exchange["release"], exchange["peer_release"])
+            counts = pairs.setdefault(pair, [0, 0])
+            counts[0 if form == "paged" else 1] += 1
+    for (release, peer_release), (paged, single) in sorted(pairs.items()):
+        lines.append(f"  {release:>9} -> {peer_release:<9} {paged:>5} {single:>5}")
+    paged = sync.get("paged", [])
+    if paged:
+        sent = max(exchange.get("pages_sent", 0) for exchange in paged)
+        received = max(exchange.get("pages_received", 0) for exchange in paged)
+        lines.append(f"  most pages in an exchange: {sent} sent, {received} received; "
+                     f"{sum(1 for exchange in paged if multi_page(exchange))} exchange(s) "
+                     "took more than one page for each list both ways")
+    builds = sync.get("builds", {})
+    lines.append(f"  pages answered busy: {sync.get('busy', 0)}; hint sets built: "
+                 f"{sum(builds.values())}, at most {max(builds.values(), default=0)} in one "
+                 "exchange")
+    return lines
 
 
 def summary_json(results, failures, releases, args):
@@ -1055,6 +1204,7 @@ def summary_json(results, failures, releases, args):
                                     for record in result["checks"]],
             "stored": [bool(record.get("stored")) for record in result["records"]],
             "full_evidence": result["full_evidence"],
+            "sync": result.get("sync"),
         }
     baselines = [result for name, result in results.items() if is_baseline(name)]
     runs = {}
@@ -1115,6 +1265,11 @@ def main():
                         "every node's audit and neighbour sync tick once in 10 to 20)")
     parser.add_argument("--full", type=int, default=0,
                         help="joiners of the full run whose disk reads as full (adds the run)")
+    parser.add_argument("--paged", action="store_true",
+                        help="add the paged run, its sync pages --page-bytes of keys")
+    parser.add_argument("--page-bytes", type=int, default=PAGE_BYTES,
+                        help="bytes of keys on a sync page in the paged run, at least one "
+                        f"key's 32 (default {PAGE_BYTES}: two keys)")
     parser.add_argument("--penalty-slack", type=int, default=PENALTY_SLACK,
                         help="penalties a mixed run may count above the highest all-old "
                         f"count, for each pair of roles and reason (default {PENALTY_SLACK})")
@@ -1145,6 +1300,10 @@ def main():
     runs = [run.strip() for run in args.runs.split(",") if run.strip()]
     if args.full and "full" not in runs:
         runs.append("full")
+    if args.paged and "paged" not in runs:
+        runs.append("paged")
+    if args.page_bytes < 32:
+        parser.error("--page-bytes must be at least one key's 32 bytes")
     unknown = [run for run in runs if run not in RUNS]
     if unknown:
         parser.error(f"unknown runs: {', '.join(unknown)}")
@@ -1178,6 +1337,10 @@ def main():
     if "full" in runs and not new.seams:
         raise HarnessError("this tree's ant-node has no free-space seam: build it with "
                            "--features test-utils")
+    if "paged" in runs and not new.page_seams:
+        raise HarnessError(f"this tree's ant-node lacks the neighbour-sync page seams "
+                           f"({PAGE_SEAM}, {PAGES_FROM_SEAM}): the paged run needs a "
+                           "release that pages, built with --features test-utils")
 
     work = Path(args.work) if args.work else (
         cache / "runs" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -1195,6 +1358,7 @@ def main():
         "old-hosts-new": (old, new),
         "all-new": (new, new),
         "full": (new, new),
+        "paged": (new, new),
     }
     keep_awake()
     for name in runs:
@@ -1203,7 +1367,8 @@ def main():
         log(f"{name}: done")
     (work / "releases.json").write_text(json.dumps(
         {release.name: {"version": release.version, "from": release.label,
-                        "seams": release.seams} for release in releases}, indent=2))
+                        "seams": release.seams, "page_seams": release.page_seams}
+         for release in releases}, indent=2))
     # Every run in the work folder: one run again into a folder whose other
     # runs passed is measured against the same all-old runs.
     return conclude(work, runs_in(work), args)
