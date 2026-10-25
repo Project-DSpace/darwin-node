@@ -437,6 +437,19 @@ impl ListingService {
         *self.p2p.write() = Some(node);
     }
 
+    /// Tests only: find stored envelopes' payments through `urls`, in that
+    /// order, in place of the RPCs given at start.
+    #[cfg(test)]
+    pub(crate) fn set_payment_rpcs_for_tests(&self, urls: Vec<reqwest::Url>) {
+        self.payment_reads.read().set_rpcs_for_tests(urls);
+    }
+
+    /// Tests only: the listing this node holds for `address`, served or not.
+    #[cfg(test)]
+    pub(crate) async fn held_listing_for_tests(&self, address: XorName) -> Option<Listing> {
+        self.held_listing(address).await
+    }
+
     /// Find stored envelopes' payments through `reads`, the payment check's,
     /// so a receipt the check has just read serves here too. Only reads of
     /// the same vault through the same RPCs as this service's are taken, as

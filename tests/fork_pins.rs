@@ -13,7 +13,8 @@
 //! transaction the proof names can settle a quote it shows paid in full to
 //! the quote's payee, with no read of the record, and can do nothing else: it
 //! never refuses, so a receipt that doesn't pay the quote leaves the record
-//! read to decide. And the bytes of
+//! read to decide. A store's whole payment check ends inside the time a
+//! released client waits for its answer. And the bytes of
 //! the payment proofs nodes pass each other in fresh offers and paid notices,
 //! and of the quotes inside them, with each quote's hash
 //! (`payment_encodings` below).
@@ -1343,6 +1344,19 @@ mod payment_reads {
                 assert_eq!(record_reads, reads, "{case}: the record read decides");
             }
         }
+    }
+
+    /// A store's whole payment check ends before a released client stops
+    /// waiting for the store's answer (its `STORE_RESPONSE_TIMEOUT`, 10 s), so
+    /// the node answers with its payment error rather than leave the client
+    /// to time out, and the reads still in flight fill the payment cache for
+    /// the client's next try.
+    #[test]
+    fn a_stores_payment_check_ends_inside_the_clients_wait() {
+        use ant_node::payment::{CLIENT_STORE_WAIT, PUT_PAYMENT_DEADLINE};
+        assert_eq!(CLIENT_STORE_WAIT, Duration::from_secs(10));
+        assert_eq!(PUT_PAYMENT_DEADLINE, Duration::from_secs(7));
+        assert!(PUT_PAYMENT_DEADLINE < CLIENT_STORE_WAIT);
     }
 }
 

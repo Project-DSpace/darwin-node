@@ -42,6 +42,7 @@ use crate::logging::{debug, info, warn};
 use crate::payment::settlement::Lane;
 use crate::payment::{
     PaymentVerifier, QuoteGenerator, VerificationContext, BATCH_PAYMENTS_REFUSED,
+    PUT_PAYMENT_DEADLINE,
 };
 use crate::pointer::PointerService;
 use crate::replication::admission;
@@ -851,36 +852,30 @@ impl AntProtocol {
             }
         }
 
-        // 5. Verify payment. The ClientPut context applies the store-strength
-        //    payment cache and verifies live proofs.
-        let payment_result = self
-            .payment_verifier
-            .verify_payment(
-                &address,
-                request.payment_proof.as_deref(),
-                VerificationContext::ClientPut,
-            )
-            .await;
-
-        match payment_result {
-            Ok(status) if status.can_store() => {
-                // Payment verified or cached
+        // 5. and 5b. The payment check, an envelope's included, ends by its
+        //    deadline, inside the time a released client waits for this
+        //    answer. At the deadline the PUT is refused with the payment error;
+        //    the chain reads still in flight finish on their own and fill the
+        //    payment cache, so the client's next try passes.
+        let checked = tokio::time::timeout(
+            PUT_PAYMENT_DEADLINE,
+            self.check_put_payment(&address, &request),
+        )
+        .await;
+        let listing = match checked {
+            Ok(Ok(listing)) => listing,
+            Ok(Err(response)) => return response,
+            Err(_) => {
+                warn!(
+                    "Payment check for {addr_hex} did not finish within {PUT_PAYMENT_DEADLINE:?}; \
+                     refusing the PUT so the client tries again"
+                );
+                return ChunkPutResponse::Error(ProtocolError::PaymentFailed(format!(
+                    "the payment check did not finish within {} s; the payment is still being \
+                     read, try again",
+                    PUT_PAYMENT_DEADLINE.as_secs()
+                )));
             }
-            Ok(_) => {
-                return ChunkPutResponse::PaymentRequired {
-                    message: "Payment required for new chunk".to_string(),
-                };
-            }
-            Err(e) => {
-                return ChunkPutResponse::Error(ProtocolError::PaymentFailed(e.to_string()));
-            }
-        }
-
-        // 5b. An envelope, of any visibility: its payment, found while the proof is
-        //     at hand; only the fields its flags show are kept.
-        let listing = match self.listing_for_put(&address, &request).await {
-            Ok(listing) => listing,
-            Err(response) => return response,
         };
 
         // 6. Store chunk
@@ -934,6 +929,45 @@ impl AntProtocol {
                 ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
             }
         }
+    }
+
+    /// A PUT's payment check: 5. its payment, verified in the `ClientPut`
+    /// context, which applies the store-strength payment cache and verifies
+    /// live proofs; then 5b. for an envelope, of any visibility, its payment,
+    /// found while the proof is at hand, of which only the fields its flags
+    /// show are kept. `Ok` holds the listing to record once the chunk is
+    /// stored; `Err` is the response that refuses the PUT.
+    async fn check_put_payment(
+        &self,
+        address: &XorName,
+        request: &ChunkPutRequest,
+    ) -> std::result::Result<Option<Listing>, ChunkPutResponse> {
+        let payment_result = self
+            .payment_verifier
+            .verify_payment(
+                address,
+                request.payment_proof.as_deref(),
+                VerificationContext::ClientPut,
+            )
+            .await;
+
+        match payment_result {
+            Ok(status) if status.can_store() => {
+                // Payment verified or cached
+            }
+            Ok(_) => {
+                return Err(ChunkPutResponse::PaymentRequired {
+                    message: "Payment required for new chunk".to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(ChunkPutResponse::Error(ProtocolError::PaymentFailed(
+                    e.to_string(),
+                )));
+            }
+        }
+
+        self.listing_for_put(address, request).await
     }
 
     /// For an envelope, of any visibility, the listing to record once the
@@ -1291,6 +1325,9 @@ impl AntProtocol {
         self.storage.put(address, content).await
     }
 }
+
+#[cfg(test)]
+mod put_deadline_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

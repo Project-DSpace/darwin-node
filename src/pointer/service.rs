@@ -53,7 +53,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
-use crate::payment::PaymentVerifier;
+use crate::payment::{PaymentVerifier, PUT_PAYMENT_DEADLINE};
 use crate::pointer::store::{Inspected, PointerStore, PutOutcome};
 use crate::replication::admission;
 use crate::replication::pointer::PointerFreshWrite;
@@ -501,6 +501,10 @@ impl PointerService {
     /// `paid_content` is what the quote must name. They are different values
     /// here, which is the whole point — the existing chunk path passes one
     /// address for both jobs.
+    ///
+    /// The check ends by [`PUT_PAYMENT_DEADLINE`], inside the time a released
+    /// client waits for the PUT's answer; reads still in flight then fill the
+    /// payment cache for the client's next try.
     async fn verify_payment(
         payments: &PaymentVerifier,
         routing_address: XorName,
@@ -513,9 +517,18 @@ impl PointerService {
                 hex::encode(paid_content)
             )));
         };
-        payments
-            .verify_pointer_payment(&routing_address, &paid_content, proof)
-            .await
+        tokio::time::timeout(
+            PUT_PAYMENT_DEADLINE,
+            payments.verify_pointer_payment(&routing_address, &paid_content, proof),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Payment(format!(
+                "the payment check did not finish within {} s; the payment is still being \
+                 read, try again",
+                PUT_PAYMENT_DEADLINE.as_secs()
+            )))
+        })
     }
 }
 
