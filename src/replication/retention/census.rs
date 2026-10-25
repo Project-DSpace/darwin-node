@@ -42,6 +42,12 @@
 //! the vendored protocol's wire messages and payment proof types, and the
 //! vendored listings protocol's messages, against a reviewed list of what a
 //! node does with each.
+//!
+//! The storage-node image's scripts (docker/entrypoint.sh, docker/nodes) can
+//! remove a node's folders too, outside this crate: tests/darwin_image.rs
+//! lists every deletion they make (`DELETIONS`), the 3-day sweep of retired
+//! folders among them, and every move (`MOVES`), each move into the swept
+//! folder a deletion put off.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;

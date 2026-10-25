@@ -9,9 +9,12 @@
 //! downloads and log forwarding. These tests read the repository: the image
 //! installs that manager and downloads nothing, its scripts call it and never
 //! Autonomi's `ant`, the registry stays where the image before kept it, the
-//! image marker reaches the nodes only from the manager's environment, and
-//! every deletion the image's scripts make is reviewed. docker/smoke-test.sh
-//! runs the image itself.
+//! image marker reaches the nodes only from the manager's environment, every
+//! deletion and every move the image's scripts make is reviewed, and the
+//! folders they set aside are out of reach of every image's sweep. These are
+//! the image's erase paths; the node's own are in
+//! src/replication/retention/census.rs. docker/smoke-test.sh runs the image
+//! itself.
 //!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict.
@@ -335,32 +338,32 @@ fn the_image_marker_reaches_the_nodes_only_from_the_managers_environment() {
 const SWEEP: &str = r#"find "$RETIRED" -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} +"#;
 
 /// Words that delete files or data, or take a node out of the registry.
-/// Moves (`mv`), plain writes and redirections are not counted: they move a
-/// folder aside or write a file whole, as the erasure census of the node's
-/// own code (src/replication/retention/census.rs) leaves out renames and
-/// plain writes.
+/// Plain writes and redirections are not counted: they write a file whole,
+/// as the erasure census of the node's own code
+/// (src/replication/retention/census.rs) leaves out plain writes. Moves are
+/// listed apart, in [`MOVES`]: a move into `$RETIRED` is a deletion put off.
 const DELETING_WORDS: &[&str] = &[
     "rm", "rmdir", "unlink", "shred", "truncate", "-delete", "dismiss",
 ];
 
-/// A reviewed command of the image's scripts that deletes something, and why
-/// that is safe.
-struct Deletion {
+/// A reviewed command of the image's scripts that deletes or moves
+/// something, and why that is safe.
+struct Reviewed {
     /// The script, relative to the repository's root.
     file: &'static str,
     /// The command as [`shell_commands`] gives it.
     command: &'static str,
     /// How many times the script has it.
     count: usize,
-    /// What it deletes, and why that is safe.
+    /// What it deletes or moves, and why that is safe.
     reason: &'static str,
 }
 
 /// Every command of the image's scripts that deletes something. Deleting a
 /// node's data is not among them: that is kept while the node is registered,
 /// for 3 days once retired, and for good once set aside as unregistered.
-const DELETIONS: &[Deletion] = &[
-    Deletion {
+const DELETIONS: &[Reviewed] = &[
+    Reviewed {
         file: "docker/entrypoint.sh",
         command: r#"rm -f "$STATE/daemon.pid" "$STATE/daemon.port" "$NODES"/node-*/node.pid"#,
         count: 1,
@@ -368,7 +371,7 @@ const DELETIONS: &[Deletion] = &[
                  process IDs start again in a new container, so a stale one could name an \
                  unrelated process. No node data.",
     },
-    Deletion {
+    Reviewed {
         file: "docker/entrypoint.sh",
         command: SWEEP,
         count: 1,
@@ -380,7 +383,7 @@ const DELETIONS: &[Deletion] = &[
                  folders; folders no node is registered for are kept beside them, in \
                  /data/unregistered, which no image's sweep reaches.",
     },
-    Deletion {
+    Reviewed {
         file: "docker/entrypoint.sh",
         command: r#"manager dismiss "$id" >/dev/null"#,
         count: 2,
@@ -389,7 +392,7 @@ const DELETIONS: &[Deletion] = &[
                  first start; and a node above a lowered NODE_COUNT, whose folders are then \
                  retired for 3 days.",
     },
-    Deletion {
+    Reviewed {
         file: "docker/entrypoint.sh",
         command: r#"rm -f "$tmp""#,
         count: 1,
@@ -398,34 +401,81 @@ const DELETIONS: &[Deletion] = &[
     },
 ];
 
-#[test]
-fn every_deletion_the_image_scripts_make_is_reviewed() {
+/// Words that move a folder: `mv`, and the entrypoint's `retire`, which moves
+/// one into `$RETIRED`, dated now, for the sweep to delete 3 days later.
+const MOVING_WORDS: &[&str] = &["mv", "retire"];
+
+/// Every command of the image's scripts that moves a node's folders, and
+/// where to. A folder moved into `$RETIRED` is deleted by the sweep 3 days
+/// later, so each `retire` is a deletion put off: only the data and logs of a
+/// node the operator retired, and the logs of a node an earlier manager
+/// evicted, go there.
+const MOVES: &[Reviewed] = &[
+    Reviewed {
+        file: "docker/entrypoint.sh",
+        command: r#"retire() { mv "$1" "$2" && touch "$2"; }"#,
+        count: 1,
+        reason: "The definition of retire: a move into $RETIRED, dated now, so the sweep keeps \
+                 the folder 3 days from its retirement however long it sat unchanged before.",
+    },
+    Reviewed {
+        file: "docker/entrypoint.sh",
+        command: r#"mv "$dir" "$NODES/node-$id""#,
+        count: 1,
+        reason: "Takes over an earlier image's layout: /data/node-<port> becomes \
+                 nodes/node-<n>, with its identity and data, registered again on its port.",
+    },
+    Reviewed {
+        file: "docker/entrypoint.sh",
+        command: r#"if [[ -d "$LOGS/node-$id" ]]; then retire "$LOGS/node-$id" "$RETIRED/$(date -u +%Y%m%dT%H%M%S)-node-$id-logs"; fi"#,
+        count: 1,
+        reason: "The logs of a node an earlier manager evicted, dismissed once: retired, so \
+                 swept 3 days later. That manager deleted its data; anything left of its \
+                 folder is set aside with the unregistered folders.",
+    },
+    Reviewed {
+        file: "docker/entrypoint.sh",
+        command: r#"if [[ -d "$NODES/node-$id" ]]; then retire "$NODES/node-$id" "$RETIRED/$stamp-node-$id"; fi"#,
+        count: 1,
+        reason: "The data of a node above a lowered NODE_COUNT, once dismissed: retired, so the \
+                 operator can undo the change within 3 days.",
+    },
+    Reviewed {
+        file: "docker/entrypoint.sh",
+        command: r#"if [[ -d "$LOGS/node-$id" ]]; then retire "$LOGS/node-$id" "$RETIRED/$stamp-node-$id-logs"; fi"#,
+        count: 1,
+        reason: "That node's logs, retired with its data.",
+    },
+    Reviewed {
+        file: "docker/entrypoint.sh",
+        command: r#"mv "$dir" "$UNREGISTERED/$(date -u +%Y%m%dT%H%M%S)-$(basename "$dir")""#,
+        count: 1,
+        reason: "A node folder no registered node has: set aside in $UNREGISTERED for good, \
+                 beside $RETIRED, where no image's sweep reaches.",
+    },
+];
+
+/// How the commands of the image's scripts that hold any of `kinds` differ
+/// from `listed`, one line each; empty when they agree.
+fn unreviewed(kinds: &[&str], listed: &[Reviewed]) -> String {
     let mut found: BTreeMap<(String, String), usize> = BTreeMap::new();
     for file in IMAGE_SCRIPTS {
         for command in shell_commands(&repo_text(file)) {
             if words(&command)
                 .iter()
-                .any(|word| DELETING_WORDS.contains(&word.as_str()))
+                .any(|word| kinds.contains(&word.as_str()))
             {
                 *found.entry((file.to_string(), command)).or_default() += 1;
             }
         }
     }
-    let reviewed: BTreeMap<(String, String), usize> = DELETIONS
+    let reviewed: BTreeMap<(String, String), usize> = listed
         .iter()
-        .map(|d| ((d.file.to_string(), d.command.to_string()), d.count))
+        .map(|r| ((r.file.to_string(), r.command.to_string()), r.count))
         .collect();
-    assert_eq!(
-        reviewed.len(),
-        DELETIONS.len(),
-        "a deletion is listed twice"
-    );
-    for deletion in DELETIONS {
-        assert!(
-            !deletion.reason.is_empty(),
-            "{} has no reason",
-            deletion.command
-        );
+    assert_eq!(reviewed.len(), listed.len(), "a command is listed twice");
+    for entry in listed {
+        assert!(!entry.reason.is_empty(), "{} has no reason", entry.command);
     }
 
     let mut differences = String::new();
@@ -437,11 +487,7 @@ fn every_deletion_the_image_scripts_make_is_reviewed() {
                 "\n{file}: `{command}` is there {count} time(s), listed {listed}"
             )
             .unwrap(),
-            None => write!(
-                differences,
-                "\n{file}: `{command}` deletes something and is not listed"
-            )
-            .unwrap(),
+            None => write!(differences, "\n{file}: `{command}` is not listed").unwrap(),
         }
     }
     for (file, command) in reviewed.keys() {
@@ -453,11 +499,115 @@ fn every_deletion_the_image_scripts_make_is_reviewed() {
             .unwrap();
         }
     }
+    differences
+}
+
+#[test]
+fn every_deletion_the_image_scripts_make_is_reviewed() {
+    let differences = unreviewed(DELETING_WORDS, DELETIONS);
     assert!(
         differences.is_empty(),
         "the image's scripts delete outside the reviewed list (DELETIONS); review each, \
          and list it with its reason:{differences}"
     );
+}
+
+#[test]
+fn every_move_the_image_scripts_make_is_reviewed() {
+    let differences = unreviewed(MOVING_WORDS, MOVES);
+    assert!(
+        differences.is_empty(),
+        "the image's scripts move folders outside the reviewed list (MOVES); review each, \
+         and list it with where it goes and why:{differences}"
+    );
+}
+
+/// The value the one plain assignment of `name` among `commands` gives it.
+fn assigned_value(commands: &[String], name: &str) -> String {
+    let prefix = format!("{name}=");
+    let values: Vec<&str> = commands
+        .iter()
+        .filter_map(|c| c.strip_prefix(prefix.as_str()))
+        .collect();
+    assert_eq!(values.len(), 1, "{name} is assigned {} times", values.len());
+    values[0].to_string()
+}
+
+fn moves_something(command: &str) -> bool {
+    words(command)
+        .iter()
+        .any(|word| MOVING_WORDS.contains(&word.as_str()))
+}
+
+/// Folders set aside as unregistered are kept for good. The set-aside loop
+/// moves each to `$UNREGISTERED`, and nothing else moves anything there;
+/// `$UNREGISTERED` is beside `$RETIRED`, not in it, so the sweep of
+/// `$RETIRED`, which the images before run too, never reaches it; nothing the
+/// scripts delete names it; and only `retire` moves a folder into `$RETIRED`,
+/// where the sweep deletes it.
+#[test]
+fn folders_set_aside_are_out_of_every_sweeps_reach() {
+    let entrypoint = shell_commands(&repo_text("docker/entrypoint.sh"));
+    let retired = assigned_value(&entrypoint, "RETIRED");
+    let unregistered = assigned_value(&entrypoint, "UNREGISTERED");
+    assert_eq!(retired, "/data/retired");
+    assert_eq!(unregistered, "/data/unregistered");
+    assert!(
+        unregistered != retired && !unregistered.starts_with(&format!("{retired}/")),
+        "UNREGISTERED ({unregistered}) is in RETIRED ({retired}), which every image's sweep empties"
+    );
+    assert_eq!(
+        entrypoint.iter().filter(|c| c.as_str() == SWEEP).count(),
+        1,
+        "the entrypoint doesn't sweep $RETIRED with {SWEEP}"
+    );
+
+    const SET_ASIDE_LOOP: &str = r#"for dir in "$NODES"/node-*; do"#;
+    assert_eq!(
+        entrypoint
+            .iter()
+            .filter(|c| c.as_str() == SET_ASIDE_LOOP)
+            .count(),
+        1,
+        "the entrypoint has no one loop over the node folders ({SET_ASIDE_LOOP})"
+    );
+    let set_aside: Vec<&String> = entrypoint
+        .iter()
+        .skip_while(|c| c.as_str() != SET_ASIDE_LOOP)
+        .skip(1)
+        .take_while(|c| c.as_str() != "done")
+        .filter(|c| moves_something(c))
+        .collect();
+    assert!(
+        set_aside.len() == 1 && set_aside[0].starts_with(r#"mv "$dir" "$UNREGISTERED/"#),
+        "the set-aside loop must move each folder to $UNREGISTERED, and only there: {set_aside:#?}"
+    );
+    for command in entrypoint.iter().filter(|c| moves_something(c)) {
+        assert!(
+            !command.contains("$UNREGISTERED") || std::ptr::eq(command, set_aside[0]),
+            "only the set-aside loop may move anything to or from $UNREGISTERED: {command}"
+        );
+        // A move into $RETIRED is a deletion put off: only retire makes one,
+        // dated now, and retire moves nowhere else.
+        let retires = words(command).iter().any(|word| word == "retire");
+        if command.contains(r#""$RETIRED/"#) {
+            assert!(retires, "a move into $RETIRED that isn't a retire: {command}");
+        }
+        if retires && !command.starts_with("retire() ") {
+            let call = &command[command.find("retire ").unwrap()..];
+            assert!(
+                call.contains(r#" "$RETIRED/"#),
+                "a retire into somewhere other than $RETIRED: {command}"
+            );
+        }
+    }
+    for deletion in DELETIONS {
+        assert!(
+            !deletion.command.contains("UNREGISTERED") && !deletion.command.contains(&unregistered),
+            "a deletion names the set-aside folders: {}",
+            deletion.command
+        );
+    }
 }
 
 #[test]

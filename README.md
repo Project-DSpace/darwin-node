@@ -230,8 +230,9 @@ never ran.
   deleted, a `/data` written by ds.15's image keeps every node's id, port,
   data and identity, and ds.15's image started again on a `/data` this
   image wrote keeps every folder set aside. `tests/darwin_image.rs` pins
-  the manager's install, the registry's place, the marker's path, and
-  every deletion the image's scripts make, each with its reason.
+  the manager's install, the registry's place, the marker's path, every
+  deletion and every move the image's scripts make, each with its reason,
+  and the set-aside folders' place beyond every sweep.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
   releases without credentials, and orders `+ds.N` builds by their number,
