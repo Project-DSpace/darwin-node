@@ -240,8 +240,8 @@ impl NodeInfo {
 
     /// Merge a new address with an explicit type tag.
     ///
-    /// Insertion position depends on type priority: Relay → Direct →
-    /// Unverified → Lan. Relay addresses always go to the front. After
+    /// Insertion position depends on type priority: Direct → Relay →
+    /// Unverified → Lan. Direct addresses always go to the front. After
     /// insertion, [`Self::enforce_per_ip_family_cap`] prunes the list so
     /// the "at most 1 Relay + 1 WAN non-Relay + 1 LAN per IP family"
     /// invariant holds.
@@ -268,23 +268,23 @@ impl NodeInfo {
         }
 
         // Insert based on type priority. Insertion order is what the cap
-        // uses to break "newest wins" ties: Relay / Direct / Unverified
+        // uses to break "newest wins" ties: Direct / Relay / Unverified
         // insert at the front of their tier so the newest sits at the
         // lowest index among same-tier entries; Lan appends so the newest
         // sits at the highest index.
         match addr_type {
-            AddressType::Relay => {
-                self.addresses.insert(0, addr);
-                self.address_types.insert(0, AddressType::Relay);
-            }
             AddressType::Direct => {
+                self.addresses.insert(0, addr);
+                self.address_types.insert(0, AddressType::Direct);
+            }
+            AddressType::Relay => {
                 let pos = self
                     .address_types
                     .iter()
-                    .position(|t| *t != AddressType::Relay)
+                    .position(|t| *t != AddressType::Direct)
                     .unwrap_or(self.addresses.len());
                 self.addresses.insert(pos, addr);
-                self.address_types.insert(pos, AddressType::Direct);
+                self.address_types.insert(pos, AddressType::Relay);
             }
             AddressType::Unverified => {
                 let pos = self
@@ -425,8 +425,8 @@ impl NodeInfo {
     /// Unlike [`Self::merge_typed_address`], which blindly remove-and-reinserts
     /// (and thus can *demote* a Relay/Direct entry to Unverified if gossip
     /// arrives out of order), this variant no-ops when the address is already
-    /// present with a tag of equal-or-higher priority. New addresses are
-    /// always added.
+    /// present with a tag of equal-or-stronger rank
+    /// ([`AddressType::tag_rank`]). New addresses are always added.
     ///
     /// Returns `true` when the state actually changed (new address appended
     /// or an existing tag was promoted to a better tier), `false` otherwise.
@@ -446,7 +446,7 @@ impl NodeInfo {
         let addr_type = AddressType::for_advertised_address(&addr, addr_type);
         if let Some(pos) = self.addresses.iter().position(|a| a == &addr) {
             let existing = self.address_type_at(pos);
-            if existing.priority() <= addr_type.priority() {
+            if existing.tag_rank() <= addr_type.tag_rank() {
                 return false;
             }
         }
@@ -770,7 +770,7 @@ impl KBucket {
     /// drops any state the sender omits (e.g., a stale relay address after
     /// the relay session closes).
     ///
-    /// The new list is sorted by [`type_priority`] (Relay → Direct → Lan)
+    /// The new list is sorted by [`type_priority`] (Direct → Relay → Unverified → Lan)
     /// to preserve the same ordering invariant that [`NodeInfo::merge_typed_address`]
     /// maintains, then truncated to [`MAX_ADDRESSES_PER_NODE`].
     ///
@@ -1781,7 +1781,7 @@ impl DhtCoreEngine {
     /// Get a peer's addresses paired with their [`AddressType`] tags.
     ///
     /// Used by [`crate::dht_network_manager::DhtNetworkManager::peer_addresses_for_dial_typed`]
-    /// to sort candidates by type priority (Relay first) per ADR-014.
+    /// to sort candidates by type priority (Direct first).
     pub async fn get_node_addresses_typed(
         &self,
         peer_id: &PeerId,
@@ -3044,11 +3044,11 @@ mod tests {
         let replaced = bucket.replace_node_addresses(&PeerId::from_bytes([1u8; 32]), typed);
         assert!(replaced);
         let node = bucket.find_node(&PeerId::from_bytes([1u8; 32])).unwrap();
-        // Relay is first, Direct second — matches NodeInfo::merge_typed_address ordering.
-        assert_eq!(node.addresses, vec![new_relay, new_direct]);
+        // Direct is first, Relay second — matches NodeInfo::merge_typed_address ordering.
+        assert_eq!(node.addresses, vec![new_direct, new_relay]);
         assert_eq!(
             node.address_types,
-            vec![AddressType::Relay, AddressType::Direct]
+            vec![AddressType::Direct, AddressType::Relay]
         );
     }
 
@@ -5030,10 +5030,74 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn address_type_priority_is_relay_direct_unverified_lan() {
-        assert!(AddressType::Relay.priority() < AddressType::Direct.priority());
-        assert!(AddressType::Direct.priority() < AddressType::Unverified.priority());
+    fn address_type_priority_is_direct_relay_unverified_lan() {
+        assert!(AddressType::Direct.priority() < AddressType::Relay.priority());
+        assert!(AddressType::Relay.priority() < AddressType::Unverified.priority());
         assert!(AddressType::Unverified.priority() < AddressType::Lan.priority());
+    }
+
+    #[test]
+    fn address_type_tag_rank_is_relay_direct_unverified_lan() {
+        assert!(AddressType::Relay.tag_rank() < AddressType::Direct.tag_rank());
+        assert!(AddressType::Direct.tag_rank() < AddressType::Unverified.tag_rank());
+        assert!(AddressType::Unverified.tag_rank() < AddressType::Lan.tag_rank());
+    }
+
+    #[test]
+    fn upgrade_only_gossip_cannot_retag_relay_as_direct() {
+        // Dialling Direct first must not let a lookup hint promote a relay
+        // address to Direct, which would make it a relay candidate.
+        let relay: MultiAddr = "/ip4/198.51.100.1/udp/9000/quic".parse().unwrap();
+        let mut node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: Vec::new(),
+            address_types: Vec::new(),
+            last_seen: AtomicInstant::now(),
+        };
+        node.merge_typed_address(relay.clone(), AddressType::Relay);
+        assert!(!node.merge_typed_address_upgrade_only(relay.clone(), AddressType::Direct));
+        assert_eq!(node.addresses, vec![relay]);
+        assert_eq!(node.address_types, vec![AddressType::Relay]);
+    }
+
+    #[test]
+    fn unsequenced_lookup_view_cannot_retag_relay_as_direct() {
+        let relay: MultiAddr = "/ip4/198.51.100.1/udp/9000/quic".parse().unwrap();
+        let direct: MultiAddr = "/ip4/203.0.113.7/udp/9001/quic".parse().unwrap();
+        let view = |addresses: Vec<MultiAddr>, address_types: Vec<AddressType>| crate::DHTNode {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addresses,
+            address_types,
+            distance: None,
+            reliability: 1.0,
+            address_authority: None,
+        };
+        let mut node = view(vec![relay.clone()], vec![AddressType::Relay]);
+        node.merge_from(view(
+            vec![relay.clone(), direct.clone()],
+            vec![AddressType::Direct, AddressType::Direct],
+        ));
+        assert_eq!(
+            node.typed_addresses(),
+            vec![(direct, AddressType::Direct), (relay, AddressType::Relay)]
+        );
+    }
+
+    #[test]
+    fn merge_typed_address_keeps_direct_before_relay() {
+        let relay: MultiAddr = "/ip4/198.51.100.1/udp/9000/quic".parse().unwrap();
+        let direct: MultiAddr = "/ip4/203.0.113.7/udp/9001/quic".parse().unwrap();
+        let unverified: MultiAddr = "/ip6/2001:db8::9/udp/9002/quic".parse().unwrap();
+        let mut node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: Vec::new(),
+            address_types: Vec::new(),
+            last_seen: AtomicInstant::now(),
+        };
+        node.merge_typed_address(unverified.clone(), AddressType::Unverified);
+        node.merge_typed_address(relay.clone(), AddressType::Relay);
+        node.merge_typed_address(direct.clone(), AddressType::Direct);
+        assert_eq!(node.addresses, vec![direct, relay, unverified]);
     }
 
     #[test]
@@ -5118,9 +5182,9 @@ mod tests {
 
         assert_eq!(
             node.address_types,
-            vec![AddressType::Relay, AddressType::Direct, AddressType::Lan]
+            vec![AddressType::Direct, AddressType::Relay, AddressType::Lan]
         );
-        assert_eq!(node.addresses, vec![relay, direct, lan]);
+        assert_eq!(node.addresses, vec![direct, relay, lan]);
     }
 
     #[test]
@@ -5651,7 +5715,7 @@ mod tests {
     #[test]
     fn replace_node_addresses_strips_wildcards_with_relay_and_direct() {
         // Mixed-tier publish: Relay + Direct + wildcard. Filter drops the
-        // wildcard, type-priority sort keeps Relay first, Direct second.
+        // wildcard, type-priority sort keeps Direct first, Relay second.
         let k = 8;
         let mut bucket = KBucket::new(k);
         bucket
@@ -5670,10 +5734,10 @@ mod tests {
         assert!(applied);
 
         let node = bucket.get_nodes().last().unwrap();
-        assert_eq!(node.addresses, vec![relay, direct]);
+        assert_eq!(node.addresses, vec![direct, relay]);
         assert_eq!(
             node.address_types,
-            vec![AddressType::Relay, AddressType::Direct]
+            vec![AddressType::Direct, AddressType::Relay]
         );
     }
 }

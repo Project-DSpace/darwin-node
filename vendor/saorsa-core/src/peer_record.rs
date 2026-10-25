@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// Address classification for priority ordering and staleness eviction.
 ///
-/// Priority: Relay > Direct > Unverified > Lan. The `merge_typed_address`
+/// Dial priority: Direct > Relay > Unverified > Lan. The `merge_typed_address`
 /// method uses this for insertion ordering and the eviction of excess
 /// `Lan` / `Unverified` entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,12 +44,38 @@ pub enum AddressType {
 impl AddressType {
     /// Priority index for ordering addresses by type. Lower is preferred.
     ///
-    /// Relay (0) → Direct (1) → Unverified (2) → Lan (3).
+    /// Direct (0) → Relay (1) → Unverified (2) → Lan (3).
+    ///
+    /// A verified direct address is dialled before a relay, so traffic to a
+    /// reachable peer does not pass through another peer's relay. A peer
+    /// behind NAT has no verified direct address, so its relay stays first.
     ///
     /// Used by `NodeInfo::merge_typed_address`, `KBucket::replace_node_addresses`,
     /// [`DHTNode::addresses_by_priority`], and `DhtNetworkManager::dialable_addresses_typed`
-    /// to maintain a consistent ordering invariant.
+    /// to maintain a consistent ordering invariant, in the same order as
+    /// `DhtNetworkManager::select_dial_candidates_with_context` dials.
     pub const fn priority(self) -> u8 {
+        match self {
+            Self::Direct => 0,
+            Self::Relay => 1,
+            Self::Unverified => 2,
+            Self::Lan => 3,
+        }
+    }
+
+    /// Strength of a tag when one view of a peer is weighed against another.
+    /// Lower wins.
+    ///
+    /// Relay (0) → Direct (1) → Unverified (2) → Lan (3): upstream's order,
+    /// which [`Self::priority`] also was before a verified direct address
+    /// was dialled first. It decides whether one view may replace the tag
+    /// another view gave the same address, and breaks ties between lookup
+    /// reports (`client_routing::best_tier_priority`). It is kept apart from
+    /// [`Self::priority`], the dial order, so dialling a direct address first
+    /// changes nothing else: a lookup hint still can't re-tag a relay address
+    /// as `Direct` (which would dial the relay's endpoint as the peer's own
+    /// address), and lookups pick between reports as upstream does.
+    pub(crate) const fn tag_rank(self) -> u8 {
         match self {
             Self::Relay => 0,
             Self::Direct => 1,
@@ -198,7 +224,7 @@ impl DHTNode {
     /// to let them stand in for a verified `Direct` tag.
     ///
     /// The returned vec preserves the storage order from `addresses`;
-    /// callers that need Relay-first ordering should pass the result to
+    /// callers that need priority ordering should pass the result to
     /// `DhtNetworkManager::dialable_addresses_typed` or use
     /// [`Self::addresses_by_priority`] for a pre-sorted `Vec<MultiAddr>`.
     pub fn typed_addresses(&self) -> Vec<(MultiAddr, AddressType)> {
@@ -217,8 +243,8 @@ impl DHTNode {
             .collect()
     }
 
-    /// Addresses sorted by [`AddressType`] priority: Relay first, then
-    /// Direct, Unverified, and Lan. Within each tier the original insertion
+    /// Addresses sorted by [`AddressType`] priority: Direct first, then
+    /// Relay, Unverified, and Lan. Within each tier the original insertion
     /// order is preserved (stable sort).
     ///
     /// Use this instead of raw `addresses` whenever the caller needs to
@@ -259,9 +285,9 @@ impl DHTNode {
 
         for (addr, ty) in other.typed_addresses() {
             if let Some(pos) = self.addresses.iter().position(|a| a == &addr) {
-                // Already present — upgrade tag if incoming has strictly
-                // higher priority (lower numeric value).
-                if ty.priority() < self.address_types[pos].priority() {
+                // Already present — upgrade tag if incoming has a strictly
+                // stronger tag (lower retag rank).
+                if ty.tag_rank() < self.address_types[pos].tag_rank() {
                     self.address_types[pos] = ty;
                 }
             } else {
@@ -270,7 +296,7 @@ impl DHTNode {
             }
         }
 
-        // Re-sort by priority so Relay comes first.
+        // Re-sort by priority so Direct comes first.
         let mut pairs: Vec<(MultiAddr, AddressType)> = self
             .addresses
             .drain(..)

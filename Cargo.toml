@@ -250,7 +250,8 @@ ant-protocol = { path = "vendor/ant-protocol" }
 # Closing a browser session cancels a DTLS handshake still in progress
 # (vendor/webrtc/VENDORED.md).
 webrtc = { path = "vendor/webrtc" }
-# saorsa-core 0.29.1 (vendor/saorsa-core/VENDORED.md).
+# A verified direct address is dialled before a relay
+# (vendor/saorsa-core/VENDORED.md).
 saorsa-core = { path = "vendor/saorsa-core" }
 
 [profile.release]

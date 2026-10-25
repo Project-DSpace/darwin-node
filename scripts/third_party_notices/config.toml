@@ -110,6 +110,10 @@ note = "an unchanged copy of Project-DSpace/darwin-listings 0.3.1 (commit 84787f
 version = "5.0.0"
 note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of the repository this release is built from; its Source above is that copy. The one change is PRICE_MULTIPLIER in src/payment/pricing.rs (see vendor/ant-protocol/VENDORED.md)."
 
+[remark.saorsa-core]
+version = "0.29.1"
+note = "a modified copy of the crates.io release, kept in vendor/saorsa-core of the repository this release is built from; its Source above is that copy. The one change is the order a peer's addresses are dialled in, a verified direct address before a relay: AddressType::priority in src/peer_record.rs, the dial plan in src/dht_network_manager.rs and the stored order in src/dht/core_engine.rs, with upstream's order kept as AddressType::tag_rank for re-tagging and the lookup tie-break in src/client_routing.rs (see vendor/saorsa-core/VENDORED.md)."
+
 [remark.webrtc]
 version = "0.14.0"
 note = "a modified copy of the crates.io release, kept in vendor/webrtc of the repository this release is built from; its Source above is that copy. The one change makes RTCDtlsTransport::stop() in src/dtls_transport/mod.rs cancel a DTLS handshake still in progress (see vendor/webrtc/VENDORED.md)."

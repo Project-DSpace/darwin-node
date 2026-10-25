@@ -4308,8 +4308,8 @@ impl DhtNetworkManager {
     /// peers. Returns an empty vec when the peer is unknown or has no
     /// dialable addresses.
     ///
-    /// Result is sorted by [`AddressType`] priority — Relay first
-    /// (known-good relay endpoint), then Direct, Unverified, and Lan. The
+    /// Result is sorted by [`AddressType`] priority — Direct first
+    /// (verified reachable), then Relay, Unverified, and Lan. The
     /// final dial plan may override this order for same-WAN peers so LAN
     /// routes are tried first only when they are plausible.
     pub(crate) async fn peer_addresses_for_dial_typed(
@@ -4317,7 +4317,7 @@ impl DhtNetworkManager {
         peer_id: &PeerId,
     ) -> Vec<(MultiAddr, AddressType)> {
         // 1. Routing table — filter to dialable QUIC addresses and sort
-        //    by AddressType priority (Relay first).
+        //    by AddressType priority (Direct first).
         let typed = self
             .dht
             .read()
@@ -4356,7 +4356,7 @@ impl DhtNetworkManager {
 
     /// Filter and sort typed addresses by [`AddressType::priority`].
     ///
-    /// Relay first, Direct second, Unverified third, Lan last. Stable
+    /// Direct first, Relay second, Unverified third, Lan last. Stable
     /// sort within each tier preserves the input order, so callers that
     /// hand in addresses in a meaningful sub-order (e.g., IPv6 before
     /// IPv4) keep that order within the type tier.
@@ -4381,14 +4381,15 @@ impl DhtNetworkManager {
     /// the cold-start policy documented on [`Self::dial_addresses`].
     ///
     /// Context-free rules:
-    /// - Relay is preferred first unless the relay endpoint is on our own
-    ///   WAN IP.
-    /// - Then dial at most one best WAN address per IP family. Direct wins
-    ///   over Unverified.
+    /// - At most one best WAN address per IP family. Direct wins over
+    ///   Unverified.
+    /// - A verified Direct address is dialled first, then the relay (unless
+    ///   the relay endpoint is on our own WAN IP), then an Unverified
+    ///   address.
     /// - LAN addresses are used only when there is no WAN/relay alternative.
     ///
     /// The live dial path calls [`Self::select_dial_candidates_with_context`]
-    /// instead so same-WAN peers can use LAN routes before relay/direct.
+    /// instead so same-WAN peers can use LAN routes before direct/relay.
     #[cfg(test)]
     fn select_dial_candidates(typed: &[(MultiAddr, AddressType)]) -> Vec<(MultiAddr, AddressType)> {
         Self::select_dial_candidates_with_context(typed, &DialAddressContext::default())
@@ -4462,14 +4463,23 @@ impl DhtNetworkManager {
 
         let has_wan_or_relay = relay.is_some() || !wan.is_empty();
         let prefer_lan = !lan.is_empty() && context.peer_shares_wan(typed);
+        let (direct, unverified): (Vec<_>, Vec<_>) = wan
+            .into_iter()
+            .partition(|(_, _, ty)| *ty == AddressType::Direct);
 
+        // Dial order: LAN first for a peer behind our own WAN IP; then a
+        // verified Direct address; then the relay; then an Unverified
+        // address; then LAN when nothing else is known. A peer behind NAT
+        // has no Direct address, so its relay is still dialled first and no
+        // direct connect timeout is spent before it.
         if prefer_lan {
             out.extend(lan.iter().map(|(_, _, addr, ty)| (addr.clone(), *ty)));
         }
+        out.extend(direct.into_iter().map(|(_, addr, ty)| (addr, ty)));
         if let Some(relay) = relay {
             out.push(relay);
         }
-        out.extend(wan.into_iter().map(|(_, addr, ty)| (addr, ty)));
+        out.extend(unverified.into_iter().map(|(_, addr, ty)| (addr, ty)));
         if !prefer_lan && !has_wan_or_relay {
             out.extend(lan.into_iter().map(|(_, _, addr, ty)| (addr, ty)));
         }
@@ -7403,7 +7413,7 @@ mod tests {
                 ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Direct),
             ],
         );
-        assert_eq!(best_tier_priority(&node), AddressType::Relay.priority());
+        assert_eq!(best_tier_priority(&node), AddressType::Relay.tag_rank());
     }
 
     #[test]
@@ -7654,8 +7664,8 @@ mod tests {
         ]);
         let picks = DhtNetworkManager::select_dial_candidates(&addrs);
         assert_eq!(picks.len(), 2);
-        assert_eq!(picks[0].1, AddressType::Relay);
-        assert_eq!(picks[1].1, AddressType::Direct);
+        assert_eq!(picks[0].1, AddressType::Direct);
+        assert_eq!(picks[1].1, AddressType::Relay);
     }
 
     #[test]
@@ -7667,9 +7677,9 @@ mod tests {
         ]);
         let picks = DhtNetworkManager::select_dial_candidates(&addrs);
         assert_eq!(picks.len(), 3);
-        assert_eq!(picks[0].1, AddressType::Relay);
-        assert_eq!(picks[1].0, addrs[1].0);
-        assert_eq!(picks[2].0, addrs[2].0);
+        assert_eq!(picks[0].0, addrs[1].0);
+        assert_eq!(picks[1].0, addrs[2].0);
+        assert_eq!(picks[2].1, AddressType::Relay);
     }
 
     #[test]
@@ -7910,6 +7920,155 @@ mod tests {
         assert_eq!(picks[0].1, AddressType::Lan);
         assert_eq!(picks[1].1, AddressType::Relay);
         assert_eq!(picks[2].1, AddressType::Unverified);
+    }
+
+    // Direct first, relay fallback: a verified Direct address is dialled
+    // before a relay, the relay before an Unverified address, and LAN keeps
+    // its place first for a same-WAN peer and last otherwise.
+
+    #[test]
+    fn direct_first_direct_plus_relay_dials_direct_first() {
+        let addrs = typed(vec![
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(
+            picks,
+            vec![addrs[1].clone(), addrs[0].clone()],
+            "Direct, then the relay"
+        );
+    }
+
+    #[test]
+    fn direct_first_unverified_plus_relay_dials_relay_first() {
+        let addrs = typed(vec![
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(
+            picks,
+            vec![addrs[1].clone(), addrs[0].clone()],
+            "the relay, then Unverified"
+        );
+    }
+
+    #[test]
+    fn direct_first_unverified_alone_is_still_dialled() {
+        let addrs = typed(vec![(
+            "/ip4/192.0.2.9/udp/9002/quic",
+            AddressType::Unverified,
+        )]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks, addrs);
+    }
+
+    #[test]
+    fn direct_first_full_order_direct_relay_unverified() {
+        // One family Direct, the other Unverified: Direct, relay, Unverified.
+        let addrs = typed(vec![
+            ("/ip6/2001:db8::9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ("/ip4/192.168.1.10/udp/9003/quic", AddressType::Lan),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(
+            picks,
+            vec![addrs[2].clone(), addrs[1].clone(), addrs[0].clone()]
+        );
+    }
+
+    #[test]
+    fn direct_first_same_wan_lan_stays_first() {
+        let addrs = typed(vec![
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ("/ip4/192.168.1.30/udp/9001/quic", AddressType::Lan),
+        ]);
+        let context = DialAddressContext::from_parts(
+            ["203.0.113.7:12000".parse().unwrap()],
+            ["/ip4/192.168.1.2/udp/9000/quic".parse().unwrap()],
+            false,
+        );
+        let picks = DhtNetworkManager::select_dial_candidates_with_context(&addrs, &context);
+        assert_eq!(
+            picks,
+            vec![addrs[2].clone(), addrs[1].clone(), addrs[0].clone()],
+            "LAN, then Direct, then the relay"
+        );
+    }
+
+    #[test]
+    fn direct_first_same_wan_relay_still_skipped() {
+        let addrs = typed(vec![
+            ("/ip4/203.0.113.7/udp/9000/quic", AddressType::Relay),
+            ("/ip4/198.51.100.9/udp/9001/quic", AddressType::Direct),
+            ("/ip6/2001:db8::9/udp/9002/quic", AddressType::Unverified),
+        ]);
+        let context = DialAddressContext::from_parts(
+            ["203.0.113.7:12000".parse().unwrap()],
+            Vec::<MultiAddr>::new(),
+            false,
+        );
+        let picks = DhtNetworkManager::select_dial_candidates_with_context(&addrs, &context);
+        assert_eq!(picks, vec![addrs[1].clone(), addrs[2].clone()]);
+    }
+
+    #[test]
+    fn direct_first_home_node_behind_nat_keeps_its_relay_first() {
+        // A node behind NAT publishes its relay, an observed external
+        // address it could not verify and its LAN address. With no Direct
+        // address the relay is the first dial, so no direct connect timeout
+        // is spent before it, and LAN is not tried from outside its WAN.
+        let addrs = typed(vec![
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/192.168.1.10/udp/9003/quic", AddressType::Lan),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks, vec![addrs[0].clone(), addrs[1].clone()]);
+        assert!(picks.iter().all(|(_, ty)| *ty != AddressType::Direct));
+    }
+
+    #[test]
+    fn direct_first_lan_is_the_last_fallback() {
+        let addrs = typed(vec![
+            ("/ip4/192.168.1.10/udp/9003/quic", AddressType::Lan),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Unverified),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks, vec![addrs[1].clone()], "LAN only when nothing else");
+
+        let lan_only = typed(vec![("/ip4/192.168.1.10/udp/9003/quic", AddressType::Lan)]);
+        assert_eq!(
+            DhtNetworkManager::select_dial_candidates(&lan_only),
+            lan_only
+        );
+    }
+
+    #[test]
+    fn direct_first_lookup_order_agrees_with_dial_order() {
+        let addrs = typed(vec![
+            ("/ip4/192.168.1.10/udp/9003/quic", AddressType::Lan),
+            ("/ip6/2001:db8::9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ]);
+        let sorted = DhtNetworkManager::dialable_addresses_typed(&addrs);
+        let kinds: Vec<_> = sorted.iter().map(|(_, ty)| *ty).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AddressType::Direct,
+                AddressType::Relay,
+                AddressType::Unverified,
+                AddressType::Lan
+            ]
+        );
+        let plan = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(plan, sorted[..3].to_vec());
     }
 
     #[test]

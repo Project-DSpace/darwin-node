@@ -23,8 +23,11 @@ const QUORUM_THRESHOLD: usize = 2;
 /// arrive and feeds [`compute_winner`].
 pub type SubjectReports = HashMap<PeerId, DHTNode>;
 
-/// Best (lowest-numeric) [`crate::AddressType::priority`] across a node's
+/// Best (lowest-numeric) [`crate::AddressType::tag_rank`] across a node's
 /// address tags. `u8::MAX` when the address list is empty.
+///
+/// The tag rank, not the dial priority: dialling a verified direct address
+/// before a relay leaves the choice between reports as upstream made it.
 ///
 /// Used as the fallback tie-breaker in [`compute_winner`]: when no
 /// quorum exists and two responders are at the same XOR distance,
@@ -32,7 +35,7 @@ pub type SubjectReports = HashMap<PeerId, DHTNode>;
 pub fn best_tier_priority(node: &DHTNode) -> u8 {
     node.typed_addresses()
         .iter()
-        .map(|(_, t)| t.priority())
+        .map(|(_, t)| t.tag_rank())
         .min()
         .unwrap_or(u8::MAX)
 }
@@ -513,5 +516,20 @@ mod tests {
         let result = apply_lookup_report_winners(vec![current.clone()], &reports, &[0; 32], 1);
         assert_eq!(result[0].addresses, current.addresses);
         assert_eq!(dht_node_publish_seq(&result[0]), 10);
+    }
+
+    #[test]
+    fn direct_first_leaves_the_lookup_tie_break_as_upstream_made_it() {
+        // Dialling a verified direct address first changes the dial order
+        // only: between two unsequenced views of a peer, the one with a
+        // relay address still wins the tie, as upstream's does.
+        let mut relayed = node(1, "/ip4/198.51.100.1/udp/9000/quic");
+        relayed.address_types = vec![AddressType::Relay];
+        let mut direct = node(1, "/ip4/203.0.113.7/udp/9001/quic");
+        direct.address_types = vec![AddressType::Direct];
+        assert_eq!(best_tier_priority(&relayed), AddressType::Relay.tag_rank());
+        assert_eq!(best_tier_priority(&direct), AddressType::Direct.tag_rank());
+        assert!(prefer_lookup_record(&relayed, &direct));
+        assert!(!prefer_lookup_record(&direct, &relayed));
     }
 }
