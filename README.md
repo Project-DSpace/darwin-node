@@ -321,10 +321,12 @@ never ran.
   older requester within its 15 seconds.
   `scripts/test_mixed_versions.py` runs this tree's nodes and the previous
   release's on one local network, each joining a network of the other, with
-  paid uploads between, and fails on a message that didn't decode, on
-  penalties heavier than in two runs of the previous release alone, on a
-  failure reason those runs never charged a role with, or on a message
-  family that stopped reaching nodes; run it before a node release's canary.
+  paid uploads between, and fails on a message that didn't decode; on
+  penalties, for any pair of roles and reason, more than 10 above the
+  highest count in two runs of the previous release alone (the spread
+  measured between such runs); on more than 3 penalties for a failure
+  reason those runs never charged a role with; or on a message family that
+  stopped reaching nodes. Run it before a node release's canary.
   Its report and summary.json list every count measured against those runs,
   with the excess over them and the limit, within the limit or not.
   The Test workflow tests what fails a run, on made-up results
