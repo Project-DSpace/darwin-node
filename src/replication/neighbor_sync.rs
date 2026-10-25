@@ -938,6 +938,13 @@ impl SyncExchange {
     pub(crate) fn received_last_page(&self) -> bool {
         self.end == ExchangeEnd::Complete && self.answer.is_some()
     }
+
+    /// Whether the peer answered busy before any page: it is there, but
+    /// nothing of its hints arrived. One that failed or timed out isn't
+    /// known to be there.
+    pub(crate) fn unheard(&self) -> bool {
+        self.answer.is_none() && self.end == ExchangeEnd::Busy
+    }
 }
 
 /// Run one exchange with `peer` in `form`, its pages strictly one after
@@ -1007,6 +1014,36 @@ enum Silence {
     Free,
 }
 
+/// Why a request got no answer this node could read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unanswered {
+    /// It couldn't be encoded: nothing went to the peer.
+    NotSent,
+    /// The send failed before the deadline: no connection, or one that
+    /// ended or refused the request.
+    Failed,
+    /// The deadline passed with no answer.
+    TimedOut,
+    /// An answer came that doesn't decode.
+    Undecodable,
+}
+
+/// Whether a first page that got no answer (`unanswered`) sends the peer's
+/// next exchange as a single message, which every release reads. A failed
+/// send or an answer that doesn't decode may come from a peer that rolled
+/// back, whose agent is left from a connection that has ended. A timeout
+/// while the peer's agent, read again after it, still names a paging release
+/// (`agent_reads_pages`) is a peer that pages but was slow, say building a
+/// large hint set: a single message would only charge it for the same
+/// slowness, so its next exchange pages again.
+pub(crate) fn single_next_after(unanswered: Unanswered, agent_reads_pages: bool) -> bool {
+    match unanswered {
+        Unanswered::NotSent => false,
+        Unanswered::Failed | Unanswered::Undecodable => true,
+        Unanswered::TimedOut => !agent_reads_pages,
+    }
+}
+
 /// Send one request and wait for its answer, as a decoded body.
 async fn request(
     peer: &PeerId,
@@ -1014,7 +1051,7 @@ async fn request(
     body: ReplicationMessageBody,
     timeout: Duration,
     silence: Silence,
-) -> Option<ReplicationMessageBody> {
+) -> Result<ReplicationMessageBody, Unanswered> {
     let msg = ReplicationMessage {
         request_id: rand::thread_rng().gen::<u64>(),
         body,
@@ -1023,9 +1060,10 @@ async fn request(
         Ok(data) => data,
         Err(e) => {
             warn!("Failed to encode sync request for {peer}: {e}");
-            return None;
+            return Err(Unanswered::NotSent);
         }
     };
+    let started = Instant::now();
     let sent = match silence {
         Silence::Charged => {
             p2p_node
@@ -1043,14 +1081,20 @@ async fn request(
         Ok(response) => response,
         Err(e) => {
             debug!("Sync with {peer} failed: {e}");
-            return None;
+            // The send's error type isn't public: a send that ends at its
+            // deadline or later timed out, one that ends sooner failed.
+            return Err(if started.elapsed() >= timeout {
+                Unanswered::TimedOut
+            } else {
+                Unanswered::Failed
+            });
         }
     };
     match ReplicationMessage::decode(&response.data) {
-        Ok(decoded) => Some(decoded.body),
+        Ok(decoded) => Ok(decoded.body),
         Err(e) => {
             warn!("Failed to decode sync response from {peer}: {e}");
-            None
+            Err(Unanswered::Undecodable)
         }
     }
 }
@@ -1083,7 +1127,7 @@ async fn exchange_single(
     .await;
     let mut busy = false;
     let answer = match answered {
-        Some(ReplicationMessageBody::NeighborSyncResponse(response)) => Some(SyncAnswer {
+        Ok(ReplicationMessageBody::NeighborSyncResponse(response)) => Some(SyncAnswer {
             replica_hints: response.replica_hints,
             paid_hints: response.paid_hints,
             bootstrapping: response.bootstrapping,
@@ -1093,18 +1137,18 @@ async fn exchange_single(
         }),
         // A responder that reads pages answers a single request it can't
         // take busy, as it does a page, whatever cycle and page it names.
-        Some(ReplicationMessageBody::NeighborSyncPageResponse(
-            NeighborSyncPageResponse::Busy { .. },
-        )) => {
+        Ok(ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy {
+            ..
+        })) => {
             debug!("Neighbor sync with {peer}: answered busy; trying again in a later cycle");
             busy = true;
             None
         }
-        Some(_) => {
+        Ok(_) => {
             warn!("Unexpected response type from {peer} during sync");
             None
         }
-        None => None,
+        Err(_) => None,
     };
     let end = single_end(answer.as_ref(), busy);
     debug!(
@@ -1201,7 +1245,7 @@ async fn exchange_paged(
         )
         .await;
         match answered {
-            Some(ReplicationMessageBody::NeighborSyncPageResponse(
+            Ok(ReplicationMessageBody::NeighborSyncPageResponse(
                 NeighborSyncPageResponse::Page {
                     cycle: echoed_cycle,
                     page: echoed_page,
@@ -1260,14 +1304,14 @@ async fn exchange_paged(
                     break;
                 }
             }
-            Some(ReplicationMessageBody::NeighborSyncPageResponse(
+            Ok(ReplicationMessageBody::NeighborSyncPageResponse(
                 NeighborSyncPageResponse::Busy { .. },
             )) => {
                 debug!("Neighbor sync with {peer}: page {page} answered busy; trying again in a later cycle");
                 end = ExchangeEnd::Busy;
                 break;
             }
-            Some(_) => {
+            Ok(_) => {
                 warn!("Unexpected response type from {peer} during sync");
                 if page == 0 {
                     sync_peers.mark_single_next(*peer);
@@ -1275,13 +1319,28 @@ async fn exchange_paged(
                 end = ExchangeEnd::Failed;
                 break;
             }
-            None => {
+            Err(unanswered) => {
                 // A first page left unanswered: the agent it was sent on may
                 // be left from a connection that has ended, and the peer
                 // rolled back. Its next exchange is a single message, which
-                // every release reads.
+                // every release reads, unless the page only timed out and
+                // the peer's agent still names a paging release
+                // ([`single_next_after`]).
                 if page == 0 {
-                    sync_peers.mark_single_next(*peer);
+                    let reads_pages = p2p_node
+                        .transport()
+                        .peer_user_agent(peer)
+                        .await
+                        .is_some_and(|agent| {
+                            sync_pages::agent_reads_pages(&agent, sync_pages::pages_from_release())
+                        });
+                    if single_next_after(unanswered, reads_pages) {
+                        sync_peers.mark_single_next(*peer);
+                    } else {
+                        debug!(
+                            "Neighbor sync with {peer}: first page {unanswered:?}; it pages                              again next cycle"
+                        );
+                    }
                 }
                 end = ExchangeEnd::Failed;
                 break;
@@ -2679,6 +2738,29 @@ mod tests {
         }
         assert_eq!(single_end(None, true), ExchangeEnd::Busy);
         assert_eq!(single_end(None, false), ExchangeEnd::Failed);
+    }
+
+    /// A first page left unanswered moves the peer to a single message only
+    /// where it may have rolled back: a failed send, or an answer that
+    /// doesn't decode. A timeout while its agent still names a paging release
+    /// is a slow peer that pages, and pages again.
+    #[test]
+    fn only_a_peer_that_may_have_rolled_back_gets_a_single_message_next() {
+        for (unanswered, reads_pages, single_next) in [
+            (Unanswered::TimedOut, true, false),
+            (Unanswered::TimedOut, false, true),
+            (Unanswered::Failed, true, true),
+            (Unanswered::Failed, false, true),
+            (Unanswered::Undecodable, true, true),
+            (Unanswered::NotSent, true, false),
+            (Unanswered::NotSent, false, false),
+        ] {
+            assert_eq!(
+                single_next_after(unanswered, reads_pages),
+                single_next,
+                "{unanswered:?}, agent reads pages: {reads_pages}"
+            );
+        }
     }
 
     #[test]

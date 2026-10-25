@@ -360,15 +360,27 @@ never ran.
   mixed-version harness reports audits per exchange, so the drop is
   measured. A node
   bootstrapping counts a neighbour as done only once that neighbour's last
-  announced page has arrived. A node pages to a peer whose user agent names
+  announced page has arrived. A neighbour that answers its first page busy,
+  or that another exchange holds, is tried again within the bootstrap sync,
+  after 5, 10 and 20 seconds; one still busy after that owes all its hints,
+  and keeps bootstrap from draining until a later exchange delivers them or
+  its record expires (110 seconds, as for a capacity-rejected source). A
+  neighbour whose first page failed or timed out isn't known to be there,
+  and is not waited for. A node pages to a peer whose user agent names
   ds.17 or later (`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`), decided again for
   each exchange from the agent of the peer's connection. Any other peer, one
   that isn't connected or of unknown release among them, gets a single
   message, as before, which every release reads; sending it connects the
   peer, so its next exchange reads a fresh agent. So does a peer whose last
-  exchange's first page went unanswered, so an agent left from a connection
-  that has since ended pages it at most once. The Release workflow refuses a
-  tag numbered below `NEIGHBOR_SYNC_PAGES_FROM_RELEASE`, or any earlier
+  exchange's first page got no answer because the send failed or the answer
+  didn't decode, or timed out while its agent no longer names a paging
+  release, so an agent left from a connection that has since ended pages it
+  at most once. A first page that timed out while the agent still names a
+  paging release is a slow peer that pages: it is paged again next cycle,
+  not sent a single message that would count the same slowness against it.
+  The Release workflow refuses a
+  tag numbered below `NEIGHBOR_SYNC_PAGES_FROM_RELEASE` (a dotted tag,
+  `+ds.17.1`, by its leading number; a tag with no number fails), or any earlier
   release tag at or past it without paged sync, and a unit test ties the
   constant to this tree's version. Scans of a node's keys, for hints and for
   the hourly rebuild of its storage commitment, compute close groups from one
