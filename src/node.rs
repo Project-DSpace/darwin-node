@@ -863,12 +863,19 @@ impl RunningNode {
                     }
                 }
 
+                // The node has started cleanly: the shared cache keeps the archives of the
+                // running and previous versions, and of any newer one, and no others.
+                prune_upgrade_cache(upgrader.current_version().clone()).await;
+
                 loop {
                     tokio::select! {
                         () = shutdown.cancelled() => {
                             break;
                         }
                         result = monitor.check_for_ready_upgrade() => {
+                            // An upgrade the disk had no room for: the version, and the
+                            // bytes needed and free.
+                            let mut skipped_for_space = None;
                             match result {
                                 Ok(Some(upgrade_info)) => {
                                     info!(
@@ -899,6 +906,10 @@ impl RunningNode {
                                         Ok(UpgradeResult::NoUpgrade) => {
                                             info!("Already running latest version");
                                         }
+                                        Ok(UpgradeResult::NotEnoughSpace { needed, available }) => {
+                                            skipped_for_space =
+                                                Some((upgrade_info.version.clone(), needed, available));
+                                        }
                                         Err(e) => {
                                             error!("Error during upgrade process: {}", e);
                                         }
@@ -918,6 +929,29 @@ impl RunningNode {
                                 Err(e) => {
                                     warn!("Error during upgrade process: {}", e);
                                 }
+                            }
+                            // An upgrade skipped for space says so in one line, with the
+                            // next check, a check interval later.
+                            if let Some((version, needed, available)) = skipped_for_space {
+                                let next = jittered_interval(monitor.check_interval());
+                                let next_check = chrono::Utc::now()
+                                    + chrono::Duration::from_std(next)
+                                        .unwrap_or_else(|_| chrono::Duration::hours(1));
+                                warn!(
+                                    "Upgrade to {version} skipped this cycle: {} MiB free on the \
+                                     disk the node's binary is on, {} MiB needed (the archive and \
+                                     twice the binary); next check at {}",
+                                    available / crate::storage::MIB,
+                                    needed.div_ceil(crate::storage::MIB),
+                                    next_check.to_rfc3339()
+                                );
+                                tokio::select! {
+                                    () = shutdown.cancelled() => {
+                                        break;
+                                    }
+                                    () = tokio::time::sleep(next) => {}
+                                }
+                                continue;
                             }
                             // If an upgrade is pending, sleep for exactly the remaining
                             // rollout delay so the node restarts at its scheduled time
@@ -1382,6 +1416,28 @@ const FIRST_UPGRADE_CHECK_LATEST: std::time::Duration = std::time::Duration::fro
 /// [`FIRST_UPGRADE_CHECK_EARLIEST`] and [`FIRST_UPGRADE_CHECK_LATEST`].
 fn first_upgrade_check_delay() -> std::time::Duration {
     rand::thread_rng().gen_range(FIRST_UPGRADE_CHECK_EARLIEST..=FIRST_UPGRADE_CHECK_LATEST)
+}
+
+/// Prunes the shared upgrade cache to the archives of the running version,
+/// the one before it and any newer one ([`BinaryCache::prune`]), logging what
+/// it deleted.
+async fn prune_upgrade_cache(running: semver::Version) {
+    let Ok(cache_dir) = upgrade_cache_dir() else {
+        return;
+    };
+    let cache = BinaryCache::new(cache_dir);
+    match tokio::task::spawn_blocking(move || cache.prune(&running)).await {
+        Ok(Ok(deleted)) if !deleted.is_empty() => {
+            let deleted: Vec<String> = deleted.iter().map(ToString::to_string).collect();
+            info!(
+                "Upgrade cache: deleted the archives of {}, older than the running and previous versions",
+                deleted.join(", ")
+            );
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => warn!("Upgrade cache: could not prune it: {e}"),
+        Err(e) => warn!("Upgrade cache: the prune task failed: {e}"),
+    }
 }
 
 /// Apply ±5% jitter to a base interval to prevent thundering-herd behaviour

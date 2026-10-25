@@ -74,6 +74,14 @@ pub enum UpgradeResult {
     },
     /// No upgrade available.
     NoUpgrade,
+    /// The disk lacks the free space the upgrade's own writes need, so this
+    /// cycle is skipped; nothing was downloaded or changed.
+    NotEnoughSpace {
+        /// Bytes the upgrade needs: the archive plus twice the binary.
+        needed: u64,
+        /// Bytes free on the disk the binary is on.
+        available: u64,
+    },
 }
 
 /// Upgrade orchestrator with rollback support.

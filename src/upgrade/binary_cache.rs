@@ -454,6 +454,53 @@ impl BinaryCache {
         Ok(())
     }
 
+    /// Deletes the cached archives, signatures and metadata of every version
+    /// older than both `running` and the newest cached version below it.
+    /// Left are the running version, the one before it, and any newer one a
+    /// node on this machine is upgrading to. Run after a clean start, under
+    /// the download lock, so no archive is deleted while being cached.
+    /// Returns the versions deleted.
+    ///
+    /// **Note:** blocks on the download lock, like
+    /// [`Self::acquire_download_lock`].
+    ///
+    /// # Errors
+    ///
+    /// When the lock can't be taken or the cache folder can't be read. A file
+    /// that can't be deleted is skipped.
+    pub fn prune(&self, running: &semver::Version) -> Result<Vec<semver::Version>> {
+        let _lock = self.acquire_download_lock()?;
+        let mut cached = std::collections::BTreeMap::<semver::Version, Vec<PathBuf>>::new();
+        for entry in fs::read_dir(&self.cache_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if let Some(version) = name.to_str().and_then(cached_version) {
+                cached.entry(version).or_default().push(entry.path());
+            }
+        }
+        let previous = cached
+            .keys()
+            .filter(|version| *version < running)
+            .max()
+            .cloned();
+        let mut deleted = Vec::new();
+        for (version, paths) in cached {
+            if version >= *running || Some(&version) == previous.as_ref() {
+                continue;
+            }
+            for path in paths {
+                if let Err(e) = fs::remove_file(&path) {
+                    warn!(
+                        "Could not delete {} from the upgrade cache: {e}",
+                        path.display()
+                    );
+                }
+            }
+            deleted.push(version);
+        }
+        Ok(deleted)
+    }
+
     /// Acquire an exclusive download lock and return the guard.
     ///
     /// This prevents multiple nodes from downloading the same archive
@@ -491,6 +538,20 @@ impl BinaryCache {
     fn meta_path(&self, version: &str) -> PathBuf {
         self.cache_dir.join(format!("ant-node-{version}.meta.json"))
     }
+}
+
+/// The version a file of the cache is for, from its name: an archive,
+/// signature or metadata file (`ant-node-<version>.archive`, `.sig`,
+/// `.meta.json`), or the temporary file of one (`.ant-node-<version>.archive.tmp`).
+fn cached_version(name: &str) -> Option<semver::Version> {
+    let name = name
+        .strip_prefix('.')
+        .map_or(name, |hidden| hidden.strip_suffix(".tmp").unwrap_or(hidden));
+    let rest = name.strip_prefix("ant-node-")?;
+    let version = [".archive", ".sig", ".meta.json", ".meta"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))?;
+    semver::Version::parse(version).ok()
 }
 
 /// RAII guard that holds an exclusive download lock.
@@ -597,6 +658,9 @@ fn sha256_file(path: &Path) -> Result<String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod prune_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

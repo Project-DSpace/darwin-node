@@ -566,6 +566,14 @@ const ERASE_SITES: &[EraseSite] = &[
     ),
     site(
         "src/upgrade/binary_cache.rs",
+        "BinaryCache::prune",
+        "remove_file",
+        1,
+        "Archives of versions older than the running and previous ones, after a clean \
+         start; upgrade cache files, no record data.",
+    ),
+    site(
+        "src/upgrade/binary_cache.rs",
         "BinaryCache::store_archive",
         "remove_file",
         1,
