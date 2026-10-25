@@ -165,8 +165,10 @@ pub fn create_funded_wallet_for_network(network: &EvmNetwork, private_key: &str)
 /// "test test test test test test test test test test test junk"
 pub mod test_accounts {
     /// Account #0 address
+    #[allow(dead_code)]
     pub const ACCOUNT_0: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     /// Account #0 private key
+    #[allow(dead_code)]
     pub const ACCOUNT_0_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 

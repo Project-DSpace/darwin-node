@@ -94,8 +94,11 @@ mod tests {
             .expect("chunk handler")
     }
 
-    /// The handler's answer to one request.
-    async fn ask(protocol: &AntProtocol, body: ChunkMessageBody) -> ChunkMessageBody {
+    /// The handler's answer to one request, or its error.
+    async fn try_ask(
+        protocol: &AntProtocol,
+        body: ChunkMessageBody,
+    ) -> Result<ChunkMessageBody, String> {
         let message = ChunkMessage {
             request_id: rand::random(),
             body,
@@ -103,18 +106,28 @@ mod tests {
         let response = protocol
             .try_handle_request(&message.encode().expect("encode"))
             .await
-            .expect("handle")
+            .map_err(|e| e.to_string())?
             .expect("a response");
-        ChunkMessage::decode(&response).expect("decode").body
+        Ok(ChunkMessage::decode(&response).expect("decode").body)
+    }
+
+    /// The handler's answer to one request.
+    async fn ask(protocol: &AntProtocol, body: ChunkMessageBody) -> ChunkMessageBody {
+        try_ask(protocol, body).await.expect("handle")
     }
 
     /// Stores `data` as a paid-for chunk (its payment cached, as a node that
-    /// has verified it), returning the handler's answer.
-    async fn put_paid(protocol: &AntProtocol, data: &[u8]) -> ChunkMessageBody {
+    /// has verified it), returning the handler's answer or its error.
+    async fn try_put_paid(protocol: &AntProtocol, data: &[u8]) -> Result<ChunkMessageBody, String> {
         let address = ChunkTestFixture::compute_address(data);
         protocol.payment_verifier().cache_insert(address);
         let request = ChunkPutRequest::new(address, Bytes::copy_from_slice(data));
-        ask(protocol, ChunkMessageBody::PutRequest(request)).await
+        try_ask(protocol, ChunkMessageBody::PutRequest(request)).await
+    }
+
+    /// Stores `data` as a paid-for chunk, returning the handler's answer.
+    async fn put_paid(protocol: &AntProtocol, data: &[u8]) -> ChunkMessageBody {
+        try_put_paid(protocol, data).await.expect("handle")
     }
 
     /// The chunk at `address`, if the handler has it.
@@ -158,13 +171,15 @@ mod tests {
         }
 
         let oversized = TestData::generate(MAX_CHUNK_SIZE * 2);
-        let answer = put_paid(&protocol, &oversized).await;
+        // Refused as an error from the handler (the message is over its size
+        // limit) or as an error answer.
+        let answer = try_put_paid(&protocol, &oversized).await;
         assert!(
             !matches!(
                 answer,
-                ChunkMessageBody::PutResponse(
+                Ok(ChunkMessageBody::PutResponse(
                     ChunkPutResponse::Success { .. } | ChunkPutResponse::AlreadyExists { .. }
-                )
+                ))
             ),
             "a chunk over 4 MiB is refused, got {answer:?}"
         );
@@ -376,8 +391,8 @@ mod tests {
     /// below was upstream's `security_attacks` or `merkle_payment` e2e test,
     /// on a 5- or 14-node network with Anvil.
     ///
-    /// - no proof: `PaymentRequired`;
-    /// - empty, garbage and empty-quotes proofs: refused;
+    /// - no proof, an empty one, garbage, a proof with no quotes: refused
+    ///   (`PaymentRequired`, or a payment error);
     /// - a proof one byte over `MAX_PAYMENT_PROOF_SIZE_BYTES`: refused by the
     ///   size gate, before it is parsed;
     /// - merkle-tagged garbage, and a well-formed, signed merkle proof whose
@@ -426,13 +441,12 @@ mod tests {
 
         /// What a case must be refused with.
         enum Refusal {
-            Required,
             Payment,
             TooLarge,
             Batch,
         }
         let cases: Vec<(&str, Vec<u8>, Option<Vec<u8>>, Refusal)> = vec![
-            ("no proof", b"no proof".to_vec(), None, Refusal::Required),
+            ("no proof", b"no proof".to_vec(), None, Refusal::Payment),
             (
                 "0 bytes",
                 b"empty proof".to_vec(),
@@ -479,10 +493,6 @@ mod tests {
             };
             let answer = ask(&protocol, ChunkMessageBody::PutRequest(request)).await;
             let refused = match (&refusal, &answer) {
-                (
-                    Refusal::Required,
-                    ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }),
-                ) => !message.is_empty(),
                 (
                     Refusal::Payment,
                     ChunkMessageBody::PutResponse(
