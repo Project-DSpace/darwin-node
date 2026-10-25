@@ -11,19 +11,60 @@
 //! [`PREFIX`].
 //!
 //! A seam for a value the node doesn't have yet is added here in the change
-//! that brings the value, with the harness's runs that set it: the size of a
-//! neighbour-sync page, for a run whose lists take more than one page, and how
-//! long a "full" notice stays fresh, for a run in which a node's mark as full
-//! lapses. Each is compiled only with `test-utils` and named under
-//! [`PREFIX`], so the Build workflow's check covers it, and the harness
-//! refuses such a run with a binary that lacks the seam, as it refuses the
-//! `full` run without [`FREE_SPACE_FILE`].
+//! that brings the value, with the harness's runs that set it, as the paged
+//! neighbour sync's two are, for the `paged` run, whose lists take more than
+//! one page: still to come is how long a "full" notice stays fresh, for a run
+//! in which a node's mark as full lapses. Each is compiled only with
+//! `test-utils` and named under [`PREFIX`], so the Build workflow's check
+//! covers it, and the harness refuses a run that needs a seam with a binary
+//! that lacks it, as it refuses the `full` run without [`FREE_SPACE_FILE`].
 
 use std::io;
 use std::path::Path;
 
 /// Every seam's environment variable starts with this.
 pub const PREFIX: &str = "ANT_TEST_SEAM_";
+
+/// The bytes of keys one neighbour-sync page carries.
+///
+/// In place of
+/// [`NEIGHBOR_SYNC_PAGE_BYTES`](crate::replication::config::NEIGHBOR_SYNC_PAGE_BYTES):
+/// a whole number, at least one key's 32 bytes. A small page makes the few
+/// records of a test run take more than one page. A value that isn't such a
+/// number is ignored.
+pub const SYNC_PAGE_BYTES: &str = "ANT_TEST_SEAM_SYNC_PAGE_BYTES";
+
+/// The first release whose nodes this node pages its hints to.
+///
+/// Its `+ds.<n>` build number, in place of
+/// [`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`](crate::replication::config::NEIGHBOR_SYNC_PAGES_FROM_RELEASE).
+/// Nodes built from a tree between releases announce the last release's
+/// version; a run of such nodes alone sets this to that release, or lower, so
+/// that they page to each other. A value that isn't a whole number is ignored.
+pub const SYNC_PAGES_FROM_RELEASE: &str = "ANT_TEST_SEAM_SYNC_PAGES_FROM_RELEASE";
+
+/// One key's bytes: the smallest page the page-size seam takes.
+const KEY_BYTES: usize = 32;
+
+/// The page size a test set for this process, if it set a valid one.
+pub(crate) fn sync_page_bytes() -> Option<usize> {
+    let value = std::env::var(SYNC_PAGE_BYTES).ok()?;
+    parse_sync_page_bytes(&value)
+}
+
+fn parse_sync_page_bytes(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|bytes| *bytes >= KEY_BYTES)
+}
+
+/// The paging release a test set for this process, if it set a valid one.
+pub(crate) fn sync_pages_from_release() -> Option<u64> {
+    let value = std::env::var(SYNC_PAGES_FROM_RELEASE).ok()?;
+    value.trim().parse::<u64>().ok()
+}
 
 /// Names a file holding the free space the node reads for its partition.
 ///
@@ -131,6 +172,17 @@ mod tests {
 
     #[test]
     fn every_seam_starts_with_the_prefix() {
-        assert!(FREE_SPACE_FILE.starts_with(PREFIX));
+        for seam in [FREE_SPACE_FILE, SYNC_PAGE_BYTES, SYNC_PAGES_FROM_RELEASE] {
+            assert!(seam.starts_with(PREFIX), "{seam}");
+        }
+    }
+
+    #[test]
+    fn a_sync_page_holds_at_least_one_key() {
+        assert_eq!(parse_sync_page_bytes("64"), Some(64));
+        assert_eq!(parse_sync_page_bytes(" 32\n"), Some(32));
+        for ignored in ["", "31", "0", "-64", "64 bytes", "6.4"] {
+            assert_eq!(parse_sync_page_bytes(ignored), None, "{ignored:?}");
+        }
     }
 }

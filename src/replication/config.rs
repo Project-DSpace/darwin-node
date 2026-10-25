@@ -137,6 +137,73 @@ const NEIGHBOR_SYNC_COOLDOWN_SECS: u64 = 60 * 60; // 1 hour
 /// Per-peer minimum spacing between successive syncs with the same peer.
 pub const NEIGHBOR_SYNC_COOLDOWN: Duration = Duration::from_secs(NEIGHBOR_SYNC_COOLDOWN_SECS);
 
+/// Bytes of keys one page of a paged neighbour-sync exchange carries.
+///
+/// Both hint lists together: 8,192 keys of 32 bytes, the count one
+/// [`PointerHints`](crate::replication::protocol::PointerHints) message
+/// carries. A page is far under [`MAX_REPLICATION_MESSAGE_SIZE`], with room
+/// for the rest of the message and the transport's envelope.
+pub const NEIGHBOR_SYNC_PAGE_BYTES: usize = 8_192 * 32;
+
+/// Most bytes of keys a single, unpaged neighbour-sync message carries.
+///
+/// To a peer that reads no pages: [`MAX_REPLICATION_MESSAGE_SIZE`] less 1 MiB,
+/// left for the rest of the message and the transport's envelope. A message
+/// nearer the cap can't be built, or is dropped by the receiving transport, so
+/// past this the hints that don't fit wait for the peer to read pages.
+pub const NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES: usize =
+    MAX_REPLICATION_MESSAGE_SIZE - SINGLE_MESSAGE_HEADROOM_BYTES;
+
+/// Room left in a single neighbour-sync message for its other fields (a
+/// signed commitment is about 5 KiB) and the transport's envelope.
+const SINGLE_MESSAGE_HEADROOM_BYTES: usize = 1024 * 1024;
+
+/// Most pages either side of one paged neighbour-sync exchange takes.
+///
+/// 256 pages of 8,192 keys, 64 MiB of keys, as much as a responder holds for
+/// exchanges in progress ([`NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES`]). A requester
+/// follows a responder's pages no further, and takes no page of more than
+/// 8,192 keys, so what it gathers in one exchange stays within that too; a
+/// responder serves no page past it. Hints past it wait for a later exchange.
+pub const MAX_NEIGHBOR_SYNC_PAGES: u32 = 256;
+
+/// How long a requester waits for the answer to one sync page.
+///
+/// Sync has its own deadline, rather than a verification batch's: the first
+/// page's answer waits for the responder to build its hints for the requester,
+/// a scan of every key it holds.
+const NEIGHBOR_SYNC_PAGE_TIMEOUT_SECS: u64 = 30;
+/// How long a requester waits for the answer to one page of a paged
+/// neighbour-sync exchange.
+pub const NEIGHBOR_SYNC_PAGE_TIMEOUT: Duration =
+    Duration::from_secs(NEIGHBOR_SYNC_PAGE_TIMEOUT_SECS);
+
+/// Most bytes of hint sets a responder keeps for paged exchanges in progress.
+///
+/// One set per requester, each built at the exchange's first page and dropped
+/// after its last. A new exchange that finds this much held is answered busy,
+/// unless no set is held at all.
+pub const NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// The first release whose nodes read paged neighbour sync.
+///
+/// Its `+ds.<n>` build number. A node pages its hints to a peer whose user
+/// agent names this release or a later one, and sends a single message to any
+/// other.
+pub const NEIGHBOR_SYNC_PAGES_FROM_RELEASE: u64 = 17;
+
+const _: () = assert!(
+    NEIGHBOR_SYNC_PAGE_BYTES >= 32
+        && NEIGHBOR_SYNC_PAGE_BYTES <= NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES
+        && NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES < MAX_REPLICATION_MESSAGE_SIZE,
+    "a sync page holds a key and fits a single message, which fits under the cap"
+);
+const _: () = assert!(
+    NEIGHBOR_SYNC_PAGE_BYTES * MAX_NEIGHBOR_SYNC_PAGES as usize
+        <= NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES,
+    "an exchange's pages hold no more than a responder holds for exchanges in progress"
+);
+
 /// Minimum age for a replica repair hint before the hinted peer can be audited
 /// for that key.
 const REPAIR_HINT_MIN_AGE_SECS: u64 = 60 * 60; // 1 hour
@@ -942,6 +1009,10 @@ pub struct ReplicationConfig {
     pub prune_hysteresis_duration: Duration,
     /// Verification request timeout (per-batch).
     pub verification_request_timeout: Duration,
+    /// How long a requester waits for the answer to one page of a paged
+    /// neighbour-sync exchange. A responder answers busy, instead of serving,
+    /// a page request that waited half of this for a worker.
+    pub neighbor_sync_page_timeout: Duration,
     /// Fetch request timeout.
     pub fetch_request_timeout: Duration,
     /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before
@@ -995,6 +1066,7 @@ impl Default for ReplicationConfig {
             bootstrap_claim_grace_period: BOOTSTRAP_CLAIM_GRACE_PERIOD,
             prune_hysteresis_duration: PRUNE_HYSTERESIS_DURATION,
             verification_request_timeout: VERIFICATION_REQUEST_TIMEOUT,
+            neighbor_sync_page_timeout: NEIGHBOR_SYNC_PAGE_TIMEOUT,
             fetch_request_timeout: FETCH_REQUEST_TIMEOUT,
             bootstrap_complete_timeout_secs: BOOTSTRAP_COMPLETE_TIMEOUT_SECS,
             possession_check_delay_min: POSSESSION_CHECK_DELAY_MIN,
@@ -1062,6 +1134,9 @@ impl ReplicationConfig {
                 self.neighbor_sync_scope, K_BUCKET_SIZE,
             ));
         }
+        if self.neighbor_sync_page_timeout.is_zero() {
+            return Err("neighbor_sync_page_timeout must be above zero".to_string());
+        }
         Ok(())
     }
 
@@ -1125,6 +1200,15 @@ impl ReplicationConfig {
             self.neighbor_sync_interval_min,
             self.neighbor_sync_interval_max,
         )
+    }
+
+    /// How long a page request may wait for a responder worker before it is
+    /// answered busy: half the requester's wait, so the busy answer reaches
+    /// a requester still waiting for it, and a request served in time leaves
+    /// the other half for building and sending its answer.
+    #[must_use]
+    pub fn neighbor_sync_page_stale_after(&self) -> Duration {
+        self.neighbor_sync_page_timeout / 2
     }
 
     /// Maximum age of an outstanding bootstrap capacity-rejection record.

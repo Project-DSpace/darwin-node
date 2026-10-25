@@ -1,5 +1,7 @@
 //! The bytes of every message one node sends another, as v0.23.0+ds.15 writes
-//! and reads them, and the variants of each that it knows.
+//! and reads them, and the variants of each that it knows; and of the messages
+//! appended since, which go only to peers known to read them: paged neighbour
+//! sync's page request and its answer.
 //!
 //! A release that changes messages between nodes keeps the rule in the
 //! README's "Messages between nodes": a new message type is appended to
@@ -33,12 +35,12 @@ use ant_node::replication::commitment::StorageCommitment;
 use ant_node::replication::protocol::{
     AuditChallenge, AuditResponse, FetchRequest, FetchResponse, FreshReplicationOffer,
     FreshReplicationResponse, GetCommitmentByPin, GetCommitmentByPinResponse,
-    KeyVerificationResult, NeighborSyncRequest, NeighborSyncResponse, PaidNotify,
-    PointerFetchRequest, PointerFetchResponse, PointerFreshOffer, PointerHints,
-    PointerStateRequest, PointerStateResponse, PointerStateSummary, RejectKind, ReplicationMessage,
-    ReplicationMessageBody, SubtreeAuditChallenge, SubtreeAuditResponse, SubtreeSliceChallenge,
-    SubtreeSliceItem, SubtreeSliceOpening, SubtreeSliceResponse, VerificationRequest,
-    VerificationResponse,
+    KeyVerificationResult, NeighborSyncPageRequest, NeighborSyncPageResponse, NeighborSyncRequest,
+    NeighborSyncResponse, PaidNotify, PointerFetchRequest, PointerFetchResponse, PointerFreshOffer,
+    PointerHints, PointerStateRequest, PointerStateResponse, PointerStateSummary, RejectKind,
+    ReplicationMessage, ReplicationMessageBody, SubtreeAuditChallenge, SubtreeAuditResponse,
+    SubtreeSliceChallenge, SubtreeSliceItem, SubtreeSliceOpening, SubtreeSliceResponse,
+    VerificationRequest, VerificationResponse,
 };
 use ant_node::replication::subtree::{SubtreeLeaf, SubtreeProof};
 use std::fmt::Write as _;
@@ -82,6 +84,7 @@ fn pointer_summary(byte: u8) -> PointerStateSummary {
 /// The name of a sample: its message, and the variant of a reply or a reply's
 /// part. The match is exhaustive, so a variant added to any of them doesn't
 /// compile until it is named here, and given a sample and bytes below.
+#[allow(clippy::too_many_lines)]
 fn name(body: &ReplicationMessageBody) -> String {
     use ReplicationMessageBody as B;
     let kind = |kind: &RejectKind| match kind {
@@ -174,6 +177,23 @@ fn name(body: &ReplicationMessageBody) -> String {
         ),
         B::PointerStateRequest(_) => "PointerStateRequest".into(),
         B::PointerStateResponse(_) => "PointerStateResponse".into(),
+        B::NeighborSyncPageRequest(request) => format!(
+            "NeighborSyncPageRequest, commitment {}",
+            if request.commitment.is_some() {
+                "Some"
+            } else {
+                "None"
+            }
+        ),
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Page { commitment, .. }) => {
+            format!(
+                "NeighborSyncPageResponse::Page, commitment {}",
+                if commitment.is_some() { "Some" } else { "None" }
+            )
+        }
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy { .. }) => {
+            "NeighborSyncPageResponse::Busy".into()
+        }
     }
 }
 
@@ -365,6 +385,46 @@ fn samples() -> Vec<ReplicationMessageBody> {
         B::PointerStateResponse(PointerStateResponse {
             states: vec![Some(pointer_summary(0x2F)), None],
         }),
+        B::NeighborSyncPageRequest(NeighborSyncPageRequest {
+            cycle: 0x0102_0304_0506_0708,
+            page: 0,
+            pages: 3,
+            replica_hints: vec![key(0x32)],
+            paid_hints: vec![key(0x33)],
+            bootstrapping: true,
+            commitment: Some(commitment()),
+        }),
+        B::NeighborSyncPageRequest(NeighborSyncPageRequest {
+            cycle: 0x0102_0304_0506_0708,
+            page: 2,
+            pages: 3,
+            replica_hints: vec![],
+            paid_hints: vec![key(0x34), key(0x35)],
+            bootstrapping: false,
+            commitment: None,
+        }),
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Page {
+            cycle: 0x0102_0304_0506_0708,
+            page: 0,
+            pages: 300,
+            replica_hints: vec![key(0x36), key(0x37)],
+            paid_hints: vec![],
+            bootstrapping: false,
+            commitment: Some(commitment()),
+        }),
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Page {
+            cycle: 0x0102_0304_0506_0708,
+            page: 299,
+            pages: 300,
+            replica_hints: vec![],
+            paid_hints: vec![key(0x38)],
+            bootstrapping: true,
+            commitment: None,
+        }),
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy {
+            cycle: 0x0102_0304_0506_0708,
+            page: 1,
+        }),
     ]
 }
 
@@ -530,6 +590,26 @@ const PINNED: &[(&str, &str)] = &[
         "PointerStateResponse",
         "b4241602012f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f3030303030303030303030303030303030303030303030303030303030303030ac0201313131313131313131313131313131313131313131313131313131313131313100",
     ),
+    (
+        "NeighborSyncPageRequest, commitment Some",
+        "b42417888e98a8c0e080810100030132323232323232323232323232323232323232323232323232323232323232320133333333333333333333333333333333333333333333333333333333333333330101c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c103c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c202c3c403c5c6c7",
+    ),
+    (
+        "NeighborSyncPageRequest, commitment None",
+        "b42417888e98a8c0e080810102030002343434343434343434343434343434343434343434343434343434343434343435353535353535353535353535353535353535353535353535353535353535350000",
+    ),
+    (
+        "NeighborSyncPageResponse::Page, commitment Some",
+        "b4241800888e98a8c0e080810100ac020236363636363636363636363636363636363636363636363636363636363636363737373737373737373737373737373737373737373737373737373737373737000001c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c103c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c202c3c403c5c6c7",
+    ),
+    (
+        "NeighborSyncPageResponse::Page, commitment None",
+        "b4241800888e98a8c0e0808101ab02ac02000138383838383838383838383838383838383838383838383838383838383838380100",
+    ),
+    (
+        "NeighborSyncPageResponse::Busy",
+        "b4241801888e98a8c0e080810101",
+    ),
 ];
 
 fn encode(body: ReplicationMessageBody) -> Vec<u8> {
@@ -626,7 +706,7 @@ fn the_variants_are_the_pinned_ones() {
     let challenge = varint(9);
     // (what, the bytes up to the variant index, how many variants it has)
     let cases: Vec<(&str, Vec<u8>, u8)> = vec![
-        ("ReplicationMessageBody", frame(&[]), 23),
+        ("ReplicationMessageBody", frame(&[]), 25),
         ("FreshReplicationResponse", frame(&[&[1]]), 2),
         ("FetchResponse", frame(&[&[8]]), 3),
         ("AuditResponse", frame(&[&[10]]), 3),
@@ -648,6 +728,7 @@ fn the_variants_are_the_pinned_ones() {
             3,
         ),
         ("GetCommitmentByPinResponse", frame(&[&[16]]), 2),
+        ("NeighborSyncPageResponse", frame(&[&[24]]), 2),
     ];
     for (what, prefix, count) in cases {
         let with = |index: u8| {

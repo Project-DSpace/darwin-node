@@ -243,6 +243,18 @@ pub enum ReplicationMessageBody {
     PointerStateRequest(PointerStateRequest),
     /// Response to [`Self::PointerStateRequest`].
     PointerStateResponse(PointerStateResponse),
+
+    // === Paged neighbour sync ===
+    // APPENDED for the same reason. A peer built before these cannot decode
+    // them, so a node sends a page request only to a peer known to read pages
+    // (see `neighbor_sync::sync_form_for`), and answers with a page only a peer
+    // that sent one. Every other peer gets the single messages above.
+    /// One page of a paged neighbour-sync exchange: the requester's page of
+    /// its hints, asking for the responder's page of the same number.
+    NeighborSyncPageRequest(NeighborSyncPageRequest),
+    /// Response to [`Self::NeighborSyncPageRequest`]: the responder's page,
+    /// or busy.
+    NeighborSyncPageResponse(NeighborSyncPageResponse),
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +273,7 @@ pub enum ReplicationMessageBody {
 // modules that do not carry any shared engine handle.
 
 /// Number of [`ReplicationMessageBody`] variants (the counter-table width).
-pub(crate) const N_REPLICATION_VARIANTS: usize = 23;
+pub(crate) const N_REPLICATION_VARIANTS: usize = 25;
 
 static REPL_TX_BYTES: [AtomicU64; N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
@@ -302,6 +314,8 @@ impl ReplicationMessageBody {
             Self::PointerFetchResponse(_) => 20,
             Self::PointerStateRequest(_) => 21,
             Self::PointerStateResponse(_) => 22,
+            Self::NeighborSyncPageRequest(_) => 23,
+            Self::NeighborSyncPageResponse(_) => 24,
         }
     }
 
@@ -368,7 +382,7 @@ impl BodyFamily {
 pub(crate) fn family_of_variant(index: usize) -> Option<BodyFamily> {
     match index {
         11..=14 => Some(BodyFamily::SubtreeAudit),
-        0..=10 | 15..=22 => Some(BodyFamily::Core),
+        0..=10 | 15..=24 => Some(BodyFamily::Core),
         _ => None,
     }
 }
@@ -573,8 +587,8 @@ fn record_rx(body: &ReplicationMessageBody, bytes: usize) {
 /// `tail.*` field and the acceptance query (`max` per field per hour → delta)
 /// yields per-variant MB/h directly.
 ///
-/// 17 variants × 4 fields = 68 flat keys. `tracing` caps an event at 32 fields,
-/// so the keys are split across three lines that share the same `target` and
+/// 25 variants × 4 fields = 100 flat keys. `tracing` caps an event at 32 fields,
+/// so the keys are split across five lines that share the same `target` and
 /// message and are distinguished by a `group` field — telegraf still lifts
 /// every key into its own ES field, so the split is transparent at query time.
 pub(crate) fn log_traffic_summary() {
@@ -659,6 +673,19 @@ pub(crate) fn log_traffic_summary() {
         pointer_state_request_rx_bytes = rb(21), pointer_state_request_rx_count = rc(21),
         pointer_state_response_tx_bytes = tb(22), pointer_state_response_tx_count = tc(22),
         pointer_state_response_rx_bytes = rb(22), pointer_state_response_rx_count = rc(22),
+        "replication traffic summary (cumulative)"
+    );
+    crate::logging::info!(
+        target: "ant_node::replication::traffic",
+        group = 5,
+        neighbor_sync_page_request_tx_bytes = tb(23),
+        neighbor_sync_page_request_tx_count = tc(23),
+        neighbor_sync_page_request_rx_bytes = rb(23),
+        neighbor_sync_page_request_rx_count = rc(23),
+        neighbor_sync_page_response_tx_bytes = tb(24),
+        neighbor_sync_page_response_tx_count = tc(24),
+        neighbor_sync_page_response_rx_bytes = rb(24),
+        neighbor_sync_page_response_rx_count = rc(24),
         "replication traffic summary (cumulative)"
     );
 }
@@ -926,6 +953,71 @@ pub struct NeighborSyncResponse {
     /// [`NeighborSyncRequest::commitment`]).
     #[serde(default)]
     pub commitment: Option<crate::replication::commitment::StorageCommitment>,
+}
+
+/// One page of a paged neighbour-sync exchange.
+///
+/// The requester cuts its two hint lists, replica hints first, into pages of
+/// at most a page's bytes of keys, and sends them one at a time, each only once
+/// the last is answered, so a responder never has two pages of one requester
+/// at once. Each asks for the responder's page of the same number, which the
+/// responder serves from the hints it built once for this exchange, at its
+/// first page. The exchange runs as many pages as the side with more has; a
+/// side out of pages sends empty ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeighborSyncPageRequest {
+    /// The requester's number for this exchange: every page of it carries the
+    /// same, and a new exchange a new one.
+    pub cycle: u64,
+    /// This page's number, from 0.
+    pub page: u32,
+    /// How many pages the requester's hints take, at least 1.
+    pub pages: u32,
+    /// The requester's replica hints on this page: keys it believes the
+    /// responder should hold.
+    pub replica_hints: Vec<XorName>,
+    /// The requester's paid hints on this page: keys it believes the responder
+    /// should track in its `PaidForList`.
+    pub paid_hints: Vec<XorName>,
+    /// Whether the requester is bootstrapping.
+    pub bootstrapping: bool,
+    /// The requester's signed storage commitment, on the first page only (see
+    /// [`NeighborSyncRequest::commitment`]).
+    pub commitment: Option<crate::replication::commitment::StorageCommitment>,
+}
+
+/// The answer to one [`NeighborSyncPageRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NeighborSyncPageResponse {
+    /// The responder's page of the number asked for: empty past its last.
+    Page {
+        /// Echo of the request's exchange number.
+        cycle: u64,
+        /// Echo of the request's page number.
+        page: u32,
+        /// How many pages the responder's hints take, at least 1; the same on
+        /// every page of an exchange.
+        pages: u32,
+        /// The responder's replica hints on this page.
+        replica_hints: Vec<XorName>,
+        /// The responder's paid hints on this page.
+        paid_hints: Vec<XorName>,
+        /// Whether the responder is bootstrapping.
+        bootstrapping: bool,
+        /// The responder's signed storage commitment, on the first page only.
+        commitment: Option<crate::replication::commitment::StorageCommitment>,
+    },
+    /// The responder took nothing from this page and serves none of the
+    /// exchange: refused at admission, waited too long for a worker, or the
+    /// exchange's hints were not held. The requester ends the exchange and
+    /// syncs with the responder again in a later cycle. An answer, so a busy
+    /// responder is never charged for silence.
+    Busy {
+        /// Echo of the request's exchange number.
+        cycle: u64,
+        /// Echo of the request's page number.
+        page: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1787,6 +1879,19 @@ mod tests {
             }),
             ReplicationMessageBody::PointerStateRequest(PointerStateRequest { addresses: vec![] }),
             ReplicationMessageBody::PointerStateResponse(PointerStateResponse { states: vec![] }),
+            ReplicationMessageBody::NeighborSyncPageRequest(NeighborSyncPageRequest {
+                cycle: 1,
+                page: 0,
+                pages: 1,
+                replica_hints: vec![],
+                paid_hints: vec![],
+                bootstrapping: false,
+                commitment: None,
+            }),
+            ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy {
+                cycle: 1,
+                page: 0,
+            }),
         ]
     }
 
@@ -1984,9 +2089,10 @@ mod tests {
     fn an_undeclared_variant_index_classifies_as_nothing() {
         let declared = all_bodies().len();
         assert_eq!(
-            declared, 23,
+            declared, N_REPLICATION_VARIANTS,
             "update this test's bounds when a variant is added or removed"
         );
+        assert_eq!(declared, 25);
         for index in [declared, declared + 1, 99, usize::MAX] {
             assert_eq!(
                 family_of_variant(index),
@@ -2321,6 +2427,301 @@ mod tests {
         } else {
             panic!("expected NeighborSyncResponse");
         }
+    }
+
+    // === Paged neighbour sync ===
+
+    /// `ReplicationMessageBody` as a node of the release before paged sync
+    /// declares it, 23 variants, in a message as such a node decodes one.
+    /// Unit variants stand in for their contents, which postcard reads only
+    /// after the index, and leaves unread here.
+    mod before_paged_sync {
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        pub(super) enum Body {
+            FreshReplicationOffer,
+            FreshReplicationResponse,
+            PaidNotify,
+            NeighborSyncRequest,
+            NeighborSyncResponse,
+            VerificationRequest,
+            VerificationResponse,
+            FetchRequest,
+            FetchResponse,
+            AuditChallenge,
+            AuditResponse,
+            SubtreeAuditChallenge,
+            SubtreeAuditResponse,
+            SubtreeSliceChallenge,
+            SubtreeSliceResponse,
+            GetCommitmentByPin,
+            GetCommitmentByPinResponse,
+            PointerFreshOffer,
+            PointerHints,
+            PointerFetchRequest,
+            PointerFetchResponse,
+            PointerStateRequest,
+            PointerStateResponse,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        pub(super) struct Message {
+            pub(super) request_id: u64,
+            pub(super) body: Body,
+        }
+    }
+
+    fn page_request(
+        commitment: Option<crate::replication::commitment::StorageCommitment>,
+    ) -> NeighborSyncPageRequest {
+        NeighborSyncPageRequest {
+            cycle: 0xC1C1,
+            page: 2,
+            pages: 3,
+            replica_hints: vec![[0x41; 32], [0x42; 32]],
+            paid_hints: vec![[0x43; 32]],
+            bootstrapping: false,
+            commitment,
+        }
+    }
+
+    fn page_response(
+        commitment: Option<crate::replication::commitment::StorageCommitment>,
+    ) -> NeighborSyncPageResponse {
+        NeighborSyncPageResponse::Page {
+            cycle: 0xC1C1,
+            page: 2,
+            pages: 5,
+            replica_hints: vec![[0x44; 32]],
+            paid_hints: vec![[0x45; 32], [0x46; 32]],
+            bootstrapping: true,
+            commitment,
+        }
+    }
+
+    fn test_commitment() -> crate::replication::commitment::StorageCommitment {
+        crate::replication::commitment::StorageCommitment {
+            root: [0x47; 32],
+            key_count: 9,
+            sender_peer_id: [0x48; 32],
+            sender_public_key: vec![0x49; 8],
+            signature: vec![0x4A; 8],
+        }
+    }
+
+    /// A node of the release before paged sync refuses its two messages
+    /// whole, at their index, past every variant it has: it never takes one
+    /// for a message it knows. Every message it knows still decodes, at its
+    /// own index. A node therefore sends these only to a peer known to read
+    /// them, and an older peer's silence, or its decode failure, is never
+    /// charged to it (the README's "Messages between nodes").
+    #[test]
+    fn a_node_from_before_paged_sync_refuses_its_messages_whole() {
+        let new_bodies = [
+            ReplicationMessageBody::NeighborSyncPageRequest(page_request(None)),
+            ReplicationMessageBody::NeighborSyncPageRequest(page_request(Some(test_commitment()))),
+            ReplicationMessageBody::NeighborSyncPageResponse(page_response(None)),
+            ReplicationMessageBody::NeighborSyncPageResponse(page_response(
+                Some(test_commitment()),
+            )),
+            ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy {
+                cycle: 0xC1C1,
+                page: 2,
+            }),
+        ];
+        for body in new_bodies {
+            let index = body.variant_index();
+            assert!(index >= 23, "a paged-sync body is appended");
+            let encoded = ReplicationMessage {
+                request_id: 77,
+                body,
+            }
+            .encode()
+            .expect("encode");
+            let refused = postcard::from_bytes::<before_paged_sync::Message>(&encoded)
+                .expect_err("an older node can't decode a paged-sync message");
+            assert!(
+                matches!(refused, postcard::Error::SerdeDeCustom),
+                "refused at the variant index, got {refused:?}"
+            );
+        }
+
+        for body in all_bodies()
+            .into_iter()
+            .filter(|body| body.variant_index() < 23)
+        {
+            let index = body.variant_index();
+            let encoded = ReplicationMessage {
+                request_id: 77,
+                body,
+            }
+            .encode()
+            .expect("encode");
+            let old = postcard::from_bytes::<before_paged_sync::Message>(&encoded)
+                .expect("an older node decodes every message it knows");
+            assert_eq!(old.request_id, 77);
+            assert_eq!(
+                format!("{:?}", old.body),
+                before_paged_sync_name(index),
+                "variant {index} keeps its index"
+            );
+        }
+    }
+
+    /// The name an older node gives the variant at `index`.
+    fn before_paged_sync_name(index: usize) -> String {
+        const NAMES: [&str; 23] = [
+            "FreshReplicationOffer",
+            "FreshReplicationResponse",
+            "PaidNotify",
+            "NeighborSyncRequest",
+            "NeighborSyncResponse",
+            "VerificationRequest",
+            "VerificationResponse",
+            "FetchRequest",
+            "FetchResponse",
+            "AuditChallenge",
+            "AuditResponse",
+            "SubtreeAuditChallenge",
+            "SubtreeAuditResponse",
+            "SubtreeSliceChallenge",
+            "SubtreeSliceResponse",
+            "GetCommitmentByPin",
+            "GetCommitmentByPinResponse",
+            "PointerFreshOffer",
+            "PointerHints",
+            "PointerFetchRequest",
+            "PointerFetchResponse",
+            "PointerStateRequest",
+            "PointerStateResponse",
+        ];
+        NAMES[index].to_string()
+    }
+
+    #[test]
+    fn neighbor_sync_page_request_roundtrip() {
+        for commitment in [None, Some(test_commitment())] {
+            let msg = ReplicationMessage {
+                request_id: 21,
+                body: ReplicationMessageBody::NeighborSyncPageRequest(page_request(
+                    commitment.clone(),
+                )),
+            };
+            let encoded = msg.encode().expect("encode should succeed");
+            let decoded = ReplicationMessage::decode(&encoded).expect("decode should succeed");
+            assert_eq!(decoded.request_id, 21);
+            let ReplicationMessageBody::NeighborSyncPageRequest(request) = decoded.body else {
+                panic!("expected NeighborSyncPageRequest");
+            };
+            assert_eq!(request.cycle, 0xC1C1);
+            assert_eq!((request.page, request.pages), (2, 3));
+            assert_eq!(request.replica_hints, vec![[0x41; 32], [0x42; 32]]);
+            assert_eq!(request.paid_hints, vec![[0x43; 32]]);
+            assert!(!request.bootstrapping);
+            assert_eq!(request.commitment, commitment);
+        }
+    }
+
+    #[test]
+    fn neighbor_sync_page_response_roundtrip() {
+        for commitment in [None, Some(test_commitment())] {
+            let msg = ReplicationMessage {
+                request_id: 22,
+                body: ReplicationMessageBody::NeighborSyncPageResponse(page_response(
+                    commitment.clone(),
+                )),
+            };
+            let encoded = msg.encode().expect("encode should succeed");
+            let decoded = ReplicationMessage::decode(&encoded).expect("decode should succeed");
+            let ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Page {
+                cycle,
+                page,
+                pages,
+                replica_hints,
+                paid_hints,
+                bootstrapping,
+                commitment: decoded_commitment,
+            }) = decoded.body
+            else {
+                panic!("expected NeighborSyncPageResponse::Page");
+            };
+            assert_eq!((cycle, page, pages), (0xC1C1, 2, 5));
+            assert_eq!(replica_hints, vec![[0x44; 32]]);
+            assert_eq!(paid_hints, vec![[0x45; 32], [0x46; 32]]);
+            assert!(bootstrapping);
+            assert_eq!(decoded_commitment, commitment);
+        }
+
+        let busy = ReplicationMessage {
+            request_id: 23,
+            body: ReplicationMessageBody::NeighborSyncPageResponse(
+                NeighborSyncPageResponse::Busy { cycle: 9, page: 4 },
+            ),
+        };
+        let decoded = ReplicationMessage::decode(&busy.encode().expect("encode")).expect("decode");
+        assert!(matches!(
+            decoded.body,
+            ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy {
+                cycle: 9,
+                page: 4
+            })
+        ));
+    }
+
+    /// A page as large as a page gets, with the commitment the first page
+    /// carries, is far under the wire cap, as is a single message at its
+    /// budget: neither is ever too large to build.
+    #[test]
+    fn a_full_sync_page_and_a_full_single_message_fit_the_wire_cap() {
+        use crate::replication::config::{
+            NEIGHBOR_SYNC_PAGE_BYTES, NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES,
+        };
+        // An ML-DSA-65 key and signature, generously sized.
+        let commitment = crate::replication::commitment::StorageCommitment {
+            root: [1; 32],
+            key_count: u32::MAX,
+            sender_peer_id: [2; 32],
+            sender_public_key: vec![3; 4096],
+            signature: vec![4; 8192],
+        };
+        let keys = |bytes: usize| vec![[0xAB; 32]; bytes / 32];
+
+        let page = ReplicationMessage {
+            request_id: u64::MAX,
+            body: ReplicationMessageBody::NeighborSyncPageResponse(
+                NeighborSyncPageResponse::Page {
+                    cycle: u64::MAX,
+                    page: u32::MAX,
+                    pages: u32::MAX,
+                    replica_hints: keys(NEIGHBOR_SYNC_PAGE_BYTES),
+                    paid_hints: vec![],
+                    bootstrapping: true,
+                    commitment: Some(commitment.clone()),
+                },
+            ),
+        };
+        let encoded = page.encode().expect("a full page encodes");
+        assert!(encoded.len() < NEIGHBOR_SYNC_PAGE_BYTES + 64 * 1024);
+
+        let single = ReplicationMessage {
+            request_id: u64::MAX,
+            body: ReplicationMessageBody::NeighborSyncResponse(NeighborSyncResponse {
+                replica_hints: keys(NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES / 2),
+                paid_hints: keys(NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES / 2),
+                bootstrapping: true,
+                rejected_keys: vec![],
+                commitment: Some(commitment),
+            }),
+        };
+        let encoded = single.encode().expect("a full single message encodes");
+        assert!(
+            encoded.len() + 512 * 1024 < MAX_REPLICATION_MESSAGE_SIZE,
+            "a full single message leaves room for the transport's envelope: {} bytes",
+            encoded.len()
+        );
     }
 
     // === Verification roundtrips ===

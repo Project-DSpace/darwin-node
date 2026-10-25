@@ -91,6 +91,10 @@ mod verify_storage_gate;
 #[cfg(test)]
 mod settlement_version_gate;
 
+// Paged neighbour sync between real nodes.
+#[cfg(test)]
+mod sync_pages;
+
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};
