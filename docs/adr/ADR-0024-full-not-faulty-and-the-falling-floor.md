@@ -175,7 +175,11 @@ waives the per-key absent penalty only when all of these hold:
   the record of these proofs is a Bloom filter in two generations, each sized at 10 bits
   for each of 20 peers per record held (2 to 32 MiB), a new one started once the current
   holds as many proofs as it was sized for, so its false "seen" answers, which charge,
-  stay under about 3.5% however long the node runs;
+  stay under about 3.5% however long the node runs; the record, its hash seed and both
+  generations are saved to `{root}/seen_holders.bin` at the end of each prune pass that
+  changed it (a temporary file renamed over the old one) and loaded at start, so a
+  restart or an upgrade forgets nothing; a missing or unreadable file starts it empty,
+  logged;
 - on the possession check after a write, the peer's own quote isn't among the paid quotes
   of the write's proof: a node paid for a record it then can't take is charged.
 
@@ -216,9 +220,14 @@ windows until they update.
   prune.
 - The first start into this release has no saved clocks: for up to three days a node at
   the line may be full while it holds copies it could erase later. No data is lost.
-- The record of keys a peer was seen proving is process-local: a restart forgets it, so
-  the waiver may apply to a key the peer proved before the restart. It also forgets a
-  proof two generations later, unless the peer proves the key again.
+- The record of keys a peer was seen proving forgets a proof two generations later,
+  unless the peer proves the key again: the waiver may then apply to a key the peer
+  proved that long ago. A generation holds 10 bits' worth of proofs for each of 20 peers
+  per record held, so this is at least one generation's worth of other proofs later.
+  This turnover narrows "never seen" to "not seen within the two generations kept", and
+  is an amendment to the S4 wording, for Dan to confirm. Restarts don't forget: the
+  record is saved with its seed (up to 2 x 32 MiB on disk, written only when it changed).
+  The first start into this release, or one after the file is lost, starts it empty.
 
 ### Neutral / Operational
 

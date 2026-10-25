@@ -1695,6 +1695,9 @@ pub struct ReplicationEngine {
     erasure_trigger: Arc<Notify>,
     /// The out-of-range clocks' own table, when it could be opened.
     out_of_range_clocks: Option<Arc<erasure::OutOfRangeClocks>>,
+    /// The node's root, where the record of keys peers were seen proving is
+    /// saved after each prune pass (`full::SEEN_FILE`).
+    root_dir: PathBuf,
     /// Payment verifier for `PoP` validation.
     payment_verifier: Arc<PaymentVerifier>,
     /// Replication pipeline queues.
@@ -1931,7 +1934,11 @@ impl ReplicationEngine {
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
         // Full, not faulty, and two-phase erasure: per node, reached by the node's id.
-        let full_view = Arc::new(full::FullView::default());
+        let seen_root = root_dir.to_path_buf();
+        let seen = tokio::task::spawn_blocking(move || full::SeenHolders::load(&seen_root))
+            .await
+            .unwrap_or_default();
+        let full_view = Arc::new(full::FullView::with_seen(seen));
         full::register_view(p2p_node.peer_id(), &full_view);
         let erasure_gate = Arc::new(erasure::ErasureGate::default());
         erasure::register_gate(p2p_node.peer_id(), &erasure_gate);
@@ -1960,6 +1967,7 @@ impl ReplicationEngine {
             erasure_gate,
             erasure_trigger: Arc::new(Notify::new()),
             out_of_range_clocks,
+            root_dir: root_dir.to_path_buf(),
             payment_verifier,
             queues: Arc::new(RwLock::new(ReplicationQueues::new())),
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
@@ -3850,6 +3858,8 @@ impl ReplicationEngine {
         let erasure_trigger = Arc::clone(&self.erasure_trigger);
         let erasure_gate = Arc::clone(&self.erasure_gate);
         let clocks = self.out_of_range_clocks.clone();
+        let full_view = Arc::clone(&self.full_view);
+        let root_dir = self.root_dir.clone();
         let pointers = self.pointers.clone();
         let shutdown = self.shutdown.clone();
         if let (Some(clocks), Some(pointers)) = (&clocks, &pointers) {
@@ -3916,6 +3926,7 @@ impl ReplicationEngine {
                 if let Some(clocks) = &clocks {
                     save_out_of_range_clocks(clocks, &paid_list, pointers.as_ref()).await;
                 }
+                full_view.seen.save(&root_dir).await;
                 if stopping {
                     break;
                 }

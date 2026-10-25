@@ -144,7 +144,8 @@ never ran.
   near it only with 6 proofs from the 7 nearest not full, and waive the
   unheld-chunk penalty for it only when its notice is under 40 minutes old,
   it answered that it lacks the key, the check isn't pinned to its
-  commitment, it was never seen proving the key, and, after a write, it
+  commitment, it was never seen proving the key (a record kept across
+  restarts in `{root}/seen_holders.bin`), and, after a write, it
   wasn't paid for it. Every lane asks one function at one reviewed site
   (the census), and `tests/fork_pins.rs` pins the waiver's conditions on
   each lane.

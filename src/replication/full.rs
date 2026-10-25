@@ -42,10 +42,10 @@
 //! sent a notice itself. Older nodes drop it, keep charging a full node as
 //! before, and don't widen their windows until they update.
 
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -268,6 +268,77 @@ const SEEN_BITS_PER_PAIR: u64 = 10;
 /// prove a key to this node sits within the key's widened window.
 const SEEN_PAIRS_PER_RECORD: u64 = MAX_WIDENED_WIDTH as u64;
 
+/// The file, under the node's root, that holds [`SeenHolders`] across
+/// restarts.
+pub const SEEN_FILE: &str = "seen_holders.bin";
+/// The layout of [`SEEN_FILE`]; a file of any other layout starts the record
+/// empty.
+const SEEN_FORMAT: u8 = 1;
+
+/// Reads a saved [`SeenHolders`] front to back.
+struct SavedReader<'a>(&'a [u8]);
+
+impl<'a> SavedReader<'a> {
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let (taken, rest) = self.0.split_at_checked(len)?;
+        self.0 = rest;
+        Some(taken)
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// Whether a generation was saved next: `None` when the byte is
+    /// neither.
+    fn present(&mut self) -> Option<bool> {
+        match self.take(1)? {
+            [0] => Some(false),
+            [1] => Some(true),
+            _ => None,
+        }
+    }
+
+    /// One saved generation, or `None` when the bytes aren't one.
+    fn generation(&mut self) -> Option<Arc<SeenGeneration>> {
+        let bits = self.u64()?;
+        let capacity = self.u64()?;
+        let distinct = self.u64()?;
+        if !(SEEN_MIN_BITS..=SEEN_MAX_BITS).contains(&bits)
+            || bits % 64 != 0
+            || capacity != bits / SEEN_BITS_PER_PAIR
+        {
+            return None;
+        }
+        let words = self
+            .take(usize::try_from(bits / 8).ok()?)?
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| AtomicU64::new(u64::from_le_bytes(*word)))
+            .collect();
+        Some(Arc::new(SeenGeneration {
+            words,
+            bits,
+            capacity,
+            distinct: AtomicU64::new(distinct),
+        }))
+    }
+}
+
+/// Write `bytes` to `path` through a temporary file beside it, synced and then
+/// renamed over `path`, so a crash leaves the old file or the new one whole.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut temporary = PathBuf::from(path);
+    temporary.set_extension("bin.tmp");
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)
+}
+
 /// One generation of [`SeenHolders`]: a Bloom filter sized when it starts.
 struct SeenGeneration {
     words: Box<[AtomicU64]>,
@@ -301,8 +372,9 @@ impl SeenGeneration {
         Some((word, 1 << (position % 64)))
     }
 
-    /// Set the pair's bits. Counts it as distinct when any bit was unset.
-    fn insert(&self, positions: impl Iterator<Item = u64>) {
+    /// Set the pair's bits. Counts it as distinct, and returns `true`, when
+    /// any bit was unset.
+    fn insert(&self, positions: impl Iterator<Item = u64>) -> bool {
         let mut new = false;
         for position in positions {
             if let Some((word, mask)) = self.word_and_mask(position) {
@@ -312,6 +384,7 @@ impl SeenGeneration {
         if new {
             self.distinct.fetch_add(1, Ordering::Relaxed);
         }
+        new
     }
 
     fn contains(&self, mut positions: impl Iterator<Item = u64>) -> bool {
@@ -363,23 +436,25 @@ pub struct SeenFill {
 /// proved again is remembered afresh. It can answer "seen" for a pair it never
 /// saw, and that charges the penalty, as for any node; the generations keep
 /// that rate under about 3.5%, both read, where a filter that only filled
-/// would charge more and more often over uptime. Process-local: a restart
-/// starts it empty.
+/// would charge more and more often over uptime. It survives restarts: its
+/// hash seed and both generations are saved in the file [`SEEN_FILE`] under
+/// the node's root after each prune pass that changed it, and loaded at start
+/// ([`Self::load`], [`Self::save`]), so only turnover forgets a proof.
 pub struct SeenHolders {
-    hasher: RandomState,
+    /// The key of the hash that places a pair's bits, saved with the bits so
+    /// a reloaded record reads the same positions.
+    seed: [u8; 32],
     generations: RwLock<SeenGenerations>,
     /// The records this node held at the last prune pass, for sizing the
     /// next generation.
     records: AtomicU64,
+    /// Whether anything changed since the last save.
+    changed: AtomicBool,
 }
 
 impl Default for SeenHolders {
     fn default() -> Self {
-        Self {
-            hasher: RandomState::new(),
-            generations: RwLock::new(SeenGenerations::default()),
-            records: AtomicU64::new(0),
-        }
+        Self::with_seed(rand::random())
     }
 }
 
@@ -398,8 +473,22 @@ impl std::fmt::Debug for SeenHolders {
 }
 
 impl SeenHolders {
+    fn with_seed(seed: [u8; 32]) -> Self {
+        Self {
+            seed,
+            generations: RwLock::new(SeenGenerations::default()),
+            records: AtomicU64::new(0),
+            changed: AtomicBool::new(false),
+        }
+    }
+
     fn positions(&self, peer: &PeerId, key: &XorName, bits: u64) -> impl Iterator<Item = u64> {
-        let hash = self.hasher.hash_one((peer.as_bytes(), key));
+        let mut hasher = blake3::Hasher::new_keyed(&self.seed);
+        hasher.update(peer.as_bytes());
+        hasher.update(key);
+        let mut first_eight = [0u8; 8];
+        first_eight.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+        let hash = u64::from_le_bytes(first_eight);
         let first = hash & 0xFFFF_FFFF;
         let step = (hash >> 32) | 1;
         (0..SEEN_HASHES).map(move |i| first.wrapping_add(i.wrapping_mul(step)) % bits)
@@ -428,7 +517,9 @@ impl SeenHolders {
     /// Record that `peer` proved it holds `key`.
     pub fn record(&self, peer: &PeerId, key: &XorName) {
         let current = self.current();
-        current.insert(self.positions(peer, key, current.bits));
+        if current.insert(self.positions(peer, key, current.bits)) {
+            self.changed.store(true, Ordering::Relaxed);
+        }
         if current.distinct.load(Ordering::Relaxed) < current.capacity {
             return;
         }
@@ -443,6 +534,7 @@ impl SeenHolders {
             generations.current = Some(Arc::new(SeenGeneration::sized_for(
                 self.records.load(Ordering::Relaxed),
             )));
+            self.changed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -456,6 +548,127 @@ impl SeenHolders {
             .iter()
             .filter_map(|generation| generation.as_ref())
             .any(|generation| generation.contains(self.positions(peer, key, generation.bits)))
+    }
+
+    /// The record as saved: [`SEEN_FORMAT`], the seed, the records held,
+    /// then the current and the previous generation, each a presence byte
+    /// and, when present, its bits, capacity and distinct pairs (big-endian)
+    /// and its words (little-endian), and last a BLAKE3 hash of all that
+    /// came before. `None` when nothing changed since the last call that
+    /// returned bytes.
+    fn encode_if_changed(&self) -> Option<Vec<u8>> {
+        if !self.changed.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        let generations = self.generations.read();
+        let words: usize = [&generations.current, &generations.previous]
+            .iter()
+            .filter_map(|generation| generation.as_ref())
+            .map(|generation| generation.words.len())
+            .sum();
+        let mut bytes = Vec::with_capacity(1 + 32 + 8 + 2 * (1 + 24) + words * 8 + 32);
+        bytes.push(SEEN_FORMAT);
+        bytes.extend_from_slice(&self.seed);
+        bytes.extend_from_slice(&self.records.load(Ordering::Relaxed).to_be_bytes());
+        for generation in [&generations.current, &generations.previous] {
+            let Some(generation) = generation else {
+                bytes.push(0);
+                continue;
+            };
+            bytes.push(1);
+            bytes.extend_from_slice(&generation.bits.to_be_bytes());
+            bytes.extend_from_slice(&generation.capacity.to_be_bytes());
+            bytes.extend_from_slice(&generation.distinct.load(Ordering::Relaxed).to_be_bytes());
+            for word in &generation.words {
+                bytes.extend_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+            }
+        }
+        drop(generations);
+        let check = blake3::hash(&bytes);
+        bytes.extend_from_slice(check.as_bytes());
+        Some(bytes)
+    }
+
+    /// The record saved as `bytes`, or `None` when they aren't a whole record
+    /// of this layout.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let (body, check) = bytes.split_at_checked(bytes.len().checked_sub(32)?)?;
+        if blake3::hash(body).as_bytes() != check {
+            return None;
+        }
+        let mut reader = SavedReader(body);
+        if reader.take(1)? != [SEEN_FORMAT] {
+            return None;
+        }
+        let seed: [u8; 32] = reader.take(32)?.try_into().ok()?;
+        let record = Self::with_seed(seed);
+        record.records.store(reader.u64()?, Ordering::Relaxed);
+        let current = if reader.present()? {
+            Some(reader.generation()?)
+        } else {
+            None
+        };
+        let previous = if reader.present()? {
+            Some(reader.generation()?)
+        } else {
+            None
+        };
+        if !reader.0.is_empty() {
+            return None;
+        }
+        *record.generations.write() = SeenGenerations { current, previous };
+        Some(record)
+    }
+
+    /// The record saved under `root_dir`, or an empty one with a new seed
+    /// when there is none or it can't be read (logged).
+    #[must_use]
+    pub fn load(root_dir: &Path) -> Self {
+        let path = root_dir.join(SEEN_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => Self::decode(&bytes).unwrap_or_else(|| {
+                crate::logging::warn!(
+                    "The record of keys peers were seen proving at {} can't be read; it starts \
+                     empty",
+                    path.display()
+                );
+                Self::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                crate::logging::info!(
+                    "No saved record of keys peers were seen proving; it starts empty"
+                );
+                Self::default()
+            }
+            Err(e) => {
+                crate::logging::warn!(
+                    "The record of keys peers were seen proving at {} can't be read: {e}; it \
+                     starts empty",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Save the record under `root_dir` when it changed since the last save:
+    /// written to a temporary file, then renamed over the saved one. A write
+    /// that fails is logged and tried again after the next pass.
+    pub async fn save(&self, root_dir: &Path) {
+        let Some(bytes) = self.encode_if_changed() else {
+            return;
+        };
+        let path = root_dir.join(SEEN_FILE);
+        let written = tokio::task::spawn_blocking(move || write_atomically(&path, &bytes)).await;
+        let failed = match written {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(e) = failed {
+            self.changed.store(true, Ordering::Relaxed);
+            crate::logging::warn!("Failed to save the record of keys peers were seen proving: {e}");
+        }
     }
 
     /// How full the record is, and its estimated rate of false "seen".
@@ -581,6 +794,15 @@ pub struct FullView {
 }
 
 impl FullView {
+    /// A view with no marks, and `seen` as the keys peers were seen proving.
+    #[must_use]
+    pub fn with_seen(seen: SeenHolders) -> Self {
+        Self {
+            seen,
+            ..Self::default()
+        }
+    }
+
     /// Note `count` keys whose verification found fewer than 4 holders.
     pub fn note_few_holders(&self, count: u64) {
         self.few_holders.fetch_add(count, Ordering::Relaxed);
@@ -1124,6 +1346,84 @@ mod tests {
         seen.size_for_records(100_000);
         seen.record(&peer(1), &[7u8; 32]);
         assert_eq!(seen.current().bits, 20_000_000);
+    }
+
+    #[test]
+    fn the_record_is_saved_and_loaded_whole_and_only_when_changed() {
+        let seen = SeenHolders::default();
+        let key = [7u8; 32];
+        assert!(seen.encode_if_changed().is_none(), "nothing recorded");
+        seen.size_for_records(100_000);
+        seen.record(&peer(1), &key);
+        let bytes = seen.encode_if_changed().unwrap();
+        assert!(seen.encode_if_changed().is_none(), "unchanged since");
+        seen.record(&peer(1), &key);
+        assert!(seen.encode_if_changed().is_none(), "a repeat sets no bit");
+
+        let loaded = SeenHolders::decode(&bytes).unwrap();
+        assert!(loaded.may_have_seen(&peer(1), &key), "same seed, same bits");
+        assert!(!loaded.may_have_seen(&peer(2), &key));
+        assert_eq!(loaded.records.load(Ordering::Relaxed), 100_000);
+        assert_eq!(loaded.current().distinct.load(Ordering::Relaxed), 1);
+        assert_eq!(loaded.fill(), seen.fill());
+
+        // A damaged, cut or extended file, or another layout, is not read.
+        let mut damaged = bytes.clone();
+        damaged[100] ^= 1;
+        assert!(SeenHolders::decode(&damaged).is_none());
+        assert!(SeenHolders::decode(&bytes[..bytes.len() - 1]).is_none());
+        assert!(SeenHolders::decode(&[]).is_none());
+        let mut other = bytes[..bytes.len() - 32].to_vec();
+        other[0] = SEEN_FORMAT + 1;
+        let check = blake3::hash(&other);
+        other.extend_from_slice(check.as_bytes());
+        assert!(SeenHolders::decode(&other).is_none());
+    }
+
+    /// Both generations are kept across a save: a proof from before a
+    /// turnover is still read after a restart.
+    #[test]
+    fn both_generations_survive_a_restart() {
+        let seen = SeenHolders::default();
+        let key = [7u8; 32];
+        seen.record(&peer(1), &key);
+        let first = seen.current();
+        let mut n = 0u64;
+        while Arc::ptr_eq(&seen.current(), &first) {
+            seen.record(&peer(3), &numbered(n));
+            n += 1;
+        }
+        let loaded = SeenHolders::decode(&seen.encode_if_changed().unwrap()).unwrap();
+        assert!(
+            loaded.may_have_seen(&peer(1), &key),
+            "the previous generation"
+        );
+        assert!(
+            loaded.may_have_seen(&peer(3), &numbered(n - 1)),
+            "the current"
+        );
+        assert!(loaded.generations.read().previous.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_saved_record_is_loaded_at_start_and_a_bad_file_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let fresh = SeenHolders::load(dir.path());
+        assert!(!fresh.may_have_seen(&peer(1), &key), "no file: empty");
+        fresh.record(&peer(1), &key);
+        fresh.save(dir.path()).await;
+        assert!(dir.path().join(SEEN_FILE).exists());
+        assert!(!dir.path().join("seen_holders.bin.tmp").exists());
+        let loaded = SeenHolders::load(dir.path());
+        assert!(
+            loaded.may_have_seen(&peer(1), &key),
+            "kept across a restart"
+        );
+
+        std::fs::write(dir.path().join(SEEN_FILE), b"not a record").unwrap();
+        let empty = SeenHolders::load(dir.path());
+        assert!(!empty.may_have_seen(&peer(1), &key), "a bad file: empty");
     }
 
     fn case<'a>(peer: &'a PeerId, key: &'a XorName, lane: Lane) -> UnheldCase<'a> {
