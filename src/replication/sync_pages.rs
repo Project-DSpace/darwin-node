@@ -18,8 +18,9 @@
 //! ([`ReceivedHints`]).
 //!
 //! Hints for a peer that come to more than one exchange carries are sent a
-//! window at a time ([`WindowStart`]): each exchange with the peer, as
-//! requester or responder, takes the next keys of each list, round and round.
+//! window at a time ([`WindowStart`]): each exchange with the peer takes the
+//! next keys of each list, round and round, from a window kept for each role
+//! this node has in the exchange ([`SyncRole`]).
 //! The window moves on by the keys that were delivered ([`WindowCut::commit`]),
 //! so an exchange that ends part way leaves the rest of its window to the next.
 //!
@@ -118,8 +119,24 @@ pub(crate) struct SyncPeers {
     received: Arc<ReceivedHints>,
 }
 
-/// Where the next window of each peer's hints starts.
-type Windows = Arc<Mutex<HashMap<PeerId, PeerWindow>>>;
+/// Where the next window of each peer's hints starts, for each role this node
+/// sends them in.
+type Windows = Arc<Mutex<HashMap<(PeerId, SyncRole), PeerWindow>>>;
+
+/// The role in which this node sends a peer its hints. Each role cuts its own
+/// window of them: a node and its peer often sync each other at the same
+/// time, and a shared window would let the later exchange's cut pass over
+/// the keys the earlier one didn't deliver. Exchanges in one role don't
+/// overlap: one exchange with a peer at a time as requester
+/// ([`SyncPeers::try_start`]), and one request of a peer at a time as
+/// responder (its admission).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SyncRole {
+    /// This node's own exchange with the peer.
+    Requester,
+    /// This node's answer to the peer's exchange.
+    Responder,
+}
 
 /// Where the next window of a peer's hints starts, and how many exchanges in a
 /// row delivered none of their window.
@@ -137,6 +154,7 @@ struct PeerWindow {
 pub(crate) struct WindowCut {
     windows: Windows,
     peer: PeerId,
+    role: SyncRole,
     start: WindowStart,
     next: WindowStart,
     /// Keys of each list the window took, and the list's length.
@@ -155,7 +173,7 @@ impl WindowCut {
         let replica = replica.min(self.replica.0);
         let paid = paid.min(self.paid.0);
         let mut windows = self.windows.lock();
-        let Some(window) = windows.get_mut(&self.peer) else {
+        let Some(window) = windows.get_mut(&(self.peer, self.role)) else {
             return;
         };
         if window.start != self.next {
@@ -266,12 +284,13 @@ impl SyncPeers {
     /// The hints this node sends `peer` in one exchange, of at most
     /// `max_keys` keys: all of them, or, when they come to more, the next
     /// window of them ([`PeerSyncHints::window`]), from where the last
-    /// exchange with the peer, as requester or responder, left off, with the
-    /// cut to [`WindowCut::commit`] once the exchange ends. Logs a warning
-    /// with both counts when the hints don't all fit.
+    /// exchange with the peer in `role` left off, with the cut to
+    /// [`WindowCut::commit`] once the exchange ends. Logs a warning with both
+    /// counts when the hints don't all fit.
     pub(crate) fn window(
         &self,
         peer: &PeerId,
+        role: SyncRole,
         hints: PeerSyncHints,
         max_keys: usize,
     ) -> (PeerSyncHints, Option<WindowCut>) {
@@ -281,7 +300,8 @@ impl SyncPeers {
             return (hints, None);
         }
         let mut windows = self.windows.lock();
-        let kept = windows.get(peer).copied().unwrap_or_else(|| {
+        let key = (*peer, role);
+        let kept = windows.get(&key).copied().unwrap_or_else(|| {
             // A peer's first window starts at a random place, so a node that
             // restarts doesn't send the same keys first every time.
             let mut rng = rand::thread_rng();
@@ -296,13 +316,13 @@ impl SyncPeers {
         let start = kept.start;
         let (window, next) = hints.window(max_keys, start);
         let cut = next.map(|next| {
-            if windows.len() >= MAX_PEERS_KEPT && !windows.contains_key(peer) {
+            if windows.len() >= MAX_PEERS_KEPT && !windows.contains_key(&key) {
                 if let Some(evicted) = windows.keys().next().copied() {
                     windows.remove(&evicted);
                 }
             }
             windows.insert(
-                *peer,
+                key,
                 PeerWindow {
                     start: next,
                     stalls: kept.stalls,
@@ -311,6 +331,7 @@ impl SyncPeers {
             WindowCut {
                 windows: Arc::clone(&self.windows),
                 peer: *peer,
+                role,
                 start,
                 next,
                 replica: (window.replica.len(), replica_total),
@@ -337,7 +358,9 @@ impl SyncPeers {
     /// Forget a peer that left the routing table.
     pub(crate) fn forget(&self, peer: &PeerId) {
         self.single_next.lock().remove(peer);
-        self.windows.lock().remove(peer);
+        let mut windows = self.windows.lock();
+        windows.remove(&(*peer, SyncRole::Requester));
+        windows.remove(&(*peer, SyncRole::Responder));
     }
 }
 
@@ -857,7 +880,7 @@ mod tests {
             bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
             let id = PeerId::from_bytes(bytes);
             peers.mark_single_next(id);
-            let _cut = peers.window(&id, hints(3, 0), 2);
+            let _cut = peers.window(&id, SyncRole::Requester, hints(3, 0), 2);
         }
         assert_eq!(peers.single_next.lock().len(), MAX_PEERS_KEPT);
         assert_eq!(peers.windows.lock().len(), MAX_PEERS_KEPT);
@@ -887,7 +910,7 @@ mod tests {
         let (mut replica_seen, mut paid_seen) = (HashSet::new(), HashSet::new());
         // 213 replica and 43 paid hints a window: 3 windows go round both.
         for _ in 0..3 {
-            let (window, cut) = peers.window(&a, all.clone(), max_keys);
+            let (window, cut) = peers.window(&a, SyncRole::Requester, all.clone(), max_keys);
             cut.expect("cut")
                 .commit(window.replica.len(), window.paid.len());
             assert_eq!(window.replica.len() + window.paid.len(), max_keys);
@@ -900,7 +923,7 @@ mod tests {
 
         // Hints that fit go whole, and leave the peer's window where it was.
         let few = hints(10, 5);
-        let (sent, cut) = peers.window(&a, few.clone(), max_keys);
+        let (sent, cut) = peers.window(&a, SyncRole::Requester, few.clone(), max_keys);
         assert!(cut.is_none());
         assert_eq!((sent.replica, sent.paid), (few.replica, few.paid));
     }
@@ -932,10 +955,10 @@ mod tests {
 
         // Stopped after 3 pages: 12 replica keys delivered, no paid ones.
         let peers = SyncPeers::default();
-        let (window, cut) = peers.window(&a, all.clone(), 256);
+        let (window, cut) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
         let first = starts_of(&all, &window);
         cut.expect("cut").commit_pages(&window, 3, page_keys);
-        let (window, cut) = peers.window(&a, all.clone(), 256);
+        let (window, cut) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
         assert_eq!(
             starts_of(&all, &window),
             ((first.0 + 12) % 500, first.1),
@@ -946,7 +969,7 @@ mod tests {
         let start = starts_of(&all, &window);
         cut.expect("cut")
             .commit(window.replica.len(), window.paid.len());
-        let (window, cut) = peers.window(&a, all.clone(), 256);
+        let (window, cut) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
         assert_eq!(
             starts_of(&all, &window),
             ((start.0 + 213) % 500, (start.1 + 43) % 100)
@@ -956,11 +979,11 @@ mod tests {
         let start = starts_of(&all, &window);
         cut.expect("cut").commit(0, 0);
         for _ in 1..STALLS_BEFORE_SHIFT {
-            let (window, cut) = peers.window(&a, all.clone(), 256);
+            let (window, cut) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
             assert_eq!(starts_of(&all, &window), start);
             cut.expect("cut").commit(0, 0);
         }
-        let (window, _) = peers.window(&a, all.clone(), 256);
+        let (window, _) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
         let shifted = starts_of(&all, &window);
         // 213 replica and 43 paid keys a window: at most one key of each.
         assert_eq!(
@@ -969,16 +992,62 @@ mod tests {
             "moved on a little after the stalls"
         );
 
-        // A cut made while another exchange's is out isn't moved back by
-        // the earlier one.
+        // Cuts in one role don't overlap (one exchange with a peer at a
+        // time); should two, a cut made since isn't moved back by the
+        // earlier one.
         let peers = SyncPeers::default();
-        let (window, first_cut) = peers.window(&a, all.clone(), 256);
+        let (window, first_cut) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
         let start = starts_of(&all, &window);
-        let (_, second_cut) = peers.window(&a, all.clone(), 256);
+        let (_, second_cut) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
         first_cut.expect("cut").commit(0, 0);
         second_cut.expect("cut").commit(213, 43);
-        let (window, _) = peers.window(&a, all.clone(), 256);
+        let (window, _) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
         assert_eq!(starts_of(&all, &window).0, (start.0 + 426) % 500);
+    }
+
+    /// A node and its peer syncing each other at once cut windows in both
+    /// roles: each role goes on from its own window, so the keys the first
+    /// exchange didn't deliver go first in the next exchange in its role,
+    /// whatever the other role's exchange delivered meanwhile.
+    #[test]
+    fn overlapping_cuts_in_both_roles_keep_each_roles_undelivered_keys() {
+        let page_keys = 4;
+        let all = hints(500, 100);
+        let a = peer(1);
+        let peers = SyncPeers::default();
+
+        let (requested, requester_cut) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
+        let requester_start = starts_of(&all, &requested);
+        let (served, responder_cut) = peers.window(&a, SyncRole::Responder, all.clone(), 256);
+        let responder_start = starts_of(&all, &served);
+
+        // The requester's exchange delivers 3 pages of its window; the
+        // responder's, cut meanwhile, all of its own.
+        requester_cut
+            .expect("cut")
+            .commit_pages(&requested, 3, page_keys);
+        responder_cut
+            .expect("cut")
+            .commit(served.replica.len(), served.paid.len());
+
+        let (requested, _) = peers.window(&a, SyncRole::Requester, all.clone(), 256);
+        assert_eq!(
+            starts_of(&all, &requested),
+            ((requester_start.0 + 12) % 500, requester_start.1),
+            "the requester's undelivered keys go first in its next window"
+        );
+        let (served, _) = peers.window(&a, SyncRole::Responder, all.clone(), 256);
+        assert_eq!(
+            starts_of(&all, &served),
+            (
+                (responder_start.0 + 213) % 500,
+                (responder_start.1 + 43) % 100
+            ),
+            "the responder's window went on by all it delivered"
+        );
+
+        peers.forget(&a);
+        assert!(peers.windows.lock().is_empty(), "both roles forgotten");
     }
 
     /// A responder's set moves the requester's window on by the pages the
@@ -991,7 +1060,7 @@ mod tests {
         let sets = ServedHintSets::new(1 << 20);
         let now = Instant::now();
 
-        let (window, cut) = peers.window(&a, all.clone(), 512);
+        let (window, cut) = peers.window(&a, SyncRole::Requester, all.clone(), 512);
         let start = starts_of(&all, &window).0;
         sets.insert(
             a,
@@ -1012,7 +1081,7 @@ mod tests {
         // The requester gave up after its request for page 4: pages 0 to 3
         // arrived.
         assert!(sets.get(&a, 5, now + IDLE * 2, IDLE).is_none());
-        let (window, _) = peers.window(&a, all.clone(), 512);
+        let (window, _) = peers.window(&a, SyncRole::Requester, all.clone(), 512);
         assert_eq!(starts_of(&all, &window).0, (start + 8) % 600);
     }
 

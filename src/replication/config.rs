@@ -1236,6 +1236,17 @@ impl ReplicationConfig {
         self.neighbor_sync_page_timeout / 2
     }
 
+    /// How long a single sync request from a peer that reads pages may wait
+    /// for a responder worker before it is answered busy: half the
+    /// requester's wait ([`Self::verification_request_timeout`]), by the same
+    /// rule as a page, so the busy answer reaches a requester still waiting
+    /// for it. A request from an older release, which can't read a busy
+    /// answer, is dropped only once the whole wait has passed.
+    #[must_use]
+    pub fn neighbor_sync_single_stale_after(&self) -> Duration {
+        self.verification_request_timeout / 2
+    }
+
     /// Maximum age of an outstanding bootstrap capacity-rejection record.
     ///
     /// A source is revisited only after the round-robin loop has advanced
@@ -1688,6 +1699,20 @@ mod tests {
             ..ReplicationConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_waiting_sync_request_is_stale_at_half_its_requesters_wait() {
+        let config = ReplicationConfig::default();
+        assert_eq!(
+            config.neighbor_sync_page_stale_after(),
+            config.neighbor_sync_page_timeout / 2
+        );
+        assert_eq!(
+            config.neighbor_sync_single_stale_after(),
+            config.verification_request_timeout / 2
+        );
+        assert!(config.neighbor_sync_single_stale_after() < config.verification_request_timeout);
     }
 
     #[test]

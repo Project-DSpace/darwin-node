@@ -965,7 +965,12 @@ pub(crate) async fn exchange(
     sync_peers: &SyncPeers,
 ) -> SyncExchange {
     let all_keys = hints.key_count();
-    let (hints, cut) = sync_peers.window(peer, hints, max_exchange_keys(form));
+    let (hints, cut) = sync_peers.window(
+        peer,
+        sync_pages::SyncRole::Requester,
+        hints,
+        max_exchange_keys(form),
+    );
     let exchange = match form {
         SyncForm::Single => {
             exchange_single(peer, p2p_node, config, is_bootstrapping, hints, commitment).await
@@ -1338,7 +1343,7 @@ async fn exchange_paged(
                         sync_peers.mark_single_next(*peer);
                     } else {
                         debug!(
-                            "Neighbor sync with {peer}: first page {unanswered:?}; it pages                              again next cycle"
+                            "Neighbor sync with {peer}: first page {unanswered:?}; it pages again next cycle"
                         );
                     }
                 }

@@ -722,3 +722,90 @@ async fn a_single_request_refused_at_admission_is_answered_busy_to_a_paging_peer
 
     harness.teardown().await.expect("teardown");
 }
+
+/// How long past its stale limit a test request is left waiting for a worker.
+const WAITED_PAST_STALE: Duration = Duration::from_secs(1);
+
+/// A single request from a peer that reads pages, left waiting for a worker
+/// past half its requester's wait, is answered busy while the requester, which
+/// waits the whole verification request timeout as a sync requester does,
+/// still waits: the responder is charged nothing. A request from an older
+/// release, left waiting as long, is still served, since it is dropped only
+/// once its requester's whole wait has passed.
+#[tokio::test]
+#[serial]
+async fn a_single_request_that_waited_too_long_is_answered_busy_to_a_paging_peer() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let responder = peer_of(&harness, RESPONDER);
+    let requester = harness
+        .test_node(REQUESTER)
+        .and_then(|node| node.p2p_node.as_ref())
+        .expect("requester");
+    let engine = harness
+        .test_node(RESPONDER)
+        .and_then(|node| node.replication_engine.as_ref())
+        .expect("engine");
+    let config = ReplicationConfig::default();
+    let stale_after = config.neighbor_sync_single_stale_after();
+    let requester_wait = config.verification_request_timeout;
+    let own = own_release();
+
+    // Connected, so the responder knows the requester's agent.
+    let _ = ask(requester, &responder, single_request()).await;
+
+    let ask_held = |release: u64| async move {
+        let _from = Seam::set(SYNC_PAGES_FROM_RELEASE, &release.to_string());
+        let held = engine.hold_neighbor_sync_workers();
+        assert!(!held.is_empty());
+        let release_workers = async move {
+            tokio::time::sleep(stale_after + WAITED_PAST_STALE).await;
+            drop(held);
+        };
+        let encoded = ReplicationMessage {
+            request_id: rand::random(),
+            body: single_request(),
+        }
+        .encode()
+        .expect("encode");
+        let asked = Instant::now();
+        let (answer, ()) = tokio::join!(
+            requester.send_request(&responder, REPLICATION_PROTOCOL_ID, encoded, requester_wait),
+            release_workers
+        );
+        let answer = answer.expect("answered within the requester's wait");
+        (
+            ReplicationMessage::decode(&answer.data)
+                .expect("decode")
+                .body,
+            asked.elapsed(),
+        )
+    };
+
+    let trust_before = requester.peer_trust(&responder);
+    let (answer, elapsed) = ask_held(own).await;
+    assert!(
+        matches!(
+            answer,
+            ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy { .. })
+        ),
+        "{answer:?}"
+    );
+    assert!(
+        elapsed >= stale_after,
+        "answered busy at dequeue, not at admission: {elapsed:?}"
+    );
+    let trust_after = requester.peer_trust(&responder);
+    assert!(
+        (trust_after - trust_before).abs() < TRUST_TOLERANCE,
+        "the requester's trust in the responder moved from {trust_before} to {trust_after}"
+    );
+
+    let (answer, _) = ask_held(own + 1).await;
+    assert!(
+        matches!(answer, ReplicationMessageBody::NeighborSyncResponse(_)),
+        "an older release's request is served until its requester's wait has passed: {answer:?}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}

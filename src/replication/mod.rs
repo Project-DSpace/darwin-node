@@ -99,7 +99,9 @@ use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
 use crate::replication::storage_commitment_audit::PointerBindings;
-use crate::replication::sync_pages::{HeldProofs, ServedHintSets, ServedHints, SyncPeers};
+use crate::replication::sync_pages::{
+    HeldProofs, ServedHintSets, ServedHints, SyncPeers, SyncRole,
+};
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
@@ -2207,6 +2209,20 @@ impl ReplicationEngine {
         let mut held = Vec::new();
         while let Ok(permit) =
             Arc::clone(&self.neighbor_sync_responder_admission_semaphore).try_acquire_owned()
+        {
+            held.push(permit);
+        }
+        held
+    }
+
+    /// Test-only: take every neighbour-sync responder worker, so that admitted
+    /// sync requests wait for a worker until the permits are dropped.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn hold_neighbor_sync_workers(&self) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut held = Vec::new();
+        while let Ok(permit) =
+            Arc::clone(&self.neighbor_sync_responder_worker_semaphore).try_acquire_owned()
         {
             held.push(permit);
         }
@@ -4403,7 +4419,7 @@ impl ReplicationEngine {
                             planned.push((peer, hints_left.remove(&peer), turn));
                         } else {
                             debug!(
-                                "Bootstrap sync with {peer}: an exchange with it is in                                  progress already; trying again shortly"
+                                "Bootstrap sync with {peer}: an exchange with it is in progress already; trying again shortly"
                             );
                             skipped.push(peer);
                         }
@@ -7200,6 +7216,7 @@ async fn dispatch_neighbor_sync_request(
     let repair_proofs = Arc::clone(&ctx.repair_proofs);
     let sync_peers = Arc::clone(&ctx.sync_peers);
     let request_timeout = ctx.config.verification_request_timeout;
+    let single_stale_after = ctx.config.neighbor_sync_single_stale_after();
     let rr_message_id = rr_message_id.map(ToOwned::to_owned);
     let busy_ctx = ctx.clone();
     ctx.detached_task_tracker.spawn(async move {
@@ -7211,11 +7228,21 @@ async fn dispatch_neighbor_sync_request(
             );
             return;
         };
-        if request_is_stale(received_at, request_timeout) {
+        // A requester that reads pages is answered busy once its request has
+        // waited half its wait, so the answer reaches it while it still
+        // waits. An older requester can't read a busy answer: its request is
+        // dropped only once the whole wait has passed, and served before.
+        let stale = if request_is_stale(received_at, single_stale_after) {
+            let reads_pages = peer_reads_sync_pages(&p2p_node, &source).await;
+            (reads_pages || request_is_stale(received_at, request_timeout)).then_some(reads_pages)
+        } else {
+            None
+        };
+        if let Some(reads_pages) = stale {
             audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::NeighborSync);
             drop(worker_permit);
             drop(guard);
-            if peer_reads_sync_pages(&p2p_node, &source).await {
+            if reads_pages {
                 debug!(
                     responder_class = "neighbor_sync",
                     source = %source,
@@ -7325,6 +7352,7 @@ async fn handle_neighbor_sync_request(
     .await;
     let (hints, cut) = sync_peers.window(
         source,
+        SyncRole::Responder,
         hints,
         neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Single),
     );
@@ -7831,6 +7859,7 @@ async fn build_served_hints(
     let all_keys = hints.key_count();
     let (mut hints, cut) = ctx.sync_peers.window(
         source,
+        SyncRole::Responder,
         hints,
         neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Paged),
     );

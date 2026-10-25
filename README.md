@@ -315,9 +315,11 @@ never ran.
   next sent only once the last is answered, up to 256 pages a side, and one
   exchange at a time with each neighbour. Hints for a neighbour that come to
   more than one exchange carries (256 pages, or the 9 MiB of keys of a
-  single message) go a window at a time: each exchange with that neighbour,
-  as requester or responder, carries the next keys of each list, each list
-  its share in proportion to its length, round and round. The window moves
+  single message) go a window at a time: each exchange with that neighbour
+  carries the next keys of each list, each list its share in proportion to
+  its length, round and round, the node keeping one window as requester and
+  another as responder, so two exchanges at once in both roles don't pass
+  over each other's undelivered keys. The window moves
   on by the keys that arrived (the requester's on the pages the responder
   answered, the responder's on the pages the requester's later requests
   show arrived, and a single message's once it is answered or sent), so
@@ -341,10 +343,12 @@ never ran.
   refused at admission (1 a peer, 8 in all, as before), left waiting
   15 seconds for a worker, or of an exchange whose hints it doesn't hold, is
   answered busy: the requester ends the exchange and syncs again in a later
-  cycle. So is a single request refused at admission or left waiting, when
-  the requester's agent names a release that reads pages (one falling back
-  to a single message after an unanswered page); a requester of an older
-  release gets no answer, as before. Pages go on the peer's connection without trust reporting, so
+  cycle. So is a single request refused at admission or left waiting 7.5
+  seconds for a worker (half the requester's 15-second wait, so the answer
+  reaches it while it waits), when the requester's agent names a release
+  that reads pages (one falling back to a single message after an
+  unanswered page); a requester of an older release gets no answer, as
+  before, and its request is dropped only once it has waited 15 seconds. Pages go on the peer's connection without trust reporting, so
   silence, a timeout or an answer that doesn't decode never counts against
   the responder. A requester waits 30 seconds for each page, sync's own
   deadline. Only a complete exchange puts the neighbour on the sync
