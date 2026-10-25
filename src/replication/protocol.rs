@@ -3070,6 +3070,43 @@ mod tests {
         }
     }
 
+    /// Every body has an index of its own, the indexes run 0 to
+    /// `N_REPLICATION_VARIANTS - 1` with no gap, and every index past ds.15's
+    /// last (22) fails to decode on a ds.15 node: a message appended for the
+    /// next release can't be read there as an older one, and is sent only to
+    /// peers known to read it. A branch that appends a message of its own
+    /// takes the next free index after every branch merged before it, and
+    /// re-pins its bytes in `tests/wire_format.rs`.
+    #[test]
+    fn every_body_index_is_distinct_and_unreadable_before_its_release() {
+        let indexes: Vec<usize> = all_bodies()
+            .into_iter()
+            .map(|body| body.variant_index())
+            .collect();
+        let distinct: std::collections::BTreeSet<usize> = indexes.iter().copied().collect();
+        assert_eq!(distinct.len(), indexes.len(), "two bodies share an index");
+        assert_eq!(
+            distinct.into_iter().collect::<Vec<_>>(),
+            (0..N_REPLICATION_VARIANTS).collect::<Vec<_>>()
+        );
+        for body in all_bodies() {
+            let index = body.variant_index();
+            if index <= 22 {
+                continue;
+            }
+            let encoded = ReplicationMessage {
+                request_id: 7,
+                body,
+            }
+            .encode()
+            .expect("encode");
+            assert!(
+                postcard::from_bytes::<before_full_notice::Message>(&encoded).is_err(),
+                "index {index} must not decode on a ds.15 node"
+            );
+        }
+    }
+
     /// The notice's bytes: the request id, the body's index 23, the flag.
     #[test]
     fn a_full_notice_keeps_its_bytes() {

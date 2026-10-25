@@ -18,6 +18,11 @@
 //!    node that said "present" doesn't say "not found" inside that window.
 //!
 //! A record that is no longer eligible leaves the set, and is hinted again.
+//! So does one whose possession check failed ([`ErasureGate::fail`]): its
+//! close group lacks copies, and this node's hint is what lets the group
+//! fetch it back. It is then left unselected for [`RETRY_COOLDOWN_EPOCHS`],
+//! so it is hinted for at least a whole cycle before it is selected, hidden
+//! and tried again.
 //!
 //! The clock that starts when a record or pointer leaves the node's range is
 //! kept, in wall-clock seconds, in a small database of its own
@@ -64,6 +69,17 @@ const MAX_ANSWERED_PRESENT: usize = 1 << 16;
 /// must pass.
 pub const EPOCHS_BEFORE_ERASURE: u64 = 2;
 
+/// How many sync epochs a key whose possession check failed stays out of the
+/// selection, and so is hinted: one whole sync cycle plus
+/// [`EPOCHS_BEFORE_ERASURE`].
+///
+/// The cycle running as the check fails may have built its hints already,
+/// without the key (the reason for [`EPOCHS_BEFORE_ERASURE`]); the whole
+/// cycle after that hints it to the close group, which may fetch it back; and
+/// one more lets the group's own syncs settle before this node selects it,
+/// hides it and tries again.
+pub const RETRY_COOLDOWN_EPOCHS: u64 = EPOCHS_BEFORE_ERASURE + 1;
+
 /// The keys a node is erasing, records and pointers apart, and the keys it
 /// lately answered "present" for.
 #[derive(Debug, Default)]
@@ -72,6 +88,12 @@ pub struct ErasureGate {
     records: Mutex<HashMap<XorName, u64>>,
     /// Each pointer being erased, likewise.
     pointers: Mutex<HashMap<XorName, u64>>,
+    /// Each record whose possession check failed, with the sync epoch it
+    /// failed in: left out of the selection, so hinted, for
+    /// [`RETRY_COOLDOWN_EPOCHS`].
+    records_cooling: Mutex<HashMap<XorName, u64>>,
+    /// Each pointer whose check failed, likewise.
+    pointers_cooling: Mutex<HashMap<XorName, u64>>,
     /// When this node last answered "present" for each key.
     answered: Mutex<AnsweredPresent>,
 }
@@ -92,6 +114,13 @@ impl ErasureGate {
         }
     }
 
+    fn cooling_of(&self, kind: ClockKind) -> &Mutex<HashMap<XorName, u64>> {
+        match kind {
+            ClockKind::Records => &self.records_cooling,
+            ClockKind::Pointers => &self.pointers_cooling,
+        }
+    }
+
     /// Whether `key` is being erased, as a record or a pointer: selected, so
     /// named in no hint.
     #[must_use]
@@ -104,7 +133,9 @@ impl ErasureGate {
     /// try them.
     ///
     /// Keys of `kind` no longer eligible leave the set. Eligible keys not yet
-    /// selected are selected, at most `max_new` of them, in order. Returns the
+    /// selected are selected, at most `max_new` of them, in order, except
+    /// those whose check failed fewer than [`RETRY_COOLDOWN_EPOCHS`] epochs
+    /// before ([`Self::fail`]), which stay hinted meanwhile. Returns the
     /// eligible keys selected [`EPOCHS_BEFORE_ERASURE`] or more epochs before,
     /// in order: those a whole cycle has passed without hinting, which the
     /// pass may now check and erase.
@@ -115,8 +146,12 @@ impl ErasureGate {
         epoch: u64,
         max_new: usize,
     ) -> Vec<XorName> {
-        let mut selected = self.of(kind).lock();
         let keep: HashSet<&XorName> = eligible.iter().collect();
+        let mut cooling = self.cooling_of(kind).lock();
+        cooling.retain(|key, failed_at| {
+            keep.contains(key) && failed_at.saturating_add(RETRY_COOLDOWN_EPOCHS) > epoch
+        });
+        let mut selected = self.of(kind).lock();
         selected.retain(|key, _| keep.contains(key));
         let mut ready = Vec::new();
         let mut added = 0usize;
@@ -128,7 +163,7 @@ impl ErasureGate {
                     }
                 }
                 None => {
-                    if added < max_new {
+                    if added < max_new && !cooling.contains_key(key) {
                         selected.insert(*key, epoch);
                         added += 1;
                     }
@@ -141,6 +176,15 @@ impl ErasureGate {
     /// Forget `key` of `kind`: erased, or kept after all.
     pub fn release(&self, kind: ClockKind, key: &XorName) {
         self.of(kind).lock().remove(key);
+    }
+
+    /// `key` of `kind` failed its possession check at sync epoch `epoch`: its
+    /// close group lacks copies. It leaves the set, so it is hinted again and
+    /// the group can fetch it from this node, and it is not selected again
+    /// before [`RETRY_COOLDOWN_EPOCHS`] have passed.
+    pub fn fail(&self, kind: ClockKind, key: &XorName, epoch: u64) {
+        self.of(kind).lock().remove(key);
+        self.cooling_of(kind).lock().insert(*key, epoch);
     }
 
     /// How many keys of `kind` are being erased.
@@ -483,6 +527,71 @@ mod tests {
         assert_eq!(gate.select(R, &eligible, 2, 4).len(), 0);
         assert_eq!(gate.selected_count(), 8);
         assert_eq!(gate.select(R, &eligible, 3, 4).len(), 4);
+    }
+
+    #[test]
+    fn the_retry_cooldown_is_a_whole_cycle_after_the_two_phase_wait() {
+        assert_eq!(RETRY_COOLDOWN_EPOCHS, 3);
+    }
+
+    /// A key whose possession check failed is hinted again at once, stays
+    /// hinted (not selected) for the cooldown, and is then selected again.
+    fn a_failed_key_is_hinted_through_its_cooldown_then_selected_again(kind: ClockKind) {
+        let gate = ErasureGate::default();
+        let eligible = vec![key(1), key(2)];
+        // Selected at 10, ready at 12.
+        gate.select(kind, &eligible, 10, 10);
+        assert!(gate.is_being_erased(&key(1)));
+        assert_eq!(gate.select(kind, &eligible, 12, 10), eligible);
+        // Its check fails at 12: no longer hidden.
+        gate.fail(kind, &key(1), 12);
+        assert!(
+            !gate.is_being_erased(&key(1)),
+            "hinted again after the failure"
+        );
+        assert!(gate.is_being_erased(&key(2)));
+        // Still eligible, with budget to spare, but cooling: not selected.
+        for epoch in 12..12 + RETRY_COOLDOWN_EPOCHS {
+            assert_eq!(gate.select(kind, &eligible, epoch, 10), vec![key(2)]);
+            assert!(
+                !gate.is_being_erased(&key(1)),
+                "visible through the cooldown, at {epoch}"
+            );
+        }
+        // Then selected, hidden, and tried again two epochs later.
+        let again = 12 + RETRY_COOLDOWN_EPOCHS;
+        assert_eq!(gate.select(kind, &eligible, again, 10), vec![key(2)]);
+        assert!(
+            gate.is_being_erased(&key(1)),
+            "selected again after the cooldown"
+        );
+        assert_eq!(
+            gate.select(kind, &eligible, again + EPOCHS_BEFORE_ERASURE, 10),
+            eligible
+        );
+    }
+
+    #[test]
+    fn a_record_whose_audit_failed_is_hinted_through_its_cooldown_then_selected_again() {
+        a_failed_key_is_hinted_through_its_cooldown_then_selected_again(R);
+    }
+
+    #[test]
+    fn a_pointer_left_unproven_is_hinted_through_its_cooldown_then_selected_again() {
+        a_failed_key_is_hinted_through_its_cooldown_then_selected_again(P);
+    }
+
+    #[test]
+    fn a_cooling_key_no_longer_eligible_is_forgotten() {
+        let gate = ErasureGate::default();
+        gate.select(R, &[key(1)], 1, 10);
+        gate.fail(R, &key(1), 3);
+        // Leaves eligibility (back in range, or erased elsewhere), then comes
+        // back: a fresh candidate, selected at once.
+        gate.select(R, &[], 4, 10);
+        gate.select(R, &[key(1)], 4, 10);
+        assert!(gate.is_being_erased(&key(1)));
+        assert_eq!(gate.records_cooling.lock().len(), 0);
     }
 
     #[test]

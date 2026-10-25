@@ -125,15 +125,21 @@ pub(crate) async fn send_fresh_offers(
     // Use the self-inclusive query to get the true close group, then filter
     // self out. One more for each peer marked full inside it: the
     // nearest beyond stand in for it, at most 20 in all.
-    let target_peers: Vec<PeerId> = crate::replication::full::widened_close_group(
+    let widened = crate::replication::full::widened_close_group(
         &ctx.p2p_node,
         key,
         ctx.config.close_group_size,
     )
-    .await
-    .into_iter()
-    .filter(|peer| *peer != self_id)
-    .collect();
+    .await;
+    // The stand-ins: past the unwidened storage admission width (9 nearest,
+    // the node itself counted), where a receiver that doesn't widen (an
+    // older node, or one without the same marks) rightly refuses the offer.
+    // The possession check doesn't charge them for not holding the record.
+    let stand_ins = stand_ins_of(&widened, ctx.config.close_group_size);
+    let target_peers: Vec<PeerId> = widened
+        .into_iter()
+        .filter(|peer| *peer != self_id)
+        .collect();
     // The paid quotes' issuers, for the possession check: a full peer paid for
     // the record is charged for not holding it.
     let paid_quote_issuers = crate::replication::full::paid_quote_issuers(&proof_of_payment);
@@ -220,8 +226,23 @@ pub(crate) async fn send_fresh_offers(
             key: *key,
             peers: target_peers,
             paid_quote_issuers,
+            stand_ins,
         });
     }
+}
+
+/// The peers of `widened`, a key's close group widened past the peers marked
+/// full (nearest first, this node included), beyond the unwidened storage
+/// admission width: the stand-ins for full peers, which a receiver that
+/// doesn't widen refuses.
+fn stand_ins_of(widened: &[PeerId], close_group_size: usize) -> Vec<PeerId> {
+    widened
+        .iter()
+        .skip(crate::replication::config::storage_admission_width(
+            close_group_size,
+        ))
+        .copied()
+        .collect()
 }
 
 /// Send `PaidNotify(K)` to every peer in `PaidCloseGroup(K)` (fire-and-forget).
@@ -279,6 +300,16 @@ async fn send_paid_notify(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Ranks 1 to 9 of the widened group are inside every receiver's
+    /// admission width; ranks 10 and beyond are stand-ins.
+    #[test]
+    fn the_stand_ins_are_the_peers_past_the_nine_nearest() {
+        let peers: Vec<PeerId> = (1..=12u8).map(|n| PeerId::from_bytes([n; 32])).collect();
+        assert_eq!(stand_ins_of(&peers, 7), peers[9..].to_vec());
+        assert_eq!(stand_ins_of(&peers[..9], 7), Vec::<PeerId>::new());
+        assert_eq!(stand_ins_of(&peers[..7], 7), Vec::<PeerId>::new());
+    }
 
     /// The permit is released with the last handle to the encoded offer, not
     /// the first: a slice the transport still holds keeps the offer counted.

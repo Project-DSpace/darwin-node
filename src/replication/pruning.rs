@@ -318,6 +318,10 @@ struct RecordPruneLookupGroups {
     strict: Vec<PeerId>,
     /// Whether a peer marked full is inside the retention width.
     near_full_peer: bool,
+    /// How many peers other than this node the routing table returned for
+    /// the key, at most [`full::MAX_WIDENED_WIDTH`]: the bound
+    /// [`erase_proofs_needed`] keeps the bar at.
+    known_remote: usize,
 }
 
 struct RecordPruneKeyOutcome {
@@ -481,14 +485,19 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
     };
 
     // One aggregate line per pass: the full lifecycle census (never per-chunk).
-    let few_holders = full::view_for(ctx.self_id).take_few_holders();
+    let view = full::view_for(ctx.self_id);
+    let few_holders = view.take_few_holders();
+    // The record of keys peers were seen proving is sized from the records
+    // held, for its next generation.
+    view.seen.size_for_records(stored_count);
     info!(
         "{}",
         prune_pass_line_with(
             &result,
             record_stats.audit_requests,
             paid_count,
-            few_holders
+            few_holders,
+            view.seen.fill(),
         )
     );
 
@@ -502,11 +511,20 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
 /// range), the records selected and waiting to be erased (`being_erased=`),
 /// the held records with a peer marked full in their window
 /// (`near_full_peers=`), the keys verification found with fewer than 4
-/// holders since the last pass (`few_holders=`), and whether the node is full
-/// (`full=`); failed checks before erasure are `audit_below_threshold=`.
+/// holders since the last pass (`few_holders=`), how full the record of keys
+/// peers were seen proving is (`seen_fill=`, the share of its current
+/// generation's bits set) and its estimated rate of false "seen" answers
+/// (`seen_false=`), and whether the node is full (`full=`); failed checks
+/// before erasure are `audit_below_threshold=`.
 #[cfg(test)]
 fn prune_pass_line(result: &PruneResult, audit_requests: usize, paid_total: usize) -> String {
-    prune_pass_line_with(result, audit_requests, paid_total, 0)
+    prune_pass_line_with(
+        result,
+        audit_requests,
+        paid_total,
+        0,
+        full::SeenFill::default(),
+    )
 }
 
 /// [`prune_pass_line`], with the keys verification found with fewer than 4
@@ -517,13 +535,14 @@ fn prune_pass_line_with(
     audit_requests: usize,
     paid_total: usize,
     few_holders: u64,
+    seen: full::SeenFill,
 ) -> String {
     format!(
         "Prune pass complete: records total={} in_range={} newly_marked={} cleared={} \
          hysteresis_pending={} candidates={} held_by_commitment={} bootstrap_deferred={} \
          budget_deferred={} audits_attempted={} audit_requests={} audit_below_threshold={} \
          disk_pressure={} beyond_floor={} pruned={} floor_step={} being_erased={} \
-         near_full_peers={} few_holders={} full={}; \
+         near_full_peers={} few_holders={} seen_fill={:.3} seen_false={:.4} full={}; \
          paid total={} marked={} cleared={} pruned={}",
         result.records_total,
         result.records_in_range,
@@ -544,6 +563,8 @@ fn prune_pass_line_with(
         result.records_being_erased,
         result.records_near_full_peers,
         few_holders,
+        seen.fill,
+        seen.false_seen,
         u8::from(result.full),
         paid_total,
         result.paid_entries_marked,
@@ -675,12 +696,14 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         },
     )
     .await;
-    let gate = ctx.erasure_epoch.map(|_| erasure::gate_for(ctx.self_id));
+    let gate = ctx
+        .erasure_epoch
+        .map(|epoch| (erasure::gate_for(ctx.self_id), epoch));
     for (key, (verdict, erased)) in outcomes {
         if erased {
             stats.pruned += 1;
             failures.forget(&key);
-            if let Some(gate) = &gate {
+            if let Some((gate, _)) = &gate {
                 gate.release(erasure::ClockKind::Records, &key);
             }
         }
@@ -689,9 +712,20 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
                 stats.cleared += 1;
                 failures.forget(&key);
             }
-            Some(PruneRevalidationOutcome::AuditFailed) => {
-                stats.audit_below_threshold += 1;
+            Some(
+                verdict @ (PruneRevalidationOutcome::AuditFailed
+                | PruneRevalidationOutcome::Unauditable),
+            ) => {
+                if verdict == PruneRevalidationOutcome::AuditFailed {
+                    stats.audit_below_threshold += 1;
+                }
                 failures.record(&key);
+                // Its close group lacks proven copies: hinted again, so the
+                // group can fetch it from here, and tried again after the
+                // cooldown.
+                if let Some((gate, epoch)) = &gate {
+                    gate.fail(erasure::ClockKind::Records, &key, *epoch);
+                }
             }
             _ => {}
         }
@@ -783,7 +817,11 @@ async fn record_prune_lookup_groups(
         .iter()
         .map(|node: &DHTNode| node.peer_id)
         .collect();
-    widened_lookup_groups(&nearest, config, marked)
+    let self_id = p2p_node.peer_id();
+    RecordPruneLookupGroups {
+        known_remote: nearest.iter().filter(|peer| *peer != self_id).count(),
+        ..widened_lookup_groups(&nearest, config, marked)
+    }
 }
 
 /// The groups of [`record_prune_lookup_groups`] from `nearest`, self
@@ -805,6 +843,7 @@ fn widened_lookup_groups(
         near_full_peer: retention.iter().any(is_full),
         retention,
         strict: nearest.iter().take(strict_len).copied().collect(),
+        known_remote: nearest.len(),
     }
 }
 
@@ -1488,6 +1527,8 @@ async fn erase_if_still_eligible(
         storage_admission_peers: &groups.retention,
         strict_close_peers: &groups.strict,
         marked_full: &marked,
+        known_remote: groups.known_remote,
+        close_group_size: ctx.config.close_group_size,
         answered_present,
         now,
     };
@@ -1549,6 +1590,11 @@ struct PruneRevalidationInputs<'a> {
     strict_close_peers: &'a [PeerId],
     /// The peers marked full now.
     marked_full: &'a HashSet<PeerId>,
+    /// How many peers other than this node the routing table returned for
+    /// the key (see [`erase_proofs_needed`]).
+    known_remote: usize,
+    /// The close group's size.
+    close_group_size: usize,
     /// Whether this node answered "present" for the key within the fetch
     /// window.
     answered_present: bool,
@@ -1561,9 +1607,9 @@ struct PruneRevalidationInputs<'a> {
 /// hysteresis still holds, no retained commitment holds the key, the node is
 /// under disk pressure, the key is strictly beyond the erase floor, this node
 /// did not answer "present" for it within the fetch window, and at least
-/// [`prune_proofs_needed`] of the current strict close group's members not
-/// marked full supplied positive possession proofs, a full member's proof
-/// counting as any other's. Stale positive reports from peers no longer in
+/// [`erase_proofs_needed`] of the current strict close group's members
+/// supplied positive possession proofs, a full member's proof counting as any
+/// other's. Stale positive reports from peers no longer in
 /// the current close group never count, and nothing stands in for the proofs.
 fn revalidate_record_prune_candidate(
     candidate: &RecordPruneCandidate,
@@ -1608,12 +1654,13 @@ fn revalidate_record_prune_candidate(
 
     // Erasing near full peers needs the proofs of the members not marked
     // full: 6 of the 7 nearest such. A full member that holds the key still
-    // proves it; one that lacks it neither proves nor vetoes.
+    // proves it; one that lacks it neither proves nor vetoes. The bar never
+    // falls below 6 because the window's cap of 20 cut the group short.
     let not_full = current_target_peers
         .iter()
         .filter(|peer| !inputs.marked_full.contains(peer))
         .count();
-    let proofs_needed = prune_proofs_needed(not_full);
+    let proofs_needed = erase_proofs_needed(not_full, inputs.known_remote, inputs.close_group_size);
     if target_peers_reported_present(
         &candidate.key,
         &current_target_peers,
@@ -1686,6 +1733,34 @@ pub(crate) fn prune_proofs_needed(group_size: usize) -> usize {
     } else {
         group_size - 1
     }
+}
+
+/// Proofs required before erasing a key whose current strict close group,
+/// widened past the peers marked full, holds `not_full` peers not marked
+/// full, when the routing table returned `known_remote` peers other than this
+/// node for the key (at most [`full::MAX_WIDENED_WIDTH`]).
+///
+/// [`prune_proofs_needed`] of the members not marked full (6 of 7 at
+/// production parameters), and never fewer than [`prune_proofs_needed`] of
+/// the close group the routing table can fill: when the window's cap of 20
+/// leaves fewer than 7 members not marked full (14 or more of the 20 nearest
+/// marked), the bar stays at 6, with a full holder's proof counting as any
+/// other's. Peers announcing themselves full never lower how many proven
+/// copies an erasure needs; only a routing table that knows fewer peers than
+/// the close group (a tiny network) does, as before. A group with no member
+/// not marked full erases nothing (0: confirmation impossible), as before.
+///
+/// The one rule for chunks ([`revalidate_record_prune_candidate`]) and
+/// pointers (the pointer prune's group proof).
+pub(crate) fn erase_proofs_needed(
+    not_full: usize,
+    known_remote: usize,
+    close_group_size: usize,
+) -> usize {
+    if not_full == 0 {
+        return 0;
+    }
+    prune_proofs_needed(not_full).max(prune_proofs_needed(known_remote.min(close_group_size)))
 }
 
 /// Whether enough target peers supplied positive evidence to allow deletion.
@@ -2829,14 +2904,18 @@ mod tests {
             paid_entries_cleared: 17,
             paid_entries_pruned: 18,
         };
+        let seen = full::SeenFill {
+            fill: 0.2594,
+            false_seen: 0.017_43,
+        };
         assert_eq!(
-            prune_pass_line_with(&result, 11, 15, 21),
+            prune_pass_line_with(&result, 11, 15, 21, seen),
             "Prune pass complete: records total=1 in_range=2 newly_marked=3 cleared=4 \
              hysteresis_pending=5 candidates=6 held_by_commitment=7 bootstrap_deferred=8 \
              budget_deferred=9 audits_attempted=10 audit_requests=11 audit_below_threshold=12 \
              disk_pressure=1 beyond_floor=13 pruned=14 floor_step=4 being_erased=19 \
-             near_full_peers=20 few_holders=21 full=1; paid total=15 marked=16 cleared=17 \
-             pruned=18"
+             near_full_peers=20 few_holders=21 seen_fill=0.259 seen_false=0.0174 full=1; \
+             paid total=15 marked=16 cleared=17 pruned=18"
         );
         let roomy = PruneResult {
             disk_pressure: false,
@@ -2844,9 +2923,10 @@ mod tests {
         };
         let line = prune_pass_line(&roomy, 0, 0);
         assert!(line.contains(" disk_pressure=0 beyond_floor=0 pruned=0 "));
-        assert!(
-            line.contains(" floor_step=0 being_erased=0 near_full_peers=0 few_holders=0 full=0;")
-        );
+        assert!(line.contains(
+            " floor_step=0 being_erased=0 near_full_peers=0 few_holders=0 seen_fill=0.000 \
+             seen_false=0.0000 full=0;"
+        ));
         // The watchdog reads the records' part, up to "; paid", by field name:
         // the first " pruned=" is still the records erased.
         let records = line.split("; paid").next().unwrap();
@@ -3322,6 +3402,11 @@ mod tests {
             storage_admission_peers,
             strict_close_peers,
             marked_full: &NO_FULL_PEERS,
+            known_remote: strict_close_peers
+                .iter()
+                .filter(|peer| *peer != self_id)
+                .count(),
+            close_group_size: PROD_CLOSE_GROUP,
             answered_present: false,
             now,
         }
@@ -3768,6 +3853,103 @@ mod tests {
                 &present_by_key,
                 &inputs
             ),
+            PruneRevalidationOutcome::AuditFailed
+        );
+    }
+
+    /// The bar is 6 of the 7 nearest not marked full, never lower because
+    /// the window's cap of 20 left fewer than 7 of them, and lower only on a
+    /// routing table that knows fewer peers than the close group.
+    #[test]
+    fn the_erase_bar_never_falls_because_the_window_is_capped() {
+        // 0 to 4 of 7 full: 6 of the 7 not full.
+        for f in 0..=4 {
+            assert_eq!(erase_proofs_needed(7, 7 + f, PROD_CLOSE_GROUP), 6);
+        }
+        // 14 and 15 of the 20 nearest full: 6 and 5 not full, still 6.
+        assert_eq!(erase_proofs_needed(6, 20, PROD_CLOSE_GROUP), 6);
+        assert_eq!(erase_proofs_needed(5, 20, PROD_CLOSE_GROUP), 6);
+        assert_eq!(erase_proofs_needed(1, 20, PROD_CLOSE_GROUP), 6);
+        // None not full: nothing to count from, nothing erased.
+        assert_eq!(erase_proofs_needed(0, 20, PROD_CLOSE_GROUP), 0);
+        // A tiny network keeps its old bar: 5 known, no marks, 4; 4 known, 3.
+        assert_eq!(erase_proofs_needed(5, 5, PROD_CLOSE_GROUP), 4);
+        assert_eq!(erase_proofs_needed(4, 4, PROD_CLOSE_GROUP), 3);
+        assert_eq!(erase_proofs_needed(2, 2, PROD_CLOSE_GROUP), 2);
+    }
+
+    /// 15 of the 20 nearest marked full leaves 5 not full inside the capped
+    /// window: their 5 proofs keep the record, and a sixth, from a full
+    /// holder, erases it. With 14 marked, 6 not full must all prove. A tiny
+    /// network of 4 peers keeps its bar of 3.
+    #[test]
+    fn a_capped_window_near_many_full_peers_still_needs_six_proofs() {
+        let self_id = peer_id_from_byte(SELF_BYTE);
+        let key = key_from_byte(0xBA);
+        let admission_peers = peer_ids(full::MAX_WIDENED_WIDTH);
+        let first_seen = Instant::now();
+        let now = matured(first_seen);
+        let decide = |group: &[PeerId], marked: &HashSet<PeerId>, proven: &[PeerId]| {
+            let mut present_by_key = HashMap::new();
+            present_by_key.insert(key, proven.iter().copied().collect::<HashSet<_>>());
+            let mut inputs = revalidation_inputs(
+                &self_id,
+                Some(first_seen),
+                false,
+                &admission_peers,
+                group,
+                now,
+            );
+            inputs.marked_full = marked;
+            revalidate_record_prune_candidate(
+                &candidate(key, group.to_vec()),
+                &present_by_key,
+                &inputs,
+            )
+        };
+
+        let nearest = peer_ids(full::MAX_WIDENED_WIDTH);
+        let marked: HashSet<PeerId> = nearest[..15].iter().copied().collect();
+        let groups = widened_lookup_groups(&nearest, &ReplicationConfig::default(), &marked);
+        assert_eq!(groups.strict.len(), 20, "capped");
+        let not_full = &nearest[15..];
+        assert_eq!(not_full.len(), 5);
+        assert_eq!(
+            decide(&groups.strict, &marked, not_full),
+            PruneRevalidationOutcome::AuditFailed,
+            "5 proofs from the 5 not full: kept"
+        );
+        let mut six = not_full.to_vec();
+        six.push(nearest[0]);
+        assert_eq!(
+            decide(&groups.strict, &marked, &six),
+            PruneRevalidationOutcome::Delete,
+            "a sixth proof, from a full holder: erased"
+        );
+
+        // 14 of 20 full: 6 not full, and 6 proofs needed.
+        let marked: HashSet<PeerId> = nearest[..14].iter().copied().collect();
+        let groups = widened_lookup_groups(&nearest, &ReplicationConfig::default(), &marked);
+        assert_eq!(groups.strict.len(), 20);
+        assert_eq!(
+            decide(&groups.strict, &marked, &nearest[14..19]),
+            PruneRevalidationOutcome::AuditFailed,
+            "5 of the 6 not full: kept"
+        );
+        assert_eq!(
+            decide(&groups.strict, &marked, &nearest[14..]),
+            PruneRevalidationOutcome::Delete,
+            "all 6 not full: erased"
+        );
+
+        // A tiny network: 4 peers known, none marked, 3 proofs as before.
+        let tiny = peer_ids(4);
+        assert_eq!(
+            decide(&tiny, &NO_FULL_PEERS, &tiny[..3]),
+            PruneRevalidationOutcome::Delete
+        );
+        assert_eq!(
+            decide(&tiny, &NO_FULL_PEERS, &tiny[..2]),
             PruneRevalidationOutcome::AuditFailed
         );
     }

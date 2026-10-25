@@ -81,7 +81,7 @@ use crate::replication::protocol::{
     PointerStateRequest, PointerStateResponse, PointerStateSummary, ReplicationMessage,
     ReplicationMessageBody, MAX_POINTER_HINTS_PER_MESSAGE, MAX_POINTER_STATE_REQUEST_ADDRESSES,
 };
-use crate::replication::pruning::prune_proofs_needed;
+use crate::replication::pruning::erase_proofs_needed;
 use crate::replication::retention::{self, DiskRetention};
 use crate::storage::{CapacityVerdict, ChunkStore};
 
@@ -260,6 +260,10 @@ pub(crate) struct PointerEraseCheck {
     pub(crate) out_of_range_for: Option<Duration>,
     /// The out-of-range wait.
     pub(crate) hysteresis: Duration,
+    /// Whether this node answered "present" for the pointer, to a state or
+    /// fetch request, within the fetch window
+    /// ([`super::erasure::FETCH_WINDOW`]); checked in two-phase erasure only.
+    pub(crate) answered_present_lately: bool,
 }
 
 /// Whether a pointer record may be erased: every condition of
@@ -271,6 +275,7 @@ pub(crate) fn pointer_may_be_erased(check: &PointerEraseCheck) -> bool {
         && check.others_hold
         && !check.committed
         && !check.responsible
+        && !check.answered_present_lately
         && check
             .out_of_range_for
             .is_some_and(|waited| waited >= check.hysteresis)
@@ -1158,7 +1163,16 @@ impl PointerReplication {
                     }
                 }
                 None => {
-                    if !admission::is_responsible(&self_id, &hinted.address, &self.p2p, width).await
+                    // The storage admission width, widened past the peers
+                    // marked full, as senders widen the hint's targets: a
+                    // node standing in for a full one takes the hint.
+                    if !admission::is_responsible_widened(
+                        &self_id,
+                        &hinted.address,
+                        &self.p2p,
+                        width,
+                    )
+                    .await
                     {
                         continue;
                     }
@@ -1503,6 +1517,12 @@ impl PointerReplication {
                 Ok(Some(record)) => Some(record.to_bytes()),
                 Ok(None) | Err(_) => None,
             };
+            // Served: kept from erasure for the fetch window, as a chunk
+            // this node answered "present" for is.
+            if record.is_some() {
+                super::erasure::gate_for(this.p2p.peer_id())
+                    .note_answered_present(&request.address, Instant::now());
+            }
             super::send_replication_response(
                 &source,
                 &this.p2p,
@@ -1553,11 +1573,21 @@ impl PointerReplication {
                 return;
             }
             this.mark_capable(&source).await;
+            // Each state answered "present" is kept from erasure for the
+            // fetch window, so the fetch that may follow finds it.
+            let gate = super::erasure::gate_for(this.p2p.peer_id());
+            let now = Instant::now();
             let states = request
                 .addresses
                 .iter()
                 .take(MAX_POINTER_STATE_REQUEST_ADDRESSES)
-                .map(|address| this.store.state(address).map(PointerStateSummary::from))
+                .map(|address| {
+                    let state = this.store.state(address);
+                    if state.is_some() {
+                        gate.note_answered_present(address, now);
+                    }
+                    state.map(PointerStateSummary::from)
+                })
                 .collect();
             super::send_replication_response(
                 &source,
@@ -2116,7 +2146,12 @@ impl PointerReplication {
             ordered,
             move |state| async move {
                 let erasure = self
-                    .erase_if_proven(state, commitment_state, disk_retention)
+                    .erase_if_proven(
+                        state,
+                        commitment_state,
+                        disk_retention,
+                        erasure_epoch.is_some(),
+                    )
                     .await;
                 (state.address, erasure)
             },
@@ -2131,7 +2166,15 @@ impl PointerReplication {
                         gate.release(super::erasure::ClockKind::Pointers, &address);
                     }
                 }
-                PointerErasure::Unproven => failures.record(&address),
+                PointerErasure::Unproven => {
+                    failures.record(&address);
+                    // Its close group lacks proven copies: hinted again, so
+                    // the group can fetch it from here, and tried again after
+                    // the cooldown.
+                    if let Some((gate, epoch)) = &gate {
+                        gate.fail(super::erasure::ClockKind::Pointers, &address, *epoch);
+                    }
+                }
                 PointerErasure::Kept => {}
             }
         }
@@ -2163,12 +2206,14 @@ impl PointerReplication {
     }
 
     /// Erase one candidate if all but one of its close group prove they hold
-    /// it and every check still passes just before deleting.
+    /// it and every check still passes just before deleting. `two_phase`:
+    /// the pass erases in two phases (see [`super::erasure`]).
     async fn erase_if_proven(
         &self,
         state: PointerState,
         commitment_state: Option<&ResponderCommitmentState>,
         disk_retention: &DiskRetention,
+        two_phase: bool,
     ) -> PointerErasure {
         if self.shutdown.is_cancelled() {
             return PointerErasure::Kept;
@@ -2192,6 +2237,12 @@ impl PointerReplication {
             storage_admission_width(self.config.close_group_size),
         )
         .await;
+        // Two-phase erasure only: as for chunks, a pointer this node answered
+        // "present" for within the fetch window is kept this pass, so a peer
+        // that just checked it here doesn't find it gone when it fetches.
+        let answered_present_lately = two_phase
+            && super::erasure::gate_for(&self_id)
+                .answered_present_lately(&state.address, Instant::now());
         let check = PointerEraseCheck {
             under_disk_pressure: disk_retention.refresh(),
             beyond_floor: retention::is_beyond_floor(
@@ -2208,6 +2259,7 @@ impl PointerReplication {
                 .get(&state.address)
                 .map(Instant::elapsed),
             hysteresis: self.config.prune_hysteresis_duration,
+            answered_present_lately,
         };
         if pointer_may_be_erased(&check) && self.delete(&state).await {
             PointerErasure::Erased
@@ -2222,7 +2274,9 @@ impl PointerReplication {
     /// Near peers marked full the group is the 7 nearest not marked
     /// full, and the full ones among them: 6 proofs are needed from the 7, a
     /// full peer that holds the record still proves it, and one that lacks it
-    /// neither proves nor vetoes. The marks are read when this runs, just
+    /// neither proves nor vetoes. When the window's cap of 20 leaves fewer
+    /// than 7 not marked full, 6 proofs are still needed from the 20
+    /// ([`erase_proofs_needed`]). The marks are read when this runs, just
     /// before the re-check.
     async fn others_hold(&self, ours: &PointerState) -> bool {
         let marked: HashSet<PeerId> = super::full::view_for(self.p2p.peer_id())
@@ -2241,8 +2295,15 @@ impl PointerReplication {
         let width = super::full::widened_len(&nearest, self.config.close_group_size, |peer| {
             marked.contains(peer)
         });
+        let known = nearest.len();
         let group: Vec<PeerId> = nearest.into_iter().take(width).collect();
-        let needed = prune_proofs_needed(group.iter().filter(|p| !marked.contains(p)).count());
+        // Never fewer than 6 because the window's cap of 20 cut the group
+        // short (see `erase_proofs_needed`).
+        let needed = erase_proofs_needed(
+            group.iter().filter(|p| !marked.contains(p)).count(),
+            known,
+            self.config.close_group_size,
+        );
         if needed == 0 {
             return false;
         }
@@ -2825,6 +2886,7 @@ mod tests {
             responsible: false,
             out_of_range_for: Some(WAIT),
             hysteresis: WAIT,
+            answered_present_lately: false,
         }
     }
 
@@ -2855,6 +2917,17 @@ mod tests {
         // the wait, under pressure, the proof is still required.
         let check = PointerEraseCheck {
             others_hold: false,
+            ..erasable()
+        };
+        assert!(!pointer_may_be_erased(&check));
+    }
+
+    /// As for chunks: a pointer this node answered "present" for within the
+    /// fetch window is kept, whatever else holds.
+    #[test]
+    fn a_pointer_answered_present_lately_is_not_erased() {
+        let check = PointerEraseCheck {
+            answered_present_lately: true,
             ..erasable()
         };
         assert!(!pointer_may_be_erased(&check));

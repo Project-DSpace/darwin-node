@@ -1350,3 +1350,94 @@ async fn a_node_that_dropped_its_committed_pointers_fails_the_storage_audit() {
 
     harness.teardown().await.expect("teardown");
 }
+
+/// A pointer hint reaches a stand-in for full peers, and the stand-in takes
+/// it: senders widen the hint's targets past the peers they mark full, and
+/// the receiver admits it across the storage admission width widened the
+/// same way, not the base width alone.
+///
+/// Five nodes and a close group of two, so the admission width is four: the
+/// fifth nearest stands in once the three between it and the nearest are
+/// marked full. While only the sender marks them, the stand-in drops the
+/// hint; once it marks them too, it takes the pointer.
+#[tokio::test]
+#[serial]
+async fn a_stand_in_for_full_peers_takes_a_pointer_hint() {
+    use ant_node::replication::full;
+
+    let harness = TestHarness::setup_with_config(prune_network(20))
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let record = signed(&pk, &sk, 1, 1);
+    mark_paid(&harness, &record);
+    let view = harness.test_node(0).expect("node");
+    let nearest: Vec<PeerId> = view
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&record.address(), 5)
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .collect();
+    assert_eq!(nearest.len(), 5);
+    let index_of = |peer: &PeerId| {
+        (0..harness.node_count())
+            .find(|i| {
+                harness
+                    .test_node(*i)
+                    .is_some_and(|node| self::peer(node) == *peer)
+            })
+            .expect("a node of the harness")
+    };
+    let sender = index_of(&nearest[0]);
+    let stand_in = index_of(&nearest[4]);
+    // Held by the four nearest, so the stand-in's check finds it.
+    for peer in &nearest[..4] {
+        store(harness.test_node(index_of(peer)).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put");
+    }
+    let mark = |index: usize| {
+        let node = harness.test_node(index).expect("node");
+        let marks = &full::view_for(&self::peer(node)).marks;
+        for peer in &nearest[1..4] {
+            marks.mark_for_test(*peer, std::time::Instant::now());
+        }
+    };
+    // Each learns the others understand pointers. Nobody is marked yet, so
+    // nobody hints the stand-in the record.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &everyone).await;
+    assert_eq!(
+        replication(harness.test_node(stand_in).expect("node")).pending_len(),
+        0
+    );
+
+    // Only the sender marks them: it hints the stand-in, which drops it.
+    mark(sender);
+    exchange_hints(&harness, &[sender], &[stand_in]).await;
+    let stand_in_node = harness.test_node(stand_in).expect("node");
+    assert_eq!(replication(stand_in_node).pending_len(), 0);
+    assert!(held(stand_in_node, &record).is_none());
+
+    // The stand-in marks them too: it takes the hint and fetches the record.
+    mark(stand_in);
+    exchange_hints(&harness, &[sender], &[stand_in]).await;
+    assert!(
+        replication(stand_in_node).pending_len() > 0 || held(stand_in_node, &record).is_some(),
+        "a stand-in for full peers takes the pointer hint"
+    );
+    replication(stand_in_node).verify_due().await;
+    assert!(
+        wait_for(&harness, stand_in, &record).await,
+        "and stores the record its close group holds"
+    );
+
+    harness.teardown().await.expect("teardown");
+}

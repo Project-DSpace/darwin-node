@@ -29,7 +29,8 @@
 //! - **Waive the unheld-key penalty** for it in one bounded case, through one
 //!   function, [`FullView::waives_unheld_penalty`]: the peer's notice is
 //!   fresh, its answer was that it lacks the key, the check isn't pinned to
-//!   its commitment, this node has never seen it prove it holds that key, and,
+//!   its commitment, this node hasn't seen it prove it holds that key (in the
+//!   two generations of [`SeenHolders`] it reads), and,
 //!   on the possession check after a write, its own quote isn't among the paid
 //!   quotes of the proof. Everything else is charged as before. The bound on
 //!   how long a node may answer "full" without a penalty is how long one
@@ -45,10 +46,10 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::PeerId;
 
 use crate::ant_protocol::XorName;
@@ -243,83 +244,228 @@ fn insert_bounded(map: &mut HashMap<PeerId, Instant>, peer: PeerId, now: Instant
     map.insert(peer, now);
 }
 
-/// Bits in the record of keys peers were seen proving: 2 MiB.
-const SEEN_BITS: usize = 1 << 24;
+/// Bits in the smallest generation of the record of keys peers were seen
+/// proving: 2 MiB, the record's size before it was sized by the records held.
+const SEEN_MIN_BITS: u64 = 1 << 24;
+/// Bits in the largest generation: 32 MiB. A node holding more records than
+/// that is sized for turns its generations over sooner instead.
+const SEEN_MAX_BITS: u64 = 1 << 28;
 /// Hashes per entry.
 const SEEN_HASHES: u64 = 3;
-/// 64-bit words of [`SEEN_BITS`].
-const SEEN_WORDS: usize = SEEN_BITS / 64;
+/// Bits a generation has for each distinct (peer, key) pair it is sized for.
+/// Full, its share of bits set is about 26% and its false "seen" about 1.7%.
+const SEEN_BITS_PER_PAIR: u64 = 10;
+/// The pairs a generation is sized for per record held: every peer that can
+/// prove a key to this node sits within the key's widened window.
+const SEEN_PAIRS_PER_RECORD: u64 = MAX_WIDENED_WIDTH as u64;
+
+/// One generation of [`SeenHolders`]: a Bloom filter sized when it starts.
+struct SeenGeneration {
+    words: Box<[AtomicU64]>,
+    /// Bits in `words`.
+    bits: u64,
+    /// The distinct pairs it is sized for; the next generation starts once it
+    /// holds this many.
+    capacity: u64,
+    /// Distinct pairs recorded: records that set at least one bit.
+    distinct: AtomicU64,
+}
+
+impl SeenGeneration {
+    fn sized_for(records: u64) -> Self {
+        let bits = records
+            .saturating_mul(SEEN_PAIRS_PER_RECORD)
+            .saturating_mul(SEEN_BITS_PER_PAIR)
+            .clamp(SEEN_MIN_BITS, SEEN_MAX_BITS)
+            .next_multiple_of(64);
+        let words = usize::try_from(bits / 64).unwrap_or(usize::MAX);
+        Self {
+            words: (0..words).map(|_| AtomicU64::new(0)).collect(),
+            bits,
+            capacity: bits / SEEN_BITS_PER_PAIR,
+            distinct: AtomicU64::new(0),
+        }
+    }
+
+    fn word_and_mask(&self, position: u64) -> Option<(&AtomicU64, u64)> {
+        let word = self.words.get(usize::try_from(position / 64).ok()?)?;
+        Some((word, 1 << (position % 64)))
+    }
+
+    /// Set the pair's bits. Counts it as distinct when any bit was unset.
+    fn insert(&self, positions: impl Iterator<Item = u64>) {
+        let mut new = false;
+        for position in positions {
+            if let Some((word, mask)) = self.word_and_mask(position) {
+                new |= word.fetch_or(mask, Ordering::Relaxed) & mask == 0;
+            }
+        }
+        if new {
+            self.distinct.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn contains(&self, mut positions: impl Iterator<Item = u64>) -> bool {
+        positions.all(|position| {
+            self.word_and_mask(position)
+                .is_some_and(|(word, mask)| word.load(Ordering::Relaxed) & mask != 0)
+        })
+    }
+
+    /// The share of its bits set.
+    #[allow(clippy::cast_precision_loss)] // a ratio for the log
+    fn fill(&self) -> f64 {
+        let set: u64 = self
+            .words
+            .iter()
+            .map(|word| u64::from(word.load(Ordering::Relaxed).count_ones()))
+            .sum();
+        set as f64 / self.bits as f64
+    }
+}
+
+#[derive(Default)]
+struct SeenGenerations {
+    /// Where pairs are recorded.
+    current: Option<Arc<SeenGeneration>>,
+    /// The one before, read until the next turns over.
+    previous: Option<Arc<SeenGeneration>>,
+}
+
+/// How full [`SeenHolders`] is, for the prune-pass line.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SeenFill {
+    /// The share of the current generation's bits set.
+    pub fill: f64,
+    /// The estimated rate of false "seen" answers, both generations read:
+    /// from each generation's fill to the power of the hashes per entry.
+    pub false_seen: f64,
+}
 
 /// The keys this node has seen each peer prove it holds: a digest matched
 /// against this node's own copy, or a fetch served with the right bytes.
 ///
-/// A Bloom filter of fixed size, so it never forgets a proof it recorded: it
-/// can only answer "seen" for a pair it never saw, and that answer charges
-/// the penalty, as for any node. As it fills, the waiver applies less often,
-/// never more. Process-local: a restart starts it empty.
+/// A Bloom filter in two generations, sized from the records this node holds
+/// ([`Self::size_for_records`]: 10 bits for each of 20 peers per record,
+/// between 2 and 32 MiB). Pairs go into the current generation; once it holds
+/// as many distinct pairs as it was sized for, a new one starts and the old
+/// one is still read until the next turns over, then dropped. So a proof is
+/// remembered for at least one generation's worth of other proofs, and a pair
+/// proved again is remembered afresh. It can answer "seen" for a pair it never
+/// saw, and that charges the penalty, as for any node; the generations keep
+/// that rate under about 3.5%, both read, where a filter that only filled
+/// would charge more and more often over uptime. Process-local: a restart
+/// starts it empty.
 pub struct SeenHolders {
     hasher: RandomState,
-    bits: OnceLock<Box<[AtomicU64]>>,
-    recorded: AtomicU64,
+    generations: RwLock<SeenGenerations>,
+    /// The records this node held at the last prune pass, for sizing the
+    /// next generation.
+    records: AtomicU64,
 }
 
 impl Default for SeenHolders {
     fn default() -> Self {
         Self {
             hasher: RandomState::new(),
-            bits: OnceLock::new(),
-            recorded: AtomicU64::new(0),
+            generations: RwLock::new(SeenGenerations::default()),
+            records: AtomicU64::new(0),
         }
     }
 }
 
 impl std::fmt::Debug for SeenHolders {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let distinct = self
+            .generations
+            .read()
+            .current
+            .as_ref()
+            .map(|current| current.distinct.load(Ordering::Relaxed));
         f.debug_struct("SeenHolders")
-            .field("recorded", &self.recorded.load(Ordering::Relaxed))
+            .field("distinct", &distinct)
             .finish_non_exhaustive()
     }
 }
 
 impl SeenHolders {
-    fn positions(&self, peer: &PeerId, key: &XorName) -> impl Iterator<Item = usize> {
+    fn positions(&self, peer: &PeerId, key: &XorName, bits: u64) -> impl Iterator<Item = u64> {
         let hash = self.hasher.hash_one((peer.as_bytes(), key));
         let first = hash & 0xFFFF_FFFF;
         let step = (hash >> 32) | 1;
-        (0..SEEN_HASHES).map(move |i| {
-            let position = first.wrapping_add(i.wrapping_mul(step)) % (SEEN_BITS as u64);
-            usize::try_from(position).unwrap_or(0)
-        })
+        (0..SEEN_HASHES).map(move |i| first.wrapping_add(i.wrapping_mul(step)) % bits)
     }
 
-    fn words(&self) -> &[AtomicU64] {
-        self.bits
-            .get_or_init(|| (0..SEEN_WORDS).map(|_| AtomicU64::new(0)).collect())
+    /// Size the generations started from now on for `records` held.
+    pub fn size_for_records(&self, records: usize) {
+        self.records.store(
+            u64::try_from(records).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn current(&self) -> Arc<SeenGeneration> {
+        if let Some(current) = self.generations.read().current.as_ref() {
+            return Arc::clone(current);
+        }
+        let mut generations = self.generations.write();
+        Arc::clone(generations.current.get_or_insert_with(|| {
+            Arc::new(SeenGeneration::sized_for(
+                self.records.load(Ordering::Relaxed),
+            ))
+        }))
     }
 
     /// Record that `peer` proved it holds `key`.
     pub fn record(&self, peer: &PeerId, key: &XorName) {
-        let words = self.words();
-        for position in self.positions(peer, key) {
-            if let Some(word) = words.get(position / 64) {
-                word.fetch_or(1 << (position % 64), Ordering::Relaxed);
-            }
+        let current = self.current();
+        current.insert(self.positions(peer, key, current.bits));
+        if current.distinct.load(Ordering::Relaxed) < current.capacity {
+            return;
         }
-        self.recorded.fetch_add(1, Ordering::Relaxed);
+        // Full: a new generation, the old one read until the next turns over.
+        let mut generations = self.generations.write();
+        if generations
+            .current
+            .as_ref()
+            .is_some_and(|now| Arc::ptr_eq(now, &current))
+        {
+            generations.previous = generations.current.take();
+            generations.current = Some(Arc::new(SeenGeneration::sized_for(
+                self.records.load(Ordering::Relaxed),
+            )));
+        }
     }
 
     /// Whether `peer` may have proved it holds `key` before: `false` only
-    /// when it never has, to this node's knowledge.
+    /// when it hasn't, to this node's knowledge, within the generations it
+    /// still reads.
     #[must_use]
     pub fn may_have_seen(&self, peer: &PeerId, key: &XorName) -> bool {
-        let Some(words) = self.bits.get() else {
-            return false;
+        let generations = self.generations.read();
+        [&generations.current, &generations.previous]
+            .iter()
+            .filter_map(|generation| generation.as_ref())
+            .any(|generation| generation.contains(self.positions(peer, key, generation.bits)))
+    }
+
+    /// How full the record is, and its estimated rate of false "seen".
+    #[must_use]
+    pub fn fill(&self) -> SeenFill {
+        let generations = self.generations.read();
+        let fill = |generation: &Option<Arc<SeenGeneration>>| {
+            generation
+                .as_ref()
+                .map_or(0.0, |generation| generation.fill())
         };
-        self.positions(peer, key).all(|position| {
-            words
-                .get(position / 64)
-                .is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (position % 64)) != 0)
-        })
+        let current = fill(&generations.current);
+        let false_rate = |fill: f64| fill * fill * fill;
+        // Either generation answering falsely: a + b - ab.
+        let (a, b) = (false_rate(current), false_rate(fill(&generations.previous)));
+        SeenFill {
+            fill: current,
+            false_seen: a.mul_add(-b, a + b),
+        }
     }
 }
 
@@ -789,6 +935,20 @@ mod tests {
         assert!(marks.sent_a_notice(&a));
     }
 
+    /// A peer that left the routing table loses its mark and its place among
+    /// the notice's readers at once, not when the mark lapses.
+    #[test]
+    fn a_peer_forgotten_is_neither_marked_nor_a_reader() {
+        let marks = FullMarks::default();
+        let now = Instant::now();
+        marks.note_notice(peer(1), true, now);
+        marks.note_notice(peer(2), true, now);
+        marks.forget(&peer(1));
+        assert!(!marks.is_marked(&peer(1), now));
+        assert!(!marks.sent_a_notice(&peer(1)));
+        assert!(marks.is_marked(&peer(2), now), "only that peer");
+    }
+
     #[test]
     fn the_marks_are_bounded() {
         let marks = FullMarks::default();
@@ -809,21 +969,90 @@ mod tests {
         );
     }
 
+    fn numbered(n: u64) -> XorName {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&n.to_be_bytes());
+        key
+    }
+
     #[test]
-    fn a_proof_once_seen_is_never_forgotten() {
+    fn a_proof_is_remembered_through_its_generation() {
         let seen = SeenHolders::default();
         let key = [7u8; 32];
         assert!(!seen.may_have_seen(&peer(1), &key));
+        assert_eq!(seen.fill(), SeenFill::default(), "nothing allocated yet");
         seen.record(&peer(1), &key);
         assert!(seen.may_have_seen(&peer(1), &key));
         assert!(!seen.may_have_seen(&peer(2), &key), "per peer");
         assert!(!seen.may_have_seen(&peer(1), &[8u8; 32]), "per key");
-        for n in 0..10_000u32 {
-            let mut other = [0u8; 32];
-            other[..4].copy_from_slice(&n.to_be_bytes());
-            seen.record(&peer(3), &other);
+        for n in 0..10_000 {
+            seen.record(&peer(3), &numbered(n));
         }
         assert!(seen.may_have_seen(&peer(1), &key));
+    }
+
+    /// The smallest generation, 2^24 bits, holds 2^24 / 10 distinct pairs;
+    /// the next starts then, the first still read, and the one after drops
+    /// it. Repeat proofs of one pair count once.
+    #[test]
+    fn generations_turn_over_as_they_fill_and_keep_false_seen_low() {
+        let seen = SeenHolders::default();
+        let capacity = SEEN_MIN_BITS / SEEN_BITS_PER_PAIR;
+        let key = [7u8; 32];
+        for _ in 0..1000 {
+            seen.record(&peer(1), &key);
+        }
+        assert_eq!(seen.current().distinct.load(Ordering::Relaxed), 1);
+
+        // Fill the first generation to just short of its capacity.
+        let mut n = 0u64;
+        let first = seen.current();
+        while first.distinct.load(Ordering::Relaxed) < capacity - 1 {
+            seen.record(&peer(3), &numbered(n));
+            n += 1;
+        }
+        let fill = seen.fill();
+        assert!((0.2..0.3).contains(&fill.fill), "{fill:?}");
+        assert!(fill.false_seen < 0.025, "{fill:?}");
+        // One more distinct pair: a new generation, the first still read.
+        while Arc::ptr_eq(&seen.current(), &first) {
+            seen.record(&peer(3), &numbered(n));
+            n += 1;
+        }
+        assert!(
+            seen.may_have_seen(&peer(1), &key),
+            "the old generation is read"
+        );
+        let fill = seen.fill();
+        assert!(fill.fill < 0.01, "{fill:?}");
+        assert!(fill.false_seen < 0.04, "{fill:?}");
+        let false_seen = (0..10_000)
+            .filter(|m| seen.may_have_seen(&peer(9), &numbered(*m)))
+            .count();
+        assert!(false_seen < 400, "{false_seen} of 10000");
+
+        // The next turnover drops the first; the pair proved again is back.
+        let second = seen.current();
+        while Arc::ptr_eq(&seen.current(), &second) {
+            seen.record(&peer(3), &numbered(n));
+            n += 1;
+        }
+        seen.record(&peer(1), &key);
+        assert!(seen.may_have_seen(&peer(1), &key), "proved afresh");
+    }
+
+    #[test]
+    fn a_generation_is_sized_from_the_records_held() {
+        assert_eq!(SeenGeneration::sized_for(0).bits, SEEN_MIN_BITS);
+        // 100,000 records: 20 peers each, 10 bits a pair, 20 million bits.
+        let sized = SeenGeneration::sized_for(100_000);
+        assert_eq!(sized.bits, 20_000_000);
+        assert_eq!(sized.capacity, 2_000_000);
+        assert_eq!(SeenGeneration::sized_for(u64::MAX).bits, SEEN_MAX_BITS);
+        let seen = SeenHolders::default();
+        seen.size_for_records(100_000);
+        seen.record(&peer(1), &[7u8; 32]);
+        assert_eq!(seen.current().bits, 20_000_000);
     }
 
     fn case<'a>(peer: &'a PeerId, key: &'a XorName, lane: Lane) -> UnheldCase<'a> {

@@ -4038,3 +4038,182 @@ async fn a_stand_in_for_a_full_peer_keeps_the_record_until_the_mark_lapses() {
 
     harness.teardown().await.expect("teardown");
 }
+
+/// Whether `peer` lost trust with `checker` over one possession check of
+/// `address` against it alone, run through the lane's own code.
+async fn possession_check_charges(
+    checker: &super::testnet::TestNode,
+    peer: PeerId,
+    address: XorName,
+    paid_quote_issuers: Option<Vec<PeerId>>,
+    stand_ins: Vec<PeerId>,
+) -> bool {
+    let p2p = checker.p2p_node.as_ref().expect("p2p");
+    let before = p2p.peer_trust(&peer);
+    checker
+        .replication_engine
+        .as_ref()
+        .expect("engine")
+        .run_possession_check_now_with(address, vec![peer], paid_quote_issuers, stand_ins)
+        .await;
+    p2p.peer_trust(&peer) < before
+}
+
+/// The possession check after a write, driven through its own code with a
+/// peer that lacks the record:
+///
+/// - a stand-in beyond the 9 nearest (which a receiver that doesn't widen
+///   rightly refuses) is not charged for answering it lacks the record, while
+///   the same peer inside the 9 is;
+/// - with a fresh "full" mark, the peer is not charged when its own quote is
+///   not among the proof's paid quotes, and is charged when it is, when the
+///   proof can't be read, once the mark has lapsed, and once it was seen
+///   proving it holds the record.
+#[tokio::test]
+#[serial]
+async fn the_possession_check_spares_only_absent_stand_ins_and_unpaid_full_peers() {
+    use ant_node::replication::full::{self, FULL_NOTICE_FRESHNESS};
+
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let a = harness.test_node(3).expect("node a");
+    let b = harness.test_node(4).expect("node b");
+    let c = harness.test_node(5).expect("node c");
+    let checker = *a.p2p_node.as_ref().expect("p2p a").peer_id();
+    let peer_b = *b.p2p_node.as_ref().expect("p2p b").peer_id();
+    let peer_c = *c.p2p_node.as_ref().expect("p2p c").peer_id();
+
+    let content = b"possession-check lanes: stand-ins and full peers";
+    let address = compute_address(content);
+    a.ant_protocol
+        .as_ref()
+        .expect("proto a")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on the checker");
+
+    // The cases not charged first, so a charge can't change how B answers
+    // them. B lacks the record throughout.
+    assert!(
+        !possession_check_charges(a, peer_b, address, None, vec![peer_b]).await,
+        "a stand-in beyond the 9 nearest answering absent is not charged"
+    );
+    // Full peers: B marked full in the checker's view, from a fresh notice.
+    let view = full::view_for(&checker);
+    view.marks
+        .note_notice(peer_b, true, std::time::Instant::now());
+    assert!(
+        !possession_check_charges(a, peer_b, address, Some(vec![peer_c]), Vec::new()).await,
+        "a full peer whose quote wasn't paid is not charged"
+    );
+    assert!(
+        possession_check_charges(a, peer_b, address, Some(vec![peer_b]), Vec::new()).await,
+        "a full peer paid for the record is charged"
+    );
+    assert!(
+        possession_check_charges(a, peer_b, address, None, Vec::new()).await,
+        "an unreadable proof charges"
+    );
+    let lapsed = std::time::Instant::now()
+        .checked_sub(FULL_NOTICE_FRESHNESS + Duration::from_secs(1))
+        .expect("an instant that long ago");
+    view.marks.mark_for_test(peer_b, lapsed);
+    assert!(
+        possession_check_charges(a, peer_b, address, Some(vec![peer_c]), Vec::new()).await,
+        "a lapsed mark is no mark"
+    );
+    view.marks
+        .note_notice(peer_b, true, std::time::Instant::now());
+    view.seen.record(&peer_b, &address);
+    assert!(
+        possession_check_charges(a, peer_b, address, Some(vec![peer_c]), Vec::new()).await,
+        "a full peer once seen holding the record is charged"
+    );
+    // No longer full, inside the 9 nearest: charged as before.
+    view.marks
+        .note_notice(peer_b, false, std::time::Instant::now());
+    assert!(
+        possession_check_charges(a, peer_b, address, None, vec![peer_c]).await,
+        "a peer inside the 9 nearest answering absent is charged"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Whether `source` lost trust with `target` over one fetch of `key` from it
+/// alone, run through the fetch lane's own code.
+async fn fetch_charges(target: &super::testnet::TestNode, key: XorName, source: PeerId) -> bool {
+    let p2p = target.p2p_node.as_ref().expect("p2p");
+    let engine = target.replication_engine.as_ref().expect("engine");
+    let before = p2p.peer_trust(&source);
+    assert!(engine.enqueue_fetch_for_test(key, vec![source]).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    while engine.fetch_queued_or_in_flight_for_test(&key).await {
+        assert!(tokio::time::Instant::now() < deadline, "the fetch resolves");
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    p2p.peer_trust(&source) < before
+}
+
+/// The fetch lane, driven through its own code with a source that answers
+/// "not found": a source with a fresh "full" mark is not charged, one once
+/// seen proving it holds the key is, and so is one no longer marked.
+#[tokio::test]
+#[serial]
+async fn the_fetch_lane_spares_only_a_fresh_full_source_that_never_held_the_key() {
+    use super::verify_storage_gate::find_key_for_target;
+    use ant_node::replication::full;
+
+    const TARGET: usize = 5;
+    const SOURCE: usize = 6;
+    let harness = TestHarness::setup_with_config(TestNetworkConfig {
+        node_count: 12,
+        replication_config: Some(ReplicationConfig {
+            close_group_size: 7,
+            ..ReplicationConfig::default()
+        }),
+        ..TestNetworkConfig::default()
+    })
+    .await
+    .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let width = storage_admission_width(7);
+    let target = harness.test_node(TARGET).expect("target");
+    let target_peer = *target.p2p_node.as_ref().expect("p2p").peer_id();
+    let source = *harness
+        .test_node(SOURCE)
+        .expect("source")
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .peer_id();
+    let view = full::view_for(&target_peer);
+
+    // The source holds none of these keys; the target is responsible for each.
+    let (_, waived) = find_key_for_target(&harness, TARGET, width, true, "fetch-waived").await;
+    let (_, seen) = find_key_for_target(&harness, TARGET, width, true, "fetch-seen").await;
+    let (_, unmarked) = find_key_for_target(&harness, TARGET, width, true, "fetch-unmarked").await;
+
+    view.marks
+        .note_notice(source, true, std::time::Instant::now());
+    assert!(
+        !fetch_charges(target, waived, source).await,
+        "a full source that lacks the key, never seen holding it, is not charged"
+    );
+    view.seen.record(&source, &seen);
+    assert!(
+        fetch_charges(target, seen, source).await,
+        "a full source once seen holding the key is charged"
+    );
+    view.marks
+        .note_notice(source, false, std::time::Instant::now());
+    assert!(
+        fetch_charges(target, unmarked, source).await,
+        "a source no longer full is charged"
+    );
+
+    harness.teardown().await.expect("teardown");
+}

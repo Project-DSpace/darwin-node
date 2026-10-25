@@ -349,9 +349,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "PointerReplication::erase_if_proven",
         "delete",
         1,
-        "Erases a pointer only under disk pressure, beyond the erase floor, farthest \
-         first, after all but one of its current close group prove they hold it and the \
-         re-check just before deleting passes.",
+        "Erases a pointer only under disk pressure, beyond the falling floor (down to the \
+         edge of the node's range, never inside the widened retention width), farthest \
+         first, in two phases (selected and named in no hint for a whole sync cycle, then \
+         tried; released and hinted again if the check fails), after 6 of the 7 nearest \
+         peers not marked full prove they hold it (a full holder's proof counting, and 6 \
+         still needed when the cap of 20 cuts the group short), never while this node \
+         answered present for it to a state or fetch request within the fetch window, \
+         and only when the re-check just before deleting passes.",
     ),
     site(
         "src/replication/possession.rs",
@@ -377,9 +382,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "erase_if_still_eligible",
         "erase_stored_record",
         1,
-        "Erases a chunk only under disk pressure, beyond the erase floor, farthest first, \
-         after all but one of its current close group prove possession and the re-check \
-         just before deleting passes.",
+        "Erases a chunk only under disk pressure, beyond the falling floor (down to the \
+         edge of the node's range, never inside the widened retention width), farthest \
+         first, in two phases (selected and named in no hint for a whole sync cycle, then \
+         tried; released and hinted again if the check fails), after 6 of the 7 nearest \
+         peers not marked full prove possession (a full holder's proof counting, and 6 \
+         still needed when the cap of 20 cuts the group short), never while this node \
+         answered present for it within the fetch window, and only when the re-check just \
+         before deleting passes.",
     ),
     site(
         "src/replication/pruning.rs",
@@ -1617,8 +1627,9 @@ fn every_call_that_can_remove_stored_data_is_reviewed() {
         "\nThe calls in src/ that can remove stored data no longer match the reviewed list.\n\n\
          {report}\n\
          A node keeps every record and pointer it holds while its disk has room. The prune \
-         passes erase one only under disk pressure, beyond the erase floor, farthest first, \
-         and only after the nodes now nearest to it prove they hold it \
+         passes erase one only under disk pressure, beyond the falling floor (never inside \
+         the node's widened retention width), farthest first, in two phases, and only after \
+         6 of the 7 nodes now nearest to it and not marked full prove they hold it \
          (src/replication/retention.rs). Every other call that can remove stored data is \
          listed, with the reason it is there, in ERASE_SITES in \
          src/replication/retention/census.rs.\n\n\

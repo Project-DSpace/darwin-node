@@ -2213,10 +2213,25 @@ impl ReplicationEngine {
         peers: Vec<PeerId>,
         paid_quote_issuers: Option<Vec<PeerId>>,
     ) {
+        self.run_possession_check_now_with(key, peers, paid_quote_issuers, Vec::new())
+            .await;
+    }
+
+    /// Test-only: [`Self::run_possession_check_now_paid`] with `stand_ins`,
+    /// the peers of `peers` beyond the unwidened storage admission width.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn run_possession_check_now_with(
+        &self,
+        key: XorName,
+        peers: Vec<PeerId>,
+        paid_quote_issuers: Option<Vec<PeerId>>,
+        stand_ins: Vec<PeerId>,
+    ) {
         possession::run_possession_check(
             key,
             peers,
             paid_quote_issuers.as_deref(),
+            &stand_ins,
             &self.p2p_node,
             &self.storage,
             &self.config,
@@ -2859,6 +2874,7 @@ impl ReplicationEngine {
                                         event.key,
                                         event.peers,
                                         event.paid_quote_issuers.as_deref(),
+                                        &event.stand_ins,
                                         &p2p,
                                         &storage,
                                         &config,
@@ -3470,6 +3486,9 @@ impl ReplicationEngine {
                                 if let Some(pointers) = &handler_context.pointers {
                                     pointers.forget_peer(&peer_id);
                                 }
+                                // Its "full" mark and its place among the
+                                // notice's readers go with it.
+                                full::view_for(p2p.peer_id()).marks.forget(&peer_id);
                                 update_bootstrap_after_peer_removed(
                                     &peer_id,
                                     &handler_context.bootstrap_state,
@@ -8772,9 +8791,17 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // have retired. What is left is a probe whose only purpose is finding a
         // holder to download from, and this node cannot write what it would
         // download.
+        // The repair of a chunk this node removed as corrupt is not held: it
+        // replaces the space the removal freed, so the store takes it while
+        // full.
         if write_blocked && !local_paid_presence_probe_keys.is_empty() {
+            let (repairs, blocked): (Vec<XorName>, Vec<XorName>) =
+                std::mem::take(&mut local_paid_presence_probe_keys)
+                    .into_iter()
+                    .partition(|key| storage.is_quarantined_repair(key));
+            local_paid_presence_probe_keys = repairs;
             let mut q = queues.write().await;
-            for key in std::mem::take(&mut local_paid_presence_probe_keys) {
+            for key in blocked {
                 if q.defer_pending(&key, config::CAPACITY_BLOCKED_RETRY) {
                     capacity_deferred_probe += 1;
                 }
@@ -9044,7 +9071,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     let mut fetch_sources = sources;
                     add_replica_hint_sources(&mut fetch_sources, &replica_hint_sources);
                     let fetch_eligible = fetch_allowed_keys.contains(&key);
-                    if fetch_eligible && write_blocked {
+                    if fetch_eligible && write_blocked && !storage.is_quarantined_repair(&key) {
                         // Capacity gate, second of two, and deliberately after
                         // Step 4: the key is now recorded in `PaidForList` and
                         // its verification stands. Only the download is held,
@@ -9527,7 +9554,7 @@ async fn execute_single_fetch(
     // failure is then classified as the source's — no trust event, but the
     // worker walks to every remaining holder, and each re-uploads the same
     // chunk into the same full disk.
-    if let Err(e) = storage.check_capacity() {
+    if let Err(e) = storage.check_capacity_for_key(&key) {
         debug!(
             "Skipping fetch for {}: local storage cannot accept a write: {e}",
             hex::encode(key)
