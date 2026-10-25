@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Checks that the GitHub workflows keep what releases rely on. The Build
-# workflow's notices job and the Test workflow run it on every run; run it
-# by hand with `bash scripts/check-workflows.sh`.
+# workflow's notices job, the Test workflow and latest.yml's checks job run
+# it on every run; run it by hand with `bash scripts/check-workflows.sh`.
 #
 # It fails unless:
 # - .github/workflows holds exactly build.yml, latest.yml, release.yml and
@@ -24,31 +24,55 @@
 #   every pin;
 # - its publish job runs in the release environment and needs build and
 #   checks;
-# - its latest job needs checks and publish;
+# - its latest job needs checks and publish, and moves :latest forward only:
+#   before it moves it, it reads :latest and refuses unless :latest's node
+#   is older than the release's, ordered as latest.yml orders them, or
+#   :latest already has the image, so a re-run, which needs no approval,
+#   can't undo an image release or a withdrawal;
 # - nothing in release.yml or latest.yml has an if: or continues on error,
 #   so no job can run after a failed need and no step can skip a check;
+# - in both, the condition of each check pinned below is followed by its
+#   ::error::, every ::error:: is followed by exit 1, so each refusal stops
+#   its step, and no line ends a step early or carries on after a failure
+#   (exit 0, exit, true, : or set +... standing alone);
 # - latest.yml, which moves :latest when no node release does (an image
 #   release, or a withdrawal), runs only by hand, with a commit, a digest
 #   and a withdraw switch that is off unless set, grants no permissions
 #   unless a job asks for them, and shares release.yml's concurrency group;
-# - its checks job can write nothing, refuses a run from any ref but main
-#   and inputs other than a full commit and a sha256 digest, checks that
-#   the commit is on main, that the commit's Build run from its push to
-#   main succeeded, smoke test included, and that the digest is the one
-#   that run recorded, while its artifact is kept, and the one the
-#   commit's image tag has, and reads the image's node version;
+#   its steps run in bash, as its defaults set it, take the inputs and what
+#   the checks found only from their job's env (no step sets its own but
+#   'Check the digest', which takes the Build run the step before it found),
+#   and change no later step's environment;
+# - its checks job can write nothing; refuses a run from any ref but main
+#   and inputs other than a full commit and a sha256 digest; runs this
+#   script on the commit it runs from; checks that the commit is on main,
+#   that its Build run from its push to main succeeded, smoke test included,
+#   and so did its newest Test run, taken as release.yml takes it, and that
+#   the digest is the image that Build run pushed, by its build provenance
+#   attestation (signed for build.yml on main at the commit, by a run a push
+#   started) or by the digest the run recorded, which must be the digest
+#   while it is kept; reads the image's node version, which must be a
+#   published release's, and writes the node's code changes since that
+#   release's tag to the summary; and, for a withdrawal, checks that the
+#   commit is a v*+ds.* tag's whose Release run succeeded, or one an earlier
+#   Latest run moved :latest to;
 # - its latest job needs the checks job, runs in the release environment,
-#   can write packages and nothing else, refuses an image whose node is
-#   older than :latest's unless the run is a withdrawal, writes :latest's
-#   digest and the new one to the step summary, and only then moves
-#   :latest, to the checked digest, and checks it;
+#   can read contents and write packages and nothing else, refuses an image
+#   whose node is newer than :latest's, and, unless the run is a withdrawal,
+#   one whose node is older or that was built from a commit before the one
+#   :latest's image was built from (its image marker, or for an image with
+#   none its node release's tag), orders versions as nodes do, makes every
+#   check before it moves :latest, writes :latest's digest and the new one
+#   to the step summary, and only then moves :latest, to the checked
+#   digest, and checks it;
 # - build.yml's manager job builds the image's node manager, darwin-nodes,
 #   with --locked from the darwin-client commit docker/manager-revision pins,
 #   once it has checked that commit is on darwin-client's main, and checks
 #   that the binary names that commit (the leading 7 or more characters
 #   ant-cli's build script records) and holds none of Autonomi's addresses
 #   and the reset and log-forwarding routes; its image job needs that job
-#   and passes the image marker;
+#   and passes the image marker, and attests the image it pushed (build
+#   provenance, kept in GitHub's attestations API);
 # - build.yml's linux-x64 job, which builds the image's node, and
 #   release.yml's build job, which builds the node releases install, build it
 #   with exactly `cargo build --release --locked --bin ant-node`, so no
@@ -64,7 +88,9 @@
 #
 # A release runs release.yml as it is at the tagged commit, so this can't
 # stop a tag on a commit that changed it; it makes that commit's Build and
-# Test runs fail, and the release waits for both.
+# Test runs fail, and the release waits for both. latest.yml runs as it is
+# at main's head when it is dispatched, which can be later than the commit
+# it is given, so its checks job runs this script itself, on that head.
 #
 # scripts/test_check_workflows.sh tests it, in the Test workflow.
 
@@ -77,6 +103,32 @@ LATEST="${DIR}/latest.yml"
 RELEASE="${DIR}/release.yml"
 TEST="${DIR}/test.yml"
 PROBLEMS=0
+
+# How the latest jobs move :latest: to an image by its digest, copying the
+# manifest as it is.
+MOVE_LATEST='docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE@$DIGEST"'
+
+# The jq program the latest jobs order node versions with, as nodes order
+# them: by X.Y.Z, then by the +ds. build number, a version with none coming
+# before ds.1; any other form is refused.
+NODE_VERSION_ORDER=$(cat <<'EOF'
+def node_version:
+capture("^ant-node (?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)(\\+ds\\.(?<build>[1-9][0-9]*))?$")
+// error("not ant-node X.Y.Z or X.Y.Z+ds.N: \(.)")
+| [.major, .minor, .patch, (.build // "0")] | map(tonumber);
+($new | node_version) as $n | ($current | node_version) as $c
+| if $n > $c then "newer than" elif $n == $c then "the same as" else "older than" end
+EOF
+)
+
+# The Test run release.yml's checks job and latest.yml's checks job take:
+# the newest from the push to main, or by hand under the name test.yml
+# gives a run without the listings cross-test (below). A later run with the
+# cross-test, which also tests darwin-client, can't take its place.
+TEST_RUN_PICK='--jq '\''[.workflow_runs[] | select((.event == "push" and .head_branch == "main") or (.event == "workflow_dispatch" and .display_title == "Test by hand"))] | max_by(.run_number) | .id // empty'\'''
+
+# The step of release.yml's latest job that reads :latest before the move.
+GUARD_STEP="Check latest's node is older than this release's"
 
 problem() {
     echo "::error::$*"
@@ -102,6 +154,15 @@ job() {
     ' "${2:-${RELEASE}}"
 }
 
+# A step of a job's lines (as job gives them), by its name: from its
+# "- name:" line up to the next step.
+step() {
+    awk -v name="$1" '
+        /^      - / { inside = ($0 == "      - name: " name) }
+        inside { print }
+    ' <<<"$2"
+}
+
 # The jobs a job of a workflow needs, release.yml unless another is given,
 # one a line, from `needs: x` or `needs: [x, y]`.
 needs() {
@@ -124,15 +185,44 @@ job_permissions() {
     '
 }
 
-# A problem saying WHAT, for each of the LINES that TEXT doesn't hold.
+# The jq program lines of TEXT order node versions with: the lines after the
+# one that passes it --arg current "$current_version", up to its closing
+# quote, with their leading spaces left out.
+version_order() {
+    awk -v q="'" '
+        { sub(/^[ \t]+/, "") }
+        !inside && index($0, "--arg current \"$current_version\" " q) { inside = 1; next }
+        inside && index($0, q "); then") { print substr($0, 1, index($0, q "); then") - 1); exit }
+        inside { print }
+    ' <<<"$1"
+}
+
+# One problem saying WHAT unless TEXT (a job's or a step's lines) holds every
+# one of the LINES. A line given as "refuse: COND" must be a line of TEXT of
+# its own, leading spaces aside, and be followed directly, each time, by an
+# `echo "::error::...` line, which is followed by exit 1 (see below): when
+# COND holds, the step stops there.
 holds() {
-    local text=$1 what=$2 line
+    local text=$1 what=$2 line missing=""
     shift 2
     for line in "$@"; do
-        if ! grep -qF -- "${line}" <<<"${text}"; then
-            problem "${what} (missing: ${line})"
+        if [[ "${line}" == "refuse: "* ]]; then
+            line=${line#refuse: }
+            if ! COND="${line}" awk '
+                { sub(/^[ \t]+/, "") }
+                expect { if (index($0, "echo \"::error::") != 1) { bad = 1 }; expect = 0 }
+                $0 == ENVIRON["COND"] { found = 1; expect = 1 }
+                END { exit !(found && !bad && !expect) }
+            ' <<<"${text}"; then
+                missing+="${missing:+; }${line} followed by an ::error:: line"
+            fi
+        elif ! grep -qF -- "${line}" <<<"${text}"; then
+            missing+="${missing:+; }${line}"
         fi
     done
+    if [[ -n "${missing}" ]]; then
+        problem "${what} (missing: ${missing})"
+    fi
 }
 
 # The workflow files.
@@ -197,12 +287,9 @@ else
     fi
 
     # The Test run it takes is the newest from the push to main, or by hand
-    # under the name test.yml gives a run without the listings cross-test
-    # (below). A later run with the cross-test, which also tests
-    # darwin-client, can't take its place.
-    pick='--jq '\''[.workflow_runs[] | select((.event == "push" and .head_branch == "main") or (.event == "workflow_dispatch" and .display_title == "Test by hand"))] | max_by(.run_number) | .id // empty'\'''
-    if ! grep -qF -- "${pick}" <<<"${checks}"; then
-        problem "release.yml's checks job must take the Test run from the push to main, or one by hand without the listings cross-test (missing: ${pick})"
+    # without the listings cross-test.
+    if ! grep -qF -- "${TEST_RUN_PICK}" <<<"${checks}"; then
+        problem "release.yml's checks job must take the Test run from the push to main, or one by hand without the listings cross-test (missing: ${TEST_RUN_PICK})"
     fi
 
     # Publishing waits for the build and the checks, in the release
@@ -223,11 +310,32 @@ else
             problem "release.yml's latest job must need ${need}"
         fi
     done
-fi
 
-# How latest.yml moves :latest: to an image by its digest, copying the
-# manifest as it is, as release.yml's latest job does.
-MOVE_LATEST='docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE@$DIGEST"'
+    # And only forward: a re-run of the latest job needs no approval, so
+    # before the move it reads :latest, and refuses unless :latest's node is
+    # older than the release's, or :latest already has the image. Otherwise
+    # latest.yml moved it after the release (an image release, or a
+    # withdrawal), and a re-run must not undo that.
+    release_latest=$(job latest)
+    guard=$(step "${GUARD_STEP}" "${release_latest}")
+    holds "${guard}" "release.yml's latest job must check, in a step named \"${GUARD_STEP}\", that :latest's node is older than the release's, or that :latest already has the image" \
+        'DIGEST: ${{ steps.image.outputs.digest }}' \
+        'current=$(docker buildx imagetools inspect "$IMAGE:latest" --format '\''{{json .Manifest}}'\'' | jq -r .digest)' \
+        'if [[ "$current" == "$DIGEST" ]]; then' \
+        'current_version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$current" --version)' \
+        'if ! order=$(jq -rn --arg new "ant-node $VERSION" --arg current "$current_version" '\''' \
+        'refuse: if [[ "$order" != "newer than" ]]; then'
+    if [[ -n "${guard}" ]]; then
+        if [[ "$(version_order "${guard}")" != "${NODE_VERSION_ORDER}" ]]; then
+            problem "release.yml's latest job must order node versions as latest.yml does (the jq program after --arg current \"\$current_version\" must be scripts/check-workflows.sh's NODE_VERSION_ORDER)"
+        fi
+        guard_at=$(grep -nxF -- "      - name: ${GUARD_STEP}" <<<"${release_latest}" | head -n 1 | cut -d: -f1)
+        moved_at=$(grep -nF -- "${MOVE_LATEST}" <<<"${release_latest}" | head -n 1 | cut -d: -f1 || true)
+        if [[ -z "${moved_at}" ]] || ((guard_at > moved_at)); then
+            problem "release.yml's latest job must check :latest (${GUARD_STEP}) before it moves it (${MOVE_LATEST})"
+        fi
+    fi
+fi
 
 if [[ ! -f "${LATEST}" ]]; then
     problem "${LATEST} is missing"
@@ -255,6 +363,14 @@ else
         problem "latest.yml must share release.yml's concurrency group; it has: $(section concurrency "${LATEST}" | tr '\n' ' ')"
     fi
 
+    # Every step in bash, which GitHub runs with -e and -o pipefail, so a
+    # failed command stops it: as the defaults set it, with no shell of a
+    # job's or a step's own.
+    if [[ "$(section defaults "${LATEST}")" != $'defaults:\n  run:\n    shell: bash' ]] \
+        || [[ $(grep -cE '^[[:space:]]*(-[[:space:]]+)?shell:' "${LATEST}" || true) -ne 1 ]]; then
+        problem "latest.yml must run every step in bash, as its defaults set it (defaults: run: shell: bash), with no shell of a job's or a step's own"
+    fi
+
     # The checks job: everything that can be checked before the approval,
     # by a job that can write nothing.
     checks=$(job checks "${LATEST}")
@@ -262,36 +378,103 @@ else
         problem "latest.yml's checks job must be able to write nothing; it asks for: $(job_permissions checks "${LATEST}" | tr '\n' ' ')"
     fi
     holds "${checks}" "latest.yml's checks job must refuse a run from any ref but main" \
-        'if [[ "$GITHUB_REF" != refs/heads/main ]]; then'
-    holds "${checks}" "latest.yml's checks job must take the commit and digest from the inputs, and refuse anything but a full commit and a sha256 digest" \
+        'refuse: if [[ "$GITHUB_REF" != refs/heads/main ]]; then'
+    holds "${checks}" "latest.yml's checks job must take the commit, the digest and the withdraw switch from the inputs, and refuse anything but a full commit and a sha256 digest" \
         'COMMIT: ${{ inputs.commit }}' \
         'DIGEST: ${{ inputs.digest }}' \
-        'if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then' \
-        'if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then'
+        'WITHDRAW: ${{ inputs.withdraw }}' \
+        'refuse: if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then' \
+        'refuse: if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then'
+
+    # This workflow runs as it is at main's head, which can be later than
+    # the commit given: the checks job checks out that head (whole, for the
+    # node's changes and the tags below) and runs this script on it.
+    checkout=$(step "Check out the commit this runs from" "${checks}")
+    if ! grep -qE '^        uses: actions/checkout@' <<<"${checkout}" \
+        || ! grep -qxF '          fetch-depth: 0' <<<"${checkout}" \
+        || grep -qE '^          (ref|repository|path):' <<<"${checkout}" \
+        || [[ "$(step "Check the workflows" "${checks}")" != $'      - name: Check the workflows\n        run: bash scripts/check-workflows.sh' ]]; then
+        problem "latest.yml's checks job must check out the commit it runs from, with its whole history and no other ref (a step named \"Check out the commit this runs from\"), and run scripts/check-workflows.sh on it (\"Check the workflows\")"
+    fi
+
     holds "${checks}" "latest.yml's checks job must check that the commit is on main" \
         'status=$(gh api "repos/$GH_REPO/compare/$COMMIT...main" --jq .status 2>/dev/null || true)' \
-        'if [[ "$status" != ahead && "$status" != identical ]]; then'
-    holds "${checks}" "latest.yml's checks job must check that the commit's Build run from its push to main succeeded, smoke test included" \
+        'refuse: if [[ "$status" != ahead && "$status" != identical ]]; then'
+    holds "$(step "Check the commit's Build run" "${checks}")" \
+        "latest.yml's checks job must check that the commit's Build run from its push to main succeeded, smoke test included" \
         'run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/build.yml/runs" \' \
         '-f head_sha="$COMMIT" -f event=push -f branch=main -f per_page=1 \' \
+        'refuse: if [[ -z "$run" ]]; then' \
         'conclusion=$(gh api "repos/$GH_REPO/actions/runs/$run" --jq '\''.conclusion // empty'\'')' \
-        'if [[ "$conclusion" != success ]]; then' \
+        'refuse: if [[ "$conclusion" != success ]]; then' \
         'smoke=$(gh api "repos/$GH_REPO/actions/runs/$run/jobs" \' \
         '--jq '\''[.jobs[] | select(.name == "image") | .steps[] | select(.name == "Smoke test") | .conclusion] | join(" ")'\'')' \
-        'if [[ "$smoke" != success ]]; then'
-    holds "${checks}" "latest.yml's checks job must check that the digest is the one the Build run recorded, while its artifact is kept, and the one the commit's image tag has" \
+        'refuse: if [[ "$smoke" != success ]]; then'
+    holds "$(step "Check the commit's Test run" "${checks}")" \
+        "latest.yml's checks job must check that the commit's newest Test run, from its push to main or by hand without the listings cross-test, succeeded" \
+        'run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/test.yml/runs" \' \
+        '-f head_sha="$COMMIT" -f per_page=100 \' \
+        "${TEST_RUN_PICK}" \
+        'refuse: if [[ -z "$run" ]]; then' \
+        'conclusion=$(gh api "repos/$GH_REPO/actions/runs/$run" --jq '\''.conclusion // empty'\'')' \
+        'refuse: if [[ "$conclusion" != success ]]; then'
+
+    # The digest is the image the commit's push Build run pushed: by the
+    # attestation that run made, signed for build.yml on main at the commit
+    # by a run a push started (the certificate's trigger, which GitHub's
+    # token sets), which doesn't expire, or by the digest the run recorded,
+    # which must be the digest while it is kept. The commit's tag in the
+    # registry is only noted.
+    holds "$(step "Check the digest" "${checks}")" \
+        "latest.yml's checks job must check that the digest is the image the commit's Build run from its push to main pushed, by its attestation or its record" \
+        'RUN: ${{ steps.build_run.outputs.run }}' \
+        'attested=$(gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GH_REPO" \' \
+        '--signer-workflow "$GH_REPO/.github/workflows/build.yml" \' \
+        '--source-ref refs/heads/main --source-digest "$COMMIT" --format json \' \
+        '--jq '\''[.[].verificationResult.signature.certificate | select(.buildTrigger == "push") | .runInvocationURI] | first // empty'\'' || true)' \
         '--jq '\''[.artifacts[] | select(.name == "storage-node-digest" and (.expired | not))] | length'\'')' \
         'if ((kept > 0)); then' \
         'gh run download "$RUN" --name storage-node-digest --dir "$RUNNER_TEMP/digest"' \
         'recorded=$(cat "$RUNNER_TEMP/digest/storage-node-digest.txt")' \
-        'if [[ "$recorded" != "$DIGEST" ]]; then' \
-        'tagged=$(docker buildx imagetools inspect "$IMAGE:$COMMIT" --format '\''{{json .Manifest}}'\'' | jq -r .digest || true)' \
-        'if [[ "$tagged" != "$DIGEST" ]]; then'
-    holds "${checks}" "latest.yml's checks job must read the node version from the image" \
+        'refuse: if [[ -n "$recorded" && "$recorded" != "$DIGEST" ]]; then' \
+        'refuse: if [[ -z "$attested" && "$recorded" != "$DIGEST" ]]; then'
+
+    # The image's node: read from the image, a published release's, and
+    # the node's code changes since that release's tag in the summary, for
+    # the approval.
+    version_step=$(step "Read the image's node version" "${checks}")
+    holds "${version_step}" "latest.yml's checks job must read the node version from the image" \
         'version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$DIGEST" --version)'
+    holds "${version_step}" "latest.yml's checks job must refuse an image whose node is not a published release's" \
+        'refuse: if [[ ! "$version" =~ ^ant-node\ ([0-9]+\.[0-9]+\.[0-9]+\+ds\.[1-9][0-9]*)$ ]]; then' \
+        'tag="v${BASH_REMATCH[1]}"' \
+        'published=$(gh release view "$tag" --json isDraft,isPrerelease --jq '\''.isDraft or .isPrerelease'\'' 2>/dev/null || true)' \
+        'refuse: if [[ "$published" != false ]]; then'
+    holds "${version_step}" "latest.yml's checks job must write the node's code changes since its release's tag to the summary" \
+        'released=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" || true)' \
+        'refuse: if [[ ! "$released" =~ ^[0-9a-f]{40}$ ]]; then' \
+        'changes=$(git diff --stat "$released" "$COMMIT" -- src vendor Cargo.toml Cargo.lock build.rs)' \
+        'echo "${changes:-no change}"' \
+        '} >> "$GITHUB_STEP_SUMMARY"'
+
+    # A withdrawal goes back to an image :latest held before: the commit of
+    # a v*+ds.* tag whose Release run succeeded, or one an earlier Latest
+    # run moved :latest to.
+    holds "$(step "Check a withdrawal goes back to an image latest had" "${checks}")" \
+        "latest.yml's checks job must check that a withdrawal goes back to an image :latest held before" \
+        'if [[ "$WITHDRAW" == true ]]; then' \
+        'tags=$(git tag --points-at "$COMMIT" --list '\''v*+ds.*'\'')' \
+        'releases=$(gh api -X GET "repos/$GH_REPO/actions/workflows/release.yml/runs" \' \
+        '-f head_sha="$COMMIT" -f event=push -f status=success -f per_page=100 \' \
+        'moved=$(gh api -X GET "repos/$GH_REPO/actions/workflows/latest.yml/runs" \' \
+        '-f status=success -f per_page=100 \' \
+        'if [[ -n "$tag" ]] && grep -qxF -- "$tag" <<<"$tags"; then' \
+        'if [[ "$title" == "Point latest at $COMMIT" || "$title" == "Withdraw latest to $COMMIT" ]]; then' \
+        'held=${by_release:-$by_latest}' \
+        'refuse: if [[ -z "$held" ]]; then'
 
     # The latest job: approved in the release environment, after the checks
-    # job, and able to write packages alone.
+    # job, and able to read contents and write packages alone.
     latest=$(job latest "${LATEST}")
     if ! grep -qx '    environment: release' <<<"${latest}"; then
         problem "latest.yml's latest job must run in the release environment"
@@ -299,21 +482,39 @@ else
     if ! needs latest "${LATEST}" | grep -qx checks; then
         problem "latest.yml's latest job must need the checks job"
     fi
-    if [[ "$(job_permissions latest "${LATEST}")" != "packages: write" ]]; then
-        problem "latest.yml's latest job must ask for packages: write and nothing else; it asks for: $(job_permissions latest "${LATEST}" | tr '\n' ' ')"
+    if [[ "$(job_permissions latest "${LATEST}" | LC_ALL=C sort | tr '\n' ' ')" != "contents: read packages: write " ]]; then
+        problem "latest.yml's latest job must ask for contents: read and packages: write and nothing else; it asks for: $(job_permissions latest "${LATEST}" | tr '\n' ' ')"
     fi
-    # An image whose node is older than :latest's only in a withdrawal.
-    holds "${latest}" "latest.yml's latest job must refuse an image whose node is older than :latest's, unless the run is a withdrawal" \
+    # A newer node goes to :latest only with its release; an older one only
+    # in a withdrawal. Versions are ordered as nodes order them.
+    holds "${latest}" "latest.yml's latest job must refuse an image whose node is newer than :latest's, or older unless the run is a withdrawal" \
         'VERSION: ${{ needs.checks.outputs.version }}' \
         'WITHDRAW: ${{ inputs.withdraw }}' \
         'current=$(docker buildx imagetools inspect "$IMAGE:latest" --format '\''{{json .Manifest}}'\'' | jq -r .digest)' \
         'current_version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$current" --version)' \
         'if ! order=$(jq -rn --arg new "$VERSION" --arg current "$current_version" '\''' \
-        '| if $n > $c then "newer than" elif $n == $c then "the same as" else "older than" end'\''); then' \
-        'if [[ "$order" == "older than" && "$WITHDRAW" != true ]]; then'
+        'refuse: if [[ "$order" == "newer than" ]]; then' \
+        'refuse: if [[ "$order" == "older than" && "$WITHDRAW" != true ]]; then'
+    if [[ "$(version_order "${latest}")" != "${NODE_VERSION_ORDER}" ]]; then
+        problem "latest.yml's latest job must order node versions as nodes do (the jq program after --arg current \"\$current_version\" must be scripts/check-workflows.sh's NODE_VERSION_ORDER)"
+    fi
+    # And, unless the run is a withdrawal, an image built from the commit
+    # :latest's image was built from, or a later one: the commit its image
+    # marker names, or, for an image with none, which only a release put on
+    # :latest, the commit of that release's tag.
+    holds "${latest}" "latest.yml's latest job must refuse, unless the run is a withdrawal, an image built from a commit before the one :latest's image was built from" \
+        'GH_REPO: ${{ github.repository }}' \
+        'COMMIT: ${{ inputs.commit }}' \
+        'marker=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)' \
+        'if [[ "$marker" =~ ^[0-9a-f]{40}$ ]]; then' \
+        'base=$marker' \
+        'base=$(gh api "repos/$GH_REPO/commits/refs/tags/v${current_version#ant-node }" --jq .sha 2>/dev/null || true)' \
+        'relation=$(gh api "repos/$GH_REPO/compare/$base...$COMMIT" --jq .status 2>/dev/null || true)' \
+        'refuse: if [[ "$relation" != ahead && "$relation" != identical && "$WITHDRAW" != true ]]; then'
     # :latest moves once, to the digest the checks job checked, and is
-    # checked; before that, the step summary names the digest :latest had,
-    # for a later run to move it back, and the new one.
+    # checked; every other check comes before the move, and so does the
+    # step summary naming the digest :latest had, for a later run to move it
+    # back, and the new one.
     if ! grep -qF 'DIGEST: ${{ inputs.digest }}' <<<"${latest}"; then
         problem "latest.yml's latest job must move :latest to the digest the checks job checked (missing: DIGEST: \${{ inputs.digest }})"
     fi
@@ -323,19 +524,64 @@ else
     if [[ ! "${moved}" =~ ^[0-9]+\ $ || ! "${checked}" =~ ^[0-9]+\ $ ]] || ((moved > checked)); then
         problem "latest.yml's latest job must move :latest once, with exactly '${MOVE_LATEST}', then check it (if [[ \"\$now\" != \"\$DIGEST\" ]]; then)"
     else
+        while IFS=: read -r at hit; do
+            if ((at > moved && at != checked + 1)); then
+                problem "latest.yml's latest job must make every check before it moves :latest, but the move's own check: line ${at} of the job refuses after it: ${hit}"
+            fi
+        done < <(grep -nF 'echo "::error::' <<<"${text}" || true)
         recorded=$(grep -nE '\$current([^A-Za-z0-9_]|$).*\$DIGEST([^A-Za-z0-9_]|$).*>> "\$GITHUB_STEP_SUMMARY"$' <<<"${text}" \
             | head -n 1 | cut -d: -f1 || true)
         if [[ -z "${recorded}" ]] || ((recorded > moved)); then
             problem "latest.yml's latest job must write the digest :latest had (\$current) and the new one (\$DIGEST) to the step summary before it moves :latest"
         fi
     fi
+
+    # The inputs and what the checks found reach each step only from its
+    # job's env, which the lines above pin. No step sets its own, but the
+    # checks job's 'Check the digest', which takes the Build run the step
+    # before it found, and no step changes a later step's environment
+    # (GITHUB_ENV, GITHUB_PATH), so none can give a check or the move
+    # another commit, digest, withdraw switch or version.
+    while IFS=$'\t' read -r where entry; do
+        if [[ "${where}"$'\t'"${entry}" != $'checks: Check the digest\tRUN: ${{ steps.build_run.outputs.run }}' ]]; then
+            problem "latest.yml's steps must take their environment from their job's env alone (only the checks job's 'Check the digest' sets RUN: \${{ steps.build_run.outputs.run }}): ${where}: ${entry}"
+        fi
+    done < <(awk '
+        function flush(   i) {
+            for (i = 1; i <= n; i++) { print where "\t" entries[i] }
+            n = 0
+        }
+        /^[ \t]*(#|$)/ { next }
+        /^[^ ]/ { flush(); in_jobs = ($0 ~ /^jobs:/); in_env = 0; next }
+        !in_jobs { next }
+        /^  [^ ]/ { flush(); job = $1; sub(/:$/, "", job); in_env = 0; next }
+        /^      - / { flush(); name = "a step with no name"; in_env = 0; $0 = "        " substr($0, 9) }
+        in_env && /^          / { entry = $0; sub(/^[ \t]+/, "", entry); entries[++n] = entry; next }
+        { in_env = 0 }
+        /^        name:/ { name = $0; sub(/^        name:[ \t]*/, "", name) }
+        /^        env:/ {
+            in_env = 1
+            entry = $0
+            sub(/^        env:[ \t]*/, "", entry)
+            if (entry != "") { entries[++n] = entry }
+        }
+        { where = job ": " name }
+        END { flush() }
+    ' "${LATEST}")
+    while IFS= read -r hit; do
+        problem "latest.yml must change no later step's environment (GITHUB_ENV, GITHUB_PATH): ${hit}"
+    done < <(grep -nE 'GITHUB_ENV|GITHUB_PATH' "${LATEST}" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
 fi
 
 # A job runs only once the jobs it needs succeeded, and a step only once the
 # steps before it did. A condition would change that: if: always() on
 # release.yml's publish or latest job, or on latest.yml's latest job, runs it
 # after a failed need, and if: false on a step of a checks or build job skips
-# that check. So would a job or step that continues on error.
+# that check. So would a job or step that continues on error. And a check
+# stops its step only if exit 1 follows its ::error::, and only if nothing
+# ends the step before it (exit 0, exit, true, : standing alone) or lets a
+# failed command pass (set +e, or any set +...). || true after a command is
+# how a step reads what may not be there.
 for file in "${RELEASE}" "${LATEST}"; do
     [[ -f "${file}" ]] || continue
     name=$(basename "${file}")
@@ -345,6 +591,24 @@ for file in "${RELEASE}" "${LATEST}"; do
     while IFS= read -r hit; do
         problem "${name} must not continue on error: ${hit}"
     done < <(grep -nE '^[[:space:]]*(-[[:space:]]+)?continue-on-error:' "${file}" || true)
+    while IFS=$'\t' read -r kind at hit; do
+        if [[ "${kind}" == error ]]; then
+            problem "${name} must follow each ::error:: with exit 1, so the refusal stops its step: line ${at} has '${hit}'"
+        else
+            problem "${name} must have no line that ends a step early or lets a failure pass (exit 0, exit, true, :, set +...): line ${at}: ${hit}"
+        fi
+    done < <(awk '
+        /^[ \t]*#/ { next }
+        { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+        after_error {
+            after_error = 0
+            if (line != "exit 1") { print "error\t" FNR "\t" line; next }
+        }
+        index(line, "echo \"::error::") == 1 { after_error = 1; next }
+        line == "true" || line == ":" || (line ~ /^exit([ \t]|$)/ && line != "exit 1") || line ~ /^set[ \t]+\+/ {
+            print "early\t" FNR "\t" line
+        }
+    ' "${file}")
 done
 
 if [[ ! -f "${TEST}" ]]; then
@@ -413,12 +677,25 @@ else
     done
     # The image takes that build, and the commit it is built from as the
     # image marker every node gets.
+    image=$(job image "${BUILD}")
     if ! needs image "${BUILD}" | grep -qx manager; then
         problem "build.yml's image job must need the manager job"
     fi
-    if ! grep -qF -- 'build-args: IMAGE_VERSION=${{ github.sha }}' <<<"$(job image "${BUILD}")"; then
+    if ! grep -qF -- 'build-args: IMAGE_VERSION=${{ github.sha }}' <<<"${image}"; then
         problem "build.yml's image job must pass the image marker (build-args: IMAGE_VERSION=\${{ github.sha }})"
     fi
+    # And it attests the image it pushed, by the digest it recorded: the
+    # record of it latest.yml takes once the digest artifact has expired.
+    image_permissions=$(job_permissions image "${BUILD}")
+    if ! grep -qx 'attestations: write' <<<"${image_permissions}" || ! grep -qx 'id-token: write' <<<"${image_permissions}"; then
+        problem "build.yml's image job must be able to attest the image (attestations: write, id-token: write); it asks for: $(tr '\n' ' ' <<<"${image_permissions}")"
+    fi
+    holds "${image}" "build.yml's image job must attest the image it pushed, by the digest it recorded, in GitHub's attestations API" \
+        'echo "digest=$digest" >> "$GITHUB_OUTPUT"' \
+        'uses: actions/attest-build-provenance@' \
+        'subject-name: ghcr.io/project-dspace/storage-node' \
+        'subject-digest: ${{ steps.digest.outputs.digest }}' \
+        'push-to-registry: false'
 fi
 
 # The node is built the same way for the image (build.yml's linux-x64 job)
@@ -496,4 +773,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test; latest.yml runs only by hand with no default permissions, and moves :latest in the release environment only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and recorded, and only to a node as new as :latest's unless the run is a withdrawal, naming :latest's digest in the summary first; neither has a condition or anything continuing on error; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, and gives the image its marker; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, and only release.yml's publish job and latest.yml's latest job run in an environment."
+echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, and moves :latest forward only; latest.yml runs only by hand with no default permissions, checks its own commit with this script, and moves :latest in the release environment only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested or recorded, from a commit whose Test run succeeded, with a published release's node, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, and only release.yml's publish job and latest.yml's latest job run in an environment."

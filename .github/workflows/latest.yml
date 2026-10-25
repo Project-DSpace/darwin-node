@@ -1,32 +1,62 @@
 # Points the storage-node image's :latest, which home operators run, at an
 # image the Build workflow made from a commit on main, when no node release
-# moves it (release.yml moves it when a release is published):
+# moves it (release.yml moves it, forward only, when a release is published):
 #
-# - an image release: a new image with the node :latest already has, such
-#   as one with a new node manager. The nodes' own upgrades replace only
-#   their binary, so operators get the rest of the image only by pulling it.
-# - a withdrawal: :latest back to the image an earlier release put there,
-#   whose node may be older than the one :latest has.
+# - an image release: a new image with the node release :latest already
+#   has, such as one with a new node manager. The nodes' own upgrades
+#   replace only their binary, so operators get the rest of the image only
+#   by pulling it.
+# - a withdrawal: :latest back to an image it held before. The withdrawn
+#   release is deleted on GitHub first, so nodes still waiting to install
+#   it drop it, and its Release run can't move :latest to it again.
 #
 # Run by hand from main, with the commit and the digest its Build run
 # recorded, and withdraw set for a withdrawal:
 #
 #   gh workflow run latest.yml --ref main -f commit=<commit> -f digest=sha256:<digest>
 #
-# The checks job, which can write nothing, checks that the run is from main,
-# that the commit is on main, that the commit's Build run from its push to
-# main succeeded, smoke test included, and that the digest is the one that
-# run recorded and the one storage-node:<commit> has, and reads the image's
-# node version. The latest job then runs in the release environment, after
-# the same approval as a release. It refuses an image whose node is older
-# than the one :latest has, unless the run is a withdrawal, writes the
-# digest :latest had and the new one to the run's summary, so a later run
-# can move it back, then moves :latest and checks it. The release
-# environment admits this workflow's runs from main, as it admits
-# release.yml's from v*+ds.* tags.
+# Runs of this workflow and release.yml share one concurrency group, which
+# keeps one run going and at most one waiting: a run queued while one is
+# waiting cancels the waiting one. So dispatch only when no Release or
+# Latest run is in progress or waiting (`gh run list --workflow release.yml`,
+# then `--workflow latest.yml`), approve or reject a run waiting for its
+# approval before pushing a release tag (until then it holds the group),
+# and re-run a cancelled run with `gh run rerun <id>`.
 #
-# scripts/check-workflows.sh, which the Build and Test workflows run, fails
-# if this file loses any of that.
+# The checks job, which can write nothing, runs scripts/check-workflows.sh
+# on the commit this workflow runs from: main's head when it was dispatched,
+# which can be later than the commit given. It checks that the run is from
+# main, that the commit is on main, that the commit's Build run from its
+# push to main succeeded, smoke test included, and so did its newest Test
+# run, and that the digest is the image that Build run pushed: by the build
+# provenance attestation the run made for it, or, for an image from before
+# the Build workflow attested its images, by the run's storage-node-digest
+# artifact while that is kept (30 days); an image with neither is refused.
+# The image's node must be a published release. It is the Build workflow's
+# own build of the commit, as in every release image, checked only by the
+# version it reports, so node code changed since that release's tag without
+# a version bump would ship under its version: the job writes those changes
+# to the run's summary, for the approval. A node takes the image's binary
+# only when it is newer than its own, so the binary of an image release
+# goes only to new nodes, and existing nodes keep their signed release
+# binary. For a withdrawal, the checks job also checks that :latest held
+# the image before: the commit of a v*+ds.* tag whose Release run
+# succeeded, or one an earlier Latest run moved :latest to.
+#
+# The latest job then runs in the release environment, after the same
+# approval as a release. It refuses an image whose node is newer than the
+# one :latest has, which goes to :latest only with its release, and, unless
+# the run is a withdrawal, one whose node is older, or that was built from a
+# commit before the one :latest's image was built from: withdraw is needed
+# for any move to an older image. It writes the digest :latest had and the
+# new one to the run's summary, so a later run can move it back, then moves
+# :latest and checks it. The release environment admits this workflow's
+# runs from main, as it admits release.yml's from v*+ds.* tags: before
+# approving a run, check that it is the Latest run from main, or the
+# Release run, meant.
+#
+# scripts/check-workflows.sh, which the Build and Test workflows and the
+# checks job below run, fails if this file loses any of that.
 
 name: Latest
 
@@ -44,7 +74,7 @@ on:
         required: true
         type: string
       withdraw:
-        description: A withdrawal, which may move the latest tag to an image with an older node
+        description: A withdrawal, which may move the latest tag back to an image it had before
         type: boolean
         default: false
 
@@ -54,7 +84,8 @@ defaults:
   run:
     shell: bash
 
-# release.yml's group: a release and this never move :latest at once.
+# release.yml's group: a release and this never move :latest at once. It
+# keeps at most one run waiting (see above).
 concurrency:
   group: release
   cancel-in-progress: false
@@ -66,6 +97,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       actions: read
+      attestations: read
       contents: read
       packages: read
     outputs:
@@ -77,6 +109,7 @@ jobs:
       IMAGE: ghcr.io/project-dspace/storage-node
       COMMIT: ${{ inputs.commit }}
       DIGEST: ${{ inputs.digest }}
+      WITHDRAW: ${{ inputs.withdraw }}
     steps:
       - name: Check the ref and the inputs
         run: |
@@ -92,6 +125,19 @@ jobs:
             echo "::error::digest must be sha256: and 64 hex digits"
             exit 1
           fi
+
+      # The commit this workflow runs from, with the whole history and every
+      # tag, for the node's changes and a withdrawal's tags below.
+      - name: Check out the commit this runs from
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # This workflow as it runs, which the commit given doesn't hold when it
+      # is older: the check the Build and Test runs of its commit make.
+      - name: Check the workflows
+        run: bash scripts/check-workflows.sh
 
       # main is the commit, or ahead of it.
       - name: Check the commit is on main
@@ -130,45 +176,151 @@ jobs:
           echo "run=$run" >> "$GITHUB_OUTPUT"
           echo "- Build run $run, from the push of $COMMIT to main, succeeded, smoke test included." >> "$GITHUB_STEP_SUMMARY"
 
+      # The newest run of the commit's suite, as release.yml's checks job
+      # takes it: from its push to main, or one run by hand without the
+      # listings cross-test. tests/darwin_image.rs, which pins every deletion
+      # the image's scripts make, runs there.
+      - name: Check the commit's Test run
+        run: |
+          run=$(gh api -X GET "repos/$GH_REPO/actions/workflows/test.yml/runs" \
+            -f head_sha="$COMMIT" -f per_page=100 \
+            --jq '[.workflow_runs[] | select((.event == "push" and .head_branch == "main") or (.event == "workflow_dispatch" and .display_title == "Test by hand"))] | max_by(.run_number) | .id // empty')
+          if [[ -z "$run" ]]; then
+            echo "::error::no Test run of $COMMIT from a push to main, or by hand without the listings cross-test: run Test on it, then this workflow"
+            exit 1
+          fi
+          conclusion=$(gh api "repos/$GH_REPO/actions/runs/$run" --jq '.conclusion // empty')
+          if [[ "$conclusion" != success ]]; then
+            echo "::error::Test run $run of $COMMIT ended '${conclusion:-unfinished}', not success: once it succeeds, run this workflow again"
+            exit 1
+          fi
+          echo "- Test run $run of $COMMIT succeeded." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Log in to the registry
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-      # The digest is the one the run recorded in its storage-node-digest
-      # artifact, while that is kept (30 days), and the one
-      # storage-node:<commit> has: a later run that pushed the commit's tag
-      # again makes the two differ.
+      # The digest must be the image the Build run pushed, by a record that
+      # run made. The build provenance attestation build.yml's image job
+      # makes, which doesn't expire: signed for build.yml on main at the
+      # commit, by a run a push started, as its certificate says (GitHub's
+      # token sets the certificate; the workflow writes the predicate). And
+      # the run's storage-node-digest artifact, kept 30 days, which must name
+      # the digest while it is kept. An image from before the Build workflow
+      # attested its images has the artifact alone, so once that has expired
+      # the image is refused, as release.yml's latest job refuses it.
+      # storage-node:<commit> is only noted: a later run by hand can push the
+      # commit's tag again.
       - name: Check the digest
         env:
           RUN: ${{ steps.build_run.outputs.run }}
         run: |
+          attested=$(gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GH_REPO" \
+            --signer-workflow "$GH_REPO/.github/workflows/build.yml" \
+            --source-ref refs/heads/main --source-digest "$COMMIT" --format json \
+            --jq '[.[].verificationResult.signature.certificate | select(.buildTrigger == "push") | .runInvocationURI] | first // empty' || true)
           kept=$(gh api "repos/$GH_REPO/actions/runs/$RUN/artifacts" \
             --jq '[.artifacts[] | select(.name == "storage-node-digest" and (.expired | not))] | length')
+          recorded=""
           if ((kept > 0)); then
             gh run download "$RUN" --name storage-node-digest --dir "$RUNNER_TEMP/digest"
             recorded=$(cat "$RUNNER_TEMP/digest/storage-node-digest.txt")
-            if [[ "$recorded" != "$DIGEST" ]]; then
-              echo "::error::Build run $RUN recorded $recorded, not $DIGEST"
-              exit 1
-            fi
-            echo "- Build run $RUN recorded $DIGEST." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "- Build run $RUN's storage-node-digest artifact has expired, so the registry alone gives the digest." >> "$GITHUB_STEP_SUMMARY"
           fi
-          tagged=$(docker buildx imagetools inspect "$IMAGE:$COMMIT" --format '{{json .Manifest}}' | jq -r .digest || true)
-          if [[ "$tagged" != "$DIGEST" ]]; then
-            echo "::error::$IMAGE:$COMMIT is ${tagged:-not found}, not $DIGEST"
+          if [[ -n "$recorded" && "$recorded" != "$DIGEST" ]]; then
+            echo "::error::Build run $RUN recorded $recorded, not $DIGEST"
             exit 1
           fi
-          echo "- $IMAGE:$COMMIT is $DIGEST." >> "$GITHUB_STEP_SUMMARY"
+          if [[ -z "$attested" && "$recorded" != "$DIGEST" ]]; then
+            echo "::error::nothing records $DIGEST as the image Build run $RUN pushed: there is no attestation of it from a push of $COMMIT to main, and the run's storage-node-digest artifact has expired"
+            exit 1
+          fi
+          {
+            if [[ -n "$attested" ]]; then
+              echo "- $DIGEST is attested as built by build.yml from the push of $COMMIT to main ($attested)."
+            else
+              echo "- No attestation from the push of $COMMIT to main verifies $DIGEST (an image from before the Build workflow attested its images)."
+            fi
+            if [[ -n "$recorded" ]]; then
+              echo "- Build run $RUN recorded $DIGEST."
+            else
+              echo "- Build run $RUN's storage-node-digest artifact has expired: the attestation alone gives the digest."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          tagged=$(docker buildx imagetools inspect "$IMAGE:$COMMIT" --format '{{json .Manifest}}' | jq -r .digest || true)
+          if [[ "$tagged" != "$DIGEST" ]]; then
+            echo "- $IMAGE:$COMMIT names ${tagged:-no image}, not $DIGEST: a later run pushed the commit's tag again. The digest the records give is used." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-      # As release.yml's latest job reads it. The latest job compares it with
-      # the node of the image it replaces.
+      # As release.yml's latest job reads it; the latest job compares it with
+      # the node of the image it replaces. It must be a published release's.
+      # The image's node is this commit's own build, checked only by the
+      # version it reports, so the summary shows what the node's code changed
+      # by between that release's tag and the commit.
       - name: Read the image's node version
         id: version
         run: |
           version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$DIGEST" --version)
+          if [[ ! "$version" =~ ^ant-node\ ([0-9]+\.[0-9]+\.[0-9]+\+ds\.[1-9][0-9]*)$ ]]; then
+            echo "::error::$IMAGE@$DIGEST runs '$version', not a release's version (ant-node X.Y.Z+ds.N)"
+            exit 1
+          fi
+          tag="v${BASH_REMATCH[1]}"
+          published=$(gh release view "$tag" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease' 2>/dev/null || true)
+          if [[ "$published" != false ]]; then
+            echo "::error::$IMAGE@$DIGEST runs $version, and $tag is not a published release"
+            exit 1
+          fi
+          released=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" || true)
+          if [[ ! "$released" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::there is no tag $tag to compare the node's code with"
+            exit 1
+          fi
+          changes=$(git diff --stat "$released" "$COMMIT" -- src vendor Cargo.toml Cargo.lock build.rs)
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "- $IMAGE@$DIGEST runs $version." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "- $IMAGE@$DIGEST runs $version, the published release $tag."
+            echo "- The node's code (src, vendor, Cargo.toml, Cargo.lock, build.rs) from $tag ($released) to $COMMIT, which the image's node is built from:"
+            echo ''
+            echo '```'
+            echo "${changes:-no change}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A withdrawal takes :latest back to an image it held before: the
+      # commit of a v*+ds.* tag whose Release run succeeded, latest job
+      # included, or the commit an earlier Latest run moved :latest to. The
+      # summary names which. Without withdraw, the latest job refuses any
+      # move back.
+      - name: Check a withdrawal goes back to an image latest had
+        run: |
+          if [[ "$WITHDRAW" == true ]]; then
+            tags=$(git tag --points-at "$COMMIT" --list 'v*+ds.*')
+            releases=$(gh api -X GET "repos/$GH_REPO/actions/workflows/release.yml/runs" \
+              -f head_sha="$COMMIT" -f event=push -f status=success -f per_page=100 \
+              --jq '.workflow_runs[] | "\(.head_branch) \(.id)"')
+            moved=$(gh api -X GET "repos/$GH_REPO/actions/workflows/latest.yml/runs" \
+              -f status=success -f per_page=100 \
+              --jq '.workflow_runs[] | "\(.id) \(.display_title)"')
+            by_release=""
+            while read -r tag run; do
+              if [[ -n "$tag" ]] && grep -qxF -- "$tag" <<<"$tags"; then
+                by_release="the commit of $tag, whose Release run $run succeeded"
+                break
+              fi
+            done <<<"$releases"
+            by_latest=""
+            while read -r run title; do
+              if [[ "$title" == "Point latest at $COMMIT" || "$title" == "Withdraw latest to $COMMIT" ]]; then
+                by_latest="the commit Latest run $run moved the latest tag to"
+                break
+              fi
+            done <<<"$moved"
+            held=${by_release:-$by_latest}
+            if [[ -z "$held" ]]; then
+              echo "::error::withdraw is set, but the latest tag never had $COMMIT's image: it is neither the commit of a v*+ds.* tag whose Release run succeeded nor one an earlier Latest run moved the latest tag to"
+              exit 1
+            fi
+            echo "- A withdrawal, to $held." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # Moves the tag once the run is approved: the only job here that can write
   # to the registry, and the only one that names :latest.
@@ -177,9 +329,11 @@ jobs:
     runs-on: ubuntu-24.04
     environment: release
     permissions:
+      contents: read
       packages: write
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       IMAGE: ghcr.io/project-dspace/storage-node
       COMMIT: ${{ inputs.commit }}
       DIGEST: ${{ inputs.digest }}
@@ -190,15 +344,19 @@ jobs:
       - name: Log in to the registry
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-      # A node only ever upgrades, so the image's node must be the one
-      # :latest has or newer, unless the run is a withdrawal. Versions are
-      # ordered as nodes order them: by X.Y.Z, then by the +ds. build number,
-      # a version with none coming before ds.1; any other form is refused.
-      # Then, before :latest moves, the summary names the digest it had, for
-      # a later run to move it back, and the one it gets. The image marker
-      # (/opt/ant/image-version), which every image with darwin-nodes as its
-      # node manager carries, names the commit an image was built from.
-      - name: Check the node against latest's, and write the summary
+      # A newer node goes to :latest only with its release (release.yml), so
+      # the image's node must be the one :latest has, or, in a withdrawal,
+      # may be older. Versions are ordered as nodes order them: by X.Y.Z,
+      # then by the +ds. build number, a version with none coming before
+      # ds.1; any other form is refused. Unless the run is a withdrawal, the
+      # image must also be built from the commit :latest's image was built
+      # from, or a later one: the commit its image marker
+      # (/opt/ant/image-version) names, which every image with darwin-nodes
+      # as its node manager carries, or, for an image with none, which only
+      # a release put on :latest, the commit of that release's tag. Then,
+      # before :latest moves, the summary names the digest it had, for a
+      # later run to move it back, and the one it gets.
+      - name: Check the image against latest's, and write the summary
         run: |
           current=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
           if [[ ! "$current" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -216,26 +374,40 @@ jobs:
             echo "::error::'$VERSION' and $IMAGE:latest's '$current_version' can't be ordered"
             exit 1
           fi
+          if [[ "$order" == "newer than" ]]; then
+            echo "::error::$IMAGE@$DIGEST runs $VERSION, newer than $IMAGE:latest's $current_version: a newer node goes to :latest only with its release"
+            exit 1
+          fi
           if [[ "$order" == "older than" && "$WITHDRAW" != true ]]; then
             echo "::error::$IMAGE@$DIGEST runs $VERSION, older than $IMAGE:latest's $current_version: only a withdrawal (withdraw) may move it back"
             exit 1
           fi
           marker=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)
           if [[ "$marker" =~ ^[0-9a-f]{40}$ ]]; then
+            base=$marker
             built="built from $marker"
           else
-            marker=""
-            built="with no image marker"
+            base=$(gh api "repos/$GH_REPO/commits/refs/tags/v${current_version#ant-node }" --jq .sha 2>/dev/null || true)
+            built="with no image marker: release v${current_version#ant-node }'s image, from ${base:-a commit not found}"
+          fi
+          relation=""
+          if [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
+            relation=$(gh api "repos/$GH_REPO/compare/$base...$COMMIT" --jq .status 2>/dev/null || true)
+          fi
+          if [[ "$relation" != ahead && "$relation" != identical && "$WITHDRAW" != true ]]; then
+            echo "::error::$COMMIT is not the commit of $IMAGE:latest's image (${base:-not found}) or a later one (${relation:-not compared}): only a withdrawal (withdraw) may move it back"
+            exit 1
           fi
           echo "Moving $IMAGE:latest from $current to $DIGEST." >> "$GITHUB_STEP_SUMMARY"
           {
             echo "- $current runs $current_version, $built."
             echo "- $DIGEST runs $VERSION, $order the image before, built from $COMMIT by Build run $RUN."
+            echo "- $COMMIT against ${base:-no commit found}, the commit of the image before: ${relation:-not compared}."
             if [[ "$WITHDRAW" == true ]]; then
-              echo "- A withdrawal: withdraw is set, so the new image's node may be older than the one before."
+              echo "- A withdrawal: withdraw is set, so the new image may be older than the one before, and its node too."
             fi
-            if [[ -n "$marker" ]]; then
-              echo "- To move it back: \`gh workflow run latest.yml --ref main -f commit=$marker -f digest=$current -f withdraw=true\`"
+            if [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "- To move it back: \`gh workflow run latest.yml --ref main -f commit=$base -f digest=$current -f withdraw=true\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

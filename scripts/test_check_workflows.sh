@@ -7,10 +7,10 @@
 # The check runs on copies of .github/workflows: once as they are, where it
 # must pass, and once for each change below, where it must fail with that
 # change's problem alone. Each change would let a release, or a move of
-# :latest, skip something it relies on. Then the filter release.yml's checks
-# job picks the tagged commit's Test run with runs on sample lists of runs,
-# and the order latest.yml's latest job puts node versions in runs on sample
-# versions.
+# :latest, skip something it relies on, or carry on past a refusal. Then
+# the filter release.yml's and latest.yml's checks jobs pick a commit's Test
+# run with runs on sample lists of runs, and the order the latest jobs put
+# node versions in runs on sample versions.
 
 set -euo pipefail
 
@@ -59,6 +59,28 @@ edit() {
         return
     fi
     printf '%s' "${text%%"${old}"*}${new}${rest}" > "${file}"
+}
+
+# The lines of the step named NAME in a file of the copy: from its
+# "- name:" line up to the next step, comment, job or top-level key.
+step_lines() {
+    NAME="      - name: $2" awk '
+        $0 == ENVIRON["NAME"] { inside = 1; print; next }
+        inside && /^(      - |      #|  [^ ]|[^ ])/ { exit }
+        inside { print }
+    ' "${COPY}/$1"
+}
+
+# Takes the step named NAME out of a file of the copy. If there is no such
+# step, the case is out of date: it fails, unrun.
+drop_step() {
+    local lines
+    lines=$(step_lines "$1" "$2")
+    if [[ -z "${lines}" ]]; then
+        STALE="$1 has no step named '$2'"
+        return
+    fi
+    edit "$1" "${lines}"$'\n' ''
 }
 
 # Runs the check on the copy. It must pass when WANT is "pass", and
@@ -204,6 +226,38 @@ fresh
 edit "${RELEASE}" '    needs: [build, checks, publish]' '    needs: [build, publish]'
 expect "latest without the checks" "latest job must need checks"
 
+# And moves :latest forward only, so a re-run, which needs no approval,
+# can't undo an image release or a withdrawal.
+GUARD_NAME="Check latest's node is older than this release's"
+GUARD="release.yml's latest job must check, in a step named \"${GUARD_NAME}\", that :latest's node is older than the release's, or that :latest already has the image"
+fresh
+drop_step "${RELEASE}" "${GUARD_NAME}"
+expect "latest moved by a release whatever it has" "${GUARD}"
+
+fresh
+edit "${RELEASE}" 'if [[ "$order" != "newer than" ]]; then' 'if false; then'
+expect "latest moved back by a re-run of a release" "${GUARD}"
+
+fresh
+edit "${RELEASE}" 'if [[ "$current" == "$DIGEST" ]]; then' 'if true; then'
+expect "any image taken for the release's own" "${GUARD}"
+
+fresh
+edit "${RELEASE}" 'current_version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$current" --version)' \
+    'current_version="ant-node 0.0.0"'
+expect "latest's node version not read from its image by a release" "${GUARD}"
+
+fresh
+edit "${RELEASE}" $'| if $n > $c then "newer than" elif $n == $c then "the same as" else "older than" end\'); then' \
+    $'| if $n >= $c then "newer than" elif $n == $c then "the same as" else "older than" end\'); then'
+expect "a release ordering versions its own way" "release.yml's latest job must order node versions as latest.yml does"
+
+fresh
+GUARD_LINES=$(step_lines "${RELEASE}" "${GUARD_NAME}")
+drop_step "${RELEASE}" "${GUARD_NAME}"
+printf '\n%s\n' "${GUARD_LINES}" >> "${COPY}/${RELEASE}"
+expect "latest read by a release only after it moved" "release.yml's latest job must check :latest (${GUARD_NAME}) before it moves it"
+
 # No condition, and nothing continuing on error.
 fresh
 edit "${RELEASE}" $'    needs: [build, checks]\n' $'    needs: [build, checks]\n    if: ${{ always() }}\n'
@@ -241,6 +295,18 @@ edit "${RELEASE}" $'  checks:\n    runs-on: ubuntu-24.04\n' \
     $'  checks:\n    runs-on: ubuntu-24.04\n    # No if: or continue-on-error: true here.\n'
 expect "a comment naming both" pass
 
+# Every refusal stops its step, and nothing ends a step before its checks.
+fresh
+edit "${RELEASE}" $'            echo "::error::$tag is not vX.Y.Z+ds.N"\n            exit 1\n' \
+    $'            echo "::error::$tag is not vX.Y.Z+ds.N"\n'
+expect "a refusal of release.yml that doesn't stop its step" "release.yml must follow each ::error:: with exit 1"
+
+fresh
+edit "${RELEASE}" $'      - name: Check this is the latest release\n        run: |\n' \
+    $'      - name: Check this is the latest release\n        run: |\n          exit 0\n'
+expect "a check of release.yml ended before it starts" \
+    "release.yml must have no line that ends a step early or lets a failure pass"
+
 # Only the latest jobs of release.yml and latest.yml write :latest.
 LATEST_WRITERS="only the latest jobs of release.yml and latest.yml may write the :latest tag"
 fresh
@@ -271,13 +337,15 @@ edit "${LATEST}" $'  checks:\n    runs-on: ubuntu-24.04\n' $'  checks:\n    runs
 expect "latest.yml's checks job in the release environment" "${IN_ENVIRONMENT}"
 
 fresh
-edit "${LATEST}" $'      WITHDRAW: ${{ inputs.withdraw }}\n' \
-    $'      WITHDRAW: ${{ inputs.withdraw }}\n      KEY: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}\n'
+edit "${LATEST}" $'      VERSION: ${{ needs.checks.outputs.version }}\n' \
+    $'      VERSION: ${{ needs.checks.outputs.version }}\n      KEY: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}\n'
 expect "the release signing key in latest.yml" "latest.yml must read no secret"
 
 # latest.yml: run only by hand, from main, and approved in the release
-# environment; it moves :latest, once its checks pass, to an image whose
-# node is as new as :latest's unless the run is a withdrawal.
+# environment; it moves :latest, once its checks pass, to an image with the
+# node :latest has, a published release's, from :latest's commit or a later
+# one, unless the run is a withdrawal, which goes back to an image :latest
+# held before.
 BY_HAND="latest.yml must run only by hand"
 fresh
 edit "${LATEST}" $'on:\n  workflow_dispatch:\n' $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n'
@@ -307,7 +375,16 @@ fresh
 edit "${LATEST}" 'if [[ "$GITHUB_REF" != refs/heads/main ]]; then' 'if false; then'
 expect "a run from another ref" "latest.yml's checks job must refuse a run from any ref but main"
 
-INPUTS="latest.yml's checks job must take the commit and digest from the inputs, and refuse anything but a full commit and a sha256 digest"
+OWN="latest.yml's checks job must check out the commit it runs from"
+fresh
+edit "${LATEST}" $'      - name: Check the workflows\n        run: bash scripts/check-workflows.sh\n' ''
+expect "latest.yml's own commit not checked" "${OWN}"
+
+fresh
+edit "${LATEST}" $'          fetch-depth: 0\n' $'          fetch-depth: 0\n          ref: ${{ inputs.commit }}\n'
+expect "the commit given checked in place of the one latest.yml runs from" "${OWN}"
+
+INPUTS="latest.yml's checks job must take the commit, the digest and the withdraw switch from the inputs, and refuse anything but a full commit and a sha256 digest"
 fresh
 edit "${LATEST}" 'if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then' 'if [[ -z "$COMMIT" ]]; then'
 expect "a commit by a short SHA or a branch" "${INPUTS}"
@@ -315,6 +392,10 @@ expect "a commit by a short SHA or a branch" "${INPUTS}"
 fresh
 edit "${LATEST}" 'if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then' 'if [[ -z "$DIGEST" ]]; then'
 expect "a digest of any form" "${INPUTS}"
+
+fresh
+edit "${LATEST}" $'      WITHDRAW: ${{ inputs.withdraw }}\n    steps:\n' $'    steps:\n'
+expect "a withdrawal's image unchecked, the switch never reaching the checks" "${INPUTS}"
 
 fresh
 edit "${LATEST}" 'if [[ "$status" != ahead && "$status" != identical ]]; then' 'if false; then'
@@ -326,16 +407,57 @@ edit "${LATEST}" '-f head_sha="$COMMIT" -f event=push -f branch=main -f per_page
 expect "a Build run by hand, or on another branch" "${BUILD_RUN}"
 
 fresh
-edit "${LATEST}" 'if [[ "$conclusion" != success ]]; then' 'if false; then'
+edit "${LATEST}" $'if [[ "$conclusion" != success ]]; then\n            echo "::error::Build run' \
+    $'if false; then\n            echo "::error::Build run'
 expect "a failed Build run" "${BUILD_RUN}"
 
 fresh
 edit "${LATEST}" 'if [[ "$smoke" != success ]]; then' 'if false; then'
 expect "the smoke test unchecked" "${BUILD_RUN}"
 
-DIGEST_CHECKED="latest.yml's checks job must check that the digest is the one the Build run recorded, while its artifact is kept, and the one the commit's image tag has"
 fresh
-edit "${LATEST}" 'if [[ "$recorded" != "$DIGEST" ]]; then' 'if false; then'
+edit "${LATEST}" $'            echo "::error::the smoke test of Build run $run ended \'${smoke:-not run}\', not success"\n            exit 1\n' \
+    $'            echo "::warning::the smoke test of Build run $run ended \'${smoke:-not run}\', not success"\n'
+expect "a failed smoke test only warned of" "${BUILD_RUN}"
+
+TEST_RUN="latest.yml's checks job must check that the commit's newest Test run, from its push to main or by hand without the listings cross-test, succeeded"
+fresh
+edit "${LATEST}" $'if [[ "$conclusion" != success ]]; then\n            echo "::error::Test run' \
+    $'if false; then\n            echo "::error::Test run'
+expect "a failed Test run" "${TEST_RUN}"
+
+fresh
+edit "${LATEST}" '-f head_sha="$COMMIT" -f per_page=100 \' '-f per_page=100 \'
+expect "another commit's Test run" "${TEST_RUN}"
+
+fresh
+edit "${LATEST}" '(.event == "workflow_dispatch" and .display_title == "Test by hand")' '.event == "workflow_dispatch"'
+expect "a Test run by hand with the listings cross-test" "${TEST_RUN}"
+
+DIGEST_CHECKED="latest.yml's checks job must check that the digest is the image the commit's Build run from its push to main pushed, by its attestation or its record"
+fresh
+edit "${LATEST}" 'select(.buildTrigger == "push") | ' ''
+expect "an image attested by a run by hand" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" '--source-ref refs/heads/main --source-digest "$COMMIT" --format json \' '--format json \'
+expect "an image attested from another ref or commit" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" $'            --signer-workflow "$GH_REPO/.github/workflows/build.yml" \\\n' ''
+expect "an image attested by another workflow" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" 'if [[ -z "$attested" && "$recorded" != "$DIGEST" ]]; then' 'if false; then'
+expect "an image with no record" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" 'if [[ -z "$attested" && "$recorded" != "$DIGEST" ]]; then' \
+    'if [[ -z "$attested" && "$recorded" != "$DIGEST" && "$tagged" != "$DIGEST" ]]; then'
+expect "the commit's tag taken in place of an expired record" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" 'if [[ -n "$recorded" && "$recorded" != "$DIGEST" ]]; then' 'if false; then'
 expect "a digest the Build run didn't record" "${DIGEST_CHECKED}"
 
 fresh
@@ -343,13 +465,47 @@ edit "${LATEST}" 'if ((kept > 0)); then' 'if false; then'
 expect "the Build run's record never read" "${DIGEST_CHECKED}"
 
 fresh
-edit "${LATEST}" 'if [[ "$tagged" != "$DIGEST" ]]; then' 'if false; then'
-expect "a digest the commit's image tag doesn't have" "${DIGEST_CHECKED}"
-
-fresh
 edit "${LATEST}" 'version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$DIGEST" --version)' \
     'version="ant-node 0.23.0+ds.15"'
 expect "a node version not read from the image" "latest.yml's checks job must read the node version from the image"
+
+PUBLISHED="latest.yml's checks job must refuse an image whose node is not a published release's"
+fresh
+edit "${LATEST}" 'if [[ "$published" != false ]]; then' 'if false; then'
+expect "a node with no published release" "${PUBLISHED}"
+
+fresh
+edit "${LATEST}" "--jq '.isDraft or .isPrerelease'" "--jq '.isDraft'"
+expect "a pre-release taken as published" "${PUBLISHED}"
+
+fresh
+edit "${LATEST}" 'if [[ ! "$version" =~ ^ant-node\ ([0-9]+\.[0-9]+\.[0-9]+\+ds\.[1-9][0-9]*)$ ]]; then' \
+    'if [[ ! "$version" =~ ^ant-node\ (.*)$ ]]; then'
+expect "a node of any version taken as a release's" "${PUBLISHED}"
+
+CHANGES="latest.yml's checks job must write the node's code changes since its release's tag to the summary"
+fresh
+edit "${LATEST}" 'changes=$(git diff --stat "$released" "$COMMIT" -- src vendor Cargo.toml Cargo.lock build.rs)' \
+    'changes=""'
+expect "the node's changes left out of the summary" "${CHANGES}"
+
+fresh
+edit "${LATEST}" '-- src vendor Cargo.toml Cargo.lock build.rs)' '-- src)'
+expect "the node's changes outside src left out" "${CHANGES}"
+
+WITHDRAWAL="latest.yml's checks job must check that a withdrawal goes back to an image :latest held before"
+fresh
+edit "${LATEST}" 'if [[ -z "$held" ]]; then' 'if false; then'
+expect "a withdrawal to any image" "${WITHDRAWAL}"
+
+fresh
+edit "${LATEST}" $'if [[ "$WITHDRAW" == true ]]; then\n            tags=' $'if false; then\n            tags='
+expect "a withdrawal's image never checked" "${WITHDRAWAL}"
+
+fresh
+edit "${LATEST}" '-f head_sha="$COMMIT" -f event=push -f status=success -f per_page=100 \' \
+    '-f head_sha="$COMMIT" -f event=push -f per_page=100 \'
+expect "a withdrawal to a release whose Release run failed" "${WITHDRAWAL}"
 
 fresh
 edit "${LATEST}" $'    environment: release\n' ''
@@ -359,28 +515,57 @@ fresh
 edit "${LATEST}" $'    needs: checks\n' ''
 expect "latest.yml's latest job without its checks" "latest.yml's latest job must need the checks job"
 
+LATEST_PERMISSIONS="latest.yml's latest job must ask for contents: read and packages: write and nothing else"
 fresh
 edit "${LATEST}" $'      packages: write\n' $'      packages: write\n      contents: write\n'
-expect "latest.yml's latest job able to write more" "latest.yml's latest job must ask for packages: write and nothing else"
+expect "latest.yml's latest job able to write more" "${LATEST_PERMISSIONS}"
 
-OLDER="latest.yml's latest job must refuse an image whose node is older than :latest's, unless the run is a withdrawal"
+fresh
+edit "${LATEST}" $'    permissions:\n      contents: read\n      packages: write\n' $'    permissions:\n      packages: write\n'
+expect "latest.yml's latest job unable to compare commits" "${LATEST_PERMISSIONS}"
+
+VERSIONS="latest.yml's latest job must refuse an image whose node is newer than :latest's, or older unless the run is a withdrawal"
 fresh
 edit "${LATEST}" 'if [[ "$order" == "older than" && "$WITHDRAW" != true ]]; then' 'if false; then'
-expect "an older node outside a withdrawal" "${OLDER}"
+expect "an older node outside a withdrawal" "${VERSIONS}"
 
 fresh
-edit "${LATEST}" $'| if $n > $c then "newer than" elif $n == $c then "the same as" else "older than" end\'); then' \
-    $'| "newer than"\'); then'
-expect "every node taken as newer" "${OLDER}"
+edit "${LATEST}" 'if [[ "$order" == "newer than" ]]; then' 'if false; then'
+expect "a newer node with no release" "${VERSIONS}"
 
 fresh
 edit "${LATEST}" 'current_version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$current" --version)' \
     'current_version="ant-node 0.0.0"'
-expect ":latest's node version not read from its image" "${OLDER}"
+expect ":latest's node version not read from its image" "${VERSIONS}"
 
 fresh
-edit "${LATEST}" $'      DIGEST: ${{ inputs.digest }}\n      WITHDRAW: ${{ inputs.withdraw }}\n' \
-    $'      DIGEST: ${{ needs.checks.outputs.other }}\n      WITHDRAW: ${{ inputs.withdraw }}\n'
+edit "${LATEST}" $'| if $n > $c then "newer than" elif $n == $c then "the same as" else "older than" end\'); then' \
+    $'| "the same as"\'); then'
+expect "every node taken as the one :latest has" "latest.yml's latest job must order node versions as nodes do"
+
+BEFORE="latest.yml's latest job must refuse, unless the run is a withdrawal, an image built from a commit before the one :latest's image was built from"
+fresh
+edit "${LATEST}" 'if [[ "$relation" != ahead && "$relation" != identical && "$WITHDRAW" != true ]]; then' \
+    'if [[ "$relation" == diverged && "$WITHDRAW" != true ]]; then'
+expect "an older image with the same node outside a withdrawal" "${BEFORE}"
+
+fresh
+edit "${LATEST}" 'relation=$(gh api "repos/$GH_REPO/compare/$base...$COMMIT" --jq .status 2>/dev/null || true)' \
+    'relation=identical'
+expect "the commit never compared with :latest's" "${BEFORE}"
+
+fresh
+edit "${LATEST}" 'base=$marker' 'base=$COMMIT'
+expect ":latest's commit not taken from its image marker" "${BEFORE}"
+
+fresh
+edit "${LATEST}" 'base=$(gh api "repos/$GH_REPO/commits/refs/tags/v${current_version#ant-node }" --jq .sha 2>/dev/null || true)' \
+    'base=$COMMIT'
+expect ":latest's commit not taken from its release's tag when it has no marker" "${BEFORE}"
+
+fresh
+edit "${LATEST}" $'      DIGEST: ${{ inputs.digest }}\n      WITHDRAW: ${{ inputs.withdraw }}\n      RUN:' \
+    $'      DIGEST: ${{ needs.checks.outputs.other }}\n      WITHDRAW: ${{ inputs.withdraw }}\n      RUN:'
 expect "latest.yml's latest job moving another digest" \
     "latest.yml's latest job must move :latest to the digest the checks job checked"
 
@@ -413,6 +598,12 @@ fresh
 edit "${LATEST}" "${SUMMARY_LINE}" $'          echo "Moving $IMAGE:latest to $DIGEST." >> "$GITHUB_STEP_SUMMARY"\n'
 expect "the digest :latest had left out of the summary" "${SUMMARY_FIRST}"
 
+COMPARE_REFUSAL=$(grep -A3 -F 'if [[ "$relation" != ahead && "$relation" != identical && "$WITHDRAW" != true ]]; then' "${LATEST}")$'\n'
+fresh
+edit "${LATEST}" "${COMPARE_REFUSAL}" ''
+edit "${LATEST}" "${MOVE_LINE}" "${MOVE_LINE}${COMPARE_REFUSAL}"
+expect "a check of latest.yml made after the move" "latest.yml's latest job must make every check before it moves :latest"
+
 fresh
 edit "${LATEST}" $'    needs: checks\n' $'    needs: checks\n    if: ${{ always() }}\n'
 expect "latest.yml's latest job after failed checks" "latest.yml must have no if:"
@@ -421,6 +612,57 @@ fresh
 edit "${LATEST}" $'      - name: Check the commit is on main\n' \
     $'      - name: Check the commit is on main\n        continue-on-error: true\n'
 expect "a check of latest.yml continuing on error" "latest.yml must not continue on error"
+
+# Every refusal stops its step, nothing ends a step before its checks or
+# lets a failure pass, and the steps take the inputs and what the checks
+# found from their job's env alone.
+STOPS="latest.yml must follow each ::error:: with exit 1"
+fresh
+edit "${LATEST}" $'            echo "::error::run this workflow from main (--ref main), not $GITHUB_REF"\n            exit 1\n' \
+    $'            echo "::error::run this workflow from main (--ref main), not $GITHUB_REF"\n'
+expect "a refusal of latest.yml that doesn't stop its step" "${STOPS}"
+
+fresh
+edit "${LATEST}" $'only a withdrawal (withdraw) may move it back"\n            exit 1\n          fi\n          marker=' \
+    $'only a withdrawal (withdraw) may move it back"\n            true\n          fi\n          marker='
+expect "a refusal of latest.yml carrying on with true" "${STOPS}"
+
+EARLY="latest.yml must have no line that ends a step early or lets a failure pass"
+fresh
+edit "${LATEST}" $'      - name: Check the commit is on main\n        run: |\n' \
+    $'      - name: Check the commit is on main\n        run: |\n          exit 0\n'
+expect "a check of latest.yml ended before it starts" "${EARLY}"
+
+fresh
+edit "${LATEST}" $'      - name: Check the commit is on main\n        run: |\n' \
+    $'      - name: Check the commit is on main\n        run: |\n          set +e\n'
+expect "a check of latest.yml carrying on after a failure" "${EARLY}"
+
+fresh
+edit "${LATEST}" $'      - name: Check the commit is on main\n        run: |\n' \
+    $'      - name: Check the commit is on main\n        shell: bash {0}\n        run: |\n'
+expect "a check of latest.yml in a shell without -e" "latest.yml must run every step in bash, as its defaults set it"
+
+OWN_ENV="latest.yml's steps must take their environment from their job's env alone"
+fresh
+edit "${LATEST}" $'      - name: Check the image against latest\'s, and write the summary\n' \
+    $'      - name: Check the image against latest\'s, and write the summary\n        env:\n          WITHDRAW: "true"\n'
+expect "every run taken as a withdrawal by the version check" "${OWN_ENV}"
+
+fresh
+edit "${LATEST}" $'      - name: Point latest at it\n' \
+    $'      - name: Point latest at it\n        env:\n          DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000\n'
+expect "latest moved to a digest a step sets" "${OWN_ENV}"
+
+fresh
+edit "${LATEST}" $'          RUN: ${{ steps.build_run.outputs.run }}\n' \
+    $'          RUN: ${{ steps.build_run.outputs.run }}\n          COMMIT: ${{ github.sha }}\n'
+expect "the digest checked against another commit" "${OWN_ENV}"
+
+fresh
+edit "${LATEST}" $'          echo "- $COMMIT is on main." >> "$GITHUB_STEP_SUMMARY"\n' \
+    $'          echo "- $COMMIT is on main." >> "$GITHUB_STEP_SUMMARY"\n          echo "WITHDRAW=true" >> "$GITHUB_ENV"\n'
+expect "a later step's environment changed" "latest.yml must change no later step's environment"
 
 # The image's node manager: built with --locked from the pinned commit,
 # checked, and taken by the image with its marker.
@@ -474,6 +716,21 @@ fresh
 edit "${BUILD}" $'          build-args: IMAGE_VERSION=${{ github.sha }}\n' ''
 expect "the image without its marker" "build.yml's image job must pass the image marker"
 
+# The image is attested, by the digest the run recorded: the record of it
+# latest.yml takes once the digest artifact has expired.
+ATTESTED="build.yml's image job must attest the image it pushed, by the digest it recorded"
+fresh
+drop_step "${BUILD}" "Attest the image"
+expect "the image not attested" "${ATTESTED}"
+
+fresh
+edit "${BUILD}" 'subject-digest: ${{ steps.digest.outputs.digest }}' 'subject-digest: ${{ inputs.digest }}'
+expect "another digest attested" "${ATTESTED}"
+
+fresh
+edit "${BUILD}" $'      id-token: write\n' ''
+expect "the image job unable to attest" "build.yml's image job must be able to attest the image"
+
 # The node, for the image and for releases: built with no feature, and
 # checked for test seams after it is built and before it is packaged.
 SEAM_STEP=$'      - name: Check the test seams are left out\n        run: |\n          if [[ ! -s target/release/ant-node ]]; then\n            echo "::error::there is no target/release/ant-node to check"\n            exit 1\n          fi\n          if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then\n            echo "::error::target/release/ant-node holds a test seam (ANT_TEST_SEAM_*): it was built with test-utils"\n            exit 1\n          fi\n\n'
@@ -513,7 +770,8 @@ expect "the image's node built with test-utils" \
     "build.yml's linux-x64 job must build the node once, with exactly 'run: cargo build --release --locked --bin ant-node'"
 
 # The filter release.yml's checks job gives gh api --jq to pick the tagged
-# commit's Test run from the runs of test.yml.
+# commit's Test run from the runs of test.yml; latest.yml's checks job picks
+# the given commit's with the same filter (the check holds both to it).
 filter=$(awk -v q="'" '
     index($0, "actions/workflows/test.yml/runs") { found = 1 }
     found && index($0, "--jq " q) {
@@ -570,7 +828,8 @@ takes "no run" "" ""
 
 # The jq filter latest.yml's latest job orders the image's node version
 # against :latest's with: the lines after the one that passes it
-# --arg current "$current_version", up to its closing quote.
+# --arg current "$current_version", up to its closing quote. release.yml's
+# latest job orders versions with the same one (the check holds both to it).
 version_order=$(awk -v q="'" '
     !inside && index($0, "--arg current \"$current_version\" " q) { inside = 1; next }
     inside && index($0, q "); then") { print substr($0, 1, index($0, q "); then") - 1); exit }
@@ -614,4 +873,4 @@ if ((FAILED > 0)); then
     echo "${FAILED} of $((PASSED + FAILED)) cases failed" >&2
     exit 1
 fi
-echo "scripts/check-workflows.sh: ${PASSED} cases pass. It passes on the workflows as they are and fails on each change that would let a release, or a move of :latest, skip a check; release.yml's filter takes the tagged commit's own Test run, and latest.yml orders node versions as nodes do."
+echo "scripts/check-workflows.sh: ${PASSED} cases pass. It passes on the workflows as they are and fails on each change that would let a release, or a move of :latest, skip a check or carry on past a refusal; the Test run filter takes a commit's own Test run, and the latest jobs order node versions as nodes do."
