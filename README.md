@@ -265,14 +265,17 @@ never ran.
   nodes still waiting to install it drop it and its Release run can't move
   `:latest` to it again, then runs the Latest workflow with `withdraw`. The
   workflow is given a commit on main, the digest of the image the Build
-  workflow made from it, `withdraw` for a withdrawal, and `node_code` when
-  the node's code changed since its release (below). Each run's title names
+  workflow made from it, `withdraw` for a withdrawal, `node_code` when the
+  node's code changed since its release, and `allow_unmarked` to take
+  `:latest` from an image with an image marker to one with none (below). Each run's title names
   the digest it moves `:latest` to, then the commit. Its `checks` job, which
   can write nothing, runs `scripts/check-workflows.sh` on the commit the
   workflow runs from (main's head when it was dispatched), and checks that
-  the run is from main, that the `latest` environment asks for a required
-  reviewer's approval, which administrators can't bypass, and admits only
-  main (GitHub makes an environment a job names, with no protection, when
+  the run is from main, that the `latest` environment asks for the
+  approval of exactly one required reviewer, the user the job's `REVIEWER`
+  names (no other user, no team), which administrators can't bypass, and
+  admits only main (`prevent_self_review` is left unchecked, as that one
+  reviewer also dispatches the runs) (GitHub makes an environment a job names, with no protection, when
   there is none), that the commit is on main, that the commit's Build run
   from its push to main succeeded, smoke test included, and so did its
   newest Test run (from the push, or one run by hand without the listings
@@ -285,7 +288,8 @@ never ran.
   images (ds.13 to ds.15), as each Release run moved `:latest` to it. An
   image with none of these is refused. `:<commit>` in the registry is only
   noted: a later run by hand can push that tag again. The image's node must
-  be a published release. It is the Build workflow's own build of the
+  be a published release, which the `latest` job checks again after the
+  approval, as a release can be withdrawn while a run waits for it. It is the Build workflow's own build of the
   commit, as in every release image, checked only by the version it
   reports, so node code changed since that release's tag without a version
   bump would ship under its version. So, unless the run is a withdrawal,
@@ -294,7 +298,12 @@ never ran.
   `rust-toolchain.toml` and `.cargo`) is refused unless `node_code` is the
   fingerprint the refusal prints: a SHA-256 of each of those paths' git
   objects at the tag and at the commit, which names that change and no
-  other. The run's summary lists the changes (`git diff --stat`). A
+  other. The run's summary lists the changes (`git diff --stat`).
+  `rust-toolchain.toml` pins the exact Rust release every workflow builds
+  with (1.99.1, which built ds.15), so an image release's node is built
+  with its release's compiler, and a compiler change is a node code change
+  like any other. ds.15's tag predates the file, so the first image release
+  after it shows that one change and needs its `node_code`. A
   withdrawal's image was on `:latest` before, a release's image, built from
   the release's own commit, or one a Latest run moved `:latest` to. A node
   takes the image's binary only when it is newer than its own, so an image
@@ -313,7 +322,11 @@ never ran.
   before the one `:latest`'s image was built from (the commit its image
   marker names, or, for an image with none, its release's tag): `withdraw`
   is needed for any move to an older image, not only to an older node. It
-  writes the digest `:latest` had and the new one to the run's summary,
+  refuses a move from an image with an image marker (`darwin-nodes` as its
+  node manager) to one with none (Autonomi's manager, which deletes a
+  node's data when its disk runs low) unless `allow_unmarked` is set, which
+  only withdrawing the first image release needs, and the summary then says
+  so in bold. It writes the digest `:latest` had and the new one to the run's summary,
   with the command that moves it back when the image it had has a record
   that doesn't expire (an attestation, or a line in
   `docker/release-images`), then moves `:latest` and checks it. The

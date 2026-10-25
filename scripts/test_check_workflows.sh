@@ -5,7 +5,8 @@
 # checkout with LF line endings. It needs jq and git, which GitHub's runners
 # have.
 #
-# The check runs on copies of .github/workflows and docker/release-images:
+# The check runs on copies of .github/workflows, docker/release-images and
+# rust-toolchain.toml:
 # once as they are, where it must pass, and once for each change below,
 # where it must fail with that change's problem alone. Each change would let
 # a release, or a move of :latest, skip something it relies on, or carry on
@@ -24,6 +25,7 @@ LATEST="${DIR}/latest.yml"
 RELEASE="${DIR}/release.yml"
 TEST="${DIR}/test.yml"
 RELEASE_IMAGES=docker/release-images
+TOOLCHAIN=rust-toolchain.toml
 PASSED=0
 FAILED=0
 STALE=""
@@ -46,8 +48,8 @@ WORK=$(mktemp -d)
 trap 'rm -rf "${WORK}"' EXIT
 COPY="${WORK}/copy"
 
-# A fresh copy of the check, the workflows and docker/release-images, for
-# the next case.
+# A fresh copy of the check, the workflows, docker/release-images and
+# rust-toolchain.toml, for the next case.
 fresh() {
     STALE=""
     rm -rf "${COPY}"
@@ -55,6 +57,7 @@ fresh() {
     cp scripts/check-workflows.sh "${COPY}/scripts/"
     cp -R "${DIR}/." "${COPY}/${DIR}/"
     cp "${RELEASE_IMAGES}" "${COPY}/docker/"
+    cp "${TOOLCHAIN}" "${COPY}/"
 }
 
 # Replaces the one place OLD appears in a file of the copy with NEW. If it
@@ -408,12 +411,17 @@ edit "${LATEST}" $'on:\n  workflow_dispatch:\n' $'on:\n  workflow_run:\n    work
 expect "latest.yml after every Build run" "${BY_HAND}"
 
 fresh
-edit "${LATEST}" $'        type: boolean\n        default: false\n' $'        type: boolean\n        default: true\n'
+edit "${LATEST}" $'it had before\n        type: boolean\n        default: false\n' $'it had before\n        type: boolean\n        default: true\n'
 expect "every run a withdrawal unless unset" "${BY_HAND}"
 
 fresh
 edit "${LATEST}" $'        type: string\n        default: ""\n' $'        type: string\n        default: reviewed\n'
 expect "every run's node changes acknowledged unless unset" "${BY_HAND}"
+
+fresh
+edit "${LATEST}" $'      allow_unmarked:\n        description: Allow moving the latest tag from an image with an image marker to one with none (Autonomi\'s node manager), as only withdrawing the first image release needs\n        type: boolean\n        default: false\n' \
+    $'      allow_unmarked:\n        description: Allow moving the latest tag from an image with an image marker to one with none (Autonomi\'s node manager), as only withdrawing the first image release needs\n        type: boolean\n        default: true\n'
+expect "every run allowed to go back to Autonomi's manager unless unset" "${BY_HAND}"
 
 # Each run is named for the digest it moves :latest to, which a withdrawal's
 # check matches earlier runs by.
@@ -477,13 +485,13 @@ expect "node_code of any form" "${INPUTS}"
 # none, with no protection, so the checks job refuses a run unless it asks
 # for a reviewer's approval that administrators can't bypass, and admits
 # only main.
-APPROVAL="latest.yml's checks job must refuse a run unless the latest environment asks for a required reviewer's approval, which administrators can't bypass, and admits only main"
+APPROVAL="latest.yml's checks job must refuse a run unless the latest environment asks for the approval of one required reviewer, the user REVIEWER names, which administrators can't bypass, and admits only main"
 fresh
 drop_step "${LATEST}" "Check the latest environment asks for an approval"
 expect "the latest environment's approval never checked" "${APPROVAL}"
 
 fresh
-edit "${LATEST}" ', .can_admins_bypass == false' ''
+edit "${LATEST}" '.can_admins_bypass == false, ' ''
 expect "a latest environment administrators can bypass" "${APPROVAL}"
 
 fresh
@@ -491,8 +499,30 @@ edit "${LATEST}" ' || "$branches" != "branch main"' ''
 expect "a latest environment that admits any branch" "${APPROVAL}"
 
 fresh
-edit "${LATEST}" '| select(.type == "required_reviewers") | .reviewers[]?] | length > 0)' '] | length >= 0)'
-expect "a latest environment with no reviewer" "${APPROVAL}"
+edit "${LATEST}" ' || "$reviewers" != "User $REVIEWER"' ''
+expect "a latest environment with no reviewer, or anyone as its reviewer" "${APPROVAL}"
+
+fresh
+edit "${LATEST}" '| .reviewers[]? | "\(.type) \(.reviewer.login // .reviewer.slug)"] | join(", ")' \
+    '| .reviewers[]? | "User \(env.REVIEWER)"] | first // ""'
+expect "a latest environment's reviewers taken as REVIEWER whoever they are" "${APPROVAL}"
+
+fresh
+edit "${LATEST}" '| .reviewers[]? | "\(.type) \(.reviewer.login // .reviewer.slug)"] | join(", ")' \
+    '| .reviewers[]? | "\(.type) \(.reviewer.login // .reviewer.slug)"] | first // ""'
+expect "a latest environment's other reviewers left out" "${APPROVAL}"
+
+fresh
+edit "${LATEST}" $'      REVIEWER: DanielDNewton\n' ''
+expect "no one named as the latest environment's reviewer" "latest.yml's checks job must name the latest environment's one required reviewer once"
+
+fresh
+edit "${LATEST}" $'      REVIEWER: DanielDNewton\n' $'      REVIEWER: "*"\n'
+expect "anyone named as the latest environment's reviewer" "latest.yml's checks job must name the latest environment's one required reviewer once"
+
+fresh
+edit "${LATEST}" '# prevent_self_review is deliberately not checked: the one reviewer' '# the one reviewer'
+expect "prevent_self_review left unchecked with no word why" "why prevent_self_review is not checked"
 
 fresh
 edit "${LATEST}" 'if [[ "$status" != ahead && "$status" != identical ]]; then' 'if false; then'
@@ -611,7 +641,8 @@ edit "${LATEST}" 'if [[ "$published" != false ]]; then' 'if false; then'
 expect "a node with no published release" "${PUBLISHED}"
 
 fresh
-edit "${LATEST}" "--jq '.isDraft or .isPrerelease'" "--jq '.isDraft'"
+edit "${LATEST}" "gh release view \"\$tag\" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease'" \
+    "gh release view \"\$tag\" --json isDraft,isPrerelease --jq '.isDraft'"
 expect "a pre-release taken as published" "${PUBLISHED}"
 
 fresh
@@ -792,6 +823,47 @@ edit "${LATEST}" $'| if $n > $c then "newer than" elif $n == $c then "the same a
     $'| "the same as"\'); then'
 expect "every node taken as the one :latest has" "latest.yml's latest job must order node versions as nodes do"
 
+# The image's node must still be a published release after the approval:
+# a release can be withdrawn while a run waits for it.
+STILL_PUBLISHED="latest.yml's latest job must check again, after the approval, that the image's node is a published release"
+fresh
+edit "${LATEST}" 'if [[ "$published_now" != false ]]; then' 'if false; then'
+expect "a node withdrawn while its run waited for approval" "${STILL_PUBLISHED}"
+
+fresh
+edit "${LATEST}" "gh release view \"\$release\" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease'" \
+    "gh release view \"\$release\" --json isDraft,isPrerelease --jq '.isDraft'"
+expect "a node made a pre-release while its run waited taken as published" "${STILL_PUBLISHED}"
+
+fresh
+edit "${LATEST}" 'release="v${VERSION#ant-node }"' 'release="v${current_version#ant-node }"'
+expect "latest's own release checked again in place of the image's" "${STILL_PUBLISHED}"
+
+# From an image with darwin-nodes as its node manager (an image marker) to
+# one with Autonomi's (none) only with allow_unmarked.
+UNMARKED="latest.yml's latest job must refuse, unless allow_unmarked is set, a move from an image with an image marker to one with none"
+fresh
+edit "${LATEST}" 'if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$ALLOW_UNMARKED" != true ]]; then' 'if false; then'
+expect "latest back to Autonomi's manager with no allow_unmarked" "${UNMARKED}"
+
+fresh
+edit "${LATEST}" 'if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$ALLOW_UNMARKED" != true ]]; then' \
+    'if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$WITHDRAW" != true ]]; then'
+expect "latest back to Autonomi's manager in any withdrawal" "${UNMARKED}"
+
+fresh
+edit "${LATEST}" 'target_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DIGEST" /opt/ant/image-version 2>/dev/null || true)' \
+    'target_marker=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)'
+expect "the new image's marker read from latest's image" "${UNMARKED}"
+
+fresh
+edit "${LATEST}" $'      ALLOW_UNMARKED: ${{ inputs.allow_unmarked }}\n' ''
+expect "allow_unmarked never reaching the latest job" "${UNMARKED}"
+
+fresh
+edit "${LATEST}" 'echo "- **allow_unmarked is set:' 'echo "- allow_unmarked is set:'
+expect "allow_unmarked not shown in bold in the summary" "${UNMARKED}"
+
 BEFORE="latest.yml's latest job must refuse, unless the run is a withdrawal, an image built from a commit before the one :latest's image was built from"
 fresh
 edit "${LATEST}" 'if [[ "$relation" != ahead && "$relation" != identical && "$WITHDRAW" != true ]]; then' \
@@ -940,6 +1012,31 @@ fresh
 edit "${LATEST}" $'          echo "- $COMMIT is on main." >> "$GITHUB_STEP_SUMMARY"\n' \
     $'          echo "- $COMMIT is on main." >> "$GITHUB_STEP_SUMMARY"\n          echo "WITHDRAW=true" >> "$GITHUB_ENV"\n'
 expect "a later step's environment changed" "latest.yml must change no later step's environment"
+
+# The compiler: rust-toolchain.toml pins an exact Rust release, and no
+# workflow builds with another.
+TOOLCHAIN_PINNED="rust-toolchain.toml must pin an exact Rust release, once"
+fresh
+edit "${TOOLCHAIN}" 'channel = "' 'channel = "stable" # '
+expect "the node built with whatever stable is on the day" "${TOOLCHAIN_PINNED}"
+
+fresh
+rm "${COPY}/${TOOLCHAIN}"
+expect "rust-toolchain.toml left out" "${TOOLCHAIN_PINNED}"
+
+fresh
+edit "${TOOLCHAIN}" 'channel = "' 'channel = "1.99"
+#channel = "'
+expect "the node built with any patch release of a minor one" "${TOOLCHAIN_PINNED}"
+
+fresh
+printf '1.99.1\n' > "${COPY}/rust-toolchain"
+expect "a rust-toolchain beside rust-toolchain.toml" "${TOOLCHAIN_PINNED}"
+
+OTHER_TOOLCHAIN="no workflow may build with a toolchain other than rust-toolchain.toml's"
+fresh
+edit "${TEST}" $'\njobs:\n' $'\nenv:\n  RUSTUP_TOOLCHAIN: stable\n\njobs:\n'
+expect "a workflow overriding the pinned toolchain" "${OTHER_TOOLCHAIN}"
 
 # The image's node manager: built with --locked from the pinned commit,
 # checked, and taken by the image with its marker.

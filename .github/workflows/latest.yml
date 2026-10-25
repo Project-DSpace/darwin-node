@@ -11,8 +11,9 @@
 #   it drop it, and its Release run can't move :latest to it again.
 #
 # Run by hand from main, with the commit and the digest its Build run
-# recorded, withdraw set for a withdrawal, and node_code when the node's
-# code changed since its release (below):
+# recorded, withdraw set for a withdrawal, node_code when the node's code
+# changed since its release, and allow_unmarked to take :latest from an
+# image with an image marker to one with none (all below):
 #
 #   gh workflow run latest.yml --ref main -f commit=<commit> -f digest=sha256:<digest>
 #
@@ -33,7 +34,8 @@
 # on the commit this workflow runs from: main's head when it was dispatched,
 # which can be later than the commit given. It checks that the run is from
 # main, that the latest environment, where the latest job runs, asks for an
-# approval, that the commit is on main, that the commit's Build run from
+# approval by exactly one required reviewer, the user REVIEWER names, that
+# the commit is on main, that the commit's Build run from
 # its push to main succeeded, smoke test included, and so did its newest
 # Test run, and that the digest is the image that Build run pushed: by the
 # build provenance attestation the run made for it, by the run's
@@ -41,12 +43,15 @@
 # withdrawal, by docker/release-images, which records the image each
 # release put on :latest before the Build workflow attested its images; an
 # image with none of these is refused. The image's node must be a published
-# release. It is the Build workflow's own build of the commit, as in every
+# release, which the latest job checks again after the approval, as a
+# release can be withdrawn while a run waits for it. It is the Build workflow's own build of the commit, as in every
 # release image, checked only by the version it reports, so node code
 # changed since that release's tag without a version bump would ship under
 # its version: any such change is refused unless node_code names it, by
 # the fingerprint the refusal prints, which covers that change alone, and
-# the run's summary lists the changes. A withdrawal needs no node_code: its
+# the run's summary lists the changes. The compiler is one of those paths:
+# rust-toolchain.toml pins the exact Rust release every workflow builds
+# with, so an image's node is built with its release's compiler. A withdrawal needs no node_code: its
 # image was on :latest before, a release's image built from the release's
 # own commit or one a Latest run moved :latest to. A node takes the image's
 # binary only when it is newer than its own, so the binary of an image
@@ -61,7 +66,12 @@
 # whose node is newer than the one :latest has, which goes to :latest only
 # with its release, and, unless the run is a withdrawal, one whose node is
 # older, or that was built from a commit before the one :latest's image was
-# built from: withdraw is needed for any move to an older image. It writes
+# built from: withdraw is needed for any move to an older image. It refuses
+# a move from an image with an image marker (/opt/ant/image-version, which
+# every image with darwin-nodes as its node manager carries) to one with
+# none, whose node manager is Autonomi's, unless allow_unmarked is set:
+# only withdrawing the first image release needs that. It checks again
+# that the image's node is a published release. It writes
 # the digest :latest had and the new one to the run's summary, with the
 # command that moves it back when the image it had has a record that
 # doesn't expire, then moves :latest and checks it. The latest environment
@@ -96,6 +106,10 @@ on:
         description: The fingerprint of the node's code changes since its release, which a run refusing them prints (64 hex digits)
         type: string
         default: ""
+      allow_unmarked:
+        description: Allow moving the latest tag from an image with an image marker to one with none (Autonomi's node manager), as only withdrawing the first image release needs
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -126,6 +140,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       IMAGE: ghcr.io/project-dspace/storage-node
+      # The one person whose approval moves :latest: the latest
+      # environment's only required reviewer.
+      REVIEWER: DanielDNewton
       COMMIT: ${{ inputs.commit }}
       DIGEST: ${{ inputs.digest }}
       WITHDRAW: ${{ inputs.withdraw }}
@@ -153,19 +170,24 @@ jobs:
       # The latest job runs in the latest environment, whose approval moves
       # :latest. GitHub makes an environment a job names when there is none,
       # with no protection, so the run is refused unless the environment
-      # asks for a required reviewer's approval, which administrators can't
-      # bypass, and admits only the branch main.
+      # asks for the approval of one required reviewer, the user REVIEWER
+      # names, and no one else (no other user, no team), which
+      # administrators can't bypass, and admits only the branch main.
+      # prevent_self_review is deliberately not checked: the one reviewer
+      # also dispatches the runs, so it has to be off.
       - name: Check the latest environment asks for an approval
         run: |
           environment=$(gh api "repos/$GH_REPO/environments/latest" \
-            --jq '[([.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length > 0), .can_admins_bypass == false, .deployment_branch_policy.custom_branch_policies == true] | all' 2>/dev/null || true)
+            --jq '[.can_admins_bypass == false, .deployment_branch_policy.custom_branch_policies == true] | all' 2>/dev/null || true)
+          reviewers=$(gh api "repos/$GH_REPO/environments/latest" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]? | "\(.type) \(.reviewer.login // .reviewer.slug)"] | join(", ")' 2>/dev/null || true)
           branches=$(gh api "repos/$GH_REPO/environments/latest/deployment-branch-policies" \
             --jq '[.branch_policies[] | "\(.type) \(.name)"] | join(", ")' 2>/dev/null || true)
-          if [[ "$environment" != true || "$branches" != "branch main" ]]; then
-            echo "::error::the latest environment must ask for a required reviewer's approval, which administrators can't bypass, and admit only the branch main (its rules: ${environment:-no such environment}; the branches it admits: ${branches:-none listed})"
+          if [[ "$environment" != true || "$reviewers" != "User $REVIEWER" || "$branches" != "branch main" ]]; then
+            echo "::error::the latest environment must ask for the approval of one required reviewer, the user $REVIEWER, which administrators can't bypass, and admit only the branch main (its rules: ${environment:-no such environment}; its required reviewers: ${reviewers:-none}; the branches it admits: ${branches:-none listed})"
             exit 1
           fi
-          echo "- The latest environment asks for a required reviewer's approval and admits only main." >> "$GITHUB_STEP_SUMMARY"
+          echo "- The latest environment asks for the approval of $REVIEWER alone and admits only main." >> "$GITHUB_STEP_SUMMARY"
 
       # The commit this workflow runs from, with the whole history and every
       # tag, for the node's changes and a withdrawal's tags below.
@@ -440,6 +462,7 @@ jobs:
       WITHDRAW: ${{ inputs.withdraw }}
       RUN: ${{ needs.checks.outputs.run }}
       VERSION: ${{ needs.checks.outputs.version }}
+      ALLOW_UNMARKED: ${{ inputs.allow_unmarked }}
     steps:
       - name: Log in to the registry
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
@@ -453,14 +476,20 @@ jobs:
       # from, or a later one: the commit its image marker
       # (/opt/ant/image-version) names, which every image with darwin-nodes
       # as its node manager carries, or, for an image with none, which only
-      # a release put on :latest, the commit of that release's tag. Then,
-      # before :latest moves, the summary names the digest it had and the
-      # one it gets, and, when the image it had has a record that doesn't
-      # expire, the command that moves it back: its attestation, or its line
-      # in docker/release-images as main had it when the run was dispatched.
-      # Without one, a withdrawal to that image is refused once its Build
-      # run's storage-node-digest artifact has expired, and the summary says
-      # so.
+      # a release put on :latest, the commit of that release's tag. A move
+      # from an image with a marker to one with none, whose node manager is
+      # Autonomi's (it deletes a node's data when its disk runs low, with no
+      # possession check), is refused unless allow_unmarked is set: only
+      # withdrawing the first image release needs that. The image's node
+      # must still be a published release: the checks job checked it before
+      # the approval, and a release can be withdrawn while a run waits for
+      # it. Then, before :latest moves, the summary names the digest it had
+      # and the one it gets, and, when the image it had has a record that
+      # doesn't expire, the command that moves it back: its attestation, or
+      # its line in docker/release-images as main had it when the run was
+      # dispatched. Without one, a withdrawal to that image is refused once
+      # its Build run's storage-node-digest artifact has expired, and the
+      # summary says so.
       - name: Check the image against latest's, and write the summary
         run: |
           current=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
@@ -495,6 +524,17 @@ jobs:
             base=$(gh api "repos/$GH_REPO/commits/refs/tags/v${current_version#ant-node }" --jq .sha 2>/dev/null || true)
             built="with no image marker: release v${current_version#ant-node }'s image, from ${base:-a commit not found}"
           fi
+          target_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DIGEST" /opt/ant/image-version 2>/dev/null || true)
+          if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$ALLOW_UNMARKED" != true ]]; then
+            echo "::error::$IMAGE@$DIGEST has no image marker, so its node manager is Autonomi's, which deletes a node's data when its disk runs low, and $IMAGE:latest's image has one: only withdrawing the first image release goes back to such an image, with -f allow_unmarked=true"
+            exit 1
+          fi
+          release="v${VERSION#ant-node }"
+          published_now=$(gh release view "$release" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease' 2>/dev/null || true)
+          if [[ "$published_now" != false ]]; then
+            echo "::error::$IMAGE@$DIGEST runs $VERSION, and $release is no longer a published release: it was deleted, or made a draft or a pre-release, after this run's checks"
+            exit 1
+          fi
           relation=""
           if [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
             relation=$(gh api "repos/$GH_REPO/compare/$base...$COMMIT" --jq .status 2>/dev/null || true)
@@ -523,6 +563,10 @@ jobs:
             echo "- $COMMIT against ${base:-no commit found}, the commit of the image before: ${relation:-not compared}."
             if [[ "$WITHDRAW" == true ]]; then
               echo "- A withdrawal: withdraw is set, so the new image may be older than the one before, and its node too."
+            fi
+            echo "- $VERSION is still the published release $release."
+            if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "- **allow_unmarked is set: the latest tag goes from an image with darwin-nodes as its node manager to one with none, whose node manager is Autonomi's.**"
             fi
             if [[ -n "$lasting" ]]; then
               echo "- To move it back (the image before is recorded for good by $lasting): \`gh workflow run latest.yml --ref main -f commit=$base -f digest=$current -f withdraw=true\`"

@@ -37,8 +37,8 @@
 #   (exit 0, exit, true, : or set +... standing alone);
 # - latest.yml, which moves :latest when no node release does (an image
 #   release, or a withdrawal), runs only by hand, with a commit, a digest,
-#   a withdraw switch that is off unless set and a node_code that is empty
-#   unless set, names each run for the digest it moves :latest to, then the
+#   a withdraw switch that is off unless set, a node_code that is empty
+#   unless set and an allow_unmarked switch that is off unless set, names each run for the digest it moves :latest to, then the
 #   commit, grants no permissions unless a job asks for them, and shares
 #   release.yml's concurrency group; its steps run in bash, as its defaults
 #   set it, take the inputs and what the checks found only from their job's
@@ -50,9 +50,9 @@
 #   and the node version alone, each from the step that checked it, which
 #   writes it once; refuses a run from any ref but main, inputs other than a
 #   full commit, a sha256 digest and an empty or 64-digit node_code, and a
-#   run whose latest environment doesn't ask for a required reviewer's
-#   approval, which administrators can't bypass, or admits any branch but
-#   main; runs this script on the commit it runs from; checks that the
+#   run whose latest environment doesn't ask for the approval of exactly
+#   one required reviewer, the user its REVIEWER names, which
+#   administrators can't bypass, or admits any branch but main; runs this script on the commit it runs from; checks that the
 #   commit is on main, that its Build run from its push to main succeeded,
 #   smoke test included, and so did its newest Test run, taken as
 #   release.yml takes it, and that the digest is the image that Build run
@@ -73,13 +73,20 @@
 #   refuses an image whose node is newer than :latest's, and, unless the
 #   run is a withdrawal, one whose node is older or that was built from a
 #   commit before the one :latest's image was built from (its image marker,
-#   or for an image with none its node release's tag), orders versions as
-#   nodes do, makes every check before it moves :latest, writes :latest's
+#   or for an image with none its node release's tag), refuses an image
+#   with no image marker when :latest's has one unless allow_unmarked is
+#   set, checks again that the image's node is a published release,
+#   orders versions as nodes do, makes every check before it moves :latest, writes :latest's
 #   digest and the new one to the step summary, with the command that moves
 #   it back only for an image attested or listed in docker/release-images,
 #   and only then moves :latest, to the checked digest, and checks it;
 # - docker/release-images lists exactly the images releases put on :latest
 #   before the Build workflow attested its images (RELEASE_IMAGES below);
+# - rust-toolchain.toml pins an exact Rust release (channel = "X.Y.Z"), and
+#   no workflow builds with another (RUSTUP_TOOLCHAIN, cargo +... or
+#   rustc +...), so the node an image release ships is built with its
+#   release's compiler, and a compiler change is a change to the node's
+#   code that node_code must name;
 # - build.yml's manager job builds the image's node manager, darwin-nodes,
 #   with --locked from the darwin-client commit docker/manager-revision pins,
 #   once it has checked that commit is on darwin-client's main, and checks
@@ -446,16 +453,18 @@ if [[ ! -f "${LATEST}" ]]; then
     problem "${LATEST} is missing"
 else
     # Run only by hand, with the commit and digest of the image :latest
-    # gets, whether the run is a withdrawal, off unless set, and node_code,
-    # empty unless set. The inputs' descriptions may change.
+    # gets, whether the run is a withdrawal, off unless set, node_code,
+    # empty unless set, and allow_unmarked, off unless set. The inputs'
+    # descriptions may change.
     expected_on=$(printf '%s\n' "on:" "  workflow_dispatch:" "    inputs:" \
         "      commit:" "        required: true" "        type: string" \
         "      digest:" "        required: true" "        type: string" \
         "      withdraw:" "        type: boolean" "        default: false" \
-        "      node_code:" "        type: string" '        default: ""')
+        "      node_code:" "        type: string" '        default: ""' \
+        "      allow_unmarked:" "        type: boolean" "        default: false")
     latest_on=$(section on "${LATEST}" | grep -v '^[[:space:]]*description:' || true)
     if [[ "${latest_on}" != "${expected_on}" ]]; then
-        problem "latest.yml must run only by hand (on: workflow_dispatch:), with the inputs commit and digest, required, withdraw, false unless set, and node_code, empty unless set; it has: $(tr '\n' ' ' <<<"${latest_on}")"
+        problem "latest.yml must run only by hand (on: workflow_dispatch:), with the inputs commit and digest, required, withdraw, false unless set, node_code, empty unless set, and allow_unmarked, false unless set; it has: $(tr '\n' ' ' <<<"${latest_on}")"
     fi
 
     # Each run named for the digest it moves :latest to, then the commit: a
@@ -502,16 +511,29 @@ else
 
     # The latest job runs in the latest environment. GitHub makes an
     # environment a job names when there is none, with no protection, so
-    # the checks job refuses a run unless that environment asks for a
-    # required reviewer's approval, which administrators can't bypass, and
-    # admits only main.
-    holds "$(step "Check the latest environment asks for an approval" "${checks}")" \
-        "latest.yml's checks job must refuse a run unless the latest environment asks for a required reviewer's approval, which administrators can't bypass, and admits only main" \
+    # the checks job refuses a run unless that environment asks for the
+    # approval of exactly one required reviewer, the user the job's
+    # REVIEWER names (one place, the job's env), which administrators can't
+    # bypass, and admits only main. prevent_self_review is deliberately
+    # not checked, and the step says so: the one reviewer also dispatches
+    # the runs.
+    approval_step=$(step "Check the latest environment asks for an approval" "${checks}")
+    holds "${approval_step}" \
+        "latest.yml's checks job must refuse a run unless the latest environment asks for the approval of one required reviewer, the user REVIEWER names, which administrators can't bypass, and admits only main" \
         'environment=$(gh api "repos/$GH_REPO/environments/latest" \' \
-        '--jq '\''[([.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length > 0), .can_admins_bypass == false, .deployment_branch_policy.custom_branch_policies == true] | all'\'' 2>/dev/null || true)' \
+        '--jq '\''[.can_admins_bypass == false, .deployment_branch_policy.custom_branch_policies == true] | all'\'' 2>/dev/null || true)' \
         'branches=$(gh api "repos/$GH_REPO/environments/latest/deployment-branch-policies" \' \
         '--jq '\''[.branch_policies[] | "\(.type) \(.name)"] | join(", ")'\'' 2>/dev/null || true)' \
-        'refuse: if [[ "$environment" != true || "$branches" != "branch main" ]]; then'
+        'refuse: if [[ "$environment" != true || "$reviewers" != "User $REVIEWER" || "$branches" != "branch main" ]]; then' \
+        'reviewers=$(gh api "repos/$GH_REPO/environments/latest" \' \
+        '--jq '\''[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]? | "\(.type) \(.reviewer.login // .reviewer.slug)"] | join(", ")'\'' 2>/dev/null || true)'
+    holds "$(cat "${LATEST}")" \
+        "latest.yml's checks job must say, above its approval check, why prevent_self_review is not checked" \
+        '# prevent_self_review is deliberately not checked: the one reviewer'
+    if [[ $(grep -cE '^      REVIEWER: [A-Za-z0-9](-?[A-Za-z0-9])*$' <<<"${checks}" || true) -ne 1 \
+        || $(grep -cE '^[[:space:]]*REVIEWER:' "${LATEST}" || true) -ne 1 ]]; then
+        problem "latest.yml's checks job must name the latest environment's one required reviewer once, in its env, as REVIEWER: <GitHub login>, and nothing else may set REVIEWER"
+    fi
 
     # This workflow runs as it is at main's head, which can be later than
     # the commit given: the checks job checks out that head (whole, for the
@@ -665,6 +687,20 @@ else
     if [[ "$(version_order "${latest}")" != "${NODE_VERSION_ORDER}" ]]; then
         problem "latest.yml's latest job must order node versions as nodes do (the jq program after --arg current \"\$current_version\" must be scripts/check-workflows.sh's NODE_VERSION_ORDER)"
     fi
+    # The image's node must still be a published release after the
+    # approval: a release can be withdrawn while a run waits for it.
+    holds "${latest}" "latest.yml's latest job must check again, after the approval, that the image's node is a published release" \
+        'release="v${VERSION#ant-node }"' \
+        'published_now=$(gh release view "$release" --json isDraft,isPrerelease --jq '\''.isDraft or .isPrerelease'\'' 2>/dev/null || true)' \
+        'refuse: if [[ "$published_now" != false ]]; then'
+    # A move from an image with a marker (darwin-nodes as its node manager)
+    # to one with none (Autonomi's, which deletes a node's data when its
+    # disk runs low) only with allow_unmarked, which the summary shows.
+    holds "${latest}" "latest.yml's latest job must refuse, unless allow_unmarked is set, a move from an image with an image marker to one with none" \
+        'ALLOW_UNMARKED: ${{ inputs.allow_unmarked }}' \
+        'target_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DIGEST" /opt/ant/image-version 2>/dev/null || true)' \
+        'refuse: if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$ALLOW_UNMARKED" != true ]]; then' \
+        'echo "- **allow_unmarked is set:'
     # And, unless the run is a withdrawal, an image built from the commit
     # :latest's image was built from, or a later one: the commit its image
     # marker names, or, for an image with none, which only a release put on
@@ -975,6 +1011,21 @@ if [[ -f "${LATEST}" ]]; then
     done < <(awk '/^[ \t]*#/ { next } /secrets/ { print FILENAME ":" FNR ": " $0 }' "${LATEST}")
 fi
 
+# The compiler: rust-toolchain.toml pins an exact Rust release, which rustup
+# takes over the stable toolchain the workflows install, and no workflow
+# builds with another, so an image release's node is built with its
+# release's compiler, and a compiler change is a change to the node's code
+# (latest.yml's node_code paths hold rust-toolchain.toml).
+TOOLCHAIN_FILE=rust-toolchain.toml
+if [[ ! -f "${TOOLCHAIN_FILE}" || -e rust-toolchain ]] \
+    || [[ $(grep -cE '^[[:space:]]*channel[[:space:]]*=' "${TOOLCHAIN_FILE}" || true) -ne 1 ]] \
+    || ! grep -qxE 'channel = "[0-9]+\.[0-9]+\.[0-9]+"' "${TOOLCHAIN_FILE}"; then
+    problem "${TOOLCHAIN_FILE} must pin an exact Rust release, once (channel = \"X.Y.Z\"), with no rust-toolchain beside it, so every workflow builds the node with one compiler; it has: $(grep -E 'channel' "${TOOLCHAIN_FILE}" 2>/dev/null | tr '\n' ' ' || true)"
+fi
+while IFS= read -r hit; do
+    problem "no workflow may build with a toolchain other than ${TOOLCHAIN_FILE}'s: ${hit}"
+done < <(grep -nE 'RUSTUP_TOOLCHAIN|(cargo|rustc|rustup run) \+' "${DIR}"/*.yml | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+
 # The images releases put on :latest before the Build workflow attested its
 # images, which latest.yml takes from docker/release-images for a
 # withdrawal: exactly RELEASE_IMAGES, comments and blank lines aside.
@@ -987,4 +1038,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, and moves :latest forward only; latest.yml runs only by hand with no default permissions, names each run for its digest, checks its own commit with this script, and moves :latest in the latest environment, once it asks for a reviewer's approval, only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested or recorded (for a withdrawal, also listed in ${RELEASE_IMAGES_FILE}), from a commit whose Test run succeeded, with a published release's node whose code changes since its tag node_code names, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, each with one registry write, and build.yml's image job alone pushes other tags; only release.yml's publish job runs in the release environment, and latest.yml's latest job in the latest environment; ${RELEASE_IMAGES_FILE} lists the images releases put on :latest before attestation."
+echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, and moves :latest forward only; latest.yml runs only by hand with no default permissions, names each run for its digest, checks its own commit with this script, and moves :latest in the latest environment, once it asks for its one reviewer's approval, only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested or recorded (for a withdrawal, also listed in ${RELEASE_IMAGES_FILE}), from a commit whose Test run succeeded, with a published release's node whose code changes since its tag node_code names, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, to an image without a marker from one with a marker only with allow_unmarked, with its release checked again after the approval, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, each with one registry write, and build.yml's image job alone pushes other tags; only release.yml's publish job runs in the release environment, and latest.yml's latest job in the latest environment; ${RELEASE_IMAGES_FILE} lists the images releases put on :latest before attestation; ${TOOLCHAIN_FILE} pins an exact Rust release that every workflow builds with."
