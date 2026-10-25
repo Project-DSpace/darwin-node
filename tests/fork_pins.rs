@@ -340,7 +340,10 @@ mod direct_first {
             vec![(SAORSA_CORE_VERSION.to_string(), None)]
         );
         // One saorsa-transport: a crates.io release that both this package's
-        // requirement and the vendored saorsa-core's accept.
+        // requirement and the vendored saorsa-core's accept. The floor is
+        // Cargo.toml's direct requirement: the plan's 0.38.2 comes with node
+        // release 1a's bump of it, which also pins that exact version; this
+        // branch's base still requires and locks 0.38.1.
         let transport = locked("saorsa-transport");
         assert_eq!(transport.len(), 1, "one saorsa-transport: {transport:?}");
         let (version, source) = &transport[0];
