@@ -126,8 +126,10 @@ serde_bytes = "0.11"
 bao = "0.13.1"
 
 # Shared portable browser profile. The native listener is enabled separately
-# by the `webrtc-direct` feature.
-saorsa-transport = { version = "0.38.1", default-features = false, features = ["webrtc"] }
+# by the `webrtc-direct` feature. 0.38.2 at least: a listener with no free
+# session answers a browser's connectivity check with a STUN 486 at once,
+# instead of leaving it to time out.
+saorsa-transport = { version = "0.38.2", default-features = false, features = ["webrtc"] }
 # Only the test-utils devnet helper that seeds public files for browser tests
 # uses it directly. Upstream's release builds do not link it, but ours do:
 # vendor/ant-listings decodes envelopes with its DataMap.
