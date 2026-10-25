@@ -8,8 +8,8 @@ previous release's nodes single messages, never pages, no penalty for a
 busy answer, and what the paged and rollback runs must show besides, with
 the releases the rolled-back node ran; and that the report and summary.json
 list every count measured, with its excess and limit, within the limit or
-not. The Test workflow runs it; run it by hand with
-`python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
+not, and the audits made per exchange. The Test workflow runs it; run it by
+hand with `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
 """
 
 import argparse
@@ -463,9 +463,21 @@ def main():
                   "  most pages in an exchange: 4 sent, 4 received; 1 exchange(s) took more "
                   "than one page for each list both ways"])
 
+    audited = result(sync=paged_sync(single=[exchange(form="single", peer_release="old")]))
+    audited["audits"] = {"joiner-00": {"responsible_audit_passed": 3, "subtree_audit_failed": 2,
+                                       "digest_received": 9},
+                         "incumbent-00": {"responsible_audit_passed": 2}}
+    expect_equal("the report gives the audits made per exchange, paged and single",
+                 [line for line in harness.sync_lines(audited) if "audits made" in line],
+                 ["  audits made: 7 over 2 exchange(s), per exchange: 3.500"])
+    expect_equal("the report says when there were no exchanges to give audits per",
+                 [line for line in harness.sync_lines(result(sync=paged_sync(exchanges=[])))
+                  if "audits made" in line],
+                 ["  audits made: 0 over 0 exchange(s), per exchange: no exchanges"])
+
     listed(options())
 
-    names = ["all-old", "all-old-2", "all-old-12", "all-old-1", "all-old-x", "new-hosts-old"]
+    names =["all-old", "all-old-2", "all-old-12", "all-old-1", "all-old-x", "new-hosts-old"]
     baselines = [name for name in names if harness.is_baseline(name)]
     if baselines != ["all-old", "all-old-2", "all-old-12"]:
         FAILED.append("all-old runs named")
