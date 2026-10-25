@@ -308,6 +308,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       actions: read
+      attestations: read
       contents: read
       packages: write
     env:
@@ -364,7 +365,11 @@ jobs:
       # before (a withdrawal). A re-run of this job, which asks for no
       # approval, must not undo either. Versions are ordered as latest.yml
       # orders them. The run's summary names the image :latest had, and the
-      # command that takes :latest back to it if this release is withdrawn.
+      # command that takes :latest back to it if this release is withdrawn
+      # when that image has a record that doesn't expire, which latest.yml
+      # needs once its Build run's storage-node-digest artifact has expired:
+      # its attestation, or its line in docker/release-images on main.
+      # Without one, the summary says so in place of the command.
       - name: Check latest's node is older than this release's
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
@@ -407,13 +412,28 @@ jobs:
             if [[ ! "$current_marker" =~ ^[0-9a-f]{40}$ && "$release_marker" =~ ^[0-9a-f]{40}$ ]]; then
               back=" -f allow_unmarked=true"
             fi
+            lasting=""
+            if [[ "$built_from" =~ ^[0-9a-f]{40}$ ]]; then
+              attested=$(gh attestation verify "oci://$IMAGE@$current" --repo "$GH_REPO" \
+                --signer-workflow "$GH_REPO/.github/workflows/build.yml" \
+                --source-ref refs/heads/main --source-digest "$built_from" --format json \
+                --jq '[.[].verificationResult.signature.certificate | select(.buildTrigger == "push") | .runInvocationURI] | first // empty' || true)
+              listed=$(gh api "repos/$GH_REPO/contents/docker/release-images?ref=main" -H 'Accept: application/vnd.github.raw+json' || true)
+              if [[ -n "$attested" ]]; then
+                lasting="its attestation"
+              elif awk -v base="$built_from" -v current="$current" '!/^#/ && NF == 3 && $2 == base && $3 == current { found = 1 } END { exit !found }' <<<"$listed"; then
+                lasting="its line in docker/release-images"
+              fi
+            fi
             {
               echo "- $IMAGE:latest is $current, whose node, $current_version, is older than $VERSION."
-              if [[ "$built_from" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "- To withdraw this release, delete it, then move :latest back: \`gh workflow run latest.yml --ref main -f commit=$built_from -f digest=$current -f withdraw=true$back\`"
+              if [[ -n "$lasting" ]]; then
+                echo "- To withdraw this release, delete it, then move :latest back (the image before is recorded for good by $lasting): \`gh workflow run latest.yml --ref main -f commit=$built_from -f digest=$current -f withdraw=true$back\`"
                 if [[ -n "$back" ]]; then
                   echo "- The command sets allow_unmarked: $current has no image marker, so its node manager is Autonomi's, and this release's image has one."
                 fi
+              else
+                echo "- **$current has no record that doesn't expire** (no attestation from the push of ${built_from:-its commit, not found,} to main, and no line in docker/release-images on main): a withdrawal of this release to it is refused once its Build run's storage-node-digest artifact has expired, 30 days after that run."
               fi
             } >> "$GITHUB_STEP_SUMMARY"
           fi

@@ -419,8 +419,8 @@ edit "${LATEST}" $'        type: string\n        default: ""\n' $'        type: 
 expect "every run's node changes acknowledged unless unset" "${BY_HAND}"
 
 fresh
-edit "${LATEST}" $'      allow_unmarked:\n        description: Allow moving the latest tag from an image with an image marker to one with none (Autonomi\'s node manager), as only withdrawing the first image release needs\n        type: boolean\n        default: false\n' \
-    $'      allow_unmarked:\n        description: Allow moving the latest tag from an image with an image marker to one with none (Autonomi\'s node manager), as only withdrawing the first image release needs\n        type: boolean\n        default: true\n'
+edit "${LATEST}" $'      allow_unmarked:\n        description: With withdraw alone, allow moving the latest tag from an image with an image marker to one with none (Autonomi\'s node manager), as only withdrawing the first image release needs\n        type: boolean\n        default: false\n' \
+    $'      allow_unmarked:\n        description: With withdraw alone, allow moving the latest tag from an image with an image marker to one with none (Autonomi\'s node manager), as only withdrawing the first image release needs\n        type: boolean\n        default: true\n'
 expect "every run allowed to go back to Autonomi's manager unless unset" "${BY_HAND}"
 
 # Each run is named for the digest it moves :latest to, which a withdrawal's
@@ -590,6 +590,17 @@ edit "${LATEST}" $'"oci://$IMAGE@$DIGEST" --repo "$GH_REPO" \\\n            --si
     $'"oci://$IMAGE@$DIGEST" --repo "$GH_REPO" \\\n'
 expect "an image attested by another workflow" "${DIGEST_CHECKED}"
 
+# A run without withdraw needs the attestation, the record that doesn't
+# expire.
+UNATTESTED="latest.yml's checks job must refuse, unless the run is a withdrawal, an image with no attestation"
+fresh
+edit "${LATEST}" 'if [[ "$WITHDRAW" != true && -z "$attested" ]]; then' 'if false; then'
+expect "an image going forward on its 30-day artifact alone" "${UNATTESTED}"
+
+fresh
+edit "${LATEST}" 'if [[ "$WITHDRAW" != true && -z "$attested" ]]; then' 'if [[ "$WITHDRAW" != true && -z "$attested" && -z "$recorded" ]]; then'
+expect "an artifact taken in place of the attestation" "${UNATTESTED}"
+
 NO_RECORD='if [[ -z "$attested" && "$recorded" != "$DIGEST" && -z "$listed" ]]; then'
 fresh
 edit "${LATEST}" "${NO_RECORD}" 'if false; then'
@@ -702,7 +713,7 @@ expect "a fingerprint of the commit's code alone, not of the change" "${CHANGES}
 # The checks job hands on the Build run and the node version alone, each
 # written once by the step that checked it, and 'Check the digest' the
 # record it took.
-HANDS_ON="latest.yml's checks job must hand on exactly the Build run and the node version its steps checked"
+HANDS_ON="latest.yml's checks job must hand on exactly the Build run, the node version and the images :latest held its steps checked or read"
 fresh
 edit "${LATEST}" '      version: ${{ steps.version.outputs.version }}' '      version: ant-node 0.23.0+ds.15'
 expect "a node version handed on as a literal" "${HANDS_ON}"
@@ -861,7 +872,7 @@ edit "${LATEST}" 'if [[ "$withdrawn_state" != deleted && "$withdrawn_state" != "
 expect "a withdrawal while the withdrawn release is still published" "${WITHDRAWN}"
 
 fresh
-edit "${LATEST}" 'if [[ "$order" == "older than" ]]; then' 'if false; then'
+edit "${LATEST}" 'if [[ "$order" == "older than" && "$WITHDRAW" == true ]]; then' 'if false; then'
 expect "the withdrawn release never looked up" "${WITHDRAWN}"
 
 fresh
@@ -907,17 +918,42 @@ edit "${RELEASE}" 'release_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DI
     'release_marker=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)'
 expect "the release image's marker read from latest's image" "${RELEASE_BACK}"
 
-# From an image with darwin-nodes as its node manager (an image marker) to
-# one with Autonomi's (none) only with allow_unmarked.
-UNMARKED="latest.yml's latest job must refuse, unless allow_unmarked is set, a move from an image with an image marker to one with none"
+# release.yml gives the command that withdraws the release only when the
+# image :latest had has a record that doesn't expire.
+RELEASE_LASTING="release.yml's latest job must give the command that withdraws the release only when the image :latest had has a record that doesn't expire"
 fresh
-edit "${LATEST}" 'if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$ALLOW_UNMARKED" != true ]]; then' 'if false; then'
+edit "${RELEASE}" $'              if [[ -n "$lasting" ]]; then\n' $'              if [[ "$built_from" =~ ^[0-9a-f]{40}$ ]]; then\n'
+expect "release.yml's withdrawal command given for an image with no lasting record" "${RELEASE_LASTING}"
+
+fresh
+edit "${RELEASE}" '--source-ref refs/heads/main --source-digest "$built_from" --format json \' '--format json \'
+expect "release.yml taking an attestation from another ref or commit" "${RELEASE_LASTING}"
+
+fresh
+edit "${RELEASE}" 'echo "- **$current has no record that doesn'"'"'t expire**' 'echo "- $current:'
+expect "release.yml's summary saying nothing of an image with no lasting record" "${RELEASE_LASTING}"
+
+fresh
+edit "${RELEASE}" $'      actions: read\n      attestations: read\n      contents: read\n      packages: write\n' $'      actions: read\n      contents: read\n      packages: write\n'
+expect "release.yml's latest job unable to read attestations" "release.yml's latest job must ask for actions: read, attestations: read, contents: read and packages: write"
+
+# From an image with darwin-nodes as its node manager (an image marker) to
+# one with Autonomi's (none) only in a withdrawal with allow_unmarked.
+UNMARKED="latest.yml's latest job must refuse, unless the run is a withdrawal and allow_unmarked is set, a move from an image with an image marker to one with none"
+UNMARKED_IF='if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ ]] && ! [[ "$ALLOW_UNMARKED" == true && "$WITHDRAW" == true ]]; then'
+fresh
+edit "${LATEST}" "${UNMARKED_IF}" 'if false; then'
 expect "latest back to Autonomi's manager with no allow_unmarked" "${UNMARKED}"
 
 fresh
-edit "${LATEST}" 'if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$ALLOW_UNMARKED" != true ]]; then' \
+edit "${LATEST}" "${UNMARKED_IF}" \
     'if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$WITHDRAW" != true ]]; then'
 expect "latest back to Autonomi's manager in any withdrawal" "${UNMARKED}"
+
+fresh
+edit "${LATEST}" "${UNMARKED_IF}" \
+    'if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ ]] && ! [[ "$ALLOW_UNMARKED" == true ]]; then'
+expect "allow_unmarked honoured on a run without withdraw" "${UNMARKED}"
 
 fresh
 edit "${LATEST}" 'target_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DIGEST" /opt/ant/image-version 2>/dev/null || true)' \
@@ -931,6 +967,92 @@ expect "allow_unmarked never reaching the latest job" "${UNMARKED}"
 fresh
 edit "${LATEST}" 'echo "- **allow_unmarked is set:' 'echo "- allow_unmarked is set:'
 expect "allow_unmarked not shown in bold in the summary" "${UNMARKED}"
+
+# A withdrawal to an older node goes back to the release before the
+# withdrawn one, never further: no published release but the withdrawn one
+# may be newer than the image's.
+NEWEST="latest.yml's latest job must refuse a withdrawal to an older node while a published release other than the withdrawn one is newer than the image's"
+fresh
+edit "${LATEST}" 'if [[ -n "$newer" ]]; then' 'if false; then'
+expect "a withdrawal past the release before the withdrawn one" "${NEWEST}"
+
+fresh
+edit "${LATEST}" $'          if [[ -n "$withdrawn" && "$order" == "older than" ]]; then\n            if ! published_releases=' $'          if false; then\n            if ! published_releases='
+expect "the published releases never listed" "${NEWEST}"
+
+fresh
+edit "${LATEST}" "--jq '.[] | select(.draft == false and .prerelease == false) | .tag_name'); then" \
+    "--jq '.[] | select(.draft == false) | .tag_name'); then"
+expect "pre-releases counted as published releases" "${NEWEST}"
+
+fresh
+edit "${LATEST}" '| select(("ant-node " + ltrimstr("v") | node_version) > $t)] | join(" ")' \
+    '| select(("ant-node " + ltrimstr("v") | node_version) > $t and false)] | join(" ")'
+expect "no published release ever taken as newer" "${NEWEST}"
+
+fresh
+edit "${LATEST}" 'and . != $withdrawn)' ')'
+expect "the withdrawn release counted among the published ones" "${NEWEST}"
+
+fresh
+edit "${LATEST}" $'                def node_version:\n                  capture(' $'                def node_version:\n                  ascii_downcase | capture('
+expect "the published releases ordered unlike nodes" "must order the published releases as nodes order versions"
+
+fresh
+edit "${LATEST}" 'echo "- With $withdrawn gone, $release is the newest published release:' 'echo "- Newest:'
+expect "the newest release left out of the summary" "${NEWEST}"
+
+# A withdrawal to the same node goes back one image: to the one :latest held
+# before its image, as the checks job read them.
+ONE_BACK="latest.yml's latest job must refuse a withdrawal to the same node to any image but the one :latest held before its image"
+fresh
+edit "${LATEST}" 'if [[ "$before" != "$DIGEST" && "$before" != "release:$COMMIT" ]]; then' 'if false; then'
+expect "a withdrawal to any earlier image of the node" "${ONE_BACK}"
+
+fresh
+edit "${LATEST}" 'if [[ "$order" == "the same as" && "$WITHDRAW" == true ]]; then' 'if false; then'
+expect "a withdrawal to the same node never checked" "${ONE_BACK}"
+
+fresh
+edit "${LATEST}" 'if ((n >= 2)) && [[ "${held[n-1]}" == "$current" ]]; then' 'if ((n >= 2)); then'
+expect "the images read not matched against latest's" "${ONE_BACK}"
+
+fresh
+edit "${LATEST}" 'before=${held[n-2]}' 'before=$DIGEST'
+expect "the image before taken as the one asked for" "${ONE_BACK}"
+
+fresh
+edit "${LATEST}" $'      HELD: ${{ needs.checks.outputs.held }}\n' ''
+expect "the images held never reaching the latest job" "${ONE_BACK}"
+
+HELD_READ="latest.yml's checks job must read, for a withdrawal, the images :latest held with the image's node since its release, in order"
+fresh
+edit "${LATEST}" 'stack=("${stack[@]:0:at+1}")' 'stack+=("$digest")'
+expect "a withdrawal read as a new image, keeping the withdrawn ones" "${HELD_READ}"
+
+fresh
+edit "${LATEST}" '-f head_sha="$released" -f event=push -f status=success -f per_page=100 \' \
+    '-f head_sha="$released" -f event=push -f per_page=100 \'
+expect "the images read from a failed Release run on" "${HELD_READ}"
+
+fresh
+edit "${LATEST}" '-f event=workflow_dispatch -f branch=main -f status=success -f per_page=100 \' \
+    '-f event=workflow_dispatch -f branch=main -f per_page=100 \'
+expect "failed Latest runs read as moving latest" "${HELD_READ}"
+
+fresh
+edit "${LATEST}" 'if [[ ! "$started" > "$since" || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then' \
+    'if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then'
+expect "Latest runs from before the node's release read" "${HELD_READ}"
+
+FROM_HELD="latest.yml's checks job must hand on what 'Read the images latest held with the image's node' checked"
+fresh
+edit "${LATEST}" 'echo "held=$held" >> "$GITHUB_OUTPUT"' 'echo "held=$HELD" >> "$GITHUB_OUTPUT"'
+expect "the images held written from elsewhere" "${FROM_HELD}"
+
+fresh
+edit "${LATEST}" $'        id: held\n' ''
+expect "the images held's step with no id" "${FROM_HELD}"
 
 BEFORE="latest.yml's latest job must refuse, unless the run is a withdrawal, an image built from a commit before the one :latest's image was built from"
 fresh
@@ -1310,6 +1432,106 @@ orders "build ds.0" refused "ant-node 0.23.0+ds.0" "ant-node 0.23.0+ds.15"
 orders "more after the version" refused "ant-node 0.23.0+ds.15 (patched)" "ant-node 0.23.0+ds.15"
 orders "another program's version" refused "darwin-nodes 0.23.0" "ant-node 0.23.0+ds.15"
 orders "no version read from :latest's image" refused "ant-node 0.23.0+ds.15" ""
+
+# The jq filter latest.yml's latest job lists, in a withdrawal to an older
+# node, the published releases newer than the image's with (the withdrawn
+# one left out): from the line that passes it --arg withdrawn "$withdrawn"
+# up to its closing quote.
+newer_filter=$(awk -v q="'" '
+    { sub(/^[ \t]+/, "") }
+    !inside && index($0, "--arg withdrawn \"$withdrawn\" " q) { inside = 1; next }
+    inside && index($0, q " <<<\"$published_releases\"); then") { print substr($0, 1, index($0, q " <<<") - 1); exit }
+    inside { print }
+' "${LATEST}")
+
+# The filter must list, of the published releases PUBLISHED (one per line),
+# those newer than TARGET once WITHDRAWN is left out, as WANT.
+newer_than() {
+    local name=$1 want=$2 target=$3 withdrawn=$4 published=$5 got
+    if [[ -z "${newer_filter}" ]]; then
+        fail "latest.yml's newer releases, ${name}: this case is out of date: no jq filter follows --arg withdrawn \"\$withdrawn\" in ${LATEST}"
+        return
+    fi
+    if ! got=$(jq -rRn --arg target "${target}" --arg withdrawn "${withdrawn}" "${newer_filter}" <<<"${published}" 2> /dev/null); then
+        got=refused
+    fi
+    if [[ "${got}" != "${want}" ]]; then
+        fail "latest.yml's newer releases, ${name}: listed '${got}', not '${want}'"
+        return
+    fi
+    PASSED=$((PASSED + 1))
+}
+
+published=$'v0.23.0+ds.15\nv0.23.0+ds.14\nv0.23.0+ds.13\nv0.21.0+ds.11'
+newer_than "back to the release before, the withdrawn one deleted" "" \
+    v0.23.0+ds.15 v0.23.0+ds.16 "${published}"
+newer_than "past the release before (ds.13 for a withdrawn ds.16)" "v0.23.0+ds.15 v0.23.0+ds.14" \
+    v0.23.0+ds.13 v0.23.0+ds.16 "${published}"
+newer_than "the withdrawn release still listed is left out" "" \
+    v0.23.0+ds.14 v0.23.0+ds.15 "${published}"
+newer_than "build numbers compared as numbers" "v0.23.0+ds.10" \
+    v0.23.0+ds.9 v0.23.0+ds.11 $'v0.23.0+ds.10\nv0.23.0+ds.9'
+newer_than "a newer release published after the withdrawn one" "v0.24.0+ds.1" \
+    v0.23.0+ds.15 v0.23.0+ds.16 $'v0.24.0+ds.1\nv0.23.0+ds.15'
+newer_than "another kind of tag ignored" "" \
+    v0.23.0+ds.15 v0.23.0+ds.16 $'v0.23.0+ds.15\nlistings-v2\nv1.0.0-rc.1'
+newer_than "no published release listed" "" v0.23.0+ds.15 v0.23.0+ds.16 ""
+
+# The lines latest.yml's checks job reads the images :latest held with,
+# from its "Read the images latest held with the image's node" step: the
+# loop from "while read -r started" to its done, run on sample lists of
+# Latest runs (started time, then title), as the step runs them after the
+# node's Release run started at SINCE.
+held_lines=$(awk '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    index(line, "while read -r started kind") == 1 { inside = 1 }
+    inside { print line }
+    inside && index(line, "done <<<\"$runs\"") == 1 { exit }
+' "${LATEST}")
+
+# The images read from RUNS (oldest first, as the step sorts them) after a
+# Release run of the commit RELEASED started at SINCE must be WANT.
+held_reads() {
+    local name=$1 want=$2 got
+    if [[ -z "${held_lines}" ]]; then
+        fail "latest.yml's images held, ${name}: this case is out of date: no while read -r started ... done <<<\"\$runs\" lines in ${LATEST}"
+        return
+    fi
+    if ! got=$(
+        since=$3
+        released=$4
+        runs=$5
+        stack=("release:${released}")
+        eval "${held_lines}"
+        echo "${stack[*]}"
+    ); then
+        fail "latest.yml's images held, ${name}: the step's lines failed"
+        return
+    fi
+    if [[ "${got}" != "${want}" ]]; then
+        fail "latest.yml's images held, ${name}: read '${got}', not '${want}'"
+        return
+    fi
+    PASSED=$((PASSED + 1))
+}
+
+c=cbd133ba3665b38b81890a6932ae1657d7a32712
+a=sha256:$(printf 'a%.0s' {1..64})
+b=sha256:$(printf 'b%.0s' {1..64})
+e=sha256:$(printf 'e%.0s' {1..64})
+held_reads "the release's image alone" "release:${c}" 2026-10-20T00:00:00Z "${c}" ""
+held_reads "two image releases" "release:${c} ${a} ${b}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"
+held_reads "a run before the release left out" "release:${c} ${b}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-19T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"
+held_reads "a withdrawal drops the images after its own" "release:${c} ${a}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"$'\n'"2026-10-23T00:00:00Z Withdraw latest to ${a} from x"
+held_reads "a withdrawn image never comes back as the one before" "release:${c} ${a} ${e}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"$'\n'"2026-10-23T00:00:00Z Withdraw latest to ${a} from x"$'\n'"2026-10-24T00:00:00Z Point latest at ${e} from z"
+held_reads "a run moving latest to the image it has adds nothing" "release:${c} ${a}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${a} from x"
+held_reads "a withdrawal to an image not among them starts again from it" "${e}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Withdraw latest to ${e} from z"
 
 # The lines latest.yml's checks job reads the node's code with, from its
 # "Read the image's node version" step: from paths=( to the end of

@@ -266,8 +266,9 @@ never ran.
   `:latest` to it again, then runs the Latest workflow with `withdraw`. The
   workflow is given a commit on main, the digest of the image the Build
   workflow made from it, `withdraw` for a withdrawal, `node_code` when the
-  node's code changed since its release, and `allow_unmarked` to take
-  `:latest` from an image with an image marker to one with none (below). Each run's title names
+  node's code changed since its release, and, in a withdrawal alone,
+  `allow_unmarked` to take `:latest` from an image with an image marker to
+  one with none (below). Each run's title names
   the digest it moves `:latest` to, then the commit. Its `checks` job, which
   can write nothing, runs `scripts/check-workflows.sh` on the commit the
   workflow runs from (main's head when it was dispatched), and checks that
@@ -286,7 +287,9 @@ never ran.
   withdrawal, by `docker/release-images`, which records for good the image
   each release put on `:latest` before the Build workflow attested its
   images (ds.13 to ds.15), as each Release run moved `:latest` to it. An
-  image with none of these is refused. `:<commit>` in the registry is only
+  image with none of these is refused, and a run without `withdraw` needs
+  the attestation, so every image it puts on `:latest` has a record that
+  doesn't expire for a later withdrawal. `:<commit>` in the registry is only
   noted: a later run by hand can push that tag again. The image's node must
   be a published release, which the `latest` job checks again after the
   approval, as a release can be withdrawn while a run waits for it. It is the Build workflow's own build of the
@@ -315,7 +318,11 @@ never ran.
   the commit's Build run recorded names while that record is kept, or the
   tag's line in `docker/release-images`. Once the record has expired, for
   an image that file doesn't list, any image attested as built by the push
-  of that commit is taken, as the summary says. Its `latest` job then
+  of that commit is taken, as the summary says. It also reads, from the
+  node's newest successful Release run and the successful Latest runs
+  started after it, the images `:latest` held with the image's node, in
+  order (a withdrawal drops the images after the one it goes back to). Its
+  `latest` job then
   refuses an image whose node is newer than the one `:latest` has, which
   goes to `:latest` only with its release, and, unless the run is a
   withdrawal, one whose node is older, or that was built from a commit
@@ -324,9 +331,18 @@ never ran.
   is needed for any move to an older image, not only to an older node. It
   refuses a move from an image with an image marker (`darwin-nodes` as its
   node manager) to one with none (Autonomi's manager, which deletes a
-  node's data when its disk runs low) unless `allow_unmarked` is set, which
-  only withdrawing the first image release needs, and the summary then says
-  so in bold. It writes the digest `:latest` had and the new one to the run's summary,
+  node's data when its disk runs low) unless the run is a withdrawal and
+  `allow_unmarked` is set, which only withdrawing the first image release
+  needs, and the summary then says so in bold. A withdrawal goes back one
+  step, never further: to an older node only once the withdrawn release is
+  deleted (or a draft or a pre-release) and no other published release is
+  newer than the image's, and to the same node only to the image `:latest`
+  held before the one it has (for the release's own image, an image of its
+  tag's commit). A floor from the root switch on, no withdrawal below the
+  root release, is to be its own check once that release exists. A Release
+  run's summary gives the command that withdraws the release only when the
+  image `:latest` had has a record that doesn't expire, and says so when it
+  has none. It writes the digest `:latest` had and the new one to the run's summary,
   with the command that moves it back when the image it had has a record
   that doesn't expire (an attestation, or a line in
   `docker/release-images`), then moves `:latest` and checks it. The

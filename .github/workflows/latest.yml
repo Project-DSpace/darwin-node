@@ -12,8 +12,9 @@
 #
 # Run by hand from main, with the commit and the digest its Build run
 # recorded, withdraw set for a withdrawal, node_code when the node's code
-# changed since its release, and allow_unmarked to take :latest from an
-# image with an image marker to one with none (all below):
+# changed since its release, and, in a withdrawal alone, allow_unmarked to
+# take :latest from an image with an image marker to one with none (all
+# below):
 #
 #   gh workflow run latest.yml --ref main -f commit=<commit> -f digest=sha256:<digest>
 #
@@ -42,7 +43,9 @@
 # storage-node-digest artifact while that is kept (30 days), or, for a
 # withdrawal, by docker/release-images, which records the image each
 # release put on :latest before the Build workflow attested its images; an
-# image with none of these is refused. The image's node must be a published
+# image with none of these is refused. A run without withdraw needs the
+# attestation, the one record of a new image that doesn't expire, so a
+# later withdrawal can always go back to it. The image's node must be a published
 # release, which the latest job checks again after the approval, as a
 # release can be withdrawn while a run waits for it. It is the Build workflow's own build of the commit, as in every
 # release image, checked only by the version it reports, so node code
@@ -59,7 +62,9 @@
 # release binary. For a withdrawal, the checks job also checks that :latest
 # held the image before: an earlier Latest run moved :latest to that
 # digest, or it is the image of a v*+ds.* tag on the commit whose Release
-# run succeeded.
+# run succeeded. It also reads, from those runs, the images :latest held
+# with the image's node since that node's release, in order, for the latest
+# job's check that a withdrawal to the same node goes back one image.
 #
 # The latest job then runs in the latest environment, after its approval,
 # given in GitHub's interface by a required reviewer. It refuses an image
@@ -69,8 +74,12 @@
 # built from: withdraw is needed for any move to an older image. It refuses
 # a move from an image with an image marker (/opt/ant/image-version, which
 # every image with darwin-nodes as its node manager carries) to one with
-# none, whose node manager is Autonomi's, unless allow_unmarked is set:
-# only withdrawing the first image release needs that. It checks again
+# none, whose node manager is Autonomi's, unless the run is a withdrawal
+# and allow_unmarked is set: only withdrawing the first image release
+# needs that. A withdrawal goes back one step, never further: to an older
+# node only once the withdrawn release is gone and the image's release is
+# then the newest published one, and to the same node only to the image
+# :latest had before the one it has. It checks again
 # that the image's node is a published release. It writes
 # the digest :latest had and the new one to the run's summary, with the
 # command that moves it back when the image it had has a record that
@@ -107,7 +116,7 @@ on:
         type: string
         default: ""
       allow_unmarked:
-        description: Allow moving the latest tag from an image with an image marker to one with none (Autonomi's node manager), as only withdrawing the first image release needs
+        description: With withdraw alone, allow moving the latest tag from an image with an image marker to one with none (Autonomi's node manager), as only withdrawing the first image release needs
         type: boolean
         default: false
 
@@ -136,6 +145,7 @@ jobs:
     outputs:
       run: ${{ steps.build_run.outputs.run }}
       version: ${{ steps.version.outputs.version }}
+      held: ${{ steps.held.outputs.held }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -276,7 +286,10 @@ jobs:
       # from, where scripts/check-workflows.sh pins it, also records the
       # image each release put on :latest before then, and the line of a
       # v*+ds.* tag on the commit is taken as a third record. An image with
-      # none of them is refused. The summary names the record taken, and so
+      # none of them is refused. A run without withdraw also needs the
+      # attestation, so the image it puts on :latest has a record that
+      # doesn't expire, which a later withdrawal to it needs once the
+      # artifact has expired. The summary names the record taken, and so
       # does the step's output, for a withdrawal's check below.
       # storage-node:<commit> is only noted: a later run by hand can push
       # the commit's tag again.
@@ -316,6 +329,10 @@ jobs:
           fi
           if [[ -z "$attested" && "$recorded" != "$DIGEST" && -z "$listed" ]]; then
             echo "::error::nothing records $DIGEST as the image Build run $RUN pushed: there is no attestation of it from a push of $COMMIT to main, the run's storage-node-digest artifact has expired, and docker/release-images lists it for no v*+ds.* tag on $COMMIT (taken for a withdrawal alone)"
+            exit 1
+          fi
+          if [[ "$WITHDRAW" != true && -z "$attested" ]]; then
+            echo "::error::no attestation by Build run $RUN from the push of $COMMIT to main verifies $DIGEST: an image goes forward to the latest tag only with its attestation, the record that doesn't expire, so a later withdrawal can go back to it once the run's storage-node-digest artifact has expired. Use the image of a later commit on main, whose Build run attests its image"
             exit 1
           fi
           if [[ "$recorded" == "$DIGEST" ]]; then
@@ -452,6 +469,64 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # For a withdrawal, the images :latest held with the image's node
+      # since that node's release, oldest first, for the latest job's check
+      # that a withdrawal to the same node goes back one image, never
+      # further. The node's newest successful Release run put its release's
+      # own image on :latest, named "release:" and its tag's commit, as the
+      # image of that commit is its record. Then each successful Latest run
+      # from main started after it, in the order they started (they share
+      # one concurrency group): a run without withdraw adds the image its
+      # title names, unless it is the newest already, and a withdrawal goes
+      # back to it, dropping the images after it, or, for an image not
+      # among them, leaves it alone, with nothing known before it. A
+      # release's Release run moving :latest to a newer node in between is
+      # not read: a withdrawal back to this node drops what came after.
+      # With no successful Release run of the node, nothing is known, and
+      # the latest job refuses a withdrawal to the same node.
+      - name: Read the images latest held with the image's node
+        id: held
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          held=""
+          if [[ "$WITHDRAW" == true ]]; then
+            tag="v${VERSION#ant-node }"
+            released=$(git rev-parse -q --verify "refs/tags/$tag^{commit}")
+            since=$(gh api --paginate -X GET "repos/$GH_REPO/actions/workflows/release.yml/runs" \
+              -f head_sha="$released" -f event=push -f status=success -f per_page=100 \
+              --jq '.workflow_runs[] | "\(.head_branch) \(.run_started_at)"' | awk -v tag="$tag" '$1 == tag { print $2 }' | sort | tail -n 1)
+            if [[ -n "$since" ]]; then
+              stack=("release:$released")
+              runs=$(gh api --paginate -X GET "repos/$GH_REPO/actions/workflows/latest.yml/runs" \
+                -f event=workflow_dispatch -f branch=main -f status=success -f per_page=100 \
+                --jq '.workflow_runs[] | "\(.run_started_at) \(.display_title)"' | sort)
+              while read -r started kind _ _ digest _; do
+                if [[ ! "$started" > "$since" || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  continue
+                fi
+                if [[ "$kind" == Point && "${stack[${#stack[@]}-1]}" != "$digest" ]]; then
+                  stack+=("$digest")
+                elif [[ "$kind" == Withdraw ]]; then
+                  at=-1
+                  for i in "${!stack[@]}"; do
+                    if [[ "${stack[$i]}" == "$digest" ]]; then
+                      at=$i
+                    fi
+                  done
+                  if ((at >= 0)); then
+                    stack=("${stack[@]:0:at+1}")
+                  else
+                    stack=("$digest")
+                  fi
+                fi
+              done <<<"$runs"
+              held="${stack[*]}"
+            fi
+            echo "- The images the latest tag held with $VERSION since its Release run, oldest first: ${held:-not known, as $tag has no successful Release run}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "held=$held" >> "$GITHUB_OUTPUT"
+
   # Moves the tag once the run is approved: the only job here that can write
   # to the registry, and the only one that names :latest.
   latest:
@@ -471,6 +546,7 @@ jobs:
       WITHDRAW: ${{ inputs.withdraw }}
       RUN: ${{ needs.checks.outputs.run }}
       VERSION: ${{ needs.checks.outputs.version }}
+      HELD: ${{ needs.checks.outputs.held }}
       ALLOW_UNMARKED: ${{ inputs.allow_unmarked }}
     steps:
       - name: Log in to the registry
@@ -488,14 +564,23 @@ jobs:
       # a release put on :latest, the commit of that release's tag. A move
       # from an image with a marker to one with none, whose node manager is
       # Autonomi's (it deletes a node's data when its disk runs low, with no
-      # possession check), is refused unless allow_unmarked is set: only
-      # withdrawing the first image release needs that. A withdrawal to an
+      # possession check), is refused unless the run is a withdrawal and
+      # allow_unmarked is set: only withdrawing the first image release
+      # needs that. A withdrawal to an
       # older node goes ahead only once the withdrawn release, the one
       # :latest's node belongs to, is deleted (or a draft or a pre-release),
       # so nodes still waiting to install it drop it and its Release run
       # can't move :latest to it again; any other answer from GitHub
-      # refuses it. A withdrawal to the same node (an image release going
-      # back) keeps that release published. The image's node
+      # refuses it. It goes back to the release before, never further: once
+      # the withdrawn release is left out, no published release (not a
+      # draft or a pre-release) may be newer than the image's, ordered as
+      # nodes order them. A withdrawal to the same node (an image release
+      # going back) keeps that release published, and goes back one image:
+      # :latest's image must be the newest of the images the checks job
+      # read it held with that node, and the new one the image before it, or,
+      # when that is the release's own image, an image of its tag's commit.
+      # A floor from the root switch on (no withdrawal below the root
+      # release) is to be its own check once that release exists. The image's node
       # must still be a published release: the checks job checked it before
       # the approval, and a release can be withdrawn while a run waits for
       # it. Then, before :latest moves, the summary names the digest it had
@@ -533,7 +618,7 @@ jobs:
             exit 1
           fi
           withdrawn=""
-          if [[ "$order" == "older than" ]]; then
+          if [[ "$order" == "older than" && "$WITHDRAW" == true ]]; then
             withdrawn="v${current_version#ant-node }"
             if ! withdrawn_state=$(gh api "repos/$GH_REPO/releases/tags/$withdrawn" \
                 --jq 'if .draft or .prerelease then "a draft or a pre-release" else "published" end' 2>"$RUNNER_TEMP/withdrawn.err"); then
@@ -556,8 +641,8 @@ jobs:
             built="with no image marker: release v${current_version#ant-node }'s image, from ${base:-a commit not found}"
           fi
           target_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DIGEST" /opt/ant/image-version 2>/dev/null || true)
-          if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ && "$ALLOW_UNMARKED" != true ]]; then
-            echo "::error::$IMAGE@$DIGEST has no image marker, so its node manager is Autonomi's, which deletes a node's data when its disk runs low, and $IMAGE:latest's image has one: only withdrawing the first image release goes back to such an image, with -f allow_unmarked=true"
+          if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ ]] && ! [[ "$ALLOW_UNMARKED" == true && "$WITHDRAW" == true ]]; then
+            echo "::error::$IMAGE@$DIGEST has no image marker, so its node manager is Autonomi's, which deletes a node's data when its disk runs low, and $IMAGE:latest's image has one: only withdrawing the first image release goes back to such an image, with -f withdraw=true -f allow_unmarked=true (allow_unmarked works only with withdraw=true)"
             exit 1
           fi
           release="v${VERSION#ant-node }"
@@ -565,6 +650,39 @@ jobs:
           if [[ "$published_now" != false ]]; then
             echo "::error::$IMAGE@$DIGEST runs $VERSION, and $release is no longer a published release: it was deleted, or made a draft or a pre-release, after this run's checks"
             exit 1
+          fi
+          if [[ -n "$withdrawn" && "$order" == "older than" ]]; then
+            if ! published_releases=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name'); then
+              echo "::error::the published releases can't be listed, to check that $release is the newest once $withdrawn is gone"
+              exit 1
+            fi
+            if ! newer=$(jq -rRn --arg target "$release" --arg withdrawn "$withdrawn" '
+                def node_version:
+                  capture("^ant-node (?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)(\\+ds\\.(?<build>[1-9][0-9]*))?$")
+                    // error("not ant-node X.Y.Z or X.Y.Z+ds.N: \(.)")
+                  | [.major, .minor, .patch, (.build // "0")] | map(tonumber);
+                ("ant-node " + ($target | ltrimstr("v")) | node_version) as $t
+                | [inputs | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+(\\+ds\\.[1-9][0-9]*)?$") and . != $withdrawn)
+                    | select(("ant-node " + ltrimstr("v") | node_version) > $t)] | join(" ")' <<<"$published_releases"); then
+              echo "::error::the published releases can't be ordered against $release"
+              exit 1
+            fi
+            if [[ -n "$newer" ]]; then
+              echo "::error::a withdrawal goes back to the release before the withdrawn one, never further: with $withdrawn gone, $newer is still published and newer than $release, which $IMAGE@$DIGEST runs. Withdraw to the newest published release's image instead"
+              exit 1
+            fi
+          fi
+          if [[ "$order" == "the same as" && "$WITHDRAW" == true ]]; then
+            read -ra held <<<"$HELD"
+            n=${#held[@]}
+            before=""
+            if ((n >= 2)) && [[ "${held[n-1]}" == "$current" ]]; then
+              before=${held[n-2]}
+            fi
+            if [[ "$before" != "$DIGEST" && "$before" != "release:$COMMIT" ]]; then
+              echo "::error::a withdrawal to the same node goes back one image, never further: to the image the latest tag had before $current, which is ${before:-not known}, and $DIGEST from $COMMIT is not it. The images it held with $VERSION since its release, oldest first (release: names the release's own image, by its tag's commit): ${HELD:-not known}"
+              exit 1
+            fi
           fi
           relation=""
           if [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
@@ -596,6 +714,12 @@ jobs:
               echo "- A withdrawal: withdraw is set, so the new image may be older than the one before, and its node too."
             fi
             echo "- $VERSION is still the published release $release."
+            if [[ "$order" == "older than" ]]; then
+              echo "- With $withdrawn gone, $release is the newest published release: the withdrawal goes back to the release before, no further."
+            fi
+            if [[ "$WITHDRAW" == true && "$order" == "the same as" ]]; then
+              echo "- A withdrawal to the same node, back one image: from $current, the newest image the latest tag held with $VERSION, to the one before it (${before})."
+            fi
             if [[ -n "$withdrawn" ]]; then
               echo "- The withdrawn release $withdrawn, of $current_version, is $withdrawn_state: nodes still waiting to install it drop it, and its Release run can't move the latest tag to it again."
             fi
