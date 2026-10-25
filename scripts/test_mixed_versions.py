@@ -52,7 +52,9 @@ tree knows (--new-only-family) reached nodes of this tree and no others.
 
 The test-only seams (src/test_seams.rs) are compiled only into builds with the
 `test-utils` feature, which both releases are built with here. The free-space
-seam makes a node's disk read as full (the `full` run).
+seam makes a node's disk read as full (the `full` run), and in that run the
+full-notice seam lets a full node of this tree tell the others that it is
+full, which they read from the release that brings the notice on.
 
 Usage, from the repository root (needs cargo, git, Python 3.8+, and Foundry's
 `anvil` on PATH):
@@ -150,6 +152,13 @@ CLIENT_TIMEOUT = 1800
 
 # The seam whose name, found in a binary, shows it was built with test-utils.
 FREE_SPACE_SEAM = "ANT_TEST_SEAM_FREE_SPACE_FILE"
+
+# The seam naming the first release whose nodes a full node tells it is full
+# (src/test_seams.rs). This tree's nodes announce the last release's version
+# until the release that brings the notice is cut, so in the `full` run, where
+# every node is of this tree, it is set to 0 on each node whose binary has it:
+# a full node then tells the others, as it will once released.
+FULL_NOTICE_SEAM = "ANT_TEST_SEAM_FULL_NOTICE_FROM_RELEASE"
 
 # What each node logs: info, and debug for the code whose debug lines name
 # messages that didn't decode (src/replication, the chunk handler, listings).
@@ -323,7 +332,9 @@ class Release:
                 raise HarnessError(f"{binary} is missing")
         self.version = subprocess.run([str(self.node), "--version"], capture_output=True,
                                       text=True).stdout.strip()
-        self.seams = FREE_SPACE_SEAM.encode() in self.node.read_bytes()
+        binary = self.node.read_bytes()
+        self.seams = FREE_SPACE_SEAM.encode() in binary
+        self.full_notice_seam = FULL_NOTICE_SEAM.encode() in binary
 
     def __str__(self):
         return f"{self.name}: {self.version}, {self.label}"
@@ -475,6 +486,8 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
             root = folder / "nodes" / node_name
             root.mkdir(parents=True)
             node_env = dict(env)
+            if name == "full" and release.full_notice_seam:
+                node_env[FULL_NOTICE_SEAM] = "0"
             if full:
                 seam = folder / "seams" / f"{node_name}.free"
                 seam.parent.mkdir(exist_ok=True)

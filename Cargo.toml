@@ -221,6 +221,13 @@ name = "full_line"
 path = "tests/full_line.rs"
 required-features = ["test-utils"]
 
+# The falling floor and "full, not faulty" on simulated small partitions, with
+# the shipped full line. Alone in its process, as it sets the free-space seam.
+[[test]]
+name = "small_disks"
+path = "tests/small_disks.rs"
+required-features = ["test-utils"]
+
 [[test]]
 name = "webrtc_direct_devnet"
 path = "tests/webrtc_direct_devnet.rs"
