@@ -5,6 +5,13 @@
 //! `Cargo.toml` puts in place of the crates.io release. Nodes and clients must
 //! carry the same multiplier, so these tests fail if the patch stops applying
 //! or the multiplier changes.
+//!
+//! The pins of pricing by record size are added beside this file in the change
+//! that brings its functions to the vendored ant-protocol, unused at first:
+//! `record_weight`; `weighted_amount`; a node's weight total, which is never
+//! above its committed key count and equals it when every record is a full
+//! chunk; and the weighted amount for a pointer, at its 5,303 bytes. That size
+//! is pinned already, in `tests/pointer_convergence.rs`.
 
 use ant_protocol::evm::Amount;
 use ant_protocol::payment::calculate_price;
