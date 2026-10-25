@@ -4469,7 +4469,7 @@ impl ReplicationEngine {
                         tried
                     }
                 };
-                let (completed, unheard) = exchange_until_heard(
+                let (completed, unheard, owing) = exchange_until_heard(
                     batch.to_vec(),
                     &BOOTSTRAP_UNHEARD_RETRY_WAITS,
                     &shutdown,
@@ -4478,11 +4478,18 @@ impl ReplicationEngine {
                 )
                 .await;
                 for peer in &unheard {
-                    debug!(
-                        "Bootstrap sync with {peer}: still busy after {} tries; it owes its \
-                         hints until a later exchange delivers them or the record expires",
-                        BOOTSTRAP_UNHEARD_RETRY_WAITS.len() + 1
-                    );
+                    if owing.contains(peer) {
+                        debug!(
+                            "Bootstrap sync with {peer}: still busy after {} tries; it owes its \
+                             hints until a later exchange delivers them or the record expires",
+                            BOOTSTRAP_UNHEARD_RETRY_WAITS.len() + 1
+                        );
+                    } else {
+                        debug!(
+                            "Bootstrap sync with {peer}: held by another exchange at its last \
+                             try; that exchange accounts for it"
+                        );
+                    }
                 }
 
                 // Process response metadata before exposing any of this batch's
@@ -4517,7 +4524,7 @@ impl ReplicationEngine {
                             record_sent_replica_hints(
                                 peer,
                                 &exchange.hints,
-                                exchange.answered_replica_hints(),
+                                &exchange.answered_replica_hints(),
                                 &repair_proofs,
                                 &sync_cycle_epoch,
                             )
@@ -4568,9 +4575,11 @@ impl ReplicationEngine {
                             })
                         })
                         .collect::<Vec<_>>();
-                    // A source still busy after its tries owes every hint.
+                    // A source still busy after its tries owes every hint;
+                    // one held by another exchange is that exchange's to
+                    // account for.
                     outcomes.extend(
-                        unheard
+                        owing
                             .iter()
                             .map(|peer| (*peer, AdmissionOutcome::owing_all())),
                     );
@@ -7356,11 +7365,13 @@ async fn handle_neighbor_sync_request(
         hints,
         neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Single),
     );
-    let sent = hints.all();
-    let sent_replica_hints = sent.replica.to_vec();
+    // As it goes out: a record being erased is named in no hint, and proofs
+    // are recorded for this same list.
+    let sent = hints.all().to_send(&neighbor_sync::erasing(&self_id));
+    let sent_replica_hints = sent.replica;
     let response = NeighborSyncResponse {
         replica_hints: sent_replica_hints.clone(),
-        paid_hints: sent.paid.to_vec(),
+        paid_hints: sent.paid,
         bootstrapping: is_bootstrapping,
         rejected_keys: Vec::new(),
         commitment: my_commitment.clone(),
@@ -7548,11 +7559,12 @@ fn record_held_proofs(source: PeerId, held: HeldProofs, ctx: &ReplicationMessage
     let repair_proofs = Arc::clone(&ctx.repair_proofs);
     let sync_cycle_epoch = Arc::clone(&ctx.sync_cycle_epoch);
     ctx.detached_task_tracker.spawn(async move {
-        let keys = held.hints.page(held.page, held.page_keys).replica.to_vec();
+        // The page's replica hints as it was sent, less those being erased
+        // then: what the requester was named is what is proved.
         record_sent_replica_hints(
             &source,
             &held.hints,
-            &keys,
+            &held.keys,
             &repair_proofs,
             &sync_cycle_epoch,
         )
@@ -7773,9 +7785,16 @@ async fn serve_neighbor_sync_page(
         }
     }
 
-    let ours = served.hints.page(page, served.page_keys);
-    let replica_sent = ours.replica.to_vec();
-    let paid_sent = ours.paid.to_vec();
+    // The page as it goes out, filtered now, since the set was built at the
+    // exchange's first page and a key may have been selected for erasure
+    // since: one list for the page and for its held proofs.
+    let ours = served
+        .hints
+        .page(page, served.page_keys)
+        .to_send(&neighbor_sync::erasing(p2p_node.peer_id()));
+    let replica_withheld = ours.withheld.len();
+    let replica_sent = ours.replica;
+    let paid_sent = ours.paid;
     let commitment = if page == 0 {
         // Emitted on the first page, so this node stays answerable for it
         // (ADR-0002).
@@ -7794,7 +7813,8 @@ async fn serve_neighbor_sync_page(
     // the answer arrives, finds them.
     let holds_proofs = waits && sender_in_rt && !request.bootstrapping && !replica_sent.is_empty();
     if holds_proofs {
-        ctx.served_hint_sets.hold_proofs(&source, cycle, page);
+        ctx.served_hint_sets
+            .hold_proofs(&source, cycle, page, replica_sent.clone());
     }
     debug!(
         target: "ant_node::replication::neighbor_sync",
@@ -7806,6 +7826,7 @@ async fn serve_neighbor_sync_page(
         requester_pages = request.pages,
         replica_hints = replica_sent.len(),
         paid_hints = paid_sent.len(),
+        replica_hints_withheld = replica_withheld,
         "Neighbor-sync page served"
     );
     let body = ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Page {
@@ -9006,7 +9027,7 @@ async fn handle_sync_response(
         record_sent_replica_hints(
             peer,
             &exchange.hints,
-            exchange.answered_replica_hints(),
+            &exchange.answered_replica_hints(),
             repair_proofs,
             sync_cycle_epoch,
         )
@@ -9092,21 +9113,27 @@ const BOOTSTRAP_UNHEARD_RETRY_WAITS: [Duration; 3] = [
 /// peer was in progress already) and those whose exchange `is_unheard` (a
 /// first page answered busy). A peer that failed or timed out is heard, and
 /// not tried again: it isn't known to be there, so it owes nothing. Returns
-/// the exchanges of the peers heard, and the peers still not heard after
-/// the last try, or when `shutdown` cut the waiting short.
+/// the exchanges of the peers heard; the peers still not heard after the
+/// last try, or when `shutdown` cut the waiting short; and those of them
+/// whose own exchange, at their last try, answered busy, which owe their
+/// hints. One skipped at its last try owes nothing here: the exchange that
+/// held it (a sync round's) publishes what it delivered, or that it answered
+/// busy, itself, and may already have found it drained.
 async fn exchange_until_heard<T, F, Fut>(
     peers: Vec<PeerId>,
     waits: &[Duration],
     shutdown: &CancellationToken,
     is_unheard: impl Fn(&T) -> bool,
     mut try_exchanges: F,
-) -> (Vec<(PeerId, T)>, Vec<PeerId>)
+) -> (Vec<(PeerId, T)>, Vec<PeerId>, Vec<PeerId>)
 where
     F: FnMut(Vec<PeerId>) -> Fut,
     Fut: Future<Output = Vec<(PeerId, Option<T>)>>,
 {
     let mut heard = Vec::with_capacity(peers.len());
     let mut unheard = peers;
+    // The unheard peers whose last try was their own busy answer.
+    let mut answered_busy = HashSet::new();
     for attempt in 0..=waits.len() {
         if attempt > 0 {
             if unheard.is_empty() {
@@ -9119,12 +9146,27 @@ where
         }
         for (peer, tried) in try_exchanges(std::mem::take(&mut unheard)).await {
             match tried {
-                Some(exchange) if !is_unheard(&exchange) => heard.push((peer, exchange)),
-                _ => unheard.push(peer),
+                Some(exchange) if !is_unheard(&exchange) => {
+                    answered_busy.remove(&peer);
+                    heard.push((peer, exchange));
+                }
+                Some(_) => {
+                    answered_busy.insert(peer);
+                    unheard.push(peer);
+                }
+                None => {
+                    answered_busy.remove(&peer);
+                    unheard.push(peer);
+                }
             }
         }
     }
-    (heard, unheard)
+    let owing = unheard
+        .iter()
+        .filter(|peer| answered_busy.contains(*peer))
+        .copied()
+        .collect();
+    (heard, unheard, owing)
 }
 
 /// Publish one atomic admission unit into bootstrap drain accounting.
@@ -12959,7 +13001,7 @@ mod tests {
                 .collect::<Vec<_>>();
             std::future::ready(tried)
         };
-        let (heard, unheard) = exchange_until_heard(
+        let (heard, unheard, owing) = exchange_until_heard(
             vec![late, held, failed, busy],
             &[Duration::ZERO; 3],
             &CancellationToken::new(),
@@ -12973,10 +13015,68 @@ mod tests {
             vec![(failed, "failed"), (late, "complete"), (held, "complete")]
         );
         assert_eq!(unheard, vec![busy]);
+        assert_eq!(owing, vec![busy], "it answered busy itself");
         assert_eq!(attempts[&failed], 1, "a failed peer isn't tried again");
         assert_eq!(attempts[&late], 2);
         assert_eq!(attempts[&held], 2);
         assert_eq!(attempts[&busy], 4, "the first try and 3 more");
+    }
+
+    /// A peer another exchange held at its last try is not marked as owing
+    /// its hints: that exchange (a sync round's) accounts for it, and may
+    /// already have found it drained. Only one whose own last answer was busy
+    /// gets a record.
+    #[tokio::test]
+    async fn a_peer_held_by_another_exchange_gets_no_owing_record() {
+        let (always_held, busy_then_held, busy) =
+            (test_peer(0xC6), test_peer(0xC7), test_peer(0xC8));
+        let mut script: HashMap<PeerId, VecDeque<Option<&'static str>>> = HashMap::from([
+            (always_held, VecDeque::from([None, None, None, None])),
+            (
+                busy_then_held,
+                VecDeque::from([Some("busy"), None, None, None]),
+            ),
+            (busy, VecDeque::new()),
+        ]);
+        let try_exchanges = |peers: Vec<PeerId>| {
+            let tried = peers
+                .into_iter()
+                .map(|peer| {
+                    let next = script
+                        .get_mut(&peer)
+                        .and_then(VecDeque::pop_front)
+                        .unwrap_or(Some("busy"));
+                    (peer, next)
+                })
+                .collect::<Vec<_>>();
+            std::future::ready(tried)
+        };
+        let (heard, unheard, owing) = exchange_until_heard(
+            vec![always_held, busy_then_held, busy],
+            &[Duration::ZERO; 3],
+            &CancellationToken::new(),
+            |end: &&str| *end == "busy",
+            try_exchanges,
+        )
+        .await;
+        assert!(heard.is_empty());
+        assert_eq!(unheard, vec![always_held, busy_then_held, busy]);
+        assert_eq!(owing, vec![busy]);
+
+        // As the bootstrap sync publishes them: a record for the busy peer
+        // only.
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        let outcomes = owing
+            .iter()
+            .map(|peer| (*peer, AdmissionOutcome::owing_all()))
+            .collect::<Vec<_>>();
+        publish_bootstrap_admission_outcomes(&bootstrap_state, &outcomes, &HashSet::new()).await;
+        let state = bootstrap_state.read().await;
+        assert!(state.capacity_rejected_sources.contains_key(&busy));
+        assert!(!state.capacity_rejected_sources.contains_key(&always_held));
+        assert!(!state
+            .capacity_rejected_sources
+            .contains_key(&busy_then_held));
     }
 
     /// A source that answered its first page busy keeps bootstrap from

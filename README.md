@@ -351,9 +351,18 @@ never ran.
   before, and its request is dropped only once it has waited 15 seconds. Pages go on the peer's connection without trust reporting, so
   silence, a timeout or an answer that doesn't decode never counts against
   the responder. A requester waits 30 seconds for each page, sync's own
-  deadline. Only a complete exchange puts the neighbour on the sync
-  cooldown; one that ended part way, busy, failed or stopped, leaves it to
-  the next cycle. Repair proofs are recorded only for acknowledged delivery:
+  deadline, and an exchange runs at most 2 minutes in all
+  (`NEIGHBOR_SYNC_EXCHANGE_DEADLINE`), so a slow neighbour can't hold a
+  round, whose exchanges run one after another: past it the exchange
+  stops, its window moving on by what was delivered. Only a complete
+  exchange that carried all of the node's own hints puts the neighbour on
+  the sync cooldown; one that ended part way, busy, failed or stopped, a
+  single answer filled to the message from a neighbour of a paging release,
+  or one that carried only a window of the node's own hints, leaves it to
+  the next cycle. A record selected for erasure is named in no hint: it is
+  left out when hints are built, and again as each page or single message
+  goes out, since a responder's hints are held across an exchange's pages;
+  repair proofs are recorded for the list sent. Repair proofs are recorded only for acknowledged delivery:
   the requester's for the pages the responder answered, the responder's once
   the requester's next request of the exchange shows the page arrived. The
   last page's keys get none from the exchange, so in a one-page exchange,
@@ -366,9 +375,11 @@ never ran.
   bootstrapping counts a neighbour as done only once that neighbour's last
   announced page has arrived. A neighbour that answers its first page busy,
   or that another exchange holds, is tried again within the bootstrap sync,
-  after 5, 10 and 20 seconds; one still busy after that owes all its hints,
-  and keeps bootstrap from draining until a later exchange delivers them or
-  its record expires (110 seconds, as for a capacity-rejected source). A
+  after 5, 10 and 20 seconds; one whose own last answer was still busy owes
+  all its hints, and keeps bootstrap from draining until a later exchange
+  delivers them or its record expires (110 seconds, as for a
+  capacity-rejected source). One another exchange still held at its last
+  try owes nothing here: that exchange accounts for it itself. A
   neighbour whose first page failed or timed out isn't known to be there,
   and is not waited for. A node pages to a peer whose user agent names
   ds.17 or later (`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`), decided again for

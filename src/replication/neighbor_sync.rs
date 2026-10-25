@@ -39,8 +39,8 @@ use saorsa_core::P2PNode;
 use crate::ant_protocol::XorName;
 use crate::replication::commitment::StorageCommitment;
 use crate::replication::config::{
-    ReplicationConfig, MAX_NEIGHBOR_SYNC_PAGES, NEIGHBOR_SYNC_PAGE_BYTES,
-    NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES, REPLICATION_PROTOCOL_ID,
+    ReplicationConfig, MAX_NEIGHBOR_SYNC_PAGES, NEIGHBOR_SYNC_EXCHANGE_DEADLINE,
+    NEIGHBOR_SYNC_PAGE_BYTES, NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -192,12 +192,61 @@ pub(crate) struct HintPage<'a> {
     pub(crate) paid: &'a [XorName],
 }
 
+/// A page of hints, or the hints of a single message, as it goes out: its
+/// replica hints less those of keys this node is erasing at that moment
+/// ([`erasing`]), and its paid hints. A key selected for erasure is named in
+/// no hint from then on (Stage B's two-phase erasure), and a hint set is held
+/// across an exchange's pages for as long as minutes, so each page is
+/// filtered as it is sent, not only when the set is built. The repair proofs
+/// of a page are recorded for [`Self::replica`], this same list, so what is
+/// sent and what is proved can't differ.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SentPage {
+    /// The replica hints sent.
+    pub(crate) replica: Vec<XorName>,
+    /// The paid hints sent.
+    pub(crate) paid: Vec<XorName>,
+    /// The page's replica hints left out as being erased.
+    pub(crate) withheld: Vec<XorName>,
+}
+
 impl HintPage<'_> {
     /// How many keys the page carries.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.replica.len() + self.paid.len()
     }
+
+    /// The page as it is sent now, `being_erased` naming the keys this node
+    /// is erasing ([`SentPage`]).
+    pub(crate) fn to_send(self, being_erased: &dyn Fn(&XorName) -> bool) -> SentPage {
+        let mut sent = SentPage {
+            replica: Vec::with_capacity(self.replica.len()),
+            paid: self.paid.to_vec(),
+            withheld: Vec::new(),
+        };
+        for key in self.replica {
+            if being_erased(key) {
+                sent.withheld.push(*key);
+            } else {
+                sent.replica.push(*key);
+            }
+        }
+        sent
+    }
+}
+
+/// Whether this node is erasing a key, as a record, so names it in no replica
+/// hint (Stage B's two-phase erasure): asked when hints are built, which keeps
+/// such keys out of a set's page count, and again as each page or single
+/// message goes out ([`HintPage::to_send`]).
+///
+/// The erasure gate that answers this is node-1b-disk's
+/// (`erasure::gate_for(self_id).is_being_erased`), which joins here when the
+/// branches merge. This branch selects nothing for erasure, so here no key is
+/// being erased.
+pub(crate) fn erasing(_self_id: &PeerId) -> impl Fn(&XorName) -> bool + Send + Sync + 'static {
+    |_key: &XorName| false
 }
 
 impl PeerSyncHints {
@@ -470,13 +519,17 @@ pub(crate) async fn build_sync_hints_for_peers(
         return empty(&snapshot);
     }
 
-    let all_keys = match storage.all_keys().await {
+    let mut all_keys = match storage.all_keys().await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read stored keys for batch hint construction: {e}");
             Vec::new()
         }
     };
+    // A record being erased is named in no hint, nor counted in a set's
+    // pages; each page is filtered again as it is sent.
+    let being_erased = erasing(p2p_node.peer_id());
+    all_keys.retain(|key| !being_erased(key));
     let all_paid_keys = match paid_list.all_keys() {
         Ok(keys) => keys,
         Err(e) => {
@@ -738,9 +791,11 @@ pub(crate) enum ExchangeEnd {
     Busy,
     /// A page went unanswered, or its answer wasn't the one asked for.
     Failed,
-    /// This node stopped following the peer's pages: what it gathers in one
-    /// exchange, or holds across its exchanges, was reached. The rest of the
-    /// peer's hints come in a later exchange.
+    /// This node stopped following the peer's pages after some arrived: what
+    /// it gathers in one exchange, or holds across its exchanges, was
+    /// reached, or the exchange ran out its time
+    /// ([`NEIGHBOR_SYNC_EXCHANGE_DEADLINE`]). The rest of the peer's hints
+    /// come in a later exchange.
     Stopped,
     /// The peer's single answer came to as many keys as a single message
     /// carries: a responder cuts its hints to a window that size when they
@@ -749,12 +804,14 @@ pub(crate) enum ExchangeEnd {
 }
 
 /// Whether an exchange puts its peer on the sync cooldown: only one that
-/// ended complete. One that ended part way, busy, failed, stopped after
-/// some pages or windowed, leaves the peer to be synced again in its next
-/// cycle, as a first page answered busy does, so the hints of the pages that
-/// weren't exchanged wait no longer than that.
+/// ended complete, carrying all of this node's own hints for the peer. One
+/// that ended part way, busy, failed, stopped after some pages or windowed,
+/// or that carried only a window of this node's hints (they came to more
+/// than one exchange carries), leaves the peer to be synced again in its next
+/// cycle, as a first page answered busy does, so the hints that weren't
+/// exchanged, either side's, wait no longer than that.
 pub(crate) fn exchange_earns_cooldown(exchange: &SyncExchange) -> bool {
-    exchange.end == ExchangeEnd::Complete
+    exchange.end == ExchangeEnd::Complete && !exchange.own_hints_windowed
 }
 
 /// Record an exchange the peer answered in `state`: the cooldown, for one
@@ -799,6 +856,15 @@ pub(crate) struct SyncExchange {
     /// How many of `hints.paid`, from the first, went out on a page the peer
     /// answered.
     pub(crate) paid_answered: usize,
+    /// Replica hints of `hints` left off the pages they were on, as being
+    /// erased when the page went out ([`SentPage::withheld`]): no proof is
+    /// recorded for them.
+    pub(crate) withheld: HashSet<XorName>,
+    /// Whether `hints` were only a window of this node's hints for the peer:
+    /// the rest go in later exchanges, so the exchange earns no cooldown
+    /// ([`exchange_earns_cooldown`]), whatever its `end`, which tells only of
+    /// the peer's answer.
+    pub(crate) own_hints_windowed: bool,
     /// The peer's answer, if it answered a page.
     pub(crate) answer: Option<SyncAnswer>,
     /// The keys of a paged answer, held against what the node holds of its
@@ -928,9 +994,14 @@ impl ExchangeReport {
 }
 
 impl SyncExchange {
-    /// The replica hints that went out on pages the peer answered.
-    pub(crate) fn answered_replica_hints(&self) -> &[XorName] {
-        &self.hints.replica[..self.replica_answered.min(self.hints.replica.len())]
+    /// The replica hints that went out on pages the peer answered: those
+    /// pages' replica hints less those withheld as being erased.
+    pub(crate) fn answered_replica_hints(&self) -> Vec<XorName> {
+        self.hints.replica[..self.replica_answered.min(self.hints.replica.len())]
+            .iter()
+            .filter(|key| !self.withheld.contains(*key))
+            .copied()
+            .collect()
     }
 
     /// Whether every page of the peer's hints arrived, its marked last page
@@ -971,7 +1042,7 @@ pub(crate) async fn exchange(
         hints,
         max_exchange_keys(form),
     );
-    let exchange = match form {
+    let mut exchange = match form {
         SyncForm::Single => {
             exchange_single(peer, p2p_node, config, is_bootstrapping, hints, commitment).await
         }
@@ -989,6 +1060,7 @@ pub(crate) async fn exchange(
             .await
         }
     };
+    exchange.own_hints_windowed = cut.is_some();
     // The window moves on by what the peer answered, so what it didn't goes
     // first in the next exchange with it.
     if let Some(cut) = cut {
@@ -1113,12 +1185,16 @@ async fn exchange_single(
     commitment: Option<StorageCommitment>,
 ) -> SyncExchange {
     let started = Instant::now();
-    let sent = hints.all();
-    let replica_sent = sent.replica.len();
-    let paid_sent = sent.paid.len();
+    let all = hints.all();
+    // Positions in `hints` the message covers, withheld keys among them.
+    let replica_sent = all.replica.len();
+    let paid_sent = all.paid.len();
+    let sent = all.to_send(&erasing(p2p_node.peer_id()));
+    let (replica_hints_sent, paid_hints_sent) = (sent.replica.len(), sent.paid.len());
+    let withheld: HashSet<XorName> = sent.withheld.into_iter().collect();
     let body = ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
-        replica_hints: sent.replica.to_vec(),
-        paid_hints: sent.paid.to_vec(),
+        replica_hints: sent.replica,
+        paid_hints: sent.paid,
         bootstrapping: is_bootstrapping,
         commitment,
     });
@@ -1155,13 +1231,19 @@ async fn exchange_single(
         }
         Err(_) => None,
     };
-    let end = single_end(answer.as_ref(), busy);
+    // Only a responder of a release that windows its single answer may have
+    // more past one that fills the message; the agent is read after the
+    // request, which may have connected the peer. One not connected has none,
+    // and counts as an older release.
+    let responder_windows = answer.is_some() && agent_reads_pages_now(peer, p2p_node).await;
+    let end = single_end(answer.as_ref(), busy, responder_windows);
     debug!(
         target: "ant_node::replication::neighbor_sync",
         peer = %peer,
         end = ?end,
-        replica_hints_sent = sent.replica.len(),
-        paid_hints_sent = sent.paid.len(),
+        replica_hints_sent,
+        paid_hints_sent,
+        replica_hints_withheld = withheld.len(),
         replica_hints_received = answer.as_ref().map_or(0, |answer| answer.replica_hints.len()),
         paid_hints_received = answer.as_ref().map_or(0, |answer| answer.paid_hints.len()),
         elapsed_ms = started.elapsed().as_millis(),
@@ -1172,22 +1254,44 @@ async fn exchange_single(
         end,
         replica_answered: if delivered { replica_sent } else { 0 },
         paid_answered: if delivered { paid_sent } else { 0 },
+        withheld,
+        own_hints_windowed: false,
         hints,
         answer,
         held: HeldAnswer::default(),
     }
 }
 
+/// Whether `peer`'s connection names a release that reads pages, and so
+/// windows its single answers: no agent, as for a peer not connected, counts
+/// as an older release.
+async fn agent_reads_pages_now(peer: &PeerId, p2p_node: &Arc<P2PNode>) -> bool {
+    p2p_node
+        .transport()
+        .peer_user_agent(peer)
+        .await
+        .is_some_and(|agent| {
+            sync_pages::agent_reads_pages(&agent, sync_pages::pages_from_release())
+        })
+}
+
 /// How a single exchange ended, with the peer's `answer`, if it answered, or
-/// answered `busy`. An answer of as many keys as a single message carries
-/// ([`max_exchange_keys`]) is windowed: a responder cuts hints that come to
-/// more to a window of exactly that many, so the peer may have more, and is
-/// not counted as drained. One of fewer is complete.
-pub(crate) fn single_end(answer: Option<&SyncAnswer>, busy: bool) -> ExchangeEnd {
+/// answered `busy`. From a responder whose release windows its single answer
+/// (`responder_windows`), an answer of as many keys as a single message
+/// carries ([`max_exchange_keys`]) is windowed: such a responder cuts hints
+/// that come to more to a window of exactly that many, so the peer may have
+/// more, and is not counted as drained. A responder of an older release never
+/// windows, so its answer, of any size, is complete, as is one of fewer keys.
+pub(crate) fn single_end(
+    answer: Option<&SyncAnswer>,
+    busy: bool,
+    responder_windows: bool,
+) -> ExchangeEnd {
     match answer {
         Some(answer)
-            if answer.replica_hints.len() + answer.paid_hints.len()
-                >= max_exchange_keys(SyncForm::Single) =>
+            if responder_windows
+                && answer.replica_hints.len() + answer.paid_hints.len()
+                    >= max_exchange_keys(SyncForm::Single) =>
         {
             ExchangeEnd::Windowed
         }
@@ -1223,6 +1327,11 @@ async fn exchange_paged(
     let mut replica_pages = (0u32, 0u32);
     let mut paid_pages = (0u32, 0u32);
 
+    // Replica hints left off their pages as being erased when the page went
+    // out: no proof is recorded for them.
+    let mut withheld: HashSet<XorName> = HashSet::new();
+    let being_erased = erasing(p2p_node.peer_id());
+
     let mut page = 0u32;
     loop {
         // As many rounds as the side with more pages has, following the
@@ -1231,24 +1340,35 @@ async fn exchange_paged(
         if page >= rounds {
             break;
         }
-        let sent = hints.page(page, page_keys);
+        // Within the exchange's own deadline: past it, the exchange ends, and
+        // the rest goes in the peer's next one.
+        let Some(wait) = page_wait(
+            started.elapsed(),
+            config.neighbor_sync_page_timeout,
+            NEIGHBOR_SYNC_EXCHANGE_DEADLINE,
+        ) else {
+            debug!(
+                "Neighbor sync with {peer}: the exchange ran out its time at page {page}; the \
+                 rest in a later exchange"
+            );
+            end = deadline_end(gathered.pages().is_some());
+            break;
+        };
+        let positions = hints.page(page, page_keys);
+        let sent = positions.to_send(&being_erased);
+        let (replica_on_page, paid_on_page) = (positions.replica.len(), positions.paid.len());
+        let (replica_sent_any, paid_sent_any) = (!sent.replica.is_empty(), !sent.paid.is_empty());
+        let page_withheld = sent.withheld;
         let body = ReplicationMessageBody::NeighborSyncPageRequest(NeighborSyncPageRequest {
             cycle,
             page,
             pages: announced,
-            replica_hints: sent.replica.to_vec(),
-            paid_hints: sent.paid.to_vec(),
+            replica_hints: sent.replica,
+            paid_hints: sent.paid,
             bootstrapping: is_bootstrapping,
             commitment: commitment.take(),
         });
-        let answered = request(
-            peer,
-            p2p_node,
-            body,
-            config.neighbor_sync_page_timeout,
-            Silence::Free,
-        )
-        .await;
+        let answered = request(peer, p2p_node, body, wait, Silence::Free).await;
         match answered {
             Ok(ReplicationMessageBody::NeighborSyncPageResponse(
                 NeighborSyncPageResponse::Page {
@@ -1275,10 +1395,10 @@ async fn exchange_paged(
                     end = ExchangeEnd::Failed;
                     break;
                 }
-                if !sent.replica.is_empty() {
+                if replica_sent_any {
                     replica_pages.0 += 1;
                 }
-                if !sent.paid.is_empty() {
+                if paid_sent_any {
                     paid_pages.0 += 1;
                 }
                 if !replica_hints.is_empty() {
@@ -1287,8 +1407,9 @@ async fn exchange_paged(
                 if !paid_hints.is_empty() {
                     paid_pages.1 += 1;
                 }
-                replica_answered += sent.replica.len();
-                paid_answered += sent.paid.len();
+                replica_answered += replica_on_page;
+                paid_answered += paid_on_page;
+                withheld.extend(page_withheld);
                 let whole = gathered.take(
                     sync_peers.received(),
                     AnsweredPage {
@@ -1332,13 +1453,7 @@ async fn exchange_paged(
                 // the peer's agent still names a paging release
                 // ([`single_next_after`]).
                 if page == 0 {
-                    let reads_pages = p2p_node
-                        .transport()
-                        .peer_user_agent(peer)
-                        .await
-                        .is_some_and(|agent| {
-                            sync_pages::agent_reads_pages(&agent, sync_pages::pages_from_release())
-                        });
+                    let reads_pages = agent_reads_pages_now(peer, p2p_node).await;
                     if single_next_after(unanswered, reads_pages) {
                         sync_peers.mark_single_next(*peer);
                     } else {
@@ -1347,7 +1462,16 @@ async fn exchange_paged(
                         );
                     }
                 }
-                end = ExchangeEnd::Failed;
+                // A later page cut short by the exchange's deadline ends it
+                // as the deadline does.
+                end = if page > 0
+                    && unanswered == Unanswered::TimedOut
+                    && started.elapsed() >= NEIGHBOR_SYNC_EXCHANGE_DEADLINE
+                {
+                    deadline_end(gathered.pages().is_some())
+                } else {
+                    ExchangeEnd::Failed
+                };
                 break;
             }
         }
@@ -1389,6 +1513,7 @@ async fn exchange_paged(
         paid_pages_sent = paid_pages.0,
         replica_pages_received = replica_pages.1,
         paid_pages_received = paid_pages.1,
+        replica_hints_withheld = withheld.len(),
         held_bytes = held.bytes(),
         received_held_bytes = sync_peers.received().held(),
         received_most_held_bytes = sync_peers.received().most_held(),
@@ -1401,8 +1526,35 @@ async fn exchange_paged(
         hints,
         replica_answered,
         paid_answered,
+        withheld,
+        own_hints_windowed: false,
         answer,
         held,
+    }
+}
+
+/// How long a page of an exchange begun `elapsed` ago waits for its answer:
+/// `page_timeout`, or what is left of the exchange's `deadline` when that is
+/// less, so no page runs past it; `None` once the deadline has passed.
+pub(crate) fn page_wait(
+    elapsed: Duration,
+    page_timeout: Duration,
+    deadline: Duration,
+) -> Option<Duration> {
+    let left = deadline
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())?;
+    Some(page_timeout.min(left))
+}
+
+/// How an exchange that ran out its deadline ends: stopped, its window moving
+/// on by what was delivered, if a page of the peer's arrived (`answered`);
+/// failed, as a first page that timed out is, if none did.
+pub(crate) fn deadline_end(answered: bool) -> ExchangeEnd {
+    if answered {
+        ExchangeEnd::Stopped
+    } else {
+        ExchangeEnd::Failed
     }
 }
 
@@ -2621,6 +2773,8 @@ mod tests {
                     hints: hints_of(0, 0),
                     replica_answered: 0,
                     paid_answered: 0,
+                    withheld: HashSet::new(),
+                    own_hints_windowed: false,
                     answer,
                     held,
                 }
@@ -2651,6 +2805,8 @@ mod tests {
             hints: hints_of(5, 2),
             replica_answered: 2,
             paid_answered: 0,
+            withheld: HashSet::new(),
+            own_hints_windowed: false,
             answer,
             held: HeldAnswer::default(),
         }
@@ -2682,14 +2838,47 @@ mod tests {
         }
     }
 
+    /// An exchange that carried only a window of this node's own hints for
+    /// the peer earns no cooldown, though the peer's answer was complete and
+    /// counts as drained: the rest of this node's hints go next cycle, not an
+    /// hour later.
+    #[test]
+    fn an_exchange_of_a_window_of_own_hints_earns_no_cooldown() {
+        let peer = peer_id_from_byte(9);
+        let cooldown = Duration::from_hours(1);
+        let exchange = SyncExchange {
+            own_hints_windowed: true,
+            ..exchange_of(ExchangeEnd::Complete, Some(answered(4, 4)))
+        };
+        assert!(exchange.received_last_page(), "the peer's answer is whole");
+        assert!(!exchange_earns_cooldown(&exchange));
+        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+        let _ = select_sync_batch(&mut state, 4, cooldown);
+        record_exchange(&mut state, &peer, &exchange);
+        assert!(
+            !state.last_sync_times.contains_key(&peer),
+            "no cooldown recorded"
+        );
+        let mut next_cycle = NeighborSyncState::new_cycle(vec![peer]);
+        next_cycle.last_sync_times = state.last_sync_times.clone();
+        assert!(select_sync_batch(&mut next_cycle, 4, cooldown).contains(&peer));
+    }
+
     /// Only the replica hints of pages the peer answered get repair proofs:
-    /// the ones the exchange counted, from the first.
+    /// the ones the exchange counted, from the first, less those withheld as
+    /// being erased when their page went out.
     #[test]
     fn only_the_answered_pages_replica_hints_get_proofs() {
         let hints = hints_of(5, 2);
         let exchange = exchange_of(ExchangeEnd::Failed, None);
         assert_eq!(exchange.answered_replica_hints(), &hints.replica[..2]);
         assert!(!exchange.received_last_page());
+
+        let withheld = SyncExchange {
+            withheld: HashSet::from([hints.replica[1]]),
+            ..exchange_of(ExchangeEnd::Failed, None)
+        };
+        assert_eq!(withheld.answered_replica_hints(), &hints.replica[..1]);
 
         let complete = SyncExchange {
             replica_answered: 99,
@@ -2713,9 +2902,10 @@ mod tests {
         );
     }
 
-    /// A single answer filled to what a single message carries may be a
-    /// window of more: its peer isn't drained, and is synced again next
-    /// cycle. One below that is complete, and a busy answer is busy.
+    /// A single answer filled to what a single message carries, from a
+    /// responder of a release that windows, may be a window of more: its peer
+    /// isn't drained, and is synced again next cycle. One below that is
+    /// complete, and a busy answer is busy.
     #[test]
     fn a_single_answer_filled_to_the_cap_owes_more() {
         let cap = max_exchange_keys(SyncForm::Single);
@@ -2732,7 +2922,7 @@ mod tests {
             (with(cap - 41, 40), ExchangeEnd::Complete),
             (with(0, 0), ExchangeEnd::Complete),
         ] {
-            let got = single_end(Some(&answer), false);
+            let got = single_end(Some(&answer), false, true);
             assert_eq!(got, end);
             let exchange = exchange_of(got, Some(answer));
             assert_eq!(
@@ -2741,8 +2931,97 @@ mod tests {
                 "{end:?}"
             );
         }
-        assert_eq!(single_end(None, true), ExchangeEnd::Busy);
-        assert_eq!(single_end(None, false), ExchangeEnd::Failed);
+        for responder_windows in [true, false] {
+            assert_eq!(single_end(None, true, responder_windows), ExchangeEnd::Busy);
+            assert_eq!(
+                single_end(None, false, responder_windows),
+                ExchangeEnd::Failed
+            );
+        }
+    }
+
+    /// A responder of a release before pages never windows its single
+    /// answer, so one that fills the message is all it has: complete, its
+    /// peer drained and put on the cooldown. A paging agent's is windowed;
+    /// which the agent names is read as `agent_reads_pages` reads it.
+    #[test]
+    fn an_older_responders_full_single_answer_is_complete() {
+        let cap = max_exchange_keys(SyncForm::Single);
+        let full = SyncAnswer {
+            replica_hints: vec![[7u8; 32]; cap],
+            ..answered(1, 1)
+        };
+        let from = crate::replication::config::NEIGHBOR_SYNC_PAGES_FROM_RELEASE;
+        for (agent, end) in [
+            (None, ExchangeEnd::Complete),
+            (
+                Some(format!("node/0.10.1+ds.{}", from - 1)),
+                ExchangeEnd::Complete,
+            ),
+            (
+                Some(format!("node/0.10.1+ds.{from}")),
+                ExchangeEnd::Windowed,
+            ),
+        ] {
+            let windows = agent
+                .as_deref()
+                .is_some_and(|agent| sync_pages::agent_reads_pages(agent, from));
+            assert_eq!(single_end(Some(&full), false, windows), end, "{agent:?}");
+        }
+    }
+
+    /// A page waits its own timeout, or what is left of the exchange's
+    /// deadline when that is less; past the deadline no page is asked for.
+    #[test]
+    fn no_page_waits_past_the_exchanges_deadline() {
+        let page = Duration::from_secs(30);
+        let deadline = Duration::from_secs(120);
+        assert_eq!(page_wait(Duration::ZERO, page, deadline), Some(page));
+        assert_eq!(
+            page_wait(Duration::from_secs(90), page, deadline),
+            Some(page)
+        );
+        assert_eq!(
+            page_wait(Duration::from_secs(100), page, deadline),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(page_wait(deadline, page, deadline), None);
+        assert_eq!(page_wait(Duration::from_secs(500), page, deadline), None);
+        assert!(
+            NEIGHBOR_SYNC_EXCHANGE_DEADLINE
+                > crate::replication::config::NEIGHBOR_SYNC_PAGE_TIMEOUT
+        );
+    }
+
+    /// An exchange that runs out its deadline after some of the peer's pages
+    /// arrived is stopped: the window moves on by what was delivered and the
+    /// peer is synced again next cycle. With none arrived it failed, as a
+    /// first page that timed out does.
+    #[test]
+    fn an_exchange_past_its_deadline_is_stopped_once_a_page_arrived() {
+        assert_eq!(deadline_end(true), ExchangeEnd::Stopped);
+        assert_eq!(deadline_end(false), ExchangeEnd::Failed);
+        let stopped = exchange_of(deadline_end(true), Some(answered(3, 9)));
+        assert!(!stopped.received_last_page());
+        assert!(!exchange_earns_cooldown(&stopped));
+    }
+
+    /// A page as it goes out leaves out the replica hints of keys being
+    /// erased, and says which; its paid hints go whole.
+    #[test]
+    fn a_page_sent_leaves_out_keys_being_erased() {
+        let hints = hints_of(4, 2);
+        let erased = hints.replica[1];
+        let sent = hints.page(0, 8).to_send(&|key: &XorName| *key == erased);
+        assert_eq!(
+            sent.replica,
+            vec![hints.replica[0], hints.replica[2], hints.replica[3]]
+        );
+        assert_eq!(sent.paid, hints.paid);
+        assert_eq!(sent.withheld, vec![erased]);
+        let none = hints.all().to_send(&|_: &XorName| false);
+        assert_eq!(none.replica, hints.replica);
+        assert!(none.withheld.is_empty());
     }
 
     /// A first page left unanswered moves the peer to a single message only

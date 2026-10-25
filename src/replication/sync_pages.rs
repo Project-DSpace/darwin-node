@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::ant_protocol::XorName;
 use crate::logging::warn;
 use parking_lot::Mutex;
 use rand::Rng;
@@ -478,12 +479,14 @@ pub(crate) struct ServedHints {
 /// requester's next request of the exchange shows that the page arrived.
 #[derive(Debug, Clone)]
 pub(crate) struct HeldProofs {
-    /// The hints the page was cut from.
+    /// The hints the page was cut from, whose snapshot gives each key's close
+    /// group.
     pub(crate) hints: Arc<PeerSyncHints>,
-    /// The page.
-    pub(crate) page: u32,
-    /// Keys on each of the responder's pages.
-    pub(crate) page_keys: usize,
+    /// The replica hints the page carried as it was sent: the page's, less
+    /// those being erased then
+    /// ([`crate::replication::neighbor_sync::SentPage`]), so no proof names
+    /// a key the page didn't.
+    pub(crate) keys: Vec<XorName>,
 }
 
 #[derive(Debug)]
@@ -494,8 +497,9 @@ struct Held {
     /// Whether a page of the requester's hints, in this exchange, had hints
     /// turned away at the verification queue's capacity.
     inbound_rejected: bool,
-    /// The page whose repair proofs wait for the requester's next request.
-    proofs: Option<u32>,
+    /// The page whose repair proofs wait for the requester's next request,
+    /// with the replica hints it was sent with, counted in `bytes`.
+    proofs: Option<(u32, Vec<XorName>)>,
     /// Pages the requester's later requests showed arrived: pages
     /// `0..arrived`.
     arrived: u32,
@@ -532,6 +536,31 @@ impl HeldSets {
         } else {
             false
         }
+    }
+
+    /// Set the proofs `peer`'s set holds back, if it is held for `cycle`,
+    /// keeping `bytes` to what is held; returns those it held before.
+    fn replace_proofs(
+        &mut self,
+        peer: &PeerId,
+        cycle: u64,
+        proofs: Option<(u32, Vec<XorName>)>,
+    ) -> Option<(u32, Vec<XorName>)> {
+        let held = self.sets.get_mut(peer)?;
+        if held.served.cycle != cycle {
+            return None;
+        }
+        let bytes_of = |proofs: &Option<(u32, Vec<XorName>)>| {
+            proofs
+                .as_ref()
+                .map_or(0, |(_, keys)| keys.len().saturating_mul(KEY_BYTES))
+        };
+        let added = bytes_of(&proofs);
+        let previous = std::mem::replace(&mut held.proofs, proofs);
+        let removed = bytes_of(&previous);
+        held.bytes = held.bytes.saturating_sub(removed).saturating_add(added);
+        self.bytes = self.bytes.saturating_sub(removed).saturating_add(added);
+        previous
     }
 
     /// Drop every set whose requester has asked for no page for `idle`: it
@@ -653,25 +682,27 @@ impl ServedHintSets {
     }
 
     /// Hold back the repair proofs of `page` of `peer`'s exchange `cycle`
-    /// until a later request of the exchange arrives, in place of any held
-    /// for it. Nothing is held when the set isn't.
-    pub(crate) fn hold_proofs(&self, peer: &PeerId, cycle: u64, page: u32) {
-        let mut inner = self.inner.lock();
-        if let Some(held) = inner.sets.get_mut(peer) {
-            if held.served.cycle == cycle {
-                held.proofs = Some(page);
-            }
-        }
+    /// for the replica hints `keys` it is sent with, until a later request of
+    /// the exchange arrives, in place of any held for it. Nothing is held
+    /// when the set isn't. The keys count in what the sets hold: at most a
+    /// page of them, each a key of the set itself.
+    pub(crate) fn hold_proofs(&self, peer: &PeerId, cycle: u64, page: u32, keys: Vec<XorName>) {
+        self.inner
+            .lock()
+            .replace_proofs(peer, cycle, Some((page, keys)));
     }
 
     /// Drop the proofs held back for `page` of `peer`'s exchange `cycle`,
     /// unless they were taken: the page was never sent.
     pub(crate) fn drop_proofs(&self, peer: &PeerId, cycle: u64, page: u32) {
         let mut inner = self.inner.lock();
-        if let Some(held) = inner.sets.get_mut(peer) {
-            if held.served.cycle == cycle && held.proofs == Some(page) {
-                held.proofs = None;
-            }
+        let held_page = inner
+            .sets
+            .get(peer)
+            .filter(|held| held.served.cycle == cycle)
+            .and_then(|held| held.proofs.as_ref().map(|(held_page, _)| *held_page));
+        if held_page == Some(page) {
+            inner.replace_proofs(peer, cycle, None);
         }
     }
 
@@ -688,16 +719,9 @@ impl ServedHintSets {
     ) -> Option<HeldProofs> {
         let mut inner = self.inner.lock();
         inner.sweep(now, idle);
-        let held = inner.sets.get_mut(peer)?;
-        if held.served.cycle != cycle {
-            return None;
-        }
-        let page = held.proofs.take()?;
-        Some(HeldProofs {
-            hints: Arc::clone(&held.served.hints),
-            page,
-            page_keys: held.served.page_keys,
-        })
+        let (_page, keys) = inner.replace_proofs(peer, cycle, None)?;
+        let hints = Arc::clone(&inner.sets.get(peer)?.served.hints);
+        Some(HeldProofs { hints, keys })
     }
 
     /// Note whether a page of `peer`'s hints in exchange `cycle` had hints
@@ -753,7 +777,6 @@ pub(crate) fn proofs_wait_for_next_page(page: u32, rounds: u32) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::ant_protocol::XorName;
     use crate::replication::neighbor_sync::RoutingSnapshot;
 
     fn peer(byte: u8) -> PeerId {
@@ -1186,20 +1209,59 @@ mod tests {
         let now = Instant::now();
         let a = peer(1);
         sets.insert(a, served(5, 10), None, now);
-        sets.hold_proofs(&a, 5, 0);
+        let page_of = |page: u32| {
+            let got = sets.get(&a, 5, now, IDLE).expect("held");
+            got.hints.page(page, got.page_keys).replica.to_vec()
+        };
+        sets.hold_proofs(&a, 5, 0, page_of(0));
         assert!(
             sets.take_proofs(&a, 6, now, IDLE).is_none(),
             "another exchange's request shows nothing of this one"
         );
         sets.insert(a, served(5, 10), None, now);
-        sets.hold_proofs(&a, 5, 2);
+        let keys = page_of(2);
+        sets.hold_proofs(&a, 5, 2, keys.clone());
+        assert_eq!(sets.held(), (1, 320 + 64), "the held keys count");
         let taken = sets.take_proofs(&a, 5, now, IDLE).expect("held for page 2");
-        assert_eq!((taken.page, taken.page_keys), (2, 2));
-        assert_eq!(
-            taken.hints.page(taken.page, taken.page_keys).replica,
-            &taken.hints.replica[4..6]
-        );
+        assert_eq!(taken.keys, keys);
+        assert_eq!(&taken.keys[..], &taken.hints.replica[4..6]);
+        assert_eq!(sets.held(), (1, 320), "given back once taken");
         assert!(sets.take_proofs(&a, 5, now, IDLE).is_none(), "taken once");
+    }
+
+    /// A key that enters erasure between two pages of an exchange, whose set
+    /// is held across them, is named neither on the later page nor in the
+    /// proofs held for it: what is sent and what is proved are one list.
+    #[test]
+    fn a_key_erased_between_pages_is_named_on_no_later_page_or_proof() {
+        let sets = ServedHintSets::new(1 << 20);
+        let now = Instant::now();
+        let a = peer(1);
+        sets.insert(a, served(5, 10), None, now);
+        let erasing: Mutex<HashSet<XorName>> = Mutex::new(HashSet::new());
+        let being_erased = |key: &XorName| erasing.lock().contains(key);
+
+        // Page 0, nothing being erased.
+        let set = sets.get(&a, 5, now, IDLE).expect("held");
+        let page0 = set.hints.page(0, set.page_keys).to_send(&being_erased);
+        assert_eq!(&page0.replica[..], &set.hints.replica[0..2]);
+        sets.hold_proofs(&a, 5, 0, page0.replica.clone());
+
+        // A key of page 1 is selected for erasure before page 1 is asked for.
+        let erased = set.hints.replica[3];
+        erasing.lock().insert(erased);
+        sets.note_arrived(&a, 5, 1);
+        let proved0 = sets.take_proofs(&a, 5, now, IDLE).expect("page 0's");
+        assert_eq!(proved0.keys, page0.replica, "page 0 went out whole");
+
+        let set = sets.get(&a, 5, now, IDLE).expect("still held");
+        let page1 = set.hints.page(1, set.page_keys).to_send(&being_erased);
+        assert_eq!(page1.replica, vec![set.hints.replica[2]]);
+        assert_eq!(page1.withheld, vec![erased]);
+        sets.hold_proofs(&a, 5, 1, page1.replica.clone());
+        let proved1 = sets.take_proofs(&a, 5, now, IDLE).expect("page 1's");
+        assert!(!proved1.keys.contains(&erased), "no proof names it");
+        assert_eq!(proved1.keys, page1.replica);
     }
 
     /// Proofs of a page never sent, or of a set its requester left idle, are
@@ -1210,20 +1272,22 @@ mod tests {
         let start = Instant::now();
         let a = peer(1);
         sets.insert(a, served(5, 10), None, start);
-        sets.hold_proofs(&a, 5, 1);
+        let keys = vec![[1u8; 32]];
+        sets.hold_proofs(&a, 5, 1, keys.clone());
         sets.drop_proofs(&a, 5, 0);
         assert!(
             sets.take_proofs(&a, 5, start, IDLE).is_some(),
             "dropping another page's leaves these"
         );
-        sets.hold_proofs(&a, 5, 1);
+        sets.hold_proofs(&a, 5, 1, keys.clone());
         sets.drop_proofs(&a, 5, 1);
+        assert_eq!(sets.held(), (1, 320), "the dropped keys are given back");
         assert!(
             sets.take_proofs(&a, 5, start, IDLE).is_none(),
             "the page wasn't sent"
         );
 
-        sets.hold_proofs(&a, 5, 3);
+        sets.hold_proofs(&a, 5, 3, keys);
         assert!(
             sets.take_proofs(&a, 5, start + IDLE * 2, IDLE).is_none(),
             "the requester stopped asking"

@@ -188,6 +188,24 @@ const NEIGHBOR_SYNC_PAGE_TIMEOUT_SECS: u64 = 30;
 pub const NEIGHBOR_SYNC_PAGE_TIMEOUT: Duration =
     Duration::from_secs(NEIGHBOR_SYNC_PAGE_TIMEOUT_SECS);
 
+/// How long one paged neighbour-sync exchange may run, all its pages
+/// together.
+///
+/// A sync round runs its exchanges one after another, so a peer that answers
+/// each page slowly would otherwise hold the round, and every other
+/// neighbour's sync, for as long as 256 pages of 30 seconds. Past this the
+/// exchange ends, stopped with its window moved on by what was delivered (or
+/// failed, if none of the peer's pages arrived), and the peer is synced again
+/// in its next cycle; no page waits past it. Two minutes: a round's
+/// [`NEIGHBOR_SYNC_PEER_COUNT`] exchanges then take at most 8 minutes, inside
+/// the shortest interval between rounds ([`NEIGHBOR_SYNC_INTERVAL_MIN`],
+/// 10 minutes), and 256 pages of 256 KiB fit in it on a link of about
+/// 0.55 MB/s or faster.
+const NEIGHBOR_SYNC_EXCHANGE_DEADLINE_SECS: u64 = 120;
+/// How long one paged neighbour-sync exchange may run.
+pub const NEIGHBOR_SYNC_EXCHANGE_DEADLINE: Duration =
+    Duration::from_secs(NEIGHBOR_SYNC_EXCHANGE_DEADLINE_SECS);
+
 /// Most bytes of hint sets a responder keeps for paged exchanges in progress.
 ///
 /// One set per requester, each built at the exchange's first page, cut to the
@@ -227,6 +245,13 @@ const _: () = assert!(
     NEIGHBOR_SYNC_PAGE_BYTES * MAX_NEIGHBOR_SYNC_PAGES as usize
         <= NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES,
     "an exchange's pages hold no more than a responder holds for exchanges in progress"
+);
+const _: () = assert!(
+    NEIGHBOR_SYNC_EXCHANGE_DEADLINE_SECS > NEIGHBOR_SYNC_PAGE_TIMEOUT_SECS
+        && NEIGHBOR_SYNC_EXCHANGE_DEADLINE_SECS * NEIGHBOR_SYNC_PEER_COUNT as u64
+            <= NEIGHBOR_SYNC_INTERVAL_MIN_SECS,
+    "an exchange's first page waits its whole timeout, and a round's exchanges end within \
+     the shortest interval between rounds"
 );
 
 /// Minimum age for a replica repair hint before the hinted peer can be audited
