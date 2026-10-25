@@ -71,6 +71,46 @@ never ran.
   a payment to another payee is refused, more than the amount due is taken
   and a wei less refused, and a merkle proof is refused before anything is
   read.
+- **Payment checks spare chain reads, and answer a store in time** (from
+  ds.16). The vault's record for a quote (`completedPayments`) stays the
+  authority: every refusal comes from a read of it, as before. In front of
+  it a node keeps payment facts by quote hash, and only payments the vault
+  recorded: an amount and the payee it went to, never an empty record, a
+  missing receipt, an error or a timeout. They come from the answers to
+  record reads and from the receipts of the transactions a proof names, one
+  read for each of its first 4 distinct transactions, counting only the
+  vault's `DataPaymentMade` logs in a receipt whose transaction succeeded.
+  The vault writes each record once and logs only that write, so a fact
+  never goes stale. A fact that pays the quote settles it with no record
+  read, and one receipt read settles a whole wave of payments; a quote with
+  no fact, or one the fact doesn't pay (paid in another transaction, paid
+  earlier, or taken first by someone else's payment), is read as before.
+  Reads of one record at once share a call while it is in flight, and a
+  caller that joined a read that came back empty, failed or was dropped
+  reads for itself. Record reads made while one is in flight go together as
+  one JSON-RPC batch of up to 32 calls; an RPC that refuses batches, or
+  leaves calls out of its answer, is read a call at a time. Calls go through
+  one pool of connections, starting at the RPC that answered last, and an
+  RPC that answered busy or didn't answer in time is asked after the others
+  for 30 seconds. A record that reads empty is read once more 1.5 seconds
+  later, skipping the facts, on a fresh connection at the next RPC, and so
+  is an envelope's receipt the RPC didn't know. A released client waits 10
+  seconds for a store's answer, so a store's whole payment check, the
+  envelope's lookup included, ends within 7 seconds: each call has 2.5
+  seconds, and a call unanswered after 2 seconds goes to the next RPC as
+  well. At the deadline the store is refused with the payment error, and
+  the reads still in flight fill the facts for the client's next try. Reads
+  for fresh offers, paid notices and listings give each call 15 seconds. A
+  paid notice of a key the paid list holds is dropped before it is
+  admitted, and the notices of one key are handled one at a time: one that
+  waited checks the paid list again, and records the key itself if the
+  first didn't. The RPC traffic figures count receipt reads, batches and
+  block reads as kinds of their own. Tests in `src/payment/settlement/` and
+  `src/payment/verifier/settlement_tests.rs` check each of these through
+  the read path against a stub chain served over JSON-RPC, including that a
+  node reading receipts reaches the verdict of one reading records alone;
+  `tests/fork_pins.rs` pins what a receipt may do and the deadline, and the
+  census lists the vault's reads.
 - **Relay serving can be turned off** (from ds.10). saorsa-core gives every
   node a MASQUE relay server, on which any peer can open a session and have
   the node send UDP for it to any address. `ANT_RELAY_SERVING=false` (or
