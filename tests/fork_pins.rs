@@ -9,7 +9,10 @@
 //! read moves on to the next RPC at once and is made again in a second round,
 //! while an answer, even an empty record, ends the read; an empty record is
 //! read once more; a payment to another payee is refused, an overpayment
-//! taken, and a merkle proof refused before anything is read.
+//! taken, and a merkle proof refused before anything is read. And the bytes of
+//! the payment proofs nodes pass each other in fresh offers and paid notices,
+//! and of the quotes inside them, with each quote's hash
+//! (`payment_encodings` below).
 //!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes. The payment reads need the
@@ -1045,6 +1048,156 @@ mod payment_reads {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The payment proofs nodes pass each other, and the quotes inside them, as
+/// ds.15 encodes them. A proof travels in fresh replication offers, paid-list
+/// notices and fresh pointer offers (`proof_of_payment`), which
+/// `tests/wire_format.rs` pins as opaque bytes; every node that receives one
+/// decodes it, hashes each quote, and reads the vault by those hashes. A
+/// vendored ant-protocol change or an evmlib bump that moves a field, or
+/// hashes a quote differently, fails here: nodes up to ds.15 would no longer
+/// decode, or would find unpaid, the proofs a newer node sends them.
+///
+/// The keys and signatures are short stand-ins, and the peer ids and
+/// transaction hash made-up bytes: only the encoding is under test. On a
+/// mismatch the test prints the bytes as they are now, for review.
+mod payment_encodings {
+    use ant_node::payment::proof::deserialize_single_node_proof;
+    use ant_node::payment::{serialize_single_node_proof, PaymentProof};
+    use evmlib::common::{Amount, TxHash};
+    use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
+    use std::fmt::Write as _;
+    use std::time::{Duration, SystemTime};
+
+    /// A quote, with its fields made from `byte`: one bound to a storage
+    /// commitment (its key count and pin), as a node with a commitment
+    /// quotes, or a baseline quote, as a node without one does. Its time is a
+    /// whole number of 100 ns, the finest a Windows clock keeps, so the bytes
+    /// are the same on every platform.
+    fn quote(byte: u8, committed: bool) -> PaymentQuote {
+        PaymentQuote {
+            content: xor_name::XorName([byte; 32]),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::new(1_792_000_000, 123_456_700),
+            price: Amount::from(3_200_000_000_000_000_u64 + u64::from(byte)),
+            rewards_address: RewardsAddress::new([byte + 1; 20]),
+            pub_key: vec![byte + 2; 3],
+            signature: vec![byte + 3; 4],
+            committed_key_count: if committed { 70_000 } else { 0 },
+            commitment_pin: committed.then_some([byte + 4; 32]),
+        }
+    }
+
+    /// A single-node proof, as a client sends it with a PUT and nodes pass it
+    /// on: here two of the close group's quotes, enough to pin how the list
+    /// is laid out, with the payment's transaction and the commitment the
+    /// first quote is bound to (an opaque sidecar).
+    fn proof() -> PaymentProof {
+        PaymentProof {
+            proof_of_payment: ProofOfPayment {
+                peer_quotes: vec![
+                    (EncodedPeerId::new([0x51; 32]), quote(0x10, true)),
+                    (EncodedPeerId::new([0x52; 32]), quote(0x20, false)),
+                ],
+            },
+            tx_hashes: vec![TxHash::from([0x7A; 32])],
+            commitment_sidecars: vec![vec![0xC0, 0xC1, 0xC2]],
+        }
+    }
+
+    /// `proof()`, as `serialize_single_node_proof` writes it: the single-node
+    /// tag (01), then the proof in `MessagePack`, each struct an array of its
+    /// fields in order: the quotes with their peer ids, the transaction
+    /// hashes, the commitment sidecars.
+    const PINNED_PROOF: &str = "0193919292dc0020515151515151515151515151515151515151515151515151515151515151515198dc0020101010101010101010101010101010101010101010101010101010101010101092ce6acfc000ce075bccbcc420000000000000000000000000000000000000000000000000000b5e620f480010c4141111111111111111111111111111111111111111931212129413131313ce00011170dc0020141414141414141414141414141414141414141414141414141414141414141492dc0020525252525252525252525252525252525252525252525252525252525252525298dc0020202020202020202020202020202020202020202020202020202020202020202092ce6acfc000ce075bccbcc420000000000000000000000000000000000000000000000000000b5e620f480020c414212121212121212121212121212121212121212193222222942323232300c091c4207a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a9193ccc0ccc1ccc2";
+
+    /// Each quote of `proof()`, as `MessagePack` writes it (an array of its 8
+    /// fields; the time as seconds and nanoseconds, the price as 32 bytes, an
+    /// absent pin as nil), and its hash: the key the vault records its
+    /// payment under.
+    const PINNED_QUOTES: &[(&str, &str, &str)] = &[
+        (
+            "committed",
+            "98dc0020101010101010101010101010101010101010101010101010101010101010101092ce6acfc000ce075bccbcc420000000000000000000000000000000000000000000000000000b5e620f480010c4141111111111111111111111111111111111111111931212129413131313ce00011170dc00201414141414141414141414141414141414141414141414141414141414141414",
+            "0807c76ec29a88205006aebd8b2f8e361ff83fc93343c4547e642e8aef6f6e90",
+        ),
+        (
+            "baseline",
+            "98dc0020202020202020202020202020202020202020202020202020202020202020202092ce6acfc000ce075bccbcc420000000000000000000000000000000000000000000000000000b5e620f480020c414212121212121212121212121212121212121212193222222942323232300c0",
+            "4f79e437123b8ad4b75fd1704ed1ba0effffebd62c91d97e119a618decec8640",
+        ),
+    ];
+
+    #[test]
+    fn a_payment_proof_keeps_its_bytes() {
+        let sample = proof();
+        let bytes = hex::encode(serialize_single_node_proof(&sample).unwrap());
+        assert!(
+            bytes == PINNED_PROOF,
+            "\nA single-node payment proof no longer matches its pinned bytes in \
+             tests/fork_pins.rs. Nodes up to ds.15 decode these bytes in every fresh offer \
+             and paid notice. Its bytes now:\n\n{bytes}\n"
+        );
+
+        // The pinned bytes decode to the same proof, and encode back to them.
+        let pinned = hex::decode(PINNED_PROOF).unwrap();
+        let decoded = deserialize_single_node_proof(&pinned)
+            .unwrap_or_else(|e| panic!("the pinned proof doesn't decode: {e}"));
+        assert_eq!(decoded.proof_of_payment, sample.proof_of_payment);
+        assert_eq!(decoded.tx_hashes, sample.tx_hashes);
+        assert_eq!(decoded.commitment_sidecars, sample.commitment_sidecars);
+        assert_eq!(serialize_single_node_proof(&decoded).unwrap(), pinned);
+    }
+
+    #[test]
+    fn a_payment_quote_keeps_its_bytes_and_its_hash() {
+        let samples = [
+            ("committed", quote(0x10, true)),
+            ("baseline", quote(0x20, false)),
+        ];
+        let found: Vec<(String, String, String)> = samples
+            .iter()
+            .map(|(name, quote)| {
+                (
+                    (*name).to_string(),
+                    hex::encode(rmp_serde::to_vec(quote).unwrap()),
+                    hex::encode(quote.hash()),
+                )
+            })
+            .collect();
+        let pinned: Vec<(String, String, String)> = PINNED_QUOTES
+            .iter()
+            .map(|(name, bytes, hash)| {
+                (
+                    (*name).to_string(),
+                    (*bytes).to_string(),
+                    (*hash).to_string(),
+                )
+            })
+            .collect();
+        let mut table = String::new();
+        for (name, bytes, hash) in &found {
+            writeln!(
+                table,
+                "    (\n        \"{name}\",\n        \"{bytes}\",\n        \"{hash}\",\n    ),"
+            )
+            .unwrap();
+        }
+        assert!(
+            found == pinned,
+            "\nA payment quote no longer matches its pinned bytes or hash in tests/fork_pins.rs. \
+             Nodes up to ds.15 decode these bytes in every proof, and read the vault by the \
+             hash. Each quote's bytes and hash now:\n\n{table}"
+        );
+
+        // The pinned bytes decode to the same quote, which hashes as pinned.
+        for ((name, quote), (_, bytes, hash)) in samples.iter().zip(PINNED_QUOTES) {
+            let decoded: PaymentQuote = rmp_serde::from_slice(&hex::decode(bytes).unwrap())
+                .unwrap_or_else(|e| panic!("{name}: the pinned quote doesn't decode: {e}"));
+            assert_eq!(&decoded, quote, "{name}");
+            assert_eq!(hex::encode(decoded.hash()), *hash, "{name}");
         }
     }
 }

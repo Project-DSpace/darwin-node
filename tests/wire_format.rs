@@ -17,6 +17,12 @@
 //! rule). The mixed-version harness (`scripts/test_mixed_versions.py`) then
 //! runs old and new nodes together.
 //!
+//! The payment proofs inside `FreshReplicationOffer`, `PaidNotify` and
+//! `PointerFreshOffer` are opaque bytes here: `tests/fork_pins.rs` pins them as
+//! encoded (`payment_encodings`), with the quotes inside them and each
+//! quote's hash. A release that encodes a proof another way brings a test of
+//! what ds.15's decoder makes of the new encoding, as for a message.
+//!
 //! On a mismatch the test prints every sample's bytes as they are now, for
 //! review. Upstream has no such file, so a merge can't drop it while
 //! resolving a conflict.

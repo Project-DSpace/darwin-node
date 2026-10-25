@@ -300,7 +300,10 @@ never ran.
 - **Messages between nodes keep their bytes.** `tests/wire_format.rs` pins
   the bytes of every replication message, and of every variant of the
   replies, as ds.15 writes them, and fails when a message or a reply gains
-  a variant without a sample of its own. A release that changes messages
+  a variant without a sample of its own. The payment proofs inside fresh
+  offers and paid notices are opaque bytes there; `tests/fork_pins.rs` pins
+  them as encoded, with the quotes inside them and each quote's hash, which
+  every node reads the vault by. A release that changes messages
   between nodes appends a new message type to `ReplicationMessageBody` and
   sends it only to a peer known to read it: one that has sent that type
   itself, or whose user agent names a release that reads it (an unknown
