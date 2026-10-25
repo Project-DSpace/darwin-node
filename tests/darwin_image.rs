@@ -21,7 +21,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -612,6 +612,266 @@ fn folders_set_aside_are_out_of_every_sweeps_reach() {
             !deletion.command.contains("UNREGISTERED") && !deletion.command.contains(&unregistered),
             "a deletion names the set-aside folders: {}",
             deletion.command
+        );
+    }
+}
+
+/// A script as bash reads its variables in it: comments left out, and the
+/// text of single quotes blanked, since the jq programs there name
+/// `$variables` of their own.
+fn bash_code(source: &str) -> String {
+    let mut code = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let (mut single, mut double) = (false, false);
+    while let Some(c) = chars.next() {
+        if single {
+            single = c != '\'';
+            code.push(if c == '\n' { '\n' } else { ' ' });
+            continue;
+        }
+        if double {
+            code.push(c);
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    code.push(next);
+                }
+            } else if c == '"' {
+                double = false;
+            }
+            continue;
+        }
+        match c {
+            '\\' => {
+                code.push(c);
+                if let Some(next) = chars.next() {
+                    code.push(next);
+                }
+            }
+            '\'' => {
+                single = true;
+                code.push(' ');
+            }
+            '"' => {
+                double = true;
+                code.push(c);
+            }
+            '#' if code
+                .chars()
+                .next_back()
+                .is_none_or(|last| last.is_whitespace() || ";&|()".contains(last)) =>
+            {
+                while chars.peek().is_some_and(|&next| next != '\n') {
+                    chars.next();
+                }
+            }
+            _ => code.push(c),
+        }
+    }
+    code
+}
+
+fn is_name_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// The variables `code` reads with neither a default nor a check that they
+/// are set (`$name`, `${name}`, `${name[...]}`, `${#name...}`, `${!name}`),
+/// and those it checks are set (`${name:?...}`), which count as set after.
+fn variable_reads(code: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let chars: Vec<char> = code.chars().collect();
+    let (mut bare, mut checked) = (BTreeSet::new(), BTreeSet::new());
+    for (at, &c) in chars.iter().enumerate() {
+        if c != '$' {
+            continue;
+        }
+        let mut i = at + 1;
+        let braced = chars.get(i) == Some(&'{');
+        if braced {
+            i += 1;
+            if matches!(chars.get(i), Some('!' | '#')) {
+                i += 1;
+            }
+        }
+        if !chars.get(i).copied().is_some_and(is_name_start) {
+            continue;
+        }
+        let start = i;
+        while chars.get(i).copied().is_some_and(is_name_char) {
+            i += 1;
+        }
+        let name: String = chars[start..i].iter().collect();
+        if braced {
+            if chars.get(i) == Some(&'[') {
+                while chars.get(i).is_some_and(|&c| c != ']') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            let rest: String = chars[i.min(chars.len())..].iter().take(2).collect();
+            if rest.starts_with(":?") || rest.starts_with('?') {
+                checked.insert(name);
+                continue;
+            }
+            if rest.starts_with(":-")
+                || rest.starts_with(":=")
+                || rest.starts_with(":+")
+                || rest.starts_with(['-', '=', '+'])
+            {
+                continue;
+            }
+        }
+        bare.insert(name);
+    }
+    (bare, checked)
+}
+
+/// The variables `code` assigns: `name=`, `name+=` and `name[...]=` at the
+/// start of a word, the names `local`, `declare` and `read` are given, and
+/// loop variables (`for name in`, `for ((name = ...`).
+fn variables_assigned(code: &str) -> BTreeSet<String> {
+    let mut assigned = BTreeSet::new();
+    let chars: Vec<char> = code.chars().collect();
+    for (at, &c) in chars.iter().enumerate() {
+        let word_start =
+            at == 0 || chars[at - 1].is_whitespace() || ";&|({".contains(chars[at - 1]);
+        if !word_start || !is_name_start(c) {
+            continue;
+        }
+        let mut i = at;
+        while chars.get(i).copied().is_some_and(is_name_char) {
+            i += 1;
+        }
+        let name: String = chars[at..i].iter().collect();
+        if chars.get(i) == Some(&'[') {
+            while chars.get(i).is_some_and(|&c| c != ']') {
+                i += 1;
+            }
+            i += 1;
+        }
+        if chars.get(i) == Some(&'+') {
+            i += 1;
+        }
+        if chars.get(i) == Some(&'=') && chars.get(i + 1) != Some(&'=') {
+            assigned.insert(name);
+        }
+    }
+    for command in code.lines() {
+        let words: Vec<&str> = command
+            .split(|c: char| c.is_whitespace() || ";&|(){}".contains(c))
+            .filter(|word| !word.is_empty())
+            .collect();
+        for (at, word) in words.iter().enumerate() {
+            let named: Vec<&str> = match *word {
+                "for" => words.get(at + 1).into_iter().copied().collect(),
+                "local" | "declare" | "read" => words[at + 1..]
+                    .iter()
+                    .copied()
+                    .skip_while(|w| w.starts_with('-'))
+                    .take_while(|w| w.chars().next().is_some_and(is_name_start))
+                    .collect(),
+                _ => continue,
+            };
+            for name in named {
+                let name: String = name.chars().take_while(|&c| is_name_char(c)).collect();
+                if !name.is_empty() {
+                    assigned.insert(name);
+                }
+            }
+        }
+    }
+    assigned
+}
+
+/// The variables the image sets for every script, in its `ENV` instruction.
+fn image_environment() -> BTreeSet<String> {
+    dockerfile_instructions()
+        .iter()
+        .filter_map(|i| i.strip_prefix("ENV "))
+        .flat_map(str::split_whitespace)
+        .filter_map(|word| word.split_once('=').map(|(name, _)| name))
+        .filter(|name| !name.is_empty() && name.chars().all(is_name_char))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every variable the image's scripts read is set: they run with `set -u`,
+/// under which reading an unset variable stops the script, and with it the
+/// container's start. A variable read with neither a default (`${name:-}`)
+/// nor a check (`${name:?...}`) must be assigned in the script or set by the
+/// image's `ENV`.
+#[test]
+fn every_variable_the_image_scripts_read_is_set() {
+    let environment = image_environment();
+    for name in ["NODE_COUNT", "PORT_START", "PUID", "PGID", "RPC_URLS"] {
+        assert!(
+            environment.contains(name),
+            "the image's ENV doesn't set {name}: {environment:?}"
+        );
+    }
+    for path in IMAGE_SCRIPTS {
+        let code = bash_code(&repo_text(path));
+        assert!(
+            shell_commands(&code)
+                .iter()
+                .any(|c| c == "set -euo pipefail"),
+            "{path} doesn't run with set -euo pipefail"
+        );
+        let (bare, checked) = variable_reads(&code);
+        let assigned = variables_assigned(&code);
+        let unset: Vec<&String> = bare
+            .iter()
+            .filter(|name| {
+                !assigned.contains(*name)
+                    && !checked.contains(*name)
+                    && !environment.contains(*name)
+            })
+            .collect();
+        assert!(
+            unset.is_empty(),
+            "{path} reads variables that nothing sets, which stops it under set -u: {unset:?}"
+        );
+    }
+}
+
+#[test]
+fn variables_are_read_and_assigned_as_bash_reads_and_assigns_them() {
+    let code = bash_code(
+        "set -u\n\
+         : \"${KEY:?set KEY}\"\n\
+         local port=$1 index=$((1 + 2)) env=()\n\
+         read -ra list <<<\"$TEXT\"\n\
+         declare -A seen tails\n\
+         for name in A B; do echo \"${!name}\"; done\n\
+         for ((at = 0; at < 2; at++)); do :; done\n\
+         seen[$name]=1 count+=1\n\
+         jq '.a = $notbash' x # $not_read either\n\
+         echo \"$port ${index} ${#list[@]} ${seen[$at]:-} ${maybe:-} ${other-x} $KEY $missing ${gone}\"\n",
+    );
+    let (bare, checked) = variable_reads(&code);
+    let names = |list: &[&str]| {
+        list.iter()
+            .map(|name| (*name).to_string())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        bare,
+        names(&["KEY", "TEXT", "at", "gone", "index", "list", "missing", "name", "port"])
+    );
+    assert_eq!(checked, names(&["KEY"]));
+    let assigned = variables_assigned(&code);
+    for name in [
+        "port", "index", "env", "list", "seen", "tails", "name", "at", "count",
+    ] {
+        assert!(assigned.contains(name), "{name} is assigned: {assigned:?}");
+    }
+    for name in ["missing", "gone", "notbash", "not_read", "TEXT"] {
+        assert!(
+            !assigned.contains(name),
+            "{name} is not assigned: {assigned:?}"
         );
     }
 }

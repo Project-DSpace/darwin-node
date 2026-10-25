@@ -346,7 +346,7 @@ else
     started=0 failed="  $result"
 fi
 if [[ -n "$failed" ]]; then
-    echo "WARNING: $((target - started)) of $target node(s) did not start:"
+    echo "WARNING: $((NODE_COUNT - started)) of $NODE_COUNT node(s) did not start:"
     echo "$failed"
 fi
 if (( BROWSER_PORT_START == 0 )); then browser=off; else browser="UDP $BROWSER_PORT_START-$((BROWSER_PORT_START + NODE_COUNT - 1))"; fi
