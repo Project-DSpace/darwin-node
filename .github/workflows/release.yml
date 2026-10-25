@@ -24,8 +24,10 @@
 #
 # Once the release is published, the latest job points the storage-node
 # image's :latest, which home operators run, at the image the Build workflow
-# made from the tagged commit when it was pushed to main. Nothing else moves
-# :latest, so it only ever follows an approved, signed release.
+# made from the tagged commit when it was pushed to main. Only latest.yml,
+# run by hand from main and approved in the same release environment, also
+# moves :latest: to an image whose node is the one :latest has or newer (an
+# image release), or back to an earlier release's image (a withdrawal).
 
 name: Release
 

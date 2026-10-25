@@ -6,15 +6,18 @@
 #
 # The check runs on copies of .github/workflows: once as they are, where it
 # must pass, and once for each change below, where it must fail with that
-# change's problem alone. Each change would let a release skip something it
-# relies on. Then the filter release.yml's checks job picks the tagged
-# commit's Test run with runs on sample lists of runs.
+# change's problem alone. Each change would let a release, or a move of
+# :latest, skip something it relies on. Then the filter release.yml's checks
+# job picks the tagged commit's Test run with runs on sample lists of runs,
+# and the order latest.yml's latest job puts node versions in runs on sample
+# versions.
 
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 DIR=.github/workflows
 BUILD="${DIR}/build.yml"
+LATEST="${DIR}/latest.yml"
 RELEASE="${DIR}/release.yml"
 TEST="${DIR}/test.yml"
 PASSED=0
@@ -88,7 +91,7 @@ expect "the workflows as they are" pass
 # The workflows and their actions.
 fresh
 printf 'name: CI\non: push\n' > "${COPY}/${DIR}/ci.yml"
-expect "a fourth workflow" "holds: build.yml ci.yml release.yml test.yml;"
+expect "a fifth workflow" "holds: build.yml ci.yml latest.yml release.yml test.yml;"
 
 fresh
 edit "${TEST}" 'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2' 'Swatinem/rust-cache@v2'
@@ -238,16 +241,186 @@ edit "${RELEASE}" $'  checks:\n    runs-on: ubuntu-24.04\n' \
     $'  checks:\n    runs-on: ubuntu-24.04\n    # No if: or continue-on-error: true here.\n'
 expect "a comment naming both" pass
 
-# Only release.yml's latest job writes :latest.
+# Only the latest jobs of release.yml and latest.yml write :latest.
+LATEST_WRITERS="only the latest jobs of release.yml and latest.yml may write the :latest tag"
 fresh
 edit "${BUILD}" $'        run: docker push "$IMAGE:${{ github.sha }}"\n' \
     $'        run: docker push "$IMAGE:${{ github.sha }}" && docker push "$IMAGE:latest"\n'
-expect ":latest pushed by Build" "only release.yml's latest job may write the :latest tag"
+expect ":latest pushed by Build" "${LATEST_WRITERS}"
 
 fresh
 edit "${RELEASE}" $'      - name: Install ant-keygen 0.1.0\n' \
     $'      - name: Move latest\n        run: docker buildx imagetools create --tag "$IMAGE:latest" x\n\n      - name: Install ant-keygen 0.1.0\n'
-expect ":latest moved by publish" "only release.yml's latest job may write the :latest tag"
+expect ":latest moved by publish" "${LATEST_WRITERS}"
+
+fresh
+edit "${LATEST}" $'          echo "version=$version" >> "$GITHUB_OUTPUT"\n' \
+    $'          docker pull "$IMAGE:latest"\n          echo "version=$version" >> "$GITHUB_OUTPUT"\n'
+expect ":latest named by latest.yml's checks job" "${LATEST_WRITERS}"
+
+# Only the jobs that publish and move :latest run in the release
+# environment, which admits latest.yml's runs from main, and latest.yml
+# reads no secret.
+IN_ENVIRONMENT="only release.yml's publish job and latest.yml's latest job may run in an environment"
+fresh
+edit "${BUILD}" $'    needs: [linux-x64, manager]\n' $'    needs: [linux-x64, manager]\n    environment: release\n'
+expect "the release environment in Build" "${IN_ENVIRONMENT}"
+
+fresh
+edit "${LATEST}" $'  checks:\n    runs-on: ubuntu-24.04\n' $'  checks:\n    runs-on: ubuntu-24.04\n    environment: release\n'
+expect "latest.yml's checks job in the release environment" "${IN_ENVIRONMENT}"
+
+fresh
+edit "${LATEST}" $'      WITHDRAW: ${{ inputs.withdraw }}\n' \
+    $'      WITHDRAW: ${{ inputs.withdraw }}\n      KEY: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}\n'
+expect "the release signing key in latest.yml" "latest.yml must read no secret"
+
+# latest.yml: run only by hand, from main, and approved in the release
+# environment; it moves :latest, once its checks pass, to an image whose
+# node is as new as :latest's unless the run is a withdrawal.
+BY_HAND="latest.yml must run only by hand"
+fresh
+edit "${LATEST}" $'on:\n  workflow_dispatch:\n' $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n'
+expect "latest.yml on pushes to main" "${BY_HAND}"
+
+fresh
+edit "${LATEST}" $'on:\n  workflow_dispatch:\n' $'on:\n  workflow_run:\n    workflows: [Build]\n    types: [completed]\n  workflow_dispatch:\n'
+expect "latest.yml after every Build run" "${BY_HAND}"
+
+fresh
+edit "${LATEST}" $'        type: boolean\n        default: false\n' $'        type: boolean\n        default: true\n'
+expect "every run a withdrawal unless unset" "${BY_HAND}"
+
+fresh
+edit "${LATEST}" $'\npermissions: {}\n' $'\npermissions: write-all\n'
+expect "latest.yml's default permissions" "latest.yml must set permissions: {} at the top"
+
+fresh
+edit "${LATEST}" $'concurrency:\n  group: release\n' $'concurrency:\n  group: latest\n'
+expect "latest.yml outside release.yml's concurrency group" "latest.yml must share release.yml's concurrency group"
+
+fresh
+edit "${LATEST}" $'      packages: read\n' $'      packages: write\n'
+expect "the checks job able to write packages" "latest.yml's checks job must be able to write nothing"
+
+fresh
+edit "${LATEST}" 'if [[ "$GITHUB_REF" != refs/heads/main ]]; then' 'if false; then'
+expect "a run from another ref" "latest.yml's checks job must refuse a run from any ref but main"
+
+INPUTS="latest.yml's checks job must take the commit and digest from the inputs, and refuse anything but a full commit and a sha256 digest"
+fresh
+edit "${LATEST}" 'if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then' 'if [[ -z "$COMMIT" ]]; then'
+expect "a commit by a short SHA or a branch" "${INPUTS}"
+
+fresh
+edit "${LATEST}" 'if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then' 'if [[ -z "$DIGEST" ]]; then'
+expect "a digest of any form" "${INPUTS}"
+
+fresh
+edit "${LATEST}" 'if [[ "$status" != ahead && "$status" != identical ]]; then' 'if false; then'
+expect "a commit not on main" "latest.yml's checks job must check that the commit is on main"
+
+BUILD_RUN="latest.yml's checks job must check that the commit's Build run from its push to main succeeded, smoke test included"
+fresh
+edit "${LATEST}" '-f head_sha="$COMMIT" -f event=push -f branch=main -f per_page=1 \' '-f head_sha="$COMMIT" -f per_page=1 \'
+expect "a Build run by hand, or on another branch" "${BUILD_RUN}"
+
+fresh
+edit "${LATEST}" 'if [[ "$conclusion" != success ]]; then' 'if false; then'
+expect "a failed Build run" "${BUILD_RUN}"
+
+fresh
+edit "${LATEST}" 'if [[ "$smoke" != success ]]; then' 'if false; then'
+expect "the smoke test unchecked" "${BUILD_RUN}"
+
+DIGEST_CHECKED="latest.yml's checks job must check that the digest is the one the Build run recorded, while its artifact is kept, and the one the commit's image tag has"
+fresh
+edit "${LATEST}" 'if [[ "$recorded" != "$DIGEST" ]]; then' 'if false; then'
+expect "a digest the Build run didn't record" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" 'if ((kept > 0)); then' 'if false; then'
+expect "the Build run's record never read" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" 'if [[ "$tagged" != "$DIGEST" ]]; then' 'if false; then'
+expect "a digest the commit's image tag doesn't have" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" 'version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$DIGEST" --version)' \
+    'version="ant-node 0.23.0+ds.15"'
+expect "a node version not read from the image" "latest.yml's checks job must read the node version from the image"
+
+fresh
+edit "${LATEST}" $'    environment: release\n' ''
+expect "latest.yml's latest job outside the release environment" "latest.yml's latest job must run in the release environment"
+
+fresh
+edit "${LATEST}" $'    needs: checks\n' ''
+expect "latest.yml's latest job without its checks" "latest.yml's latest job must need the checks job"
+
+fresh
+edit "${LATEST}" $'      packages: write\n' $'      packages: write\n      contents: write\n'
+expect "latest.yml's latest job able to write more" "latest.yml's latest job must ask for packages: write and nothing else"
+
+OLDER="latest.yml's latest job must refuse an image whose node is older than :latest's, unless the run is a withdrawal"
+fresh
+edit "${LATEST}" 'if [[ "$order" == "older than" && "$WITHDRAW" != true ]]; then' 'if false; then'
+expect "an older node outside a withdrawal" "${OLDER}"
+
+fresh
+edit "${LATEST}" $'| if $n > $c then "newer than" elif $n == $c then "the same as" else "older than" end\'); then' \
+    $'| "newer than"\'); then'
+expect "every node taken as newer" "${OLDER}"
+
+fresh
+edit "${LATEST}" 'current_version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$current" --version)' \
+    'current_version="ant-node 0.0.0"'
+expect ":latest's node version not read from its image" "${OLDER}"
+
+fresh
+edit "${LATEST}" $'      DIGEST: ${{ inputs.digest }}\n      WITHDRAW: ${{ inputs.withdraw }}\n' \
+    $'      DIGEST: ${{ needs.checks.outputs.other }}\n      WITHDRAW: ${{ inputs.withdraw }}\n'
+expect "latest.yml's latest job moving another digest" \
+    "latest.yml's latest job must move :latest to the digest the checks job checked"
+
+MOVED="latest.yml's latest job must move :latest once, with exactly"
+fresh
+edit "${LATEST}" 'docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE@$DIGEST"' \
+    'docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE:$COMMIT"'
+expect "latest moved to the commit's tag, not the checked digest" "${MOVED}"
+
+fresh
+edit "${LATEST}" 'if [[ "$now" != "$DIGEST" ]]; then' 'if false; then'
+expect "latest moved and not checked" "${MOVED}"
+
+MOVE_LINE=$'          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE@$DIGEST"\n'
+fresh
+edit "${LATEST}" "${MOVE_LINE}" ''
+edit "${LATEST}" $'          echo "- $IMAGE:latest is now $DIGEST." | tee -a "$GITHUB_STEP_SUMMARY"\n' \
+    "${MOVE_LINE}"$'          echo "- $IMAGE:latest is now $DIGEST." | tee -a "$GITHUB_STEP_SUMMARY"\n'
+expect "latest checked before it moved" "${MOVED}"
+
+SUMMARY_LINE=$'          echo "Moving $IMAGE:latest from $current to $DIGEST." >> "$GITHUB_STEP_SUMMARY"\n'
+SUMMARY_FIRST="latest.yml's latest job must write the digest :latest had (\$current) and the new one (\$DIGEST) to the step summary before it moves :latest"
+fresh
+edit "${LATEST}" "${SUMMARY_LINE}" ''
+edit "${LATEST}" $'          echo "- $IMAGE:latest is now $DIGEST." | tee -a "$GITHUB_STEP_SUMMARY"\n' \
+    $'          echo "- $IMAGE:latest is now $DIGEST." | tee -a "$GITHUB_STEP_SUMMARY"\n'"${SUMMARY_LINE}"
+expect "the digest :latest had written only after it moved" "${SUMMARY_FIRST}"
+
+fresh
+edit "${LATEST}" "${SUMMARY_LINE}" $'          echo "Moving $IMAGE:latest to $DIGEST." >> "$GITHUB_STEP_SUMMARY"\n'
+expect "the digest :latest had left out of the summary" "${SUMMARY_FIRST}"
+
+fresh
+edit "${LATEST}" $'    needs: checks\n' $'    needs: checks\n    if: ${{ always() }}\n'
+expect "latest.yml's latest job after failed checks" "latest.yml must have no if:"
+
+fresh
+edit "${LATEST}" $'      - name: Check the commit is on main\n' \
+    $'      - name: Check the commit is on main\n        continue-on-error: true\n'
+expect "a check of latest.yml continuing on error" "latest.yml must not continue on error"
 
 # The image's node manager: built with --locked from the pinned commit,
 # checked, and taken by the image with its marker.
@@ -395,8 +568,50 @@ takes "a run by hand named before runs were named" "" "${unnamed}"
 takes "a push to another branch" "" "${elsewhere}"
 takes "no run" "" ""
 
+# The jq filter latest.yml's latest job orders the image's node version
+# against :latest's with: the lines after the one that passes it
+# --arg current "$current_version", up to its closing quote.
+version_order=$(awk -v q="'" '
+    !inside && index($0, "--arg current \"$current_version\" " q) { inside = 1; next }
+    inside && index($0, q "); then") { print substr($0, 1, index($0, q "); then") - 1); exit }
+    inside { print }
+' "${LATEST}")
+
+# The filter must put the version NEW reports against CURRENT as WANT
+# ("newer than", "the same as" or "older than"), or fail when WANT is
+# "refused".
+orders() {
+    local name=$1 want=$2 new=$3 current=$4 got
+    if [[ -z "${version_order}" ]]; then
+        fail "latest.yml's version order, ${name}: this case is out of date: no jq filter follows --arg current \"\$current_version\" in ${LATEST}"
+        return
+    fi
+    if ! got=$(jq -rn --arg new "${new}" --arg current "${current}" "${version_order}" 2> /dev/null); then
+        got=refused
+    fi
+    if [[ "${got}" != "${want}" ]]; then
+        fail "latest.yml's version order, ${name}: put '${new}' against '${current}' as '${got}', not '${want}'"
+        return
+    fi
+    PASSED=$((PASSED + 1))
+}
+
+orders "the same version" "the same as" "ant-node 0.23.0+ds.15" "ant-node 0.23.0+ds.15"
+orders "the next build" "newer than" "ant-node 0.23.0+ds.16" "ant-node 0.23.0+ds.15"
+orders "the build before" "older than" "ant-node 0.23.0+ds.14" "ant-node 0.23.0+ds.15"
+orders "build numbers compared as numbers" "newer than" "ant-node 0.23.0+ds.10" "ant-node 0.23.0+ds.9"
+orders "a later upstream version over any build" "newer than" "ant-node 0.23.1" "ant-node 0.23.0+ds.99"
+orders "an upstream version before its ds.1" "older than" "ant-node 0.23.0" "ant-node 0.23.0+ds.1"
+orders "the minor version before the patch" "older than" "ant-node 0.23.9+ds.40" "ant-node 0.24.0"
+orders "a pre-release" refused "ant-node 0.24.0-rc.1" "ant-node 0.23.0+ds.15"
+orders "another build label" refused "ant-node 0.23.0+dev.16" "ant-node 0.23.0+ds.15"
+orders "build ds.0" refused "ant-node 0.23.0+ds.0" "ant-node 0.23.0+ds.15"
+orders "more after the version" refused "ant-node 0.23.0+ds.15 (patched)" "ant-node 0.23.0+ds.15"
+orders "another program's version" refused "darwin-nodes 0.23.0" "ant-node 0.23.0+ds.15"
+orders "no version read from :latest's image" refused "ant-node 0.23.0+ds.15" ""
+
 if ((FAILED > 0)); then
     echo "${FAILED} of $((PASSED + FAILED)) cases failed" >&2
     exit 1
 fi
-echo "scripts/check-workflows.sh: ${PASSED} cases pass. It passes on the workflows as they are and fails on each change that would let a release skip a check, and release.yml's filter takes the tagged commit's own Test run."
+echo "scripts/check-workflows.sh: ${PASSED} cases pass. It passes on the workflows as they are and fails on each change that would let a release, or a move of :latest, skip a check; release.yml's filter takes the tagged commit's own Test run, and latest.yml orders node versions as nodes do."

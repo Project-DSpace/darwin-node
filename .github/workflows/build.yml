@@ -7,8 +7,10 @@
 #
 # It never publishes :latest, which home operators run: release.yml points
 # :latest at the image a push run here made from a release's commit, once that
-# release is approved and published. Each run records the digest it pushed
-# (the storage-node-digest artifact) for that.
+# release is approved and published, and latest.yml, run by hand and approved
+# the same way, at the image a push run here made from a commit on main. Each
+# run records the digest it pushed (the storage-node-digest artifact) for
+# them.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and multi-platform releases.
@@ -52,10 +54,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # The workflow files keep what releases rely on: only these three
-      # workflows, every action pinned to a commit, and release.yml's tags,
-      # permissions, key check and the checks its publish waits for (see the
-      # script).
+      # The workflow files keep what releases rely on: only these four
+      # workflows, every action pinned to a commit, release.yml's tags,
+      # permissions, key check and the checks its publish waits for, and
+      # latest.yml's trigger, approval and checks (see the script).
       - name: Check the workflows
         shell: bash
         run: bash scripts/check-workflows.sh
@@ -394,7 +396,8 @@ jobs:
         run: docker push "$IMAGE:${{ github.sha }}"
 
       # The digest this run pushed, read back from the registry. release.yml
-      # copies exactly this image to :latest, so a later run that pushes the
+      # copies exactly this image to :latest, and latest.yml copies it only
+      # while the commit's tag still names it, so a later run that pushes the
       # same commit tag again (a reuse_build run, say) can't change what
       # :latest gets.
       - name: Record the image digest
