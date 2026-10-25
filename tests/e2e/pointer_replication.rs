@@ -1654,3 +1654,79 @@ async fn a_pointer_update_near_full_nodes_is_quoted_only_by_those_that_can_take_
 
     harness.teardown().await.expect("teardown");
 }
+
+/// A full node repairs a pointer it holds and doesn't look for one it
+/// doesn't: a newer state of a held pointer takes no new space, a new pointer
+/// would (`may_repair_address`). Both hints are queued; the round fetches only
+/// the held one, and the other is fetched once the node is no longer full,
+/// which shows its hint was sound and only the full gate held it back.
+#[tokio::test]
+#[serial]
+async fn a_full_node_repairs_a_pointer_it_holds_and_fetches_none_it_does_not() {
+    use ant_node::storage::FullTrigger;
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let created = signed(&pk, &sk, 0, 1);
+    let updated = signed(&pk, &sk, 3, 2);
+    let (other_pk, other_sk) = owner();
+    let unheld = signed(&other_pk, &other_sk, 0, 3);
+    let full_node = 4;
+    let current = others(&harness, &[full_node]);
+
+    // Everyone holds the create; everyone but the full node holds the update
+    // and a second pointer, written straight into their stores so nothing
+    // replicates them.
+    for i in 0..harness.node_count() {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&created.to_bytes())
+            .await
+            .expect("put");
+    }
+    for i in &current {
+        let node_store = store(harness.test_node(*i).expect("node"));
+        node_store
+            .put_bytes(&updated.to_bytes())
+            .await
+            .expect("put");
+        node_store.put_bytes(&unheld.to_bytes()).await.expect("put");
+    }
+
+    let node = harness.test_node(full_node).expect("node");
+    let chunks = node.ant_protocol.as_ref().expect("protocol").storage();
+    chunks.set_full_for_test(Some(FullTrigger::Bytes));
+
+    // The engine's own verification loop may take the held pointer's hint
+    // before this round does; either way only that one is fetched.
+    exchange_hints(&harness, &current, &[full_node]).await;
+    replication(node).verify_due().await;
+
+    assert!(
+        wait_for(&harness, full_node, &updated).await,
+        "the full node didn't repair the pointer it holds"
+    );
+    // Give a fetch of the unheld pointer, were one started, time to land;
+    // the engine's own verification loop runs meanwhile too.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        held(node, &unheld).is_none(),
+        "the full node fetched a pointer it doesn't hold"
+    );
+    assert_eq!(
+        replication(node).pending_len(),
+        1,
+        "the unheld pointer's hint was queued and waits"
+    );
+
+    // No longer full, it fetches the hint it held back.
+    chunks.set_full_for_test(None);
+    replication(node).verify_due().await;
+    assert!(
+        wait_for(&harness, full_node, &unheld).await,
+        "the hint held back while full was not sound"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
