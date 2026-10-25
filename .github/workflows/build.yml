@@ -209,8 +209,11 @@ jobs:
   # branch is lost if that branch is squashed or rebased into main, and
   # GitHub stops serving it once it is garbage-collected. A darwin-client
   # change the image needs therefore lands on darwin-client's main first,
-  # merged with its commits kept; then docker/manager-revision and
-  # docker/NOTICE name the commit as it is there, in one darwin-node commit.
+  # merged with its commits kept where it can be, so the commit reviewed is
+  # the one pinned; then docker/manager-revision and docker/NOTICE name the
+  # commit as it is on main, however it landed, in one darwin-node commit;
+  # only then does the darwin-node change that needs it land on main, or
+  # every Build run there fails here and publishes no image.
   manager:
     runs-on: ubuntu-24.04
     steps:

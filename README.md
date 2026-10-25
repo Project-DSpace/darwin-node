@@ -214,8 +214,10 @@ never ran.
   retires, so the folder is kept 3 days from its retirement however long it
   sat unchanged before. The image's node manager is `darwin-nodes`, built by
   the Build workflow with `--locked` from the darwin-client commit
-  `docker/manager-revision` pins, in place of Autonomi's `ant` 0.3.9, which
-  the images up to ds.15's downloaded. It deletes no node's data: Autonomi's
+  `docker/manager-revision` pins, which must be on darwin-client's main
+  (a change the image needs lands there first, then the pin follows it), in
+  place of Autonomi's `ant` 0.3.9, which the images up to ds.15's
+  downloaded. It deletes no node's data: Autonomi's
   deleted the data of the node holding the least at 500 MiB free on a disk
   shared by 2 or more nodes. It keeps the registry where `ant` did
   (`/data/manager/ant/node_registry.json`), and passes nodes the same
