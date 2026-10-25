@@ -876,7 +876,10 @@ Run `cargo test --features test-utils` (the EVM tests need Foundry's
 `anvil`). The library alone has about 1,400 tests. CI runs the suite on
 every push to main, weekly and by hand (`.github/workflows/test.yml`), and
 weekly, or by hand when asked, `scripts/test_e2e_listings.sh` against
-darwin-client.
+darwin-client. Every file under `tests/` is listed in a census
+(`every_test_file_is_reviewed` in `tests/fork_pins.rs`), with the upstream
+test files this fork removed and where their checks live now, so a merge
+can't add a test file or bring a removed one back unreviewed.
 
 ### Data Types Supported
 
