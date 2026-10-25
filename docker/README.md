@@ -151,15 +151,16 @@ In the folder with `docker-compose.yml`:
   among it, changes only with a new image: `docker compose pull`, then
   `docker compose up -d`. The compose file runs the image's `:latest`,
   which moves to a new image with each node release, and with each image
-  release: a new image with the same node (a new node manager, say), which
-  the repository's Latest workflow publishes once it is approved, as a
-  release is. Only a pull gets you either. Pull at least once if
-  `docker exec storage-node darwin-nodes --version` fails: your image still
-  runs Autonomi's node manager, which deletes a node's data when the disk is
-  nearly full ([When the disk fills](#when-the-disk-fills)), and the nodes'
-  own updates don't replace it. A release withdrawn after it is published
-  takes `:latest` back to the image before it, through the same workflow,
-  and a pull then gets that image. Nodes that already installed the
+  release: a new image with the same node release (a new node manager,
+  say), which the repository's Latest workflow publishes once it is
+  approved, as a release is. Only a pull gets you either. Pull at least
+  once if `docker exec storage-node darwin-nodes --version` fails: your
+  image still runs Autonomi's node manager, which deletes a node's data
+  when the disk is nearly full ([When the disk fills](#when-the-disk-fills)),
+  and the nodes' own updates don't replace it. A release withdrawn after it
+  is published is deleted first, so nodes still waiting to install it
+  don't, and `:latest` goes back to the image before it, through the same
+  workflow; a pull then gets that image. Nodes that already installed the
   withdrawn release keep its binary until the release after it: no image
   installs an older node binary than a node has.
 - **Stop:** `docker compose down` (data stays); `docker compose up -d` starts
