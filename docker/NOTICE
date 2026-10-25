@@ -10,7 +10,7 @@ ant-node (/opt/ant/ant-node)
 
 darwin-nodes (/usr/local/bin/darwin-nodes)
   The node manager, built from https://github.com/Project-DSpace/darwin-client
-  at commit ab60bdcd2fbed9f201af63fef40d767ae9d5d2aa, a fork of Autonomi's
+  at commit 9bdea5b9e8f71534ae99b1b749b8e3b27b706085, a fork of Autonomi's
   ant-client. Licensed under MIT OR Apache-2.0: see darwin-nodes/LICENSE-MIT
   and darwin-nodes/LICENSE-APACHE, which carry its own copyright line.
   darwin-nodes/THIRD-PARTY-NOTICES.txt has the licences and notices of the

@@ -279,6 +279,14 @@ jobs:
             fi
           done
 
+      # darwin-client's own check of the release build, from the pinned
+      # commit: it also checks that the binary serves node status and
+      # health and reads the registry the image keeps.
+      - name: Check the manager with darwin-client's own check
+        shell: bash
+        working-directory: darwin-client
+        run: bash scripts/check-darwin-nodes.sh target/release/darwin-nodes
+
       # darwin-client's own generator and policy, for the package the binary
       # is built from (see the notices job for what it checks).
       - name: Generate THIRD-PARTY-NOTICES.txt

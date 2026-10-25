@@ -267,6 +267,10 @@ edit "${BUILD}" 'for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v
 expect "the manager's binary checked for less" "build.yml's manager job must build darwin-nodes with --locked"
 
 fresh
+edit "${BUILD}" 'run: bash scripts/check-darwin-nodes.sh target/release/darwin-nodes' 'run: true'
+expect "the manager without darwin-client's own check" "build.yml's manager job must build darwin-nodes with --locked"
+
+fresh
 edit "${BUILD}" 'if [[ ! "$commit" =~ ^[0-9a-f]{7,40}$ || "$REVISION" != "$commit"* ]]; then' \
     'if [[ "$version" != *"commit ${REVISION:0:7}" ]]; then'
 expect "the manager's commit matched on exactly 7 characters" \

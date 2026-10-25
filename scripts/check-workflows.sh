@@ -237,7 +237,8 @@ else
         'run: cargo build --release --locked -p ant-cli --bin darwin-nodes' \
         'commit=${version##*commit }' \
         'if [[ ! "$commit" =~ ^[0-9a-f]{7,40}$ || "$REVISION" != "$commit"* ]]; then' \
-        'for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v1/logs/forward; do'; do
+        'for text in WithAutonomi logs.autonomi.com /api/v1/reset /api/v1/logs/forward; do' \
+        'run: bash scripts/check-darwin-nodes.sh target/release/darwin-nodes'; do
         if ! grep -qF -- "${line}" <<<"${manager}"; then
             problem "build.yml's manager job must build darwin-nodes with --locked from the commit docker/manager-revision pins, and check the binary (missing: ${line})"
         fi
