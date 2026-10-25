@@ -195,6 +195,8 @@ impl NodeBuilder {
         };
 
         let repl_config = ReplicationConfig::default();
+        #[cfg(feature = "test-utils")]
+        let repl_config = crate::test_seams::replication_timing(repl_config);
 
         // Initialize ANT protocol handler for chunk storage and
         // wire the fresh-write channel so PUTs trigger replication.

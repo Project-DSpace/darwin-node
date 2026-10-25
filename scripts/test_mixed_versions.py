@@ -21,7 +21,9 @@ The runs (`--runs`):
   old-hosts-new  the previous release's devnet and incumbents; this tree joins
   all-new        this tree throughout (not run unless asked for)
   full           this tree throughout, with --full joiners whose disk reads as
-                 full through the free-space seam (run when --full is given)
+                 full through the free-space seam (run when --full is given),
+                 and the incumbents under disk pressure once the records are
+                 stored, so they erase what they may (see "The full run")
 
 Every run must show, over the time from the joiners' start to the last read:
 no message that failed to decode, in any node's log; no audit failed for a
@@ -55,6 +57,35 @@ The test-only seams (src/test_seams.rs) are compiled only into builds with the
 seam makes a node's disk read as full (the `full` run), and in that run the
 full-notice seam lets a full node of this tree tell the others that it is
 full, which they read from the release that brings the notice on.
+
+The full run. Every node of it runs with short timings through the seams
+(neighbour sync every FULL_RUN_SYNC_SECS, an out-of-range wait of
+FULL_RUN_HYSTERESIS_SECS, a "full" mark fresh for FULL_RUN_FRESHNESS_SECS),
+so erasure in two phases goes ahead within the run. The --full first joiners
+read a full disk from the start. After the uploads, and a few sync cycles, the
+harness asks each record's nearest nodes (up to 20) for it: the early count.
+It then puts every incumbent under pressure at the falling floor's last step,
+above the full line, so each may erase the copies it holds out of its range;
+asks again halfway through the observation (the mid count); stops the first
+full joiner, whose mark then lapses at its peers; and asks again at the end.
+It must show, beyond what every run shows:
+
+- copies stay at 7: at each count, every record is held by at least 7 nodes
+  not full, less the devnet's nodes among its 7 nearest not full (they take no
+  replicas), and, at the end, less the stopped node where it is among them;
+- stand-ins aren't erased: a node not full that holds a record at the early
+  count from beyond the 9 nearest it, while full nodes widen its window, still
+  holds it at the mid count, before any mark lapses;
+- erasure goes ahead with 6 real proofs: every erasure a node logs needed at
+  least 6 proofs, and had them;
+- a lapsed mark counts as missing (C06): once the stopped node's mark has
+  lapsed, no erasure counts more members marked full than full nodes still
+  run.
+
+The report lists, for each count, the records by how many of their 7 + f
+nearest are full (f), so runs with --full 1, 2, 3 and 4 show which f each
+reached. Run them one at a time (--work naming a folder for each), so a
+failure names its f.
 
 Usage, from the repository root (needs cargo, git, Python 3.8+, and Foundry's
 `anvil` on PATH):
@@ -159,6 +190,36 @@ FREE_SPACE_SEAM = "ANT_TEST_SEAM_FREE_SPACE_FILE"
 # every node is of this tree, it is set to 0 on each node whose binary has it:
 # a full node then tells the others, as it will once released.
 FULL_NOTICE_SEAM = "ANT_TEST_SEAM_FULL_NOTICE_FROM_RELEASE"
+
+# The full run's timing seams (src/test_seams.rs), set on every node of the
+# run, so that the several sync cycles an erasure takes, the out-of-range
+# wait and a mark's lapse all fall within it. A sync cycle every 30 to 60 s
+# gives an erasure (selected, then tried two epochs later) within a few
+# minutes; a mark fresh for 120 s, renewed every 30 s, lapses two minutes
+# after its node stops.
+NEIGHBOR_SYNC_SEAM = "ANT_TEST_SEAM_NEIGHBOR_SYNC_SECS"
+HYSTERESIS_SEAM = "ANT_TEST_SEAM_PRUNE_HYSTERESIS_SECS"
+FRESHNESS_SEAM = "ANT_TEST_SEAM_FULL_FRESHNESS_SECS"
+FULL_RUN_SYNC_SECS = 30
+FULL_RUN_HYSTERESIS_SECS = 60
+FULL_RUN_FRESHNESS_SECS = 120
+
+# The incumbents' disk under pressure in the full run: 2 GiB free of a 1 TB
+# partition, under the falling floor's last step (2.5%), so a node may erase
+# anything out of its range, and above the full line (1 GiB), so it isn't
+# full.
+PRESSURED_FREE = 2 * 1024 ** 3
+PRESSURED_TOTAL = 10 ** 12
+
+# A key's close group, the storage admission width, the proofs an erasure
+# needs from the 7 nearest not full, and the widest a window grows.
+CLOSE_GROUP = 7
+ADMISSION_WIDTH = 9
+ERASE_PROOFS = 6
+WIDEST = 20
+
+# The line a node logs for each record it erases, with its proofs.
+ERASED_LINE = "Erased an out-of-range record under disk pressure"
 
 # What each node logs: info, and debug for the code whose debug lines name
 # messages that didn't decode (src/replication, the chunk handler, listings).
@@ -335,6 +396,8 @@ class Release:
         binary = self.node.read_bytes()
         self.seams = FREE_SPACE_SEAM.encode() in binary
         self.full_notice_seam = FULL_NOTICE_SEAM.encode() in binary
+        self.timing_seams = all(seam.encode() in binary for seam in
+                                (NEIGHBOR_SYNC_SEAM, HYSTERESIS_SEAM, FRESHNESS_SEAM))
 
     def __str__(self):
         return f"{self.name}: {self.version}, {self.label}"
@@ -488,11 +551,17 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
             node_env = dict(env)
             if name == "full" and release.full_notice_seam:
                 node_env[FULL_NOTICE_SEAM] = "0"
-            if full:
+            if name == "full":
+                node_env[NEIGHBOR_SYNC_SEAM] = str(FULL_RUN_SYNC_SECS)
+                node_env[HYSTERESIS_SEAM] = str(FULL_RUN_HYSTERESIS_SECS)
+                node_env[FRESHNESS_SEAM] = str(FULL_RUN_FRESHNESS_SECS)
+            if full or (name == "full" and role == "incumbent"):
+                # A full joiner reads no free space; an incumbent reads the
+                # host's own until it is put under pressure.
                 seam = folder / "seams" / f"{node_name}.free"
                 seam.parent.mkdir(exist_ok=True)
-                total = shutil.disk_usage(folder).total
-                seam.write_text(f"0 {total}\n")
+                disk = shutil.disk_usage(folder)
+                seam.write_text(f"0 {disk.total}\n" if full else f"{disk.free} {disk.total}\n")
                 node_env[FREE_SPACE_SEAM] = str(seam)
             command = [
                 str(release.node), "--root-dir", str(root), "--port", "0", "--ipv4-only",
@@ -538,15 +607,52 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         uploads.append(upload(harness, manifest_path, folder / "uploads-after.json",
                               args.records_after))
 
-        log(f"{name}: observing for {args.observe_minutes} min")
-        deadline = time.monotonic() + args.observe_minutes * 60
-        while time.monotonic() < deadline:
-            for process in processes:
-                if not process.alive():
-                    raise HarnessError(f"{process.name} exited; see {process.log_path}")
-            time.sleep(5)
-        checks = [check(harness, manifest_path, path, folder / f"check-{path.stem}.json")
-                  for path in uploads]
+        stopped = set()
+
+        def observe(minutes):
+            deadline = time.monotonic() + minutes * 60
+            while time.monotonic() < deadline:
+                for process in processes:
+                    if process.name not in stopped and not process.alive():
+                        raise HarnessError(f"{process.name} exited; see {process.log_path}")
+                time.sleep(5)
+
+        def check_all(phase):
+            suffix = f"-{phase}" if phase else ""
+            return [check(harness, manifest_path, path,
+                          folder / f"check{suffix}-{path.stem}.json") for path in uploads]
+
+        phases = {}
+        if name == "full":
+            # A few sync cycles for the fresh offers and the full nodes'
+            # notices to land, then the early count.
+            log(f"{name}: waiting {4 * FULL_RUN_SYNC_SECS} s, then counting copies")
+            observe(4 * FULL_RUN_SYNC_SECS / 60)
+            phases["early"] = [path.name for path in check_all("early")]
+            for node in incumbents:
+                (folder / "seams" / f"{node.name}.free").write_text(
+                    f"{PRESSURED_FREE} {PRESSURED_TOTAL}\n")
+            timeline["pressure"] = utc_now().isoformat()
+            first_half = args.observe_minutes / 2
+            log(f"{name}: incumbents under pressure; observing for {first_half:g} min")
+            observe(first_half)
+            phases["mid"] = [path.name for path in check_all("mid")]
+            full_joiners = [node for node in joiners if node.full]
+            victim = full_joiners[0]
+            victim.process.signal()
+            victim.process.stop()
+            stopped.add(victim.process.name)
+            timeline["stopped"] = {"node": victim.name, "peer_id": victim.peer_id,
+                                   "at": utc_now().isoformat()}
+            second_half = max(args.observe_minutes / 2,
+                              (FULL_RUN_FRESHNESS_SECS + 6 * FULL_RUN_SYNC_SECS) / 60)
+            log(f"{name}: stopped {victim.name}, whose mark lapses in "
+                f"{FULL_RUN_FRESHNESS_SECS} s; observing for {second_half:g} min")
+            observe(second_half)
+        else:
+            log(f"{name}: observing for {args.observe_minutes} min")
+            observe(args.observe_minutes)
+        checks = check_all(None)
         timeline["ended"] = utc_now().isoformat()
         devnet_peers = sorted(path.name for path in (devnet_data / "nodes").iterdir()
                               if path.is_dir())
@@ -567,6 +673,9 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
                    "full": node.full, "log": node.process.log_path.name} for node in nodes],
         "uploads": [path.name for path in uploads],
         "checks": [path.name for path in checks],
+        "phase_checks": phases,
+        "full_phases": {key: timeline[key] for key in ("pressure", "stopped")
+                        if key in timeline},
     }
     (folder / "run.json").write_text(json.dumps(record, indent=2))
     return folder
@@ -580,6 +689,9 @@ def load_run(folder):
                              for stamp in record["window"])
     record["uploads"] = [json.loads((folder / name).read_text()) for name in record["uploads"]]
     record["checks"] = [json.loads((folder / name).read_text()) for name in record["checks"]]
+    record["phase_checks"] = {
+        phase: [json.loads((folder / name).read_text()) for name in names]
+        for phase, names in record.get("phase_checks", {}).items()}
     return record
 
 
@@ -770,7 +882,9 @@ def analyze(run):
             # A refusal for lack of space: the seam's 0 free bytes are under
             # any reserve, where the host's own disk has room.
             full_evidence[node["name"]] = "Insufficient disk space" in text
+    full_run = full_run_checks(run, records, checks) if run.get("full_phases") else None
     return {
+        "full_run": full_run,
         "decode_failures": decode_failures,
         "penalties": penalties,
         "penalties_on_full": penalties_on_full,
@@ -790,6 +904,111 @@ def analyze(run):
                 for role in ("incumbent", "joiner")},
         "releases": {node["name"]: node["release"] for node in run["nodes"]},
     }
+
+
+def window_of(nearest, full):
+    """A record's 7 nearest not full, and its full nodes among them: walking
+    its nearest nodes, nearest first, until 7 not full are passed (at most
+    WIDEST)."""
+    not_full, full_inside = [], []
+    for peer in nearest[:WIDEST]:
+        if len(not_full) == CLOSE_GROUP:
+            break
+        (full_inside if peer in full else not_full).append(peer)
+    return not_full, full_inside
+
+
+def holders(record):
+    return {answer["peer"] for answer in record["answers"] if answer["outcome"] == "held"}
+
+
+def full_run_checks(run, records, end_checks):
+    """The full run's checks: copies at each count, stand-ins kept, the
+    erasures' proofs, and a lapsed mark counted as missing."""
+    full = {node["peer_id"] for node in run["nodes"] if node["full"]}
+    devnet = set(run["devnet_peers"])
+    stopped = (run["full_phases"].get("stopped") or {}).get("peer_id")
+    failures = []
+    by_f = {}
+    counts = {}
+
+    def copies(phase, phase_checks, full_now, gone):
+        for record in phase_checks:
+            nearest = record.get("nearest") or record["close_group"]
+            not_full, full_inside = window_of(nearest, full_now)
+            f = len(full_inside)
+            by_f.setdefault(phase, {}).setdefault(f, 0)
+            by_f[phase][f] += 1
+            held = holders(record) - full_now - gone
+            missing = sum(1 for peer in not_full if peer in devnet or peer in gone)
+            needed = CLOSE_GROUP - missing
+            counts.setdefault(phase, []).append(len(held))
+            if len(held) < needed:
+                failures.append(f"{phase}: record {record['address']} (f = {f}) is held by "
+                                f"{len(held)} nodes not full, fewer than {needed}")
+
+    early = run["phase_checks"].get("early", [])
+    mid = run["phase_checks"].get("mid", [])
+    copies("early", early, full, set())
+    copies("mid", mid, full, set())
+    gone = {stopped} if stopped else set()
+    copies("end", end_checks, full - gone, gone)
+
+    # Stand-ins: held at the early count from beyond the 9 nearest, inside
+    # the window full nodes widen, and still held at the mid count.
+    mid_by_address = {record["address"]: record for record in mid}
+    stand_ins_kept = 0
+    for record in early:
+        nearest = record.get("nearest") or []
+        _, full_inside = window_of(nearest, full)
+        width = ADMISSION_WIDTH + len(full_inside)
+        stand_ins = {peer for peer in nearest[ADMISSION_WIDTH:width] if peer not in full}
+        later = mid_by_address.get(record["address"])
+        if later is None:
+            continue
+        for peer in stand_ins & holders(record):
+            if peer in holders(later):
+                stand_ins_kept += 1
+            else:
+                failures.append(f"mid: stand-in {peer[:16]} no longer holds record "
+                                f"{record['address']}, while the marks are fresh")
+
+    # The erasures' proofs, from every node's log.
+    erasures = []
+    stopped_at = (run["full_phases"].get("stopped") or {}).get("at")
+    lapsed_at = None
+    if stopped_at:
+        lapsed_at = (datetime.datetime.fromisoformat(stopped_at)
+                     + datetime.timedelta(seconds=FULL_RUN_FRESHNESS_SECS))
+    still_full = len(full - ({stopped} if stopped else set()))
+    for node in run["nodes"]:
+        for stamp, text in read_log(run["folder"] / node["log"], run["window"]):
+            if ERASED_LINE not in text:
+                continue
+            found = fields(text)
+            try:
+                proofs = int(found.get("proofs_not_full", "0")) + int(found.get("proofs_full", "0"))
+                needed = int(found.get("proofs_needed", "0"))
+                group_full = int(found.get("group_full", "0"))
+            except ValueError:
+                failures.append(f"{node['name']}: an erasure line that doesn't parse: {text}")
+                continue
+            after_lapse = lapsed_at is not None and stamp > lapsed_at
+            erasures.append({"node": node["name"], "record": found.get("erased_record"),
+                             "proofs": proofs, "needed": needed, "group_full": group_full,
+                             "after_lapse": after_lapse})
+            if needed < ERASE_PROOFS or proofs < needed:
+                failures.append(f"{node['name']} erased {found.get('erased_record')} with "
+                                f"{proofs} proofs, needing {needed}: fewer than "
+                                f"{ERASE_PROOFS} real proofs")
+            if after_lapse and group_full > still_full:
+                failures.append(f"{node['name']} erased {found.get('erased_record')} after "
+                                f"the stopped node's mark lapsed counting {group_full} "
+                                f"members marked full, more than the {still_full} still "
+                                "running: a lapsed mark wasn't counted as missing")
+    return {"failures": failures, "by_f": by_f, "copies": counts,
+            "stand_ins_kept": stand_ins_kept, "erasures": erasures,
+            "stopped": run["full_phases"].get("stopped")}
 
 
 def received_families(result, role):
@@ -903,7 +1122,13 @@ def verdicts(results, args):
             if not record.get("stored"):
                 failures.append(f"{name}: record {record['address']} wasn't stored: "
                                 f"{record.get('error')}")
+        if result.get("full_run"):
+            failures.extend(f"{name}: {failure}" for failure in result["full_run"]["failures"])
         for record in result["checks"]:
+            # In the full run the incumbents may erase what they stored out
+            # of their range: the copies counted there stand in for this.
+            if result.get("full_run"):
+                break
             if record["held_by_storers"] < MAJORITY:
                 failures.append(f"{name}: record {record['address']} is held at the end by "
                                 f"{record['held_by_storers']} of the "
@@ -1020,6 +1245,24 @@ def report(results, args):
                     result["between_releases"].items()):
                 lines.append(f"  {observer:>9} -> {target:<9} {reason:<19} {count:>5} "
                              f"{weight:8.2f}")
+        if result.get("full_run"):
+            run = result["full_run"]
+            for phase in ("early", "mid", "end"):
+                by_f = ", ".join(f"f = {f}: {count}" for f, count in
+                                 sorted(run["by_f"].get(phase, {}).items()))
+                held = run["copies"].get(phase, [])
+                lines.append(f"{phase} count: records by full nodes in their window: "
+                             f"{by_f or 'none'}; held by {min(held, default=0)} to "
+                             f"{max(held, default=0)} nodes not full")
+            lines.append(f"stand-in copies kept while the marks were fresh: "
+                         f"{run['stand_ins_kept']}")
+            erasures = run["erasures"]
+            lapsed = sum(1 for erasure in erasures if erasure["after_lapse"])
+            fewest = min((erasure["proofs"] for erasure in erasures), default=0)
+            lines.append(f"erasures: {len(erasures)} ({lapsed} after the stopped node's "
+                         f"mark lapsed), with {fewest} proofs or more each")
+            if run["stopped"]:
+                lines.append(f"stopped: {run['stopped']['node']} at {run['stopped']['at']}")
         if result["penalties_on_full"]:
             lines.append("penalties on full nodes:")
             for key, (count, weight) in sorted(result["penalties_on_full"].items()):
@@ -1073,6 +1316,7 @@ def summary_json(results, failures, releases, args):
                                     for record in result["checks"]],
             "stored": [bool(record.get("stored")) for record in result["records"]],
             "full_evidence": result["full_evidence"],
+            "full_run": result.get("full_run"),
         }
     baselines = [result for name, result in results.items() if is_baseline(name)]
     runs = {}
@@ -1196,6 +1440,9 @@ def main():
     if "full" in runs and not new.seams:
         raise HarnessError("this tree's ant-node has no free-space seam: build it with "
                            "--features test-utils")
+    if "full" in runs and not new.timing_seams:
+        raise HarnessError("this tree's ant-node lacks the sync, out-of-range wait or "
+                           "freshness seam the full run needs")
 
     work = Path(args.work) if args.work else (
         cache / "runs" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
