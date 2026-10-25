@@ -73,6 +73,14 @@ release_key*
 *.pdb
 
 # -----------------------------------------------------------------------------
+# PYTHON BYTECODE
+# -----------------------------------------------------------------------------
+# Python writes these beside a module it imports, as when the mixed-version
+# harness's verdict test (scripts/test_mixed_versions_verdicts.py) runs
+__pycache__/
+*.py[cod]
+
+# -----------------------------------------------------------------------------
 # IDE AND EDITOR FILES
 # -----------------------------------------------------------------------------
 # VSCode
