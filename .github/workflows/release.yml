@@ -91,21 +91,28 @@ jobs:
         run: |
           tag="$GITHUB_REF_NAME"
           release="${tag##*+ds.}"
+          # A dotted tag (+ds.17.1) is release 17: take the leading number.
+          release="${release%%.*}"
+          if [[ ! "$release" =~ ^[0-9]+$ ]]; then
+            echo "::error::$tag names no release number after +ds. that this step can read"
+            exit 1
+          fi
           from=$(sed -nE 's/^pub const NEIGHBOR_SYNC_PAGES_FROM_RELEASE: u64 = ([0-9]+);.*$/\1/p' \
             src/replication/config.rs)
           if [[ ! "$from" =~ ^[0-9]+$ ]]; then
             echo "::error::src/replication/config.rs has no NEIGHBOR_SYNC_PAGES_FROM_RELEASE this step can read"
             exit 1
           fi
-          if (( release < from )); then
+          if (( 10#$release < 10#$from )); then
             echo "::error::$tag is release $release; nodes page to release $from and later (NEIGHBOR_SYNC_PAGES_FROM_RELEASE), so its nodes would not page to each other"
             exit 1
           fi
           git fetch --quiet --no-tags --depth=1 origin '+refs/tags/v*:refs/tags/v*'
           for earlier in $(git tag --list 'v*+ds.*'); do
             number="${earlier##*+ds.}"
+            number="${number%%.*}"
             [[ "$number" =~ ^[0-9]+$ ]] || continue
-            if (( number >= from )) && ! git show "$earlier:src/replication/config.rs" 2>/dev/null \
+            if (( 10#$number >= 10#$from )) && ! git show "$earlier:src/replication/config.rs" 2>/dev/null \
                 | grep -q NEIGHBOR_SYNC_PAGES_FROM_RELEASE; then
               echo "::error::$earlier is release $number, at or after release $from, which nodes page to, and carries no paged sync"
               exit 1
