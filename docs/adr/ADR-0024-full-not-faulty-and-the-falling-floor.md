@@ -81,8 +81,15 @@ The prune passes run in a task of their own after each neighbour-sync cycle. An 
 record is first selected, and from then on named in no replica hint this node sends; it
 is erased only in a pass of a later cycle, after its possession check, and never while
 this node answered "present" for it within the fetch window (the verification and fetch
-timeouts plus the longest retry wait, 345 s). A node therefore never hints a record and
-then answers that it lacks it.
+timeouts plus the longest retry wait, 345 s), for chunks and pointers alike (a pointer
+state or fetch answered with the record counts as "present"). A node therefore never hints
+a record and then answers that it lacks it.
+
+A record whose possession check fails leaves the selection at once and is hinted again,
+since its close group lacks copies and this node's hint is what lets the group fetch it
+back. It is not selected again for 3 sync epochs (one whole cycle plus the two of the
+two-phase wait), so it is hinted for at least a whole cycle before it is hidden and tried
+again.
 
 ### Out-of-range clocks that survive restarts
 
@@ -101,7 +108,9 @@ full. Then it:
 - prices no new data: a quote for data it doesn't hold is refused with the existing
   `QuoteFailed`. A chunk it holds is still answered as already stored, so nobody pays for
   it again, and an update of a pointer it holds is still quoted;
-- refuses every new record, fresh offers with the existing `Rejected`;
+- refuses every new record, fresh offers with the existing `Rejected`, but takes the
+  repair of a chunk it held and removed because its bytes were wrong, which replaces the
+  space the removal freed (at most 1,024 such chunks remembered);
 - takes updates and repairs of pointers it holds, which use no new space;
 - keeps serving and proving what it holds: its audit and possession replies keep their
   format, real digests for held keys and the absent digest for others;
@@ -123,7 +132,13 @@ full. Then it:
 - Erasing a copy near full nodes needs 6 proofs from the 7 nearest nodes not marked full.
   A full node that lacks the key is neither a proof nor a veto; one that holds it still
   proves it; the erasing node never counts itself. The marks are read again just before
-  deleting.
+  deleting. When 14 or more of a key's 20 nearest are marked full, the window's cap of 20
+  holds fewer than 7 not marked full, and 6 proofs are still needed from the 20: peers
+  announcing themselves full never lower the bar. Only a routing table that knows fewer
+  peers than the close group (a tiny network) lowers it, as before.
+- The possession check after a write doesn't charge a stand-in beyond the 9 nearest for
+  answering that it lacks the record: a receiver that doesn't widen (an older node, or one
+  without the same marks) rightly refused the offer. Any other failure is charged.
 
 ### The one waiver of the unheld-chunk penalty (amends ADR-0022)
 
@@ -134,8 +149,12 @@ waives the per-key absent penalty only when all of these hold:
 - the peer answered that it lacks the key (the absent digest, "not found", or a denial);
   no answer, a wrong digest or any other failure is charged;
 - the check isn't pinned to the peer's commitment (subtree audits are charged);
-- the checker has never seen the peer prove it holds the key (a matched digest, or a fetch
-  served with the right bytes);
+- the checker hasn't seen the peer prove it holds the key (a matched digest, a fetch
+  served with the right bytes, or a block verified in a subtree audit's second round);
+  the record of these proofs is a Bloom filter in two generations, each sized at 10 bits
+  for each of 20 peers per record held (2 to 32 MiB), a new one started once the current
+  holds as many proofs as it was sized for, so its false "seen" answers, which charge,
+  stay under about 3.5% however long the node runs;
 - on the possession check after a write, the peer's own quote isn't among the paid quotes
   of the write's proof: a node paid for a record it then can't take is charged.
 
@@ -172,13 +191,15 @@ windows until they update.
 - The first start into this release has no saved clocks: for up to three days a node at
   the line may be full while it holds copies it could erase later. No data is lost.
 - The record of keys a peer was seen proving is process-local: a restart forgets it, so
-  the waiver may apply to a key the peer proved before the restart.
+  the waiver may apply to a key the peer proved before the restart. It also forgets a
+  proof two generations later, unless the peer proves the key again.
 
 ### Neutral / Operational
 
 - The prune-pass line reports the floor's step, the records selected for erasure, held
   records with a peer marked full in their window, the keys verification found with fewer
-  than 4 holders, and whether the node is full.
+  than 4 holders, how full the record of keys peers were seen proving is and its estimated
+  share of false "seen" answers, and whether the node is full.
 
 ## Validation
 

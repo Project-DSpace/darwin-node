@@ -1488,8 +1488,10 @@ times, 4 for the edge of its own range), `being_erased=` (records selected
 for erasure, named in no hint, and erased a whole sync cycle later),
 `near_full_peers=` (held records with a peer marked full among their nearest
 nodes), `few_holders=` (keys whose verification since the last pass found
-fewer than 4 holders) and `full=` (1 while the node is full: at the full line
-with nothing left it may erase). `Disk pressure:` and `Disk pressure over:`
+fewer than 4 holders), `seen_fill=` and `seen_false=` (how full the node's
+record of keys peers were seen proving is, and its estimated share of false
+"seen" answers, which charge a full peer) and `full=` (1 while the node is
+full: at the full line with nothing left it may erase). `Disk pressure:` and `Disk pressure over:`
 mark when erasing may start and when it stops, `Disk pressure: the erase
 floor moves to step` each step down, and `Free space on the record store's
 partition could not be measured` that it stopped because the disk could not
