@@ -165,6 +165,12 @@ pub struct Cli {
     #[arg(long, short)]
     pub config: Option<PathBuf>,
 
+    /// The image marker: the darwin-node commit of the storage-node image this
+    /// node runs in, which the image's entrypoint passes to every node. The
+    /// node reports it in its user agent; without one it logs a line at start.
+    #[arg(long, env = "ANT_IMAGE_VERSION", value_name = "COMMIT")]
+    pub image_version: Option<String>,
+
     /// Exit cleanly on upgrade instead of spawning a new process.
     /// Use when running under a service manager (systemd, launchd, Windows Service)
     /// that will restart the process automatically.
@@ -289,6 +295,7 @@ impl Cli {
             config.log_level = self.log_level.into();
         }
         config.network_mode = self.network_mode.into();
+        config.image_version = self.image_version;
 
         // Apply CLI bootstrap peers if provided; otherwise keep config file value.
         if cli_bootstrap_provided {

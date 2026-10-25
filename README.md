@@ -240,7 +240,11 @@ never ran.
   keeps every folder set aside. `tests/darwin_image.rs` pins
   the manager's install, the registry's place, the marker's path, every
   deletion and every move the image's scripts make, each with its reason,
-  and the set-aside folders' place beyond every sweep.
+  and the set-aside folders' place beyond every sweep. Nodes after ds.15
+  report the marker in their user agent, after the release
+  (`node/<version>.image.<commit>`), where the node census still reads the
+  release, and log a line at start when they have none; tests in
+  `src/node.rs` pin both.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
   releases without credentials, and orders `+ds.N` builds by their number,

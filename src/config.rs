@@ -157,6 +157,13 @@ pub struct NodeConfig {
     /// Log level.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// The image marker: the darwin-node commit the storage-node image this
+    /// node runs in was built from, which that image passes in
+    /// `ANT_IMAGE_VERSION` (`--image-version`). The node reports it in its
+    /// user agent. Never read from a config file.
+    #[serde(skip)]
+    pub image_version: Option<String>,
 }
 
 /// Configuration for the ADR-0015 WebRTC Direct browser listener.
@@ -595,6 +602,7 @@ impl Default for NodeConfig {
             close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
             log_level: default_log_level(),
+            image_version: None,
         }
     }
 }

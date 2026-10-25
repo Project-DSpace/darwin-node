@@ -55,8 +55,33 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// that lost the prefix would stop being routed to. The version is this build's rather than
 /// the transport's, because it is the one a peer needs in order to tell which release it is
 /// talking to.
-fn user_agent() -> String {
-    format!("node/{}", env!("CARGO_PKG_VERSION"))
+///
+/// The image marker, when the node has one ([`image_marker`]), follows the release in the
+/// version's build metadata: `node/0.23.0+ds.16.image.<commit>`. The node census reads a node's
+/// release as the semver after `node/` and the `ds.<n>` its build metadata starts with, so it
+/// still reads the release, and can count the nodes whose image gave no marker.
+fn user_agent(image: Option<&str>) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    image.map_or_else(
+        || format!("node/{version}"),
+        |marker| {
+            let separator = if version.contains('+') { '.' } else { '+' };
+            format!("node/{version}{separator}image.{marker}")
+        },
+    )
+}
+
+/// The image marker this node reports: what `ANT_IMAGE_VERSION` gives (`--image-version`), if
+/// it is what the storage-node image passes, the 40 lowercase hex digits of the darwin-node
+/// commit the image was built from. Images before the one that ships darwin-nodes, whose node
+/// manager deletes a node's data on a nearly full disk, pass none.
+pub(crate) fn image_marker(given: Option<&str>) -> Option<&str> {
+    given.filter(|marker| {
+        marker.len() == 40
+            && marker
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// Builder for constructing an Ant node.
@@ -126,6 +151,18 @@ impl NodeBuilder {
         let peer_id = identity.peer_id().to_hex();
 
         info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
+
+        // One line at start: the image marker, or that there is none.
+        if let Some(marker) = image_marker(self.config.image_version.as_deref()) {
+            info!(image_version = marker, "Image marker");
+        } else {
+            warn!(
+                "No image marker (ANT_IMAGE_VERSION): if this node runs in a storage-node \
+                 container, that container's node manager may delete a node's data when the \
+                 disk is nearly full; pull the new image (docker compose pull, then docker \
+                 compose up -d)"
+            );
+        }
 
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
@@ -361,7 +398,8 @@ impl NodeBuilder {
             }
         }
 
-        core_config.custom_user_agent = Some(user_agent());
+        core_config.custom_user_agent =
+            Some(user_agent(image_marker(config.image_version.as_deref())));
 
         // Persist close group peers + trust scores across restarts.
         // Default to root_dir (alongside node_identity.key) when not explicitly set.
@@ -1427,11 +1465,84 @@ mod tests {
         };
 
         // What it tells every peer, in the user agent saorsa-core sends with each signed
-        // message: this build's version under the `node/` prefix, and nothing after it.
+        // message: this build's version under the `node/` prefix, and nothing after it
+        // when it has no image marker.
         let agent = node.p2p_node.config().user_agent();
         assert_eq!(agent, format!("node/{}", env!("CARGO_PKG_VERSION")));
-        assert_eq!(agent, user_agent());
+        assert_eq!(agent, user_agent(None));
         node.shutdown.cancel();
+    }
+
+    /// The image marker the image passes reaches the user agent saorsa-core sends with every
+    /// signed message; anything else given in its place is left out.
+    #[test]
+    fn the_image_marker_reaches_the_user_agent() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = local_node_config(dir.path(), 0);
+        config.image_version = Some(MARKER.to_string());
+        let core = NodeBuilder::build_core_config(&config).expect("core config");
+        assert_eq!(core.user_agent(), user_agent(Some(MARKER)));
+        assert!(core.user_agent().ends_with(&format!("image.{MARKER}")));
+
+        config.image_version = Some("not a commit".to_string());
+        let core = NodeBuilder::build_core_config(&config).expect("core config");
+        assert_eq!(core.user_agent(), user_agent(None));
+    }
+
+    /// The commit an image passes: 40 lowercase hex digits.
+    const MARKER: &str = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
+
+    #[test]
+    fn only_a_commit_is_an_image_marker() {
+        assert_eq!(image_marker(Some(MARKER)), Some(MARKER));
+        for given in [
+            "",
+            "9757a72",
+            "9757A72AFBF6B56617D2BE28573CB8D4B3FB2F65",
+            "9757a72afbf6b56617d2be28573cb8d4b3fb2f650",
+            "9757a72afbf6b56617d2be28573cb8d4b3fb2f6 ",
+            "9757a72afbf6b56617d2be28573cb8d4b3fb2f6.",
+            "g757a72afbf6b56617d2be28573cb8d4b3fb2f65",
+        ] {
+            assert_eq!(image_marker(Some(given)), None, "{given:?}");
+        }
+        assert_eq!(image_marker(None), None);
+    }
+
+    /// The release a node's user agent gives, read as darwin-client's node census reads it
+    /// (`listings_census::supports_feed`): the semver after `node/`, and the number after the
+    /// `ds.` its build metadata starts with.
+    fn census_release(agent: &str) -> Option<u64> {
+        let version = semver::Version::parse(agent.strip_prefix("node/")?).ok()?;
+        version
+            .build
+            .as_str()
+            .strip_prefix("ds.")?
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// A marked user agent is still `node/` and a semver, with the release where the node
+    /// census reads it, so the census reads a marked node's release as an unmarked one's.
+    #[test]
+    fn the_node_census_reads_the_release_of_a_marked_user_agent() {
+        let plain = user_agent(None);
+        let marked = user_agent(Some(MARKER));
+        assert!(marked.starts_with("node/"), "{marked}");
+        let release = census_release(&plain);
+        assert!(
+            release.is_some(),
+            "this build's version gives no ds release: {plain}"
+        );
+        assert_eq!(census_release(&marked), release, "{marked}");
+        let version = semver::Version::parse(marked.strip_prefix("node/").unwrap()).unwrap();
+        assert_eq!(
+            version.build.as_str().rsplit('.').next(),
+            Some(MARKER),
+            "the marker ends the build metadata"
+        );
     }
 
     /// A node with chunks in a store this build cannot read STARTS, however it is
@@ -2154,13 +2265,18 @@ mod tests {
     }
 
     /// The prefix is what keeps this node in its peers' routing tables, and the version is
-    /// this build's, with nothing after it.
+    /// this build's, with nothing after it but the image marker.
     #[test]
     fn the_user_agent_is_this_builds_version_under_the_node_prefix() {
         assert_eq!(
-            super::user_agent(),
+            super::user_agent(None),
             format!("node/{}", env!("CARGO_PKG_VERSION"))
         );
-        assert!(super::user_agent().starts_with("node/"));
+        assert!(super::user_agent(None).starts_with("node/"));
+        let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
+        assert_eq!(
+            super::user_agent(Some(marker)),
+            format!("node/{}.image.{marker}", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
