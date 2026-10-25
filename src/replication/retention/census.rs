@@ -1910,6 +1910,14 @@ fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
             "waives_unheld_penalty",
             1,
         ),
+        // The pointer possession check after a write, answered with no state
+        // of the pointer at all.
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "waives_unheld_penalty",
+            1,
+        ),
     ];
     const LANES: &[(Option<&str>, &str)] = &[(Some("Lane"), "*")];
     const NAMED: &[Reviewed] = &[
@@ -1943,6 +1951,12 @@ fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
             "Lane::PruneAudit",
             1,
         ),
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "Lane::PointerPossession",
+            1,
+        ),
     ];
     let sites = unreviewed(Counting::Calls(WAIVER), SITES);
     assert!(
@@ -1962,6 +1976,53 @@ fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
          Each lane names itself in the case it asks about, so the log says which lane \
          waived, and the behaviour tests of each lane (src/replication/full.rs, \
          tests/fork_pins.rs) cover what that lane asks.\n"
+    );
+}
+
+/// Each lane of the waiver reads the peer's answer through its own small mapping,
+/// whose unit tests pin what counts as "absent" on that lane.
+#[test]
+fn each_lane_reads_its_answer_through_its_tested_mapping() {
+    const ANSWERS: &[(Option<&str>, &str)] = &[
+        (None, "hint_answer"),
+        (None, "audit_answer"),
+        (None, "prune_answer"),
+        (None, "possession_answer"),
+    ];
+    const ANSWERED: &[Reviewed] = &[
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "hint_answer",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "audit_answer",
+            1,
+        ),
+        (
+            "src/replication/pruning.rs",
+            "peer_proves_records",
+            "prune_answer",
+            1,
+        ),
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "possession_answer",
+            1,
+        ),
+    ];
+    let answered = unreviewed(Counting::Calls(ANSWERS), ANSWERED);
+    assert!(
+        answered.is_empty(),
+        "\nA lane reads the peer's answer other than through its tested mapping.\n\n\
+         {answered}\n\
+         hint_answer, audit_answer, prune_answer and possession_answer say what counts as \
+         \"absent\" on their lanes, and their unit tests pin it (a digest mismatch, a \
+         rejected hint or a failed prune answer is charged). Read the answer through them.\n"
     );
 }
 

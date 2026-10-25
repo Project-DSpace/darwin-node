@@ -100,9 +100,13 @@ selection runs ahead of what a pass can audit.
 ### Out-of-range clocks that survive restarts
 
 Each held record's and pointer's out-of-range start time is kept in wall-clock seconds in
-`{root}/out_of_range.mdb`, written at the end of each prune pass and loaded at start. A
-time in the future counts as now; a record back in range or no longer held is cleared; a
-missing or unreadable table starts every clock now, as before.
+`{root}/out_of_range.mdb`, with the time of the write, written at the end of each prune
+pass and loaded at start. A restored clock counts only the time the node saw before that
+write: the time the node was down, or ran a release that doesn't keep the table (a
+rollback), doesn't count toward the wait, since nothing checked then that the key stayed
+out of range. A start after the write counts as now; a record back in range or no longer
+held is cleared; a missing, unreadable or older-layout table starts every clock now, as
+before.
 
 ### Full, not faulty
 
@@ -127,6 +131,10 @@ full. Then it:
   is remembered (at most 4,096) until it leaves the routing table, so a renewal still
   reaches it while it is disconnected;
 - logs one line on entering ("Node full: since <unix seconds>") and one on leaving;
+  the state isn't kept across a restart, so at start a node with room above the line
+  logs "Node full: not at start", which `nodes status` reads as no longer full, and one
+  that starts at the line tells its peers once, at its first renewal, if no prune pass
+  has made it full again by then, so their marks don't lapse in between;
 - leaves "full" only with 256 MiB of free bytes above the line (and, where inodes are
   counted, 65,536 inodes above their line), so the state doesn't flap.
 
@@ -134,8 +142,9 @@ full. Then it:
 
 - A peer is marked full only from its own notice. The mark lapses 40 minutes (two of the
   longest neighbour-sync intervals) after the last notice unless renewed.
-- With f peers marked full among a key's nearest, replica hints and fresh offers go to the
-  7 + f nearest, and a node admits and keeps the key while it is among the 9 + f nearest,
+- With f peers marked full among a key's nearest, replica hints and fresh offers (of
+  chunks and pointers alike) go to the 7 + f nearest, and a node admits and keeps the key
+  while it is among the 9 + f nearest,
   both at most 20. The full node stays responsible for what it holds; the nodes standing
   in for it are in range, not erase candidates.
 - Erasing a copy near full nodes needs 6 proofs from the 7 nearest nodes not marked full.
@@ -149,7 +158,8 @@ full. Then it:
   beyond them are offered the record but not possession-checked, since a receiver that
   doesn't widen (an older node, or one without the same marks) rightly refuses the offer.
   Nothing is waived for them, and a stand-in that does take the record is, by intent, not
-  recorded as seen holding it.
+  recorded as seen holding it. A pointer's check after a write probes its 7 nearest, as
+  before, and its stand-ins likewise aren't checked.
 
 ### The one waiver of the unheld-chunk penalty (amends ADR-0022)
 
@@ -168,6 +178,11 @@ waives the per-key absent penalty only when all of these hold:
   stay under about 3.5% however long the node runs;
 - on the possession check after a write, the peer's own quote isn't among the paid quotes
   of the write's proof: a node paid for a record it then can't take is charged.
+
+The same holds for the possession check after a pointer write (a seventh lane, beside the
+six of chunks): a full peer that answers it holds no state of the pointer at all, a new
+address it refused, is waived on the same conditions. One that holds an older state of
+the pointer is charged, since a full node still takes updates of the pointers it holds.
 
 Every lane asks one function, `FullView::waives_unheld_penalty`, at one reviewed site. The
 bound on how long a node may answer "full" without the penalty is how long one notice

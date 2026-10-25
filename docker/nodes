@@ -13,8 +13,9 @@
 # `nodes status`, as typed, also lists the nodes that are full (from ds.17),
 # and since when, from the line each node logs on entering and leaving "full"
 # (`Node full: since <unix seconds>, at the full line by <bytes|inodes> ...`,
-# then `Node full: no longer ...`). `--json` and every other command print the
-# manager's output alone.
+# then `Node full: no longer ...`, or `Node full: not at start ...` when it
+# restarts with room). `--json` and every other command print the manager's
+# output alone.
 set -euo pipefail
 
 LOGS=/data/logs                      # node-<id>/logs: one node's log files

@@ -261,7 +261,10 @@ mod unheld_chunk_penalty {
             key,
             answer: UnheldAnswer::Absent,
             commitment_pinned: false,
-            own_quote: if matches!(lane, Lane::PossessionFailed | Lane::PossessionNoAnswer) {
+            own_quote: if matches!(
+                lane,
+                Lane::PossessionFailed | Lane::PossessionNoAnswer | Lane::PointerPossession
+            ) {
                 OwnQuote::NotPaid
             } else {
                 OwnQuote::NoProof

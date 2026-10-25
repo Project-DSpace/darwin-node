@@ -206,6 +206,9 @@ In the folder with `docker-compose.yml`:
   to the next nearest node instead. It logs `Node full: since ...` on
   entering and `Node full: no longer` on leaving, which it does once 256 MiB
   above the line is free again, and `nodes status` lists the full nodes.
+  A restart (after adding disk, say) starts a node not full: with room it
+  logs `Node full: not at start`, and `nodes status` stops listing it; at
+  the line it is full again once a prune pass finds nothing it may erase.
   Nodes up to ds.16 keep charging a full node until they update. To store
   more, add disk or lower `NODE_COUNT`.
 - **Logs:** each node's files in `logs/node-<id>/logs/` start anew at 50 MiB

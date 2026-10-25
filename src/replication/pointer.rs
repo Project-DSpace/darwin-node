@@ -494,7 +494,11 @@ enum Fetched {
     Record(Pointer),
     /// A record that does not, which the peer has already been penalised for.
     Invalid,
-    /// No record: no answer, an empty one, or one about another address.
+    /// An answer about the address with no record in it: the peer holds no
+    /// state of the pointer at all.
+    Absent,
+    /// No usable answer: none, one of another kind, or one about another
+    /// address.
     Nothing,
     /// A record this node could not check, or a request it never sent, for a
     /// reason of its own.
@@ -557,8 +561,37 @@ fn judge_possession(fetched: Fetched, fresh: &PointerState) -> Possession {
                 Possession::Missing
             }
         }
-        Fetched::Nothing => Possession::Missing,
+        Fetched::Absent | Fetched::Nothing => Possession::Missing,
         Fetched::Invalid | Fetched::LocalFailure => Possession::NotJudged,
+    }
+}
+
+/// The peers of `widened`, a pointer's close group widened past the peers
+/// marked full (nearest first, this node included), that the possession check
+/// asks: the close group itself, this node left out. The stand-ins beyond it
+/// are offered the state but not checked.
+fn possession_checked(
+    widened: &[PeerId],
+    self_id: &PeerId,
+    close_group_size: usize,
+) -> Vec<PeerId> {
+    widened
+        .iter()
+        .take(close_group_size)
+        .filter(|peer| *peer != self_id)
+        .copied()
+        .collect()
+}
+
+/// What a peer answered about a pointer, for the "full" waiver: absent only
+/// when it answered that it holds no state of the pointer at all, so a peer
+/// holding an older state (a pointer it held, whose updates a full node
+/// still takes) or one that didn't answer is never waived.
+fn possession_answer(fetched: &Fetched) -> super::full::UnheldAnswer {
+    if matches!(fetched, Fetched::Absent) {
+        super::full::UnheldAnswer::Absent
+    } else {
+        super::full::UnheldAnswer::Other
     }
 }
 
@@ -978,7 +1011,7 @@ impl PointerReplication {
     async fn fetch_record(&self, peer: &PeerId, address: &XorName) -> Option<Pointer> {
         match self.fetch_outcome(peer, address).await {
             Fetched::Record(record) => Some(record),
-            Fetched::Invalid | Fetched::Nothing | Fetched::LocalFailure => None,
+            Fetched::Invalid | Fetched::Absent | Fetched::Nothing | Fetched::LocalFailure => None,
         }
     }
 
@@ -1007,7 +1040,7 @@ impl PointerReplication {
             return Fetched::Nothing;
         }
         let Some(bytes) = response.record else {
-            return Fetched::Nothing;
+            return Fetched::Absent;
         };
         // Parsing verifies the ML-DSA signature, milliseconds of CPU a peer
         // can demand once per record it serves: off the async executor, as
@@ -1622,23 +1655,33 @@ impl PointerReplication {
         })
     }
 
-    /// Offer a freshly paid state to the rest of its close group, and schedule
-    /// the check that they took it.
+    /// Offer a freshly paid state to the rest of its close group, widened past
+    /// the peers marked full as a chunk's offer is, and schedule the check
+    /// that the close group itself took it.
     pub async fn replicate_fresh(self: &Arc<Self>, write: PointerFreshWrite) {
         let Ok(state) = PointerState::parse(&write.record) else {
             warn!("A fresh pointer write did not parse; not replicating it");
             return;
         };
         let self_id = *self.p2p.peer_id();
-        let targets: Vec<PeerId> = self
-            .p2p
-            .dht_manager()
-            .find_closest_nodes_local_with_self(&state.address, self.config.close_group_size)
-            .await
+        // One more for each peer marked full inside the close group: the
+        // nearest beyond stand in for it, at most 20 in all.
+        let widened = super::full::widened_close_group(
+            &self.p2p,
+            &state.address,
+            self.config.close_group_size,
+        )
+        .await;
+        // The stand-ins are offered the state but not possession-checked: only
+        // the close group owes it (see `owes`).
+        let checked = possession_checked(&widened, &self_id, self.config.close_group_size);
+        let targets: Vec<PeerId> = widened
             .into_iter()
-            .map(|node| node.peer_id)
             .filter(|peer| *peer != self_id)
             .collect();
+        // The paid quotes' issuers, for the possession check: a full peer paid
+        // for the state is charged for not holding it.
+        let paid_quotes = super::full::paid_quote_issuers(&write.payment_proof);
 
         let msg = ReplicationMessage {
             request_id: rand::thread_rng().gen::<u64>(),
@@ -1683,7 +1726,7 @@ impl PointerReplication {
             hex::encode(state.address),
             targets.len()
         );
-        self.schedule_possession_check(state, targets);
+        self.schedule_possession_check(state, checked, paid_quotes);
     }
 
     /// Take a fresh offer from `source` in the background, unless too many are
@@ -1926,7 +1969,12 @@ impl PointerReplication {
     // Possession
     // -----------------------------------------------------------------------
 
-    fn schedule_possession_check(self: &Arc<Self>, fresh: PointerState, peers: Vec<PeerId>) {
+    fn schedule_possession_check(
+        self: &Arc<Self>,
+        fresh: PointerState,
+        peers: Vec<PeerId>,
+        paid_quotes: Option<Vec<PeerId>>,
+    ) {
         if peers.is_empty() {
             return;
         }
@@ -1943,13 +1991,25 @@ impl PointerReplication {
                 () = this.shutdown.cancelled() => return,
                 () = tokio::time::sleep(delay) => {}
             }
-            this.check_possession(fresh, &peers).await;
+            this.check_possession(fresh, &peers, paid_quotes.as_deref())
+                .await;
         });
     }
 
     /// Ask each peer for the record, and penalise any still responsible for it
     /// that cannot produce `fresh` or a state that replaces it.
-    pub async fn check_possession(&self, fresh: PointerState, peers: &[PeerId]) {
+    ///
+    /// Full, not faulty: a peer with a fresh "full" notice that answers it
+    /// holds no state of the pointer, was never seen holding it and was not
+    /// paid for it (its quote isn't among `paid_quotes`, the paid quotes of
+    /// the write's proof; `None` when unknown) refused a new address it
+    /// couldn't take, and is not charged.
+    pub async fn check_possession(
+        &self,
+        fresh: PointerState,
+        peers: &[PeerId],
+        paid_quotes: Option<&[PeerId]>,
+    ) {
         let self_id = *self.p2p.peer_id();
         for peer in peers {
             // A peer that has left the group owes nothing, and one that cannot
@@ -1958,6 +2018,7 @@ impl PointerReplication {
                 continue;
             }
             let fetched = self.fetch_outcome(peer, &fresh.address).await;
+            let answer = possession_answer(&fetched);
             match judge_possession(fetched, &fresh) {
                 Possession::Missing => {}
                 // Two different final states: the owner signed both and each
@@ -1982,6 +2043,17 @@ impl PointerReplication {
             // before it, and it may have left the group meanwhile. It is
             // judged on what it owes now, not on what it owed when this began.
             if !self.owes(peer, &fresh.address).await {
+                continue;
+            }
+            let case = super::full::UnheldCase {
+                lane: super::full::Lane::PointerPossession,
+                peer,
+                key: &fresh.address,
+                answer,
+                commitment_pinned: false,
+                own_quote: super::full::own_quote(peer, paid_quotes),
+            };
+            if super::full::view_for(&self_id).waives_unheld_penalty(&case, Instant::now()) {
                 continue;
             }
             warn!(
@@ -2526,6 +2598,22 @@ mod tests {
         );
         assert_eq!(judge(Fetched::Record(record(4, 1))), Possession::Missing);
         assert_eq!(judge(Fetched::Nothing), Possession::Missing);
+        assert_eq!(judge(Fetched::Absent), Possession::Missing);
+        // The same answers, as the "full" waiver reads them: only "no state
+        // at all" is absent.
+        assert_eq!(
+            possession_answer(&Fetched::Absent),
+            super::super::full::UnheldAnswer::Absent
+        );
+        assert_eq!(
+            possession_answer(&Fetched::Nothing),
+            super::super::full::UnheldAnswer::Other
+        );
+        assert_eq!(
+            possession_answer(&Fetched::Record(record(4, 1))),
+            super::super::full::UnheldAnswer::Other,
+            "an older state of a held pointer is never waived"
+        );
         // The fetch already charged the peer for an invalid record; charging
         // it again as missing would count one bad answer twice.
         assert_eq!(judge(Fetched::Invalid), Possession::NotJudged);

@@ -3902,13 +3902,22 @@ impl ReplicationEngine {
                     erased = passes => erased,
                 };
                 let not_yet_erased = erasure_gate.not_yet_erased();
+                // The notice dials peers in turn: a shutdown stops it, and
+                // the clocks are still saved before the task leaves.
+                let mut stopping = false;
                 if let Some(full) =
                     full::after_passes(&storage, &disk_retention, erased, not_yet_erased)
                 {
-                    full::send_full_notice(&p2p, full).await;
+                    tokio::select! {
+                        () = shutdown.cancelled() => stopping = true,
+                        _ = full::send_full_notice(&p2p, full) => {}
+                    }
                 }
                 if let Some(clocks) = &clocks {
                     save_out_of_range_clocks(clocks, &paid_list, pointers.as_ref()).await;
+                }
+                if stopping {
+                    break;
                 }
             }
             debug!("Erasure task shut down");
@@ -3920,20 +3929,36 @@ impl ReplicationEngine {
     /// every [`full::full_notice_renewal`], so its peers' marks stay fresh, and
     /// look again between prune passes for the room to leave "full", telling
     /// its peers once when it does.
+    ///
+    /// The "full" state isn't kept across a restart: at start the node logs
+    /// where it stands ([`full::at_start`]), and a node that starts at the
+    /// line tells its peers once, at the first renewal, if no prune pass has
+    /// put it back in "full" by then, so their marks from before the restart
+    /// don't lapse while it waits for that pass.
     fn start_full_notice_loop(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
         let disk_retention = Arc::clone(&self.disk_retention);
         let shutdown = self.shutdown.clone();
         let handle = tokio::spawn(async move {
+            let mut at_the_line_at_start = full::at_start(&disk_retention);
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(full::full_notice_renewal()) => {}
                 }
                 if !storage.is_full() {
+                    if std::mem::take(&mut at_the_line_at_start)
+                        && disk_retention.at_the_line().is_some()
+                    {
+                        tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            _ = full::send_full_notice(&p2p, true) => {}
+                        }
+                    }
                     continue;
                 }
+                at_the_line_at_start = false;
                 let full = full::leave_if_room(&storage, &disk_retention) != Some(false);
                 tokio::select! {
                     () = shutdown.cancelled() => break,
@@ -7984,6 +8009,102 @@ async fn record_sent_replica_hints(
 }
 
 // ---------------------------------------------------------------------------
+// What a peer answered, as the "full" waiver reads it
+// ---------------------------------------------------------------------------
+
+/// A replica hint's verification outcome, as the "full" waiver reads its
+/// sender's answer: a hint the close group rejected is not a denial, so it is
+/// never waived; any other outcome that leaves the sender punishable means
+/// it denied holding the key.
+fn hint_answer(outcome: &KeyVerificationOutcome) -> full::UnheldAnswer {
+    if matches!(outcome, KeyVerificationOutcome::QuorumFailed) {
+        full::UnheldAnswer::Other
+    } else {
+        full::UnheldAnswer::Absent
+    }
+}
+
+/// A failed responsible-chunk audit, as the "full" waiver reads it: absent
+/// only when every one of the `failed_keys` confirmed failures was the
+/// absent-key answer. A digest mismatch, or any other reason, makes the whole
+/// audit "other", so it is charged.
+fn audit_answer(
+    reason: &AuditFailureReason,
+    summary: &crate::replication::types::AuditFailureSummary,
+    failed_keys: usize,
+) -> full::UnheldAnswer {
+    if *reason == AuditFailureReason::KeyAbsent
+        && summary.digest_mismatch_keys == 0
+        && summary.absent_keys == failed_keys
+        && failed_keys > 0
+    {
+        full::UnheldAnswer::Absent
+    } else {
+        full::UnheldAnswer::Other
+    }
+}
+
+#[cfg(test)]
+mod full_lane_answers {
+    use super::*;
+
+    fn fresh_full_peer() -> (full::FullView, PeerId) {
+        let view = full::FullView::default();
+        let peer = PeerId::from_bytes([4; 32]);
+        view.marks.note_notice(peer, true, Instant::now());
+        (view, peer)
+    }
+
+    fn waived(lane: full::Lane, answer: full::UnheldAnswer) -> bool {
+        let (view, peer) = fresh_full_peer();
+        view.waives_unheld_penalty(
+            &full::UnheldCase {
+                lane,
+                peer: &peer,
+                key: &[9; 32],
+                answer,
+                commitment_pinned: false,
+                own_quote: full::OwnQuote::NoProof,
+            },
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn a_hint_the_quorum_rejected_is_charged_even_from_a_full_peer() {
+        let rejected = hint_answer(&KeyVerificationOutcome::QuorumFailed);
+        assert_eq!(rejected, full::UnheldAnswer::Other);
+        assert!(!waived(full::Lane::ReplicaHint, rejected));
+        let denied = hint_answer(&KeyVerificationOutcome::QuorumInconclusive);
+        assert_eq!(denied, full::UnheldAnswer::Absent);
+        assert!(waived(full::Lane::ReplicaHint, denied));
+    }
+
+    #[test]
+    fn an_audit_with_a_digest_mismatch_is_charged_even_from_a_full_peer() {
+        let summary = |absent, mismatch| crate::replication::types::AuditFailureSummary {
+            challenged_keys: 4,
+            failed_keys: absent + mismatch,
+            absent_keys: absent,
+            digest_mismatch_keys: mismatch,
+        };
+        // One absent key and one digest mismatch: charged.
+        let mixed = audit_answer(&AuditFailureReason::KeyAbsent, &summary(1, 1), 2);
+        assert_eq!(mixed, full::UnheldAnswer::Other);
+        assert!(!waived(full::Lane::ResponsibleAudit, mixed));
+        let mismatch = audit_answer(&AuditFailureReason::DigestMismatch, &summary(1, 1), 2);
+        assert_eq!(mismatch, full::UnheldAnswer::Other);
+        // Every failed key absent: waived.
+        let absent = audit_answer(&AuditFailureReason::KeyAbsent, &summary(2, 0), 2);
+        assert_eq!(absent, full::UnheldAnswer::Absent);
+        assert!(waived(full::Lane::ResponsibleAudit, absent));
+        // No failed key at all is never read as absent.
+        let none = audit_answer(&AuditFailureReason::KeyAbsent, &summary(0, 0), 0);
+        assert_eq!(none, full::UnheldAnswer::Other);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Out-of-range clocks across restarts
 // ---------------------------------------------------------------------------
 
@@ -8009,9 +8130,10 @@ async fn open_out_of_range_clocks(
 }
 
 /// Put back the out-of-range clocks of the records still held, as saved
-/// before the restart (see [`erasure`]): each stands for the same wall-clock
-/// start it had. A record no longer held is left out; one back in range is
-/// cleared by the first prune pass, as any is.
+/// before the restart (see [`erasure`]): each keeps the time the node saw it
+/// out of range before the save, and the time since the save doesn't count.
+/// A record no longer held is left out; one back in range is cleared by the
+/// first prune pass, as any is.
 async fn restore_record_clocks(
     clocks: &erasure::OutOfRangeClocks,
     storage: &ChunkStore,
@@ -8030,13 +8152,12 @@ async fn restore_record_clocks(
         }
     };
     let now = Instant::now();
-    let wall_now = SystemTime::now();
     let mut restored = 0usize;
-    for (key, secs) in saved {
+    for (key, secs) in saved.starts {
         if held.contains(&key) {
             paid_list.restore_record_out_of_range(
                 &key,
-                erasure::restored_instant(secs, now, wall_now, hysteresis),
+                erasure::restored_instant(secs, saved.saved_at, now, hysteresis),
             );
             restored += 1;
         }
@@ -8056,18 +8177,19 @@ fn restore_pointer_clocks(
         return;
     }
     let now = Instant::now();
-    let wall_now = SystemTime::now();
-    pointers.restore_out_of_range(saved.into_iter().map(|(address, secs)| {
+    let saved_at = saved.saved_at;
+    pointers.restore_out_of_range(saved.starts.into_iter().map(|(address, secs)| {
         (
             address,
-            erasure::restored_instant(secs, now, wall_now, hysteresis),
+            erasure::restored_instant(secs, saved_at, now, hysteresis),
         )
     }));
 }
 
 /// Save the out-of-range clocks of the records and pointers held, in wall-clock
-/// seconds, in place of those saved before. A write that fails leaves the
-/// earlier list, and is tried again after the next pass.
+/// seconds, with the time of the write, in place of those saved before. A
+/// write that fails leaves the earlier list and its write time, and is tried
+/// again after the next pass.
 async fn save_out_of_range_clocks(
     clocks: &erasure::OutOfRangeClocks,
     paid_list: &PaidList,
@@ -8081,13 +8203,20 @@ async fn save_out_of_range_clocks(
             .map(|(key, since)| (key, erasure::wall_secs(since, now, wall_now)))
             .collect()
     };
+    let saved_at = erasure::wall_secs(now, now, wall_now);
     let records = in_wall_secs(paid_list.record_out_of_range_entries());
-    if let Err(e) = clocks.save(erasure::ClockKind::Records, records).await {
+    if let Err(e) = clocks
+        .save(erasure::ClockKind::Records, saved_at, records)
+        .await
+    {
         warn!("Could not save the records' out-of-range clocks: {e}");
     }
     if let Some(pointers) = pointers {
         let saved = in_wall_secs(pointers.out_of_range_clocks());
-        if let Err(e) = clocks.save(erasure::ClockKind::Pointers, saved).await {
+        if let Err(e) = clocks
+            .save(erasure::ClockKind::Pointers, saved_at, saved)
+            .await
+        {
             warn!("Could not save the pointers' out-of-range clocks: {e}");
         }
     }
@@ -9033,16 +9162,11 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     // Full, not faulty: a full source that only denied holding a key it
                     // hinted, in the one case the waiver allows, is not
                     // charged. A hint the close group rejected is.
-                    let answer = if matches!(outcome, KeyVerificationOutcome::QuorumFailed) {
-                        full::UnheldAnswer::Other
-                    } else {
-                        full::UnheldAnswer::Absent
-                    };
                     let case = full::UnheldCase {
                         lane: full::Lane::ReplicaHint,
                         peer: &source,
                         key: &key,
-                        answer,
+                        answer: hint_answer(&outcome),
                         commitment_pinned: false,
                         own_quote: full::OwnQuote::NoProof,
                     };
@@ -10030,20 +10154,17 @@ async fn handle_audit_result(
                 // Full, not faulty: an audit a full peer failed only by lacking keys, each in
                 // the one case the waiver allows, is not charged. Any key failed
                 // otherwise charges the audit.
-                let only_absent = *reason == AuditFailureReason::KeyAbsent
-                    && summary.digest_mismatch_keys == 0
-                    && summary.absent_keys == confirmed_failed_keys.len()
-                    && !confirmed_failed_keys.is_empty();
+                let answer = audit_answer(reason, summary, confirmed_failed_keys.len());
                 let view = full::view_for(p2p_node.peer_id());
                 let now = Instant::now();
-                let waived = only_absent
+                let waived = answer == full::UnheldAnswer::Absent
                     && confirmed_failed_keys.iter().all(|key| {
                         view.waives_unheld_penalty(
                             &full::UnheldCase {
                                 lane: full::Lane::ResponsibleAudit,
                                 peer: challenged_peer,
                                 key,
-                                answer: full::UnheldAnswer::Absent,
+                                answer,
                                 commitment_pinned: false,
                                 own_quote: full::OwnQuote::NoProof,
                             },

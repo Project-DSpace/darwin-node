@@ -462,7 +462,7 @@ async fn the_possession_check_penalises_only_a_member_that_dropped_the_record() 
     let keeper_before = checker_p2p.peer_trust(&keeper_peer);
 
     replication(checker_node)
-        .check_possession(record.state(), &[dropper_peer, keeper_peer])
+        .check_possession(record.state(), &[dropper_peer, keeper_peer], None)
         .await;
 
     assert!(
@@ -472,6 +472,74 @@ async fn the_possession_check_penalises_only_a_member_that_dropped_the_record() 
     assert!(
         checker_p2p.peer_trust(&keeper_peer) >= keeper_before,
         "the member that holds the record was penalised"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Full, not faulty: a new pointer written near a full node (one whose "full"
+/// notice is fresh, and that refused the offer, so it holds no state of the
+/// pointer) costs that node nothing in the possession check after the write,
+/// when it wasn't paid for the write. A member that isn't full and lacks the
+/// pointer is still penalised, and so is the full one if it was paid.
+#[tokio::test]
+#[serial]
+async fn the_pointer_possession_check_does_not_penalise_a_full_member_for_a_new_pointer() {
+    use ant_node::replication::full;
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let record = signed(&pk, &sk, 0, 1);
+    let checker = 3;
+    let full_member = 1;
+    let lacking = 2;
+    for i in others(&harness, &[full_member, lacking]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put");
+    }
+
+    // The checker only asks peers that understand pointers.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[checker]).await;
+
+    let checker_node = harness.test_node(checker).expect("node");
+    let checker_p2p = checker_node.p2p_node.as_ref().expect("p2p");
+    let full_peer = peer(harness.test_node(full_member).expect("node"));
+    let lacking_peer = peer(harness.test_node(lacking).expect("node"));
+    full::view_for(&peer(checker_node)).marks.note_notice(
+        full_peer,
+        true,
+        std::time::Instant::now(),
+    );
+    let full_before = checker_p2p.peer_trust(&full_peer);
+    let lacking_before = checker_p2p.peer_trust(&lacking_peer);
+
+    // Neither was among the write's paid quotes.
+    let paid: Vec<PeerId> = Vec::new();
+    replication(checker_node)
+        .check_possession(record.state(), &[full_peer, lacking_peer], Some(&paid))
+        .await;
+    assert!(
+        checker_p2p.peer_trust(&full_peer) >= full_before,
+        "the full member was penalised for a new pointer it couldn't take"
+    );
+    assert!(
+        checker_p2p.peer_trust(&lacking_peer) < lacking_before,
+        "the member that isn't full and lacks the pointer was not penalised"
+    );
+
+    // Paid for the write, the full member is charged like any other.
+    let full_before = checker_p2p.peer_trust(&full_peer);
+    replication(checker_node)
+        .check_possession(record.state(), &[full_peer], Some(&[full_peer]))
+        .await;
+    assert!(
+        checker_p2p.peer_trust(&full_peer) < full_before,
+        "the full member paid for the write was not penalised"
     );
 
     harness.teardown().await.expect("teardown");
@@ -719,7 +787,7 @@ async fn the_possession_check_does_not_penalise_the_other_side_of_a_fork() {
     let dropper_before = checker_p2p.peer_trust(&dropper_peer);
 
     replication(checker_node)
-        .check_possession(one_side.state(), &[forked_peer, dropper_peer])
+        .check_possession(one_side.state(), &[forked_peer, dropper_peer], None)
         .await;
 
     assert!(

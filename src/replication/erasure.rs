@@ -31,10 +31,14 @@
 //! The clock that starts when a record or pointer leaves the node's range is
 //! kept, in wall-clock seconds, in a small database of its own
 //! ([`OutOfRangeClocks`], `{root}/out_of_range.mdb`, not inside the paid
-//! list's), written at the end of each pass and loaded at start. A record
-//! still out of range keeps its time, one back in range or no longer held is
-//! cleared, a time in the future counts as now, and a missing or unreadable
-//! table starts every clock now, as before.
+//! list's), written at the end of each pass with the time of the write, and
+//! loaded at start. A restored clock counts only the time the node saw before
+//! that write: a restart neither resets the wait nor adds the time the node
+//! was down, and a table left from before a rollback to a release that
+//! doesn't write it can't make a record eligible early. A record still out of
+//! range keeps its seen time, one back in range or no longer held is cleared,
+//! a start after the write counts as now, and a missing, unreadable or
+//! older-layout table starts every clock now, as before.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -352,8 +356,13 @@ pub const OUT_OF_RANGE_DB: &str = "out_of_range.mdb";
 /// LMDB map size for the clocks: 40 bytes an entry, so room for millions.
 const MAP_SIZE: usize = 256 * 1024 * 1024;
 
-/// The layout of one saved list: this byte, then 40-byte entries.
-const FORMAT_VERSION: u8 = 1;
+/// The layout of one saved list: this byte, the write's time in big-endian
+/// Unix seconds, then 40-byte entries. Version 1 had no write time; a list of
+/// that layout starts every clock now.
+const FORMAT_VERSION: u8 = 2;
+
+/// Bytes of the header after the version byte: the write's Unix seconds.
+const SAVED_AT_LEN: usize = 8;
 
 /// Bytes of one entry: the key, then big-endian Unix seconds.
 const ENTRY_LEN: usize = 32 + 8;
@@ -373,6 +382,24 @@ impl ClockKind {
             Self::Records => b"records",
             Self::Pointers => b"pointers",
         }
+    }
+}
+
+/// One saved list: when it was written, and each clock's start, both in
+/// Unix seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedClocks {
+    /// Unix seconds of the write.
+    pub saved_at: u64,
+    /// Each clock's start, in Unix seconds, by key.
+    pub starts: HashMap<XorName, u64>,
+}
+
+impl SavedClocks {
+    /// Whether no clock was saved.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.starts.is_empty()
     }
 }
 
@@ -421,10 +448,10 @@ impl OutOfRangeClocks {
         .map_err(|e| Error::Storage(format!("Out-of-range table task failed: {e}")))?
     }
 
-    /// The saved clocks of `kind`, as Unix seconds by key. Empty when none
-    /// were saved or the list can't be read.
+    /// The saved clocks of `kind`, with the time they were written. Empty
+    /// when none were saved or the list can't be read.
     #[must_use]
-    pub fn load(&self, kind: ClockKind) -> HashMap<XorName, u64> {
+    pub fn load(&self, kind: ClockKind) -> SavedClocks {
         let read = || -> Option<Vec<u8>> {
             let rtxn = self.env.read_txn().ok()?;
             self.db
@@ -433,19 +460,26 @@ impl OutOfRangeClocks {
                 .flatten()
                 .map(<[u8]>::to_vec)
         };
-        read().map_or_else(HashMap::new, |bytes| decode_clocks(&bytes))
+        read().map_or_else(SavedClocks::default, |bytes| decode_clocks(&bytes))
     }
 
-    /// Save the clocks of `kind`, in place of those saved before.
+    /// Save the clocks of `kind`, written at `saved_at` Unix seconds, in
+    /// place of those saved before.
     ///
     /// # Errors
     ///
-    /// When the write fails; the clocks saved before stay.
-    pub async fn save(&self, kind: ClockKind, clocks: Vec<(XorName, u64)>) -> Result<()> {
+    /// When the write fails; the clocks saved before stay, with their own
+    /// write time.
+    pub async fn save(
+        &self,
+        kind: ClockKind,
+        saved_at: u64,
+        clocks: Vec<(XorName, u64)>,
+    ) -> Result<()> {
         let env = self.env.clone();
         let db = self.db;
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let bytes = encode_clocks(&clocks);
+            let bytes = encode_clocks(saved_at, &clocks);
             let mut wtxn = env
                 .write_txn()
                 .map_err(|e| Error::Storage(format!("Failed to begin a write: {e}")))?;
@@ -459,9 +493,10 @@ impl OutOfRangeClocks {
     }
 }
 
-fn encode_clocks(clocks: &[(XorName, u64)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(1 + clocks.len() * ENTRY_LEN);
+fn encode_clocks(saved_at: u64, clocks: &[(XorName, u64)]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(1 + SAVED_AT_LEN + clocks.len() * ENTRY_LEN);
     bytes.push(FORMAT_VERSION);
+    bytes.extend_from_slice(&saved_at.to_be_bytes());
     for (key, secs) in clocks {
         bytes.extend_from_slice(key);
         bytes.extend_from_slice(&secs.to_be_bytes());
@@ -469,17 +504,21 @@ fn encode_clocks(clocks: &[(XorName, u64)]) -> Vec<u8> {
     bytes
 }
 
-fn decode_clocks(bytes: &[u8]) -> HashMap<XorName, u64> {
-    let Some((&FORMAT_VERSION, entries)) = bytes.split_first() else {
+fn decode_clocks(bytes: &[u8]) -> SavedClocks {
+    let Some((&FORMAT_VERSION, body)) = bytes.split_first() else {
         debug!("Out-of-range clocks of an unknown layout; every clock starts now");
-        return HashMap::new();
+        return SavedClocks::default();
+    };
+    let Some((saved_at, entries)) = body.split_first_chunk::<SAVED_AT_LEN>() else {
+        warn!("Out-of-range clocks are truncated; every clock starts now");
+        return SavedClocks::default();
     };
     let (entries, rest) = entries.as_chunks::<ENTRY_LEN>();
     if !rest.is_empty() {
         warn!("Out-of-range clocks are truncated; every clock starts now");
-        return HashMap::new();
+        return SavedClocks::default();
     }
-    entries
+    let starts = entries
         .iter()
         .filter_map(|entry| {
             let (key, secs) = entry.split_at(32);
@@ -488,7 +527,11 @@ fn decode_clocks(bytes: &[u8]) -> HashMap<XorName, u64> {
                 u64::from_be_bytes(secs.try_into().ok()?),
             ))
         })
-        .collect()
+        .collect();
+    SavedClocks {
+        saved_at: u64::from_be_bytes(*saved_at),
+        starts,
+    }
 }
 
 /// Unix seconds of the wall-clock time `since` stands for, measured against
@@ -503,24 +546,22 @@ pub fn wall_secs(since: Instant, now: Instant, wall_now: SystemTime) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The instant a saved clock of `saved_secs` Unix seconds stands for,
-/// measured against `now` and `wall_now`.
+/// The instant a saved clock that started at `start_secs` stands for, in a
+/// list written at `saved_at` (both Unix seconds), as of `now`.
 ///
-/// A time in the future counts as now. Where the platform's monotonic clock
-/// can't reach that far back (a host up for less than the time elapsed, off
-/// Linux), the earliest of the elapsed time and `cap` that it can reach, else
-/// now.
+/// Only the time the node saw before the write counts: `now - (saved_at -
+/// start_secs)`. The time between the write and `now` (the node down, or
+/// running a release that doesn't keep the table) doesn't, since nothing
+/// checked then that the key stayed out of range. A start after the write (a
+/// wall clock that moved back) counts as now. Where the platform's monotonic
+/// clock can't reach that far back (a host up for less than the seen time,
+/// off Linux), the earliest of the seen time and `cap` that it can reach,
+/// else now.
 #[must_use]
-pub fn restored_instant(
-    saved_secs: u64,
-    now: Instant,
-    wall_now: SystemTime,
-    cap: Duration,
-) -> Instant {
-    let saved = UNIX_EPOCH + Duration::from_secs(saved_secs);
-    let elapsed = wall_now.duration_since(saved).unwrap_or(Duration::ZERO);
-    now.checked_sub(elapsed)
-        .or_else(|| now.checked_sub(elapsed.min(cap)))
+pub fn restored_instant(start_secs: u64, saved_at: u64, now: Instant, cap: Duration) -> Instant {
+    let seen = Duration::from_secs(saved_at.saturating_sub(start_secs));
+    now.checked_sub(seen)
+        .or_else(|| now.checked_sub(seen.min(cap)))
         .unwrap_or(now)
 }
 
@@ -799,14 +840,22 @@ mod tests {
     #[test]
     fn the_clocks_round_trip_and_a_bad_layout_starts_them_now() {
         let clocks = vec![(key(1), 1_700_000_000), (key(2), 42)];
-        let decoded = decode_clocks(&encode_clocks(&clocks));
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded.get(&key(1)), Some(&1_700_000_000));
+        let decoded = decode_clocks(&encode_clocks(1_700_000_100, &clocks));
+        assert_eq!(decoded.saved_at, 1_700_000_100);
+        assert_eq!(decoded.starts.len(), 2);
+        assert_eq!(decoded.starts.get(&key(1)), Some(&1_700_000_000));
         assert!(decode_clocks(&[]).is_empty());
         assert!(decode_clocks(&[9, 1, 2]).is_empty());
-        let mut truncated = encode_clocks(&clocks);
+        assert!(decode_clocks(&[FORMAT_VERSION, 1, 2]).is_empty());
+        let mut truncated = encode_clocks(1, &clocks);
         truncated.pop();
         assert!(decode_clocks(&truncated).is_empty());
+        // A list of the first layout, with no write time, starts every clock
+        // now.
+        let mut v1 = vec![1u8];
+        v1.extend_from_slice(&key(1));
+        v1.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+        assert!(decode_clocks(&v1).is_empty());
     }
 
     #[test]
@@ -814,14 +863,31 @@ mod tests {
         let now = Instant::now();
         // Unix second 1_800_000_000.
         let wall_now = UNIX_EPOCH + Duration::from_hours(500_000);
+        let saved_at = wall_secs(now, now, wall_now);
+        assert_eq!(saved_at, 1_800_000_000);
         let since = now.checked_sub(Duration::from_hours(1)).unwrap();
         let secs = wall_secs(since, now, wall_now);
         assert_eq!(secs, 1_800_000_000 - 3600);
-        let back = restored_instant(secs, now, wall_now, Duration::from_hours(24));
+        let back = restored_instant(secs, saved_at, now, Duration::from_hours(24));
         assert_eq!(now.duration_since(back), Duration::from_hours(1));
-        // A time in the future counts as now.
-        let future = restored_instant(1_900_000_000, now, wall_now, Duration::from_hours(24));
+        // A start after the write (a wall clock that moved back) counts as now.
+        let future = restored_instant(1_900_000_000, saved_at, now, Duration::from_hours(24));
         assert_eq!(future, now);
+    }
+
+    #[test]
+    fn time_after_the_write_does_not_count_toward_the_wait() {
+        // Saved 4 days ago, with a clock that started an hour before that
+        // write: restored, it has waited an hour, not 4 days and an hour.
+        let now = Instant::now();
+        let wall_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let saved_at = wall_now - 4 * 24 * 3600;
+        let start = saved_at - 3600;
+        let back = restored_instant(start, saved_at, now, Duration::from_hours(72));
+        assert_eq!(now.duration_since(back), Duration::from_hours(1));
     }
 
     #[tokio::test]
@@ -830,24 +896,30 @@ mod tests {
         let clocks = OutOfRangeClocks::open(dir.path()).await.unwrap();
         assert!(clocks.load(ClockKind::Records).is_empty());
         clocks
-            .save(ClockKind::Records, vec![(key(1), 100), (key(2), 200)])
+            .save(ClockKind::Records, 250, vec![(key(1), 100), (key(2), 200)])
             .await
             .unwrap();
         clocks
-            .save(ClockKind::Pointers, vec![(key(3), 300)])
+            .save(ClockKind::Pointers, 350, vec![(key(3), 300)])
             .await
             .unwrap();
         drop(clocks);
         let clocks = OutOfRangeClocks::open(dir.path()).await.unwrap();
         let records = clocks.load(ClockKind::Records);
-        assert_eq!(records.get(&key(2)), Some(&200));
-        assert_eq!(clocks.load(ClockKind::Pointers).get(&key(3)), Some(&300));
-        // A later save replaces the list: a cleared clock is gone.
+        assert_eq!(records.saved_at, 250);
+        assert_eq!(records.starts.get(&key(2)), Some(&200));
+        let pointers = clocks.load(ClockKind::Pointers);
+        assert_eq!(pointers.saved_at, 350);
+        assert_eq!(pointers.starts.get(&key(3)), Some(&300));
+        // A later save replaces the list and its write time: a cleared clock
+        // is gone.
         clocks
-            .save(ClockKind::Records, vec![(key(2), 200)])
+            .save(ClockKind::Records, 400, vec![(key(2), 200)])
             .await
             .unwrap();
-        assert_eq!(clocks.load(ClockKind::Records).len(), 1);
+        let records = clocks.load(ClockKind::Records);
+        assert_eq!(records.starts.len(), 1);
+        assert_eq!(records.saved_at, 400);
         assert!(dir.path().join(OUT_OF_RANGE_DB).is_dir());
         assert!(!dir.path().join("paid_list.mdb").exists());
     }

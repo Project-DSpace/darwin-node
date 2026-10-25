@@ -494,17 +494,21 @@ pub enum Lane {
     PossessionFailed,
     /// A prune audit the peer failed.
     PruneAudit,
+    /// The pointer possession check after a write, answered with no state of
+    /// the pointer at all: a new address, which a full node refuses.
+    PointerPossession,
 }
 
 impl Lane {
     /// Every lane, in the census's order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Fetch,
         Self::ResponsibleAudit,
         Self::ReplicaHint,
         Self::PossessionNoAnswer,
         Self::PossessionFailed,
         Self::PruneAudit,
+        Self::PointerPossession,
     ];
 
     /// The lane's name in logs.
@@ -517,6 +521,7 @@ impl Lane {
             Self::PossessionNoAnswer => "possession_no_answer",
             Self::PossessionFailed => "possession_failed",
             Self::PruneAudit => "prune_audit",
+            Self::PointerPossession => "pointer_possession",
         }
     }
 }
@@ -802,6 +807,40 @@ pub fn leave_if_room(
         space.available
     );
     Some(false)
+}
+
+/// At start, once the disk is read, say whether the node is full.
+///
+/// A node's "full" state isn't kept across a restart. With room above the line, log one
+/// "Node full:" line that clears an older "since" line for `nodes status`
+/// (the node prices and takes new data again). At the line, log no clear:
+/// the node enters "full" again at a prune pass that finds nothing it may
+/// erase. Returns whether it is at the line, so the caller tells its peers
+/// once before that pass and their marks don't lapse in between.
+pub fn at_start(retention: &crate::replication::retention::DiskRetention) -> bool {
+    retention.refresh();
+    let Some(space) = retention.last_space() else {
+        return false;
+    };
+    if let Some(trigger) = retention.at_the_line() {
+        crate::logging::info!(
+            free_bytes = space.available,
+            line_bytes = retention.line(),
+            "At the full line by {} at start: the node takes no new data, and enters \"full\" \
+             again at a prune pass that finds nothing it may erase",
+            trigger.as_str()
+        );
+        return true;
+    }
+    crate::logging::info!(
+        full = 0,
+        free_bytes = space.available,
+        line_bytes = retention.line(),
+        "Node full: not at start; {} bytes free, above the full line, so it prices and takes \
+         new data",
+        space.available
+    );
+    false
 }
 
 /// Tell this node's nearest peers that read it whether it is full.

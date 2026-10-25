@@ -1962,11 +1962,7 @@ async fn peer_proves_records(
                     PruneAuditStatus::Absent => "absent",
                     _ => "failed",
                 };
-                let answer = if status == PruneAuditStatus::Absent {
-                    UnheldAnswer::Absent
-                } else {
-                    UnheldAnswer::Other
-                };
+                let answer = prune_answer(status);
                 if !audit_failure_reported
                     && report_prune_audit_failure_once(
                         &peer,
@@ -2298,6 +2294,17 @@ async fn local_record_bytes(key: &XorName, storage: &Arc<ChunkStore>) -> Option<
             );
             None
         }
+    }
+}
+
+/// A prune audit's answer for one key, as the "full" waiver reads it: absent
+/// only for the absent digest. A wrong digest or a refused challenge is
+/// "other", so it is charged.
+fn prune_answer(status: PruneAuditStatus) -> UnheldAnswer {
+    if status == PruneAuditStatus::Absent {
+        UnheldAnswer::Absent
+    } else {
+        UnheldAnswer::Other
     }
 }
 
@@ -4096,6 +4103,34 @@ mod tests {
             .next()
             .map(|(_, status)| status)
             .expect("single-key batch returns exactly one status")
+    }
+
+    #[test]
+    fn an_absent_prune_answer_from_a_full_peer_is_waived_and_a_failed_one_is_not() {
+        let view = full::FullView::default();
+        let peer = peer_id_from_byte(5);
+        let key = key_from_byte(0xC5);
+        view.marks
+            .note_notice(peer, true, std::time::Instant::now());
+        let waived = |status| {
+            view.waives_unheld_penalty(
+                &UnheldCase {
+                    lane: Lane::PruneAudit,
+                    peer: &peer,
+                    key: &key,
+                    answer: prune_answer(status),
+                    commitment_pinned: false,
+                    own_quote: OwnQuote::NoProof,
+                },
+                std::time::Instant::now(),
+            )
+        };
+        assert_eq!(prune_answer(PruneAuditStatus::Absent), UnheldAnswer::Absent);
+        assert!(waived(PruneAuditStatus::Absent));
+        for status in [PruneAuditStatus::Failed, PruneAuditStatus::Rejected] {
+            assert_eq!(prune_answer(status), UnheldAnswer::Other);
+            assert!(!waived(status), "{status:?} is charged");
+        }
     }
 
     #[test]
