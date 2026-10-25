@@ -939,8 +939,8 @@ impl RunningNode {
                                         .unwrap_or_else(|_| chrono::Duration::hours(1));
                                 warn!(
                                     "Upgrade to {version} skipped this cycle: {} MiB free on the \
-                                     disk the node's binary is on, {} MiB needed (the archive and \
-                                     twice the binary); next check at {}",
+                                     disk the node's binary is on, {} MiB needed (twice the archive \
+                                     and twice the binary); next check at {}",
                                     available / crate::storage::MIB,
                                     needed.div_ceil(crate::storage::MIB),
                                     next_check.to_rfc3339()

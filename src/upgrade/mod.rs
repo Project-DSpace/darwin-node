@@ -77,7 +77,7 @@ pub enum UpgradeResult {
     /// The disk lacks the free space the upgrade's own writes need, so this
     /// cycle is skipped; nothing was downloaded or changed.
     NotEnoughSpace {
-        /// Bytes the upgrade needs: the archive plus twice the binary.
+        /// Bytes the upgrade needs: twice the archive and twice the binary.
         needed: u64,
         /// Bytes free on the disk the binary is on.
         available: u64,
