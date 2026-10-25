@@ -1,40 +1,57 @@
-//! Paged neighbour sync's bookkeeping: which peers read pages, and the hints
-//! a responder holds for the paged exchanges in progress.
+//! Paged neighbour sync's bookkeeping: what a node keeps of its exchanges with
+//! each peer, and the hints a responder holds for the paged exchanges in
+//! progress.
 //!
 //! A node pages its hints only to a peer known to read pages (the README's
-//! "Messages between nodes"): one whose user agent names
-//! [`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`] or a later release, or, while it is
-//! not connected, one whose last sync message was a page. Any other peer,
-//! one of unknown release among them, gets a single message.
+//! "Messages between nodes"): one whose connection's user agent names
+//! [`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`] or a later release. Any other peer, one
+//! that isn't connected or of unknown release among them, gets a single
+//! message, which every release reads; sending it connects the peer, so its
+//! next exchange reads a fresh agent. A peer whose first page went unanswered
+//! gets a single message in its next exchange too ([`SyncPeers`]), so an agent
+//! left from a connection that has since ended pages it at most once.
 //!
-//! A node runs one exchange at a time with each peer ([`ExchangesInProgress`]):
+//! A node runs one exchange at a time with each peer ([`SyncPeers::try_start`]):
 //! its bootstrap sync and its sync rounds both sync, and a responder holds one
-//! exchange's hints for each requester.
+//! exchange's hints for each requester. What a node holds of its peers'
+//! answers, across every exchange in progress, is bounded and counted
+//! ([`ReceivedHints`]).
+//!
+//! Hints for a peer that come to more than one exchange carries are sent a
+//! window at a time ([`WindowStart`]): each exchange with the peer, as
+//! requester or responder, takes the next keys of each list, round and round.
 //!
 //! A responder builds its hints for a requester once, at the exchange's first
-//! page, and serves every page of the exchange from them ([`ServedHintSets`]).
-//! What it holds is bounded by [`NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES`], counted,
-//! and dropped after the exchange's last page, when the requester starts
-//! another exchange, or when the requester asks for no page for as long as it
-//! waits for one.
+//! page, keeps only the window it serves, and serves every page of the
+//! exchange from them ([`ServedHintSets`]). What it holds is bounded by
+//! [`NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES`], counted, and dropped after the
+//! exchange's last page, when the requester starts another exchange, or when
+//! the requester asks for no page for as long as it waits for one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::logging::warn;
 use parking_lot::Mutex;
+use rand::Rng;
 use saorsa_core::identity::PeerId;
 
 use crate::replication::config::{
-    NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES, NEIGHBOR_SYNC_PAGES_FROM_RELEASE,
+    MAX_NEIGHBOR_SYNC_PAGES, NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES, NEIGHBOR_SYNC_PAGES_FROM_RELEASE,
+    NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES,
 };
-use crate::replication::neighbor_sync::PeerSyncHints;
+use crate::replication::neighbor_sync::{PeerSyncHints, WindowStart};
 
-/// Most peers whose form of sync is remembered. Only routing-table peers sync,
-/// and a routing-table removal forgets one, so this bounds only what a
-/// lagging event stream could leave behind. A form forgotten this way is
-/// learned again from the peer's agent or its next sync message.
-const MAX_REMEMBERED_FORMS: usize = 4096;
+/// Most peers whose next window, or whose "single message next", a node
+/// keeps. Only routing-table peers sync, and a routing-table removal forgets
+/// one, so this bounds only what a lagging event stream could leave behind.
+/// A window forgotten this way starts again at a random place; a mark
+/// forgotten this way costs one more unanswered page at most.
+const MAX_PEERS_KEPT: usize = 4096;
+
+/// Bytes of one key.
+const KEY_BYTES: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Which peers read pages
@@ -51,6 +68,20 @@ pub(crate) fn pages_from_release() -> u64 {
     NEIGHBOR_SYNC_PAGES_FROM_RELEASE
 }
 
+/// The release a node's version names: `n` of `<version>+ds.<n>`, whatever
+/// the version before it, if it names one.
+#[must_use]
+pub fn release_of(version: &str) -> Option<u64> {
+    semver::Version::parse(version).ok().and_then(|version| {
+        version
+            .build
+            .as_str()
+            .strip_prefix("ds.")
+            .and_then(|release| release.split('.').next())
+            .and_then(|release| release.parse::<u64>().ok())
+    })
+}
+
 /// Whether `user_agent` is a node's of a release that reads paged sync.
 ///
 /// That is `node/<version>+ds.<n>` with `n` at least `from_release`, whatever
@@ -60,89 +91,230 @@ pub(crate) fn pages_from_release() -> u64 {
 pub fn agent_reads_pages(user_agent: &str, from_release: u64) -> bool {
     user_agent
         .strip_prefix("node/")
-        .and_then(|version| semver::Version::parse(version).ok())
-        .and_then(|version| {
-            version
-                .build
-                .as_str()
-                .strip_prefix("ds.")
-                .and_then(|release| release.split('.').next())
-                .and_then(|release| release.parse::<u64>().ok())
-        })
+        .and_then(release_of)
         .is_some_and(|release| release >= from_release)
 }
 
-/// What each peer last showed of whether it reads pages: the agent of its
-/// last connection, or the last sync message it sent, whichever came later.
-#[derive(Debug, Default)]
-pub(crate) struct SyncForms {
-    reads_pages: Mutex<HashMap<PeerId, bool>>,
-}
-
-impl SyncForms {
-    /// Note what `peer` just showed: that it reads pages, or that it doesn't.
-    pub(crate) fn note(&self, peer: PeerId, reads_pages: bool) {
-        let mut forms = self.reads_pages.lock();
-        if forms.len() >= MAX_REMEMBERED_FORMS && !forms.contains_key(&peer) {
-            if let Some(evicted) = forms.keys().next().copied() {
-                forms.remove(&evicted);
-            }
-        }
-        forms.insert(peer, reads_pages);
-    }
-
-    /// Whether `peer` last showed that it reads pages; `false` when it has
-    /// shown nothing.
-    pub(crate) fn reads_pages(&self, peer: &PeerId) -> bool {
-        self.reads_pages.lock().get(peer).copied().unwrap_or(false)
-    }
-
-    /// Forget a peer that left the routing table.
-    pub(crate) fn forget(&self, peer: &PeerId) {
-        self.reads_pages.lock().remove(peer);
-    }
-}
-
 // ---------------------------------------------------------------------------
-// One exchange at a time with each peer
+// What a node keeps of its exchanges with each peer
 // ---------------------------------------------------------------------------
 
-/// The peers this node has an exchange in progress with, as requester.
-///
-/// A node's bootstrap sync and its sync rounds run side by side, and both can
-/// pick the same peer. A responder holds the hints of one exchange for each
-/// requester, so two exchanges with one peer at once would each drop the
-/// other's hints, and both would end busy part way. The second waits its turn
-/// in a later cycle instead.
-#[derive(Debug, Default)]
-pub(crate) struct ExchangesInProgress {
-    peers: Mutex<HashSet<PeerId>>,
+/// What a node keeps of its sync exchanges with each peer: the exchanges in
+/// progress, the peers whose next exchange is a single message, where the
+/// next window of the hints it sends each peer starts, and what it holds of
+/// its peers' answers.
+#[derive(Debug)]
+pub(crate) struct SyncPeers {
+    exchanges: Mutex<HashSet<PeerId>>,
+    single_next: Mutex<HashSet<PeerId>>,
+    windows: Mutex<HashMap<PeerId, WindowStart>>,
+    received: Arc<ReceivedHints>,
 }
 
 /// An exchange in progress with one peer; dropping it ends the exchange.
 #[derive(Debug)]
 pub(crate) struct ExchangeTurn {
-    exchanges: Arc<ExchangesInProgress>,
+    peers: Arc<SyncPeers>,
     peer: PeerId,
 }
 
-impl ExchangesInProgress {
+impl Default for SyncPeers {
+    fn default() -> Self {
+        Self::new(NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES)
+    }
+}
+
+impl SyncPeers {
+    /// No exchanges, holding at most `received_max_bytes` of peers' answers.
+    pub(crate) fn new(received_max_bytes: usize) -> Self {
+        Self {
+            exchanges: Mutex::new(HashSet::new()),
+            single_next: Mutex::new(HashSet::new()),
+            windows: Mutex::new(HashMap::new()),
+            received: Arc::new(ReceivedHints::new(received_max_bytes)),
+        }
+    }
+
     /// Start an exchange with `peer`, unless one is in progress.
+    ///
+    /// A node's bootstrap sync and its sync rounds run side by side, and both
+    /// can pick the same peer. A responder holds the hints of one exchange
+    /// for each requester, so two exchanges with one peer at once would each
+    /// drop the other's hints, and both would end busy part way. The second
+    /// waits its turn in a later cycle instead.
     pub(crate) fn try_start(self: &Arc<Self>, peer: PeerId) -> Option<ExchangeTurn> {
-        if self.peers.lock().insert(peer) {
+        if self.exchanges.lock().insert(peer) {
             Some(ExchangeTurn {
-                exchanges: Arc::clone(self),
+                peers: Arc::clone(self),
                 peer,
             })
         } else {
             None
         }
     }
+
+    /// Send `peer` a single message in its next exchange, whatever its agent
+    /// names: the first page of its last exchange went unanswered.
+    pub(crate) fn mark_single_next(&self, peer: PeerId) {
+        let mut marked = self.single_next.lock();
+        if marked.len() >= MAX_PEERS_KEPT && !marked.contains(&peer) {
+            if let Some(evicted) = marked.iter().next().copied() {
+                marked.remove(&evicted);
+            }
+        }
+        marked.insert(peer);
+    }
+
+    /// Whether `peer`'s next exchange is a single message, as
+    /// [`Self::mark_single_next`] set; the mark is spent on this exchange.
+    pub(crate) fn take_single_next(&self, peer: &PeerId) -> bool {
+        self.single_next.lock().remove(peer)
+    }
+
+    /// The hints this node sends `peer` in one exchange, of at most
+    /// `max_keys` keys: all of them, or, when they come to more, the next
+    /// window of them ([`PeerSyncHints::window`]), from where the last
+    /// exchange with the peer, as requester or responder, left off. Logs a
+    /// warning with both counts when the hints don't all fit.
+    pub(crate) fn window(
+        &self,
+        peer: &PeerId,
+        hints: PeerSyncHints,
+        max_keys: usize,
+    ) -> PeerSyncHints {
+        let (replica_total, paid_total) = (hints.replica.len(), hints.paid.len());
+        let total = replica_total + paid_total;
+        if total <= max_keys {
+            return hints;
+        }
+        let mut windows = self.windows.lock();
+        let start = windows.get(peer).copied().unwrap_or_else(|| {
+            // A peer's first window starts at a random place, so a node that
+            // restarts doesn't send the same keys first every time.
+            let mut rng = rand::thread_rng();
+            WindowStart {
+                replica: rng.gen(),
+                paid: rng.gen(),
+            }
+        });
+        let (window, next) = hints.window(max_keys, start);
+        if let Some(next) = next {
+            if windows.len() >= MAX_PEERS_KEPT && !windows.contains_key(peer) {
+                if let Some(evicted) = windows.keys().next().copied() {
+                    windows.remove(&evicted);
+                }
+            }
+            windows.insert(*peer, next);
+        }
+        drop(windows);
+        warn!(
+            "Neighbor sync with {peer}: {total} hints ({replica_total} replica, {paid_total} \
+             paid), more than one exchange carries; this one carries {} ({} replica, {} paid), \
+             and the next goes on from where it ends",
+            window.replica.len() + window.paid.len(),
+            window.replica.len(),
+            window.paid.len(),
+        );
+        window
+    }
+
+    /// What the node holds of its peers' answers.
+    pub(crate) fn received(&self) -> &Arc<ReceivedHints> {
+        &self.received
+    }
+
+    /// Forget a peer that left the routing table.
+    pub(crate) fn forget(&self, peer: &PeerId) {
+        self.single_next.lock().remove(peer);
+        self.windows.lock().remove(peer);
+    }
 }
 
 impl Drop for ExchangeTurn {
     fn drop(&mut self) {
-        self.exchanges.peers.lock().remove(&self.peer);
+        self.peers.exchanges.lock().remove(&self.peer);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a requester holds of its peers' answers
+// ---------------------------------------------------------------------------
+
+/// The bytes of keys a requester holds of its peers' answers to paged
+/// exchanges, across every exchange in progress: its bootstrap sync's, its
+/// sync round's and their replacements'. An exchange takes a page's keys only
+/// while the total is under the budget, and gives them back once the hints
+/// are admitted.
+#[derive(Debug)]
+pub(crate) struct ReceivedHints {
+    state: Mutex<ReceivedState>,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct ReceivedState {
+    held: usize,
+    most: usize,
+}
+
+/// The keys of a peer's answer one exchange holds against [`ReceivedHints`];
+/// given back when it is dropped.
+#[derive(Debug, Default)]
+pub(crate) struct HeldAnswer {
+    budget: Option<Arc<ReceivedHints>>,
+    bytes: usize,
+}
+
+impl ReceivedHints {
+    /// A budget of `max_bytes` of keys.
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            state: Mutex::new(ReceivedState::default()),
+            max_bytes,
+        }
+    }
+
+    /// Hold up to `keys` more keys for `held`, as many as the budget has room
+    /// for, and return how many it holds.
+    pub(crate) fn hold(self: &Arc<Self>, held: &mut HeldAnswer, keys: usize) -> usize {
+        let mut state = self.state.lock();
+        let room = self.max_bytes.saturating_sub(state.held) / KEY_BYTES;
+        let granted = keys.min(room);
+        let bytes = granted * KEY_BYTES;
+        state.held += bytes;
+        state.most = state.most.max(state.held);
+        drop(state);
+        if held.budget.is_none() {
+            held.budget = Some(Arc::clone(self));
+        }
+        held.bytes += bytes;
+        granted
+    }
+
+    /// Bytes of keys held now.
+    pub(crate) fn held(&self) -> usize {
+        self.state.lock().held
+    }
+
+    /// The most bytes of keys held at once since the node started.
+    pub(crate) fn most_held(&self) -> usize {
+        self.state.lock().most
+    }
+}
+
+impl HeldAnswer {
+    /// Bytes of keys held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for HeldAnswer {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            let mut state = budget.state.lock();
+            state.held = state.held.saturating_sub(self.bytes);
+        }
     }
 }
 
@@ -155,12 +327,29 @@ impl Drop for ExchangeTurn {
 pub(crate) struct ServedHints {
     /// The requester's number for the exchange.
     pub(crate) cycle: u64,
-    /// The hints, built once at the exchange's first page.
+    /// The hints, built once at the exchange's first page: the window of
+    /// them this exchange serves.
     pub(crate) hints: Arc<PeerSyncHints>,
     /// Keys on each of the responder's pages.
     pub(crate) page_keys: usize,
-    /// How many pages the hints take.
+    /// How many pages the hints take: the pages this exchange serves.
     pub(crate) pages: u32,
+    /// How many pages the responder announces: every page its hints for the
+    /// requester take, more than [`Self::pages`] when they come to more than
+    /// an exchange carries ([`crate::replication::neighbor_sync::announced_pages`]).
+    pub(crate) announced: u32,
+}
+
+/// The repair proofs of a page the responder served, held back until the
+/// requester's next request of the exchange shows that the page arrived.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldProofs {
+    /// The hints the page was cut from.
+    pub(crate) hints: Arc<PeerSyncHints>,
+    /// The page.
+    pub(crate) page: u32,
+    /// Keys on each of the responder's pages.
+    pub(crate) page_keys: usize,
 }
 
 #[derive(Debug)]
@@ -171,6 +360,8 @@ struct Held {
     /// Whether a page of the requester's hints, in this exchange, had hints
     /// turned away at the verification queue's capacity.
     inbound_rejected: bool,
+    /// The page whose repair proofs wait for the requester's next request.
+    proofs: Option<u32>,
 }
 
 /// The hint sets a responder holds, one per requester with a paged exchange
@@ -200,7 +391,7 @@ impl HeldSets {
     }
 
     /// Drop every set whose requester has asked for no page for `idle`: it
-    /// gave up on the exchange.
+    /// gave up on the exchange, and proofs held back for it go with it.
     fn sweep(&mut self, now: Instant, idle: Duration) {
         let stale: Vec<PeerId> = self
             .sets
@@ -257,8 +448,9 @@ impl ServedHintSets {
     }
 
     /// Whether a new set may be built: less than the budget is held, or
-    /// nothing is. At most one set per worker is built at once, so what is
-    /// held can pass the budget by that many sets, and no more.
+    /// nothing is. At most one set per worker is built at once, and a set
+    /// holds no more than one exchange serves, so what is held can pass the
+    /// budget by that many sets, and no more.
     pub(crate) fn may_build(&self, now: Instant, idle: Duration) -> bool {
         let mut inner = self.inner.lock();
         inner.sweep(now, idle);
@@ -279,6 +471,7 @@ impl ServedHintSets {
                 bytes,
                 last_used: now,
                 inbound_rejected: false,
+                proofs: None,
             },
         );
     }
@@ -293,6 +486,54 @@ impl ServedHintSets {
         {
             inner.drop_set(peer);
         }
+    }
+
+    /// Hold back the repair proofs of `page` of `peer`'s exchange `cycle`
+    /// until a later request of the exchange arrives, in place of any held
+    /// for it. Nothing is held when the set isn't.
+    pub(crate) fn hold_proofs(&self, peer: &PeerId, cycle: u64, page: u32) {
+        let mut inner = self.inner.lock();
+        if let Some(held) = inner.sets.get_mut(peer) {
+            if held.served.cycle == cycle {
+                held.proofs = Some(page);
+            }
+        }
+    }
+
+    /// Drop the proofs held back for `page` of `peer`'s exchange `cycle`,
+    /// unless they were taken: the page was never sent.
+    pub(crate) fn drop_proofs(&self, peer: &PeerId, cycle: u64, page: u32) {
+        let mut inner = self.inner.lock();
+        if let Some(held) = inner.sets.get_mut(peer) {
+            if held.served.cycle == cycle && held.proofs == Some(page) {
+                held.proofs = None;
+            }
+        }
+    }
+
+    /// The proofs held back for `peer`'s exchange `cycle`, taken: a request
+    /// of the exchange after the page they were held for arrived, which its
+    /// requester sends only once it has that page. Proofs of a set left idle
+    /// are gone, never taken.
+    pub(crate) fn take_proofs(
+        &self,
+        peer: &PeerId,
+        cycle: u64,
+        now: Instant,
+        idle: Duration,
+    ) -> Option<HeldProofs> {
+        let mut inner = self.inner.lock();
+        inner.sweep(now, idle);
+        let held = inner.sets.get_mut(peer)?;
+        if held.served.cycle != cycle {
+            return None;
+        }
+        let page = held.proofs.take()?;
+        Some(HeldProofs {
+            hints: Arc::clone(&held.served.hints),
+            page,
+            page_keys: held.served.page_keys,
+        })
     }
 
     /// Note whether a page of `peer`'s hints in exchange `cycle` had hints
@@ -326,6 +567,24 @@ impl ServedHintSets {
     }
 }
 
+/// The pages an exchange runs, in which the responder announces
+/// `responder_pages` and the requester `requester_pages`: as many as the side
+/// that announces more, and no more than an exchange takes
+/// ([`MAX_NEIGHBOR_SYNC_PAGES`]), the requester following no further.
+pub(crate) fn exchange_rounds(responder_pages: u32, requester_pages: u32) -> u32 {
+    responder_pages
+        .max(requester_pages)
+        .min(MAX_NEIGHBOR_SYNC_PAGES)
+}
+
+/// Whether the repair proofs of the keys on `page` wait for the requester's
+/// next request, in an exchange of `rounds` pages: every page's but the last,
+/// after which the requester sends nothing more, so the last page's keys get
+/// no proofs from this exchange.
+pub(crate) fn proofs_wait_for_next_page(page: u32, rounds: u32) -> bool {
+    page.saturating_add(1) < rounds
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -336,15 +595,34 @@ mod tests {
         PeerId::from_bytes([byte; 32])
     }
 
-    fn served(cycle: u64, keys: usize) -> ServedHints {
+    fn hints(replica: usize, paid: usize) -> PeerSyncHints {
         let snapshot = Arc::new(RoutingSnapshot::new(peer(0), vec![peer(1)]));
         let mut hints = PeerSyncHints::empty(snapshot, 7);
-        hints.replica = vec![[7; 32]; keys];
+        hints.replica = (0..replica)
+            .map(|n| {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                key
+            })
+            .collect();
+        hints.paid = (0..paid)
+            .map(|n| {
+                let mut key = [1u8; 32];
+                key[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                key
+            })
+            .collect();
+        hints
+    }
+
+    fn served(cycle: u64, keys: usize) -> ServedHints {
+        let pages = u32::try_from(keys.div_ceil(2).max(1)).unwrap();
         ServedHints {
             cycle,
-            hints: Arc::new(hints),
+            hints: Arc::new(hints(keys, 0)),
             page_keys: 2,
-            pages: u32::try_from(keys.div_ceil(2).max(1)).unwrap(),
+            pages,
+            announced: pages,
         }
     }
 
@@ -374,6 +652,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_version_names_its_release_after_ds() {
+        assert_eq!(release_of("0.23.0+ds.15"), Some(15));
+        assert_eq!(release_of("0.24.0+ds.17.1"), Some(17));
+        for none in ["0.23.0", "0.23.0+dsx.17", "0.23.0+ds.", "garbage", ""] {
+            assert_eq!(release_of(none), None, "{none:?}");
+        }
+    }
+
     /// The release nodes page to is past ds.15, the release before pages,
     /// whose nodes can't decode them.
     #[test]
@@ -382,47 +669,113 @@ mod tests {
             "node/0.23.0+ds.15",
             NEIGHBOR_SYNC_PAGES_FROM_RELEASE
         ));
-        assert_eq!(NEIGHBOR_SYNC_PAGES_FROM_RELEASE, 17);
+    }
+
+    /// The last release whose nodes read no pages. This tree announced it, by
+    /// its version, until the release that carries pages was cut. When a
+    /// release without pages is cut before it, its number goes here.
+    const LAST_RELEASE_WITHOUT_PAGES: u64 = 15;
+
+    /// The release nodes page from is the one this tree is cut as: nodes of
+    /// this tree page to each other only once their agents name it, and a
+    /// release numbered past it that lacked pages would be paged and never
+    /// answer. So the tree's version names the release before pages (not cut
+    /// yet) or the release nodes page from (the cut). Once that release has
+    /// shipped, this relaxes to "at least the release nodes page from".
+    #[test]
+    fn the_release_nodes_page_from_is_the_one_this_tree_is_cut_as() {
+        let own = release_of(env!("CARGO_PKG_VERSION")).expect("a +ds version");
+        assert!(
+            own == LAST_RELEASE_WITHOUT_PAGES || own == NEIGHBOR_SYNC_PAGES_FROM_RELEASE,
+            "this tree is ds.{own}: nodes page from ds.{NEIGHBOR_SYNC_PAGES_FROM_RELEASE} \
+             (NEIGHBOR_SYNC_PAGES_FROM_RELEASE), and the last release without pages is \
+             ds.{LAST_RELEASE_WITHOUT_PAGES}; set the one that moved"
+        );
+        const { assert!(LAST_RELEASE_WITHOUT_PAGES < NEIGHBOR_SYNC_PAGES_FROM_RELEASE) };
     }
 
     #[test]
-    fn a_peer_reads_pages_as_it_last_showed() {
-        let forms = SyncForms::default();
+    fn a_peer_marked_single_gets_one_single_message() {
+        let peers = SyncPeers::default();
         let a = peer(1);
-        assert!(!forms.reads_pages(&a), "an unknown peer reads none");
-        forms.note(a, true);
-        assert!(forms.reads_pages(&a));
-        // Rolled back: its next connection's agent, or its next message,
-        // shows an older release.
-        forms.note(a, false);
-        assert!(!forms.reads_pages(&a));
-        forms.note(a, true);
-        forms.forget(&a);
-        assert!(!forms.reads_pages(&a));
+        assert!(!peers.take_single_next(&a), "unmarked");
+        peers.mark_single_next(a);
+        assert!(peers.take_single_next(&a), "marked");
+        assert!(!peers.take_single_next(&a), "spent on one exchange");
+        peers.mark_single_next(a);
+        peers.forget(&a);
+        assert!(!peers.take_single_next(&a), "forgotten with the peer");
     }
 
     #[test]
-    fn the_remembered_forms_are_bounded() {
-        let forms = SyncForms::default();
-        for index in 0..=MAX_REMEMBERED_FORMS {
+    fn the_marks_and_windows_kept_are_bounded() {
+        let peers = SyncPeers::default();
+        for index in 0..=MAX_PEERS_KEPT {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            forms.note(PeerId::from_bytes(bytes), true);
+            let id = PeerId::from_bytes(bytes);
+            peers.mark_single_next(id);
+            let _ = peers.window(&id, hints(3, 0), 2);
         }
-        assert_eq!(forms.reads_pages.lock().len(), MAX_REMEMBERED_FORMS);
+        assert_eq!(peers.single_next.lock().len(), MAX_PEERS_KEPT);
+        assert_eq!(peers.windows.lock().len(), MAX_PEERS_KEPT);
     }
 
     #[test]
     fn one_exchange_at_a_time_with_each_peer() {
-        let exchanges = Arc::new(ExchangesInProgress::default());
-        let first = exchanges
-            .try_start(peer(1))
-            .expect("no exchange in progress");
-        assert!(exchanges.try_start(peer(1)).is_none(), "one at a time");
-        let other = exchanges.try_start(peer(2)).expect("other peers are free");
+        let peers = Arc::new(SyncPeers::default());
+        let first = peers.try_start(peer(1)).expect("no exchange in progress");
+        assert!(peers.try_start(peer(1)).is_none(), "one at a time");
+        let other = peers.try_start(peer(2)).expect("other peers are free");
         drop(first);
-        assert!(exchanges.try_start(peer(1)).is_some(), "free once it ends");
+        assert!(peers.try_start(peer(1)).is_some(), "free once it ends");
         drop(other);
+    }
+
+    /// Hints over what one exchange carries are sent a window at a time, the
+    /// next exchange with the peer going on from where the last ended, so
+    /// every key of both lists goes out within the exchanges it takes to go
+    /// round each list once.
+    #[test]
+    fn windows_go_round_every_key_of_a_peer() {
+        let peers = SyncPeers::default();
+        let a = peer(1);
+        let all = hints(500, 100);
+        let max_keys = 256;
+        let (mut replica_seen, mut paid_seen) = (HashSet::new(), HashSet::new());
+        // 213 replica and 43 paid hints a window: 3 windows go round both.
+        for _ in 0..3 {
+            let window = peers.window(&a, all.clone(), max_keys);
+            assert_eq!(window.replica.len() + window.paid.len(), max_keys);
+            assert!(!window.paid.is_empty(), "the paid hints have a share");
+            replica_seen.extend(window.replica.iter().copied());
+            paid_seen.extend(window.paid.iter().copied());
+        }
+        assert_eq!(replica_seen.len(), 500, "every replica hint went out");
+        assert_eq!(paid_seen.len(), 100, "every paid hint went out");
+
+        // Hints that fit go whole, and leave the peer's window where it was.
+        let few = hints(10, 5);
+        let sent = peers.window(&a, few.clone(), max_keys);
+        assert_eq!((sent.replica, sent.paid), (few.replica, few.paid));
+    }
+
+    #[test]
+    fn what_a_requester_holds_of_answers_is_bounded_and_given_back() {
+        // Room for 10 keys.
+        let budget = Arc::new(ReceivedHints::new(320));
+        let mut first = HeldAnswer::default();
+        assert_eq!(budget.hold(&mut first, 6), 6);
+        let mut second = HeldAnswer::default();
+        assert_eq!(budget.hold(&mut second, 6), 4, "only the room left");
+        assert_eq!(budget.hold(&mut second, 1), 0, "none left");
+        assert_eq!((first.bytes(), second.bytes()), (192, 128));
+        assert_eq!(budget.held(), 320);
+        drop(first);
+        assert_eq!(budget.held(), 128, "given back once dropped");
+        drop(second);
+        assert_eq!(budget.held(), 0);
+        assert_eq!(budget.most_held(), 320, "the most held at once");
     }
 
     #[test]
@@ -498,5 +851,87 @@ mod tests {
             !sets.note_inbound(&a, 6, false),
             "another exchange's page is its own"
         );
+    }
+
+    /// A page's repair proofs wait for the requester's next request of the
+    /// exchange: taken once, then gone.
+    #[test]
+    fn a_pages_proofs_are_taken_by_the_next_request_of_its_exchange() {
+        let sets = ServedHintSets::new(1 << 20);
+        let now = Instant::now();
+        let a = peer(1);
+        sets.insert(a, served(5, 10), now);
+        sets.hold_proofs(&a, 5, 0);
+        assert!(
+            sets.take_proofs(&a, 6, now, IDLE).is_none(),
+            "another exchange's request shows nothing of this one"
+        );
+        sets.insert(a, served(5, 10), now);
+        sets.hold_proofs(&a, 5, 2);
+        let taken = sets.take_proofs(&a, 5, now, IDLE).expect("held for page 2");
+        assert_eq!((taken.page, taken.page_keys), (2, 2));
+        assert_eq!(
+            taken.hints.page(taken.page, taken.page_keys).replica,
+            &taken.hints.replica[4..6]
+        );
+        assert!(sets.take_proofs(&a, 5, now, IDLE).is_none(), "taken once");
+    }
+
+    /// Proofs of a page never sent, or of a set its requester left idle, are
+    /// dropped, never recorded.
+    #[test]
+    fn proofs_of_a_page_not_followed_up_are_dropped() {
+        let sets = ServedHintSets::new(1 << 20);
+        let start = Instant::now();
+        let a = peer(1);
+        sets.insert(a, served(5, 10), start);
+        sets.hold_proofs(&a, 5, 1);
+        sets.drop_proofs(&a, 5, 0);
+        assert!(
+            sets.take_proofs(&a, 5, start, IDLE).is_some(),
+            "dropping another page's leaves these"
+        );
+        sets.hold_proofs(&a, 5, 1);
+        sets.drop_proofs(&a, 5, 1);
+        assert!(
+            sets.take_proofs(&a, 5, start, IDLE).is_none(),
+            "the page wasn't sent"
+        );
+
+        sets.hold_proofs(&a, 5, 3);
+        assert!(
+            sets.take_proofs(&a, 5, start + IDLE * 2, IDLE).is_none(),
+            "the requester stopped asking"
+        );
+        assert_eq!(sets.held(), (0, 0));
+    }
+
+    #[test]
+    fn only_the_last_pages_proofs_are_not_held() {
+        assert!(proofs_wait_for_next_page(0, 2));
+        assert!(proofs_wait_for_next_page(254, 256));
+        assert!(!proofs_wait_for_next_page(1, 2), "the last page");
+        assert!(!proofs_wait_for_next_page(0, 1), "a one-page exchange");
+    }
+
+    /// An exchange runs as many pages as the side that announces more, up to
+    /// what an exchange takes: a side announcing more than that (its hints
+    /// come to more than one exchange carries) ends the exchange at its 256th
+    /// page, whose proofs aren't held.
+    #[test]
+    fn an_exchange_runs_the_pages_of_the_side_with_more_up_to_its_bound() {
+        assert_eq!(exchange_rounds(3, 1), 3);
+        assert_eq!(exchange_rounds(1, 5), 5);
+        assert_eq!(exchange_rounds(300, 2), MAX_NEIGHBOR_SYNC_PAGES);
+        assert_eq!(exchange_rounds(2, u32::MAX), MAX_NEIGHBOR_SYNC_PAGES);
+        let rounds = exchange_rounds(300, 2);
+        assert!(proofs_wait_for_next_page(
+            MAX_NEIGHBOR_SYNC_PAGES - 2,
+            rounds
+        ));
+        assert!(!proofs_wait_for_next_page(
+            MAX_NEIGHBOR_SYNC_PAGES - 1,
+            rounds
+        ));
     }
 }

@@ -150,7 +150,8 @@ pub const NEIGHBOR_SYNC_PAGE_BYTES: usize = 8_192 * 32;
 /// To a peer that reads no pages: [`MAX_REPLICATION_MESSAGE_SIZE`] less 1 MiB,
 /// left for the rest of the message and the transport's envelope. A message
 /// nearer the cap can't be built, or is dropped by the receiving transport, so
-/// past this the hints that don't fit wait for the peer to read pages.
+/// hints past this go a window at a time: each exchange with the peer carries
+/// the next keys of each list, from where the last left off.
 pub const NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES: usize =
     MAX_REPLICATION_MESSAGE_SIZE - SINGLE_MESSAGE_HEADROOM_BYTES;
 
@@ -161,10 +162,19 @@ const SINGLE_MESSAGE_HEADROOM_BYTES: usize = 1024 * 1024;
 /// Most pages either side of one paged neighbour-sync exchange takes.
 ///
 /// 256 pages of 8,192 keys, 64 MiB of keys, as much as a responder holds for
-/// exchanges in progress ([`NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES`]). A requester
-/// follows a responder's pages no further, and takes no page of more than
-/// 8,192 keys, so what it gathers in one exchange stays within that too; a
-/// responder serves no page past it. Hints past it wait for a later exchange.
+/// exchanges in progress ([`NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES`]). A side whose
+/// hints for the other come to more sends them a window of 256 pages at a
+/// time, each list its share: each exchange with that peer, as requester or
+/// responder, carries the next keys of each list from where the last left
+/// off, round and round, so every key goes out within the exchanges it takes
+/// to go round once. Its pages announce every page its hints take, so the
+/// other side, having had all 256, knows more are to come: the exchange isn't
+/// complete, and a bootstrapping node doesn't count the side as drained. A
+/// responder holds only the window it serves, and serves
+/// no page past it. A requester follows a responder's pages no further, and
+/// bounds what it gathers in one exchange, not each page: it takes the keys of
+/// 256 pages of 8,192 at most, however the responder cuts them (each page is
+/// bounded only by the message cap), and leaves the rest to a later exchange.
 pub const MAX_NEIGHBOR_SYNC_PAGES: u32 = 256;
 
 /// How long a requester waits for the answer to one sync page.
@@ -180,16 +190,31 @@ pub const NEIGHBOR_SYNC_PAGE_TIMEOUT: Duration =
 
 /// Most bytes of hint sets a responder keeps for paged exchanges in progress.
 ///
-/// One set per requester, each built at the exchange's first page and dropped
-/// after its last. A new exchange that finds this much held is answered busy,
-/// unless no set is held at all.
+/// One set per requester, each built at the exchange's first page, cut to the
+/// window it serves, and dropped after its last. A new exchange that finds
+/// this much held is answered busy, unless no set is held at all. Each set
+/// holds at most 256 pages, and one is built at a time per worker, so what is
+/// held stays under this plus one set per worker.
 pub const NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Most bytes of keys a requester holds of its peers' answers to paged
+/// exchanges, across every exchange in progress: its bootstrap sync's, its
+/// sync round's and their replacements'.
+///
+/// As much as a responder holds for exchanges in progress
+/// ([`NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES`]). An exchange takes no more of a
+/// page than this leaves room for, stops following its peer's pages once it
+/// is spent, and gives its keys back once they are admitted; the peer's other
+/// hints come in a later exchange.
+pub const NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES: usize = NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES;
 
 /// The first release whose nodes read paged neighbour sync.
 ///
 /// Its `+ds.<n>` build number. A node pages its hints to a peer whose user
 /// agent names this release or a later one, and sends a single message to any
-/// other.
+/// other. It must be the release that first carries pages, and every release
+/// numbered from it on must carry them: a test ties it to this tree's version,
+/// and the Release workflow checks the tag and every earlier release tag.
 pub const NEIGHBOR_SYNC_PAGES_FROM_RELEASE: u64 = 17;
 
 const _: () = assert!(

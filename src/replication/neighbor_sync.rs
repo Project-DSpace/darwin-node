@@ -3,19 +3,25 @@
 //! Round-robin cycle management: snapshot close neighbors, iterate through
 //! them in batches of `NEIGHBOR_SYNC_PEER_COUNT`, exchanging hint sets.
 //!
-//! An exchange takes one of two forms, chosen for each exchange from what the
-//! peer last showed of itself ([`sync_form_for`]):
+//! An exchange takes one of two forms, chosen for each exchange from the
+//! agent of the peer's connection ([`sync_form_for`]):
 //!
-//! - **Paged**, with a peer that reads pages: each side's two hint lists are
-//!   cut into pages of at most [`NEIGHBOR_SYNC_PAGE_BYTES`] of keys
-//!   ([`PeerSyncHints::page`]), each page its own request and answer, sent one
-//!   after another, carrying the exchange's number and "page n of N". The
-//!   responder builds its hints for the requester once, at the first page,
-//!   and serves every page from them. A responder that can't take a page
-//!   answers busy, and the requester tries again in a later cycle.
+//! - **Paged**, with a connected peer whose agent names a release that reads
+//!   pages: each side's two hint lists are cut into pages of at most
+//!   [`NEIGHBOR_SYNC_PAGE_BYTES`] of keys ([`PeerSyncHints::page`]), each page
+//!   its own request and answer, sent one after another, carrying the
+//!   exchange's number and "page n of N". The responder builds its hints for
+//!   the requester once, at the first page, and serves every page from them.
+//!   A responder that can't take a page answers busy, and the requester tries
+//!   again in a later cycle. Silence on a page never counts against the peer.
 //! - **Single**, today's one request and one answer, with any other peer: a
-//!   peer of a release before pages, or one whose release isn't known. It
-//!   carries at most [`NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES`] of keys.
+//!   peer of a release before pages, one whose release isn't known, or one
+//!   that isn't connected. It carries at most
+//!   [`NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES`] of keys.
+//!
+//! Hints that come to more than an exchange carries go a window at a time
+//! ([`PeerSyncHints::window`]), each exchange with the peer going on from
+//! where the last ended.
 //!
 //! Every scan of the node's keys computes the close groups it needs locally,
 //! from one [`RoutingSnapshot`] of the routing table, off the async workers.
@@ -41,7 +47,7 @@ use crate::replication::protocol::{
     NeighborSyncPageRequest, NeighborSyncPageResponse, NeighborSyncRequest, ReplicationMessage,
     ReplicationMessageBody,
 };
-use crate::replication::sync_pages::{self, SyncForms};
+use crate::replication::sync_pages::{self, HeldAnswer, ReceivedHints, SyncPeers};
 use crate::replication::types::NeighborSyncState;
 use crate::storage::ChunkStore;
 
@@ -51,10 +57,13 @@ const HINT_BUILD_SLOW_LOG_MS: u128 = 250;
 /// Bytes of one key on a page.
 const KEY_BYTES: usize = 32;
 
-/// Most keys a page of an answer may carry: a page of
-/// [`NEIGHBOR_SYNC_PAGE_BYTES`]. With [`MAX_NEIGHBOR_SYNC_PAGES`], this bounds
-/// what a requester gathers in one exchange.
+/// Keys of a page of [`NEIGHBOR_SYNC_PAGE_BYTES`].
 const MAX_PAGE_KEYS: usize = NEIGHBOR_SYNC_PAGE_BYTES / KEY_BYTES;
+
+/// Most keys a requester gathers of a peer's answer in one exchange:
+/// [`MAX_NEIGHBOR_SYNC_PAGES`] pages of [`NEIGHBOR_SYNC_PAGE_BYTES`], however
+/// the peer cuts its pages.
+const MAX_EXCHANGE_KEYS: usize = MAX_NEIGHBOR_SYNC_PAGES as usize * MAX_PAGE_KEYS;
 
 // ---------------------------------------------------------------------------
 // Routing snapshot
@@ -185,6 +194,7 @@ pub(crate) struct HintPage<'a> {
 
 impl HintPage<'_> {
     /// How many keys the page carries.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.replica.len() + self.paid.len()
     }
@@ -201,9 +211,14 @@ impl PeerSyncHints {
         }
     }
 
+    /// Keys held, of both lists.
+    pub(crate) fn key_count(&self) -> usize {
+        self.replica.len() + self.paid.len()
+    }
+
     /// Bytes of keys held.
     pub(crate) fn bytes(&self) -> usize {
-        (self.replica.len() + self.paid.len()).saturating_mul(KEY_BYTES)
+        self.key_count().saturating_mul(KEY_BYTES)
     }
 
     /// How many pages of `page_keys` keys the hints take: at least one, at
@@ -232,11 +247,46 @@ impl PeerSyncHints {
         self.keys_in(start..start.saturating_add(page_keys))
     }
 
-    /// The hints a single message carries: every one, unless they come to
-    /// more than [`NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES`], then the replica
-    /// hints and then the paid hints up to that.
-    pub(crate) fn single_message(&self) -> HintPage<'_> {
-        self.keys_in(0..NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES / KEY_BYTES)
+    /// Every hint, for a single message.
+    pub(crate) fn all(&self) -> HintPage<'_> {
+        HintPage {
+            replica: &self.replica,
+            paid: &self.paid,
+        }
+    }
+
+    /// The hints one exchange carries, at most `max_keys` of them: all of
+    /// them when they fit; otherwise a window of `max_keys`, each list's share
+    /// in proportion to its length (at least one key of a list that has any),
+    /// each share the list's next keys from `start` on, wrapping round to its
+    /// first. Returns the window, and, when not all fit, where the next
+    /// starts: an exchange with the peer each time the window moves on goes
+    /// round both lists in as many exchanges as it takes to go round once.
+    /// The window's lists are new, so the rest is freed with `self`.
+    pub(crate) fn window(self, max_keys: usize, start: WindowStart) -> (Self, Option<WindowStart>) {
+        let (replica_total, paid_total) = (self.replica.len(), self.paid.len());
+        if replica_total + paid_total <= max_keys {
+            return (self, None);
+        }
+        let (replica_take, paid_take) = window_shares(replica_total, paid_total, max_keys);
+        let window = Self {
+            snapshot: Arc::clone(&self.snapshot),
+            close_group_size: self.close_group_size,
+            replica: take_wrapping(&self.replica, start.replica, replica_take),
+            paid: take_wrapping(&self.paid, start.paid, paid_take),
+        };
+        let next = WindowStart {
+            replica: advance(start.replica, replica_take, replica_total),
+            paid: advance(start.paid, paid_take, paid_total),
+        };
+        (window, Some(next))
+    }
+
+    /// Let go of the lists' spare capacity, so that what is held is what is
+    /// counted.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.replica.shrink_to_fit();
+        self.paid.shrink_to_fit();
     }
 
     /// The keys at `range` of the replica hints followed by the paid hints.
@@ -260,6 +310,58 @@ impl PeerSyncHints {
             close_group_size: self.close_group_size,
             keys: keys.to_vec(),
         }
+    }
+}
+
+/// Where the next window of a peer's hints starts in each list
+/// ([`PeerSyncHints::window`]): a place in the list, taken modulo its length
+/// when the window is cut, so a list that grew or shrank in between still
+/// goes round.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WindowStart {
+    /// In the replica hints.
+    pub(crate) replica: usize,
+    /// In the paid hints.
+    pub(crate) paid: usize,
+}
+
+/// Each list's share of a window of `max_keys` keys, for lists of `replica`
+/// and `paid` keys that come to more: in proportion to their lengths, at least
+/// one key of a list that has any, `max_keys` in all.
+fn window_shares(replica: usize, paid: usize, max_keys: usize) -> (usize, usize) {
+    let total = replica + paid;
+    let replica_take = max_keys.saturating_mul(replica) / total.max(1);
+    if replica > 0 && replica_take == 0 {
+        (1, max_keys.saturating_sub(1).min(paid))
+    } else {
+        (replica_take, (max_keys - replica_take).min(paid))
+    }
+}
+
+/// `count` keys of `list` from `start` (modulo its length) on, wrapping round
+/// to its first.
+fn take_wrapping(list: &[XorName], start: usize, count: usize) -> Vec<XorName> {
+    if list.is_empty() {
+        return Vec::new();
+    }
+    let start = start % list.len();
+    let mut taken = Vec::with_capacity(count.min(list.len()));
+    taken.extend(
+        list[start..]
+            .iter()
+            .chain(list[..start].iter())
+            .take(count)
+            .copied(),
+    );
+    taken
+}
+
+/// Where a window of `count` keys from `start` (modulo `len`) ends, wrapping.
+fn advance(start: usize, count: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (start % len + count % len) % len
     }
 }
 
@@ -308,6 +410,18 @@ pub(crate) async fn build_sync_hints_for_peer(
             close_group_size,
         ),
     }
+}
+
+/// The pages a side announces ("page n of N") for hints of `keys` keys, on
+/// pages of `page_keys`: every page they take, at least one, though one
+/// exchange carries only a window of [`MAX_NEIGHBOR_SYNC_PAGES`] of them
+/// ([`PeerSyncHints::window`]). So a side whose hints come to more announces
+/// more pages than the exchange runs, and the other side, having had every
+/// page the exchange runs, still knows more are to come: it counts the side
+/// as done (a bootstrap source drained, an exchange complete) only once none
+/// are.
+pub(crate) fn announced_pages(keys: usize, page_keys: usize) -> u32 {
+    u32::try_from(keys.div_ceil(page_keys.max(1)).max(1)).unwrap_or(u32::MAX)
 }
 
 /// Keys of one page: [`NEIGHBOR_SYNC_PAGE_BYTES`], or, in a `test-utils`
@@ -579,30 +693,39 @@ pub(crate) enum SyncForm {
     Single,
 }
 
-/// Whether to page this exchange with `peer`, from what the peer last showed
-/// of itself: the user agent of its connection, when it is connected, names
-/// its release; otherwise the last sync message it sent, or the last agent
-/// seen, says whether it reads pages. A peer of unknown release counts as
-/// one that doesn't, so a peer rolled back to an older release gets single
-/// messages again from its next connection or its next message.
+/// Whether to page this exchange with `peer`, from the user agent of its
+/// connection ([`form_for`]). The choice is made again for each exchange, so a
+/// peer rolled back to an older release gets single messages from its next
+/// connection on, and one that comes back to a release that reads pages gets
+/// pages again.
 pub(crate) async fn sync_form_for(
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
-    forms: &SyncForms,
+    sync_peers: &SyncPeers,
 ) -> SyncForm {
-    if let Some(agent) = p2p_node.transport().peer_user_agent(peer).await {
-        let reads = sync_pages::agent_reads_pages(&agent, sync_pages::pages_from_release());
-        forms.note(*peer, reads);
-        return if reads {
+    let agent = p2p_node.transport().peer_user_agent(peer).await;
+    let single_next = sync_peers.take_single_next(peer);
+    form_for(
+        agent.as_deref(),
+        single_next,
+        sync_pages::pages_from_release(),
+    )
+}
+
+/// The form of an exchange with a peer whose connection's agent is `agent`:
+/// pages when the agent names `from_release` or a later one; otherwise a
+/// single message. A peer that isn't connected (no agent) counts as one of
+/// unknown release, which gets a single message: every release reads it, and
+/// sending it connects the peer, so its next exchange reads a fresh agent. So
+/// does a peer marked `single_next`, whose last exchange's first page went
+/// unanswered: an agent left from a connection that has since ended pages it
+/// no more than once.
+pub(crate) fn form_for(agent: Option<&str>, single_next: bool, from_release: u64) -> SyncForm {
+    match agent {
+        Some(agent) if !single_next && sync_pages::agent_reads_pages(agent, from_release) => {
             SyncForm::Paged
-        } else {
-            SyncForm::Single
-        };
-    }
-    if forms.reads_pages(peer) {
-        SyncForm::Paged
-    } else {
-        SyncForm::Single
+        }
+        _ => SyncForm::Single,
     }
 }
 
@@ -615,6 +738,31 @@ pub(crate) enum ExchangeEnd {
     Busy,
     /// A page went unanswered, or its answer wasn't the one asked for.
     Failed,
+    /// This node stopped following the peer's pages: what it gathers in one
+    /// exchange, or holds across its exchanges, was reached. The rest of the
+    /// peer's hints come in a later exchange.
+    Stopped,
+}
+
+/// Whether an exchange puts its peer on the sync cooldown: only one that
+/// ended complete. One that ended part way, busy, failed or stopped after
+/// some pages, leaves the peer to be synced again in its next cycle, as a
+/// first page answered busy does, so the hints of the pages that weren't
+/// exchanged wait no longer than that.
+pub(crate) fn exchange_earns_cooldown(exchange: &SyncExchange) -> bool {
+    exchange.end == ExchangeEnd::Complete
+}
+
+/// Record an exchange the peer answered in `state`: the cooldown, for one
+/// that earns it ([`exchange_earns_cooldown`]).
+pub(crate) fn record_exchange(
+    state: &mut NeighborSyncState,
+    peer: &PeerId,
+    exchange: &SyncExchange,
+) {
+    if exchange_earns_cooldown(exchange) {
+        record_successful_sync(state, peer);
+    }
 }
 
 /// What the peer answered, every answered page's lists joined in page order.
@@ -635,17 +783,95 @@ pub(crate) struct SyncAnswer {
 }
 
 /// One exchange with a peer, as the requester saw it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct SyncExchange {
     /// How it ended.
     pub(crate) end: ExchangeEnd,
-    /// The hints this node had for the peer.
+    /// The hints this node had for the peer in this exchange.
     pub(crate) hints: PeerSyncHints,
     /// How many of `hints.replica`, from the first, went out on a page the
     /// peer answered: the only ones whose repair proof may be recorded.
     pub(crate) replica_answered: usize,
     /// The peer's answer, if it answered a page.
     pub(crate) answer: Option<SyncAnswer>,
+    /// The keys of a paged answer, held against what the node holds of its
+    /// peers' answers until the exchange is dropped, after its hints are
+    /// admitted.
+    #[allow(dead_code)] // Held for its drop, which gives the keys back.
+    pub(crate) held: HeldAnswer,
+}
+
+/// The pages of a peer's answer a requester keeps in one exchange: within
+/// [`MAX_EXCHANGE_KEYS`] for the exchange, and within what the node holds of
+/// its peers' answers across its exchanges ([`ReceivedHints`]).
+#[derive(Debug, Default)]
+pub(crate) struct GatheredAnswer {
+    answer: Option<SyncAnswer>,
+    held: HeldAnswer,
+}
+
+/// One page of a peer's answer.
+#[derive(Debug)]
+pub(crate) struct AnsweredPage {
+    pub(crate) pages: u32,
+    pub(crate) replica_hints: Vec<XorName>,
+    pub(crate) paid_hints: Vec<XorName>,
+    pub(crate) bootstrapping: bool,
+    pub(crate) commitment: Option<StorageCommitment>,
+}
+
+impl GatheredAnswer {
+    /// Keep `page`, as much of it as the bounds leave room for, its replica
+    /// hints first; returns whether all of it was kept. A page is bounded
+    /// only by the message cap, so a peer may cut its pages larger than this
+    /// node does; what is gathered in all stays within the bounds.
+    pub(crate) fn take(&mut self, budget: &Arc<ReceivedHints>, page: AnsweredPage) -> bool {
+        let gathered = self.answer.as_ref().map_or(0, |answer| {
+            answer.replica_hints.len() + answer.paid_hints.len()
+        });
+        let offered = page.replica_hints.len() + page.paid_hints.len();
+        let room = MAX_EXCHANGE_KEYS.saturating_sub(gathered).min(offered);
+        let kept = budget.hold(&mut self.held, room);
+        let AnsweredPage {
+            pages,
+            mut replica_hints,
+            mut paid_hints,
+            bootstrapping,
+            commitment,
+        } = page;
+        if kept < offered {
+            replica_hints.truncate(kept);
+            paid_hints.truncate(kept - replica_hints.len());
+        }
+        match self.answer.as_mut() {
+            None => {
+                self.answer = Some(SyncAnswer {
+                    replica_hints,
+                    paid_hints,
+                    bootstrapping,
+                    commitment,
+                    pages_answered: 1,
+                    pages,
+                });
+            }
+            Some(answer) => {
+                answer.replica_hints.extend(replica_hints);
+                answer.paid_hints.extend(paid_hints);
+                answer.pages_answered += 1;
+            }
+        }
+        kept == offered
+    }
+
+    /// How many pages the peer's hints take, once its first page arrived.
+    pub(crate) fn pages(&self) -> Option<u32> {
+        self.answer.as_ref().map(|answer| answer.pages)
+    }
+
+    /// The answer and its held keys.
+    pub(crate) fn into_parts(self) -> (Option<SyncAnswer>, HeldAnswer) {
+        (self.answer, self.held)
+    }
 }
 
 /// What one exchange saw, for a test to read (`test-utils` builds only).
@@ -710,7 +936,9 @@ impl SyncExchange {
 /// Run one exchange with `peer` in `form`, its pages strictly one after
 /// another. The first page carries `commitment`, the sender's current one,
 /// piggybacked so the receiver can ingest it (ADR-0002: commitment gossip
-/// travels on neighbor sync).
+/// travels on neighbor sync). `hints` are cut to what one exchange in `form`
+/// carries first ([`SyncPeers::window`]); a paged exchange announces the pages
+/// of all of them ([`announced_pages`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn exchange(
     peer: &PeerId,
@@ -720,15 +948,50 @@ pub(crate) async fn exchange(
     hints: PeerSyncHints,
     commitment: Option<StorageCommitment>,
     form: SyncForm,
+    sync_peers: &SyncPeers,
 ) -> SyncExchange {
+    let all_keys = hints.key_count();
+    let hints = sync_peers.window(peer, hints, max_exchange_keys(form));
     match form {
         SyncForm::Single => {
             exchange_single(peer, p2p_node, config, is_bootstrapping, hints, commitment).await
         }
         SyncForm::Paged => {
-            exchange_paged(peer, p2p_node, config, is_bootstrapping, hints, commitment).await
+            exchange_paged(
+                peer,
+                p2p_node,
+                config,
+                is_bootstrapping,
+                hints,
+                all_keys,
+                commitment,
+                sync_peers,
+            )
+            .await
         }
     }
+}
+
+/// Most keys this node sends a peer in one exchange in `form`: 256 pages, or
+/// one single message.
+pub(crate) fn max_exchange_keys(form: SyncForm) -> usize {
+    match form {
+        SyncForm::Paged => (MAX_NEIGHBOR_SYNC_PAGES as usize).saturating_mul(page_keys()),
+        SyncForm::Single => NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES / KEY_BYTES,
+    }
+}
+
+/// Whether a request left unanswered counts against the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Silence {
+    /// saorsa-core's send, which charges the peer for a timeout or a failed
+    /// connection, and connects the peer first if it isn't connected: a
+    /// single message, which every release reads.
+    Charged,
+    /// The transport's own send on the peer's connection, which charges
+    /// nothing: a page, a message type of its own, on which silence, a
+    /// timeout or a reply that doesn't decode never counts against the peer.
+    Free,
 }
 
 /// Send one request and wait for its answer, as a decoded body.
@@ -737,6 +1000,7 @@ async fn request(
     p2p_node: &Arc<P2PNode>,
     body: ReplicationMessageBody,
     timeout: Duration,
+    silence: Silence,
 ) -> Option<ReplicationMessageBody> {
     let msg = ReplicationMessage {
         request_id: rand::thread_rng().gen::<u64>(),
@@ -749,10 +1013,20 @@ async fn request(
             return None;
         }
     };
-    let response = match p2p_node
-        .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
-        .await
-    {
+    let sent = match silence {
+        Silence::Charged => {
+            p2p_node
+                .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
+                .await
+        }
+        Silence::Free => {
+            p2p_node
+                .transport()
+                .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
+                .await
+        }
+    };
+    let response = match sent {
         Ok(response) => response,
         Err(e) => {
             debug!("Sync with {peer} failed: {e}");
@@ -776,23 +1050,23 @@ async fn exchange_single(
     hints: PeerSyncHints,
     commitment: Option<StorageCommitment>,
 ) -> SyncExchange {
-    let sent = hints.single_message();
+    let started = Instant::now();
+    let sent = hints.all();
     let replica_sent = sent.replica.len();
-    if sent.len() < hints.replica.len() + hints.paid.len() {
-        warn!(
-            "Neighbor sync with {peer}: a single message carries {} of {} hints; the rest wait \
-             for the peer to read pages",
-            sent.len(),
-            hints.replica.len() + hints.paid.len()
-        );
-    }
     let body = ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
         replica_hints: sent.replica.to_vec(),
         paid_hints: sent.paid.to_vec(),
         bootstrapping: is_bootstrapping,
         commitment,
     });
-    let answered = request(peer, p2p_node, body, config.verification_request_timeout).await;
+    let answered = request(
+        peer,
+        p2p_node,
+        body,
+        config.verification_request_timeout,
+        Silence::Charged,
+    )
+    .await;
     let answer = match answered {
         Some(ReplicationMessageBody::NeighborSyncResponse(response)) => Some(SyncAnswer {
             replica_hints: response.replica_hints,
@@ -821,6 +1095,7 @@ async fn exchange_single(
         paid_hints_sent = sent.paid.len(),
         replica_hints_received = answer.as_ref().map_or(0, |answer| answer.replica_hints.len()),
         paid_hints_received = answer.as_ref().map_or(0, |answer| answer.paid_hints.len()),
+        elapsed_ms = started.elapsed().as_millis(),
         "Neighbor-sync single exchange"
     );
     SyncExchange {
@@ -828,22 +1103,29 @@ async fn exchange_single(
         replica_answered: if answer.is_some() { replica_sent } else { 0 },
         hints,
         answer,
+        held: HeldAnswer::default(),
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// A paged exchange of `hints`, the window this exchange carries of
+/// `all_keys` hints: its pages announce the pages of all of them.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn exchange_paged(
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
     hints: PeerSyncHints,
+    all_keys: usize,
     mut commitment: Option<StorageCommitment>,
+    sync_peers: &SyncPeers,
 ) -> SyncExchange {
+    let started = Instant::now();
     let cycle = rand::thread_rng().gen::<u64>();
     let page_keys = page_keys();
     let own_pages = hints.page_count(page_keys);
-    let mut answer: Option<SyncAnswer> = None;
+    let announced = announced_pages(all_keys, page_keys).max(own_pages);
+    let mut gathered = GatheredAnswer::default();
     let mut replica_answered = 0usize;
     let mut end = ExchangeEnd::Complete;
     // Pages of each list sent and received, for the exchange's log line.
@@ -852,9 +1134,9 @@ async fn exchange_paged(
 
     let mut page = 0u32;
     loop {
-        let rounds = answer
-            .as_ref()
-            .map_or(own_pages, |answer| own_pages.max(answer.pages));
+        // As many rounds as the side with more pages has, following the
+        // peer's pages no further than an exchange takes.
+        let rounds = sync_pages::exchange_rounds(gathered.pages().unwrap_or(0), own_pages);
         if page >= rounds {
             break;
         }
@@ -862,13 +1144,20 @@ async fn exchange_paged(
         let body = ReplicationMessageBody::NeighborSyncPageRequest(NeighborSyncPageRequest {
             cycle,
             page,
-            pages: own_pages,
+            pages: announced,
             replica_hints: sent.replica.to_vec(),
             paid_hints: sent.paid.to_vec(),
             bootstrapping: is_bootstrapping,
             commitment: commitment.take(),
         });
-        let answered = request(peer, p2p_node, body, config.neighbor_sync_page_timeout).await;
+        let answered = request(
+            peer,
+            p2p_node,
+            body,
+            config.neighbor_sync_page_timeout,
+            Silence::Free,
+        )
+        .await;
         match answered {
             Some(ReplicationMessageBody::NeighborSyncPageResponse(
                 NeighborSyncPageResponse::Page {
@@ -881,26 +1170,16 @@ async fn exchange_paged(
                     commitment: peer_commitment,
                 },
             )) => {
-                let expected_pages = answer.as_ref().map(|answer| answer.pages);
+                let expected_pages = gathered.pages();
                 if echoed_cycle != cycle
                     || echoed_page != page
                     || pages == 0
-                    || pages > MAX_NEIGHBOR_SYNC_PAGES
                     || expected_pages.is_some_and(|expected| expected != pages)
                 {
                     warn!(
                         "Neighbor sync with {peer}: page {page} answered as page {echoed_page} \
                          of {pages} of exchange {echoed_cycle:016x}, not of {cycle:016x}; ending \
                          the exchange"
-                    );
-                    end = ExchangeEnd::Failed;
-                    break;
-                }
-                if replica_hints.len() + paid_hints.len() > MAX_PAGE_KEYS {
-                    warn!(
-                        "Neighbor sync with {peer}: page {page} carries {} keys, more than a \
-                         page holds; ending the exchange",
-                        replica_hints.len() + paid_hints.len()
                     );
                     end = ExchangeEnd::Failed;
                     break;
@@ -918,22 +1197,24 @@ async fn exchange_paged(
                     paid_pages.1 += 1;
                 }
                 replica_answered += sent.replica.len();
-                match answer.as_mut() {
-                    None => {
-                        answer = Some(SyncAnswer {
-                            replica_hints,
-                            paid_hints,
-                            bootstrapping,
-                            commitment: peer_commitment,
-                            pages_answered: 1,
-                            pages,
-                        });
-                    }
-                    Some(answer) => {
-                        answer.replica_hints.extend(replica_hints);
-                        answer.paid_hints.extend(paid_hints);
-                        answer.pages_answered += 1;
-                    }
+                let whole = gathered.take(
+                    sync_peers.received(),
+                    AnsweredPage {
+                        pages,
+                        replica_hints,
+                        paid_hints,
+                        bootstrapping,
+                        commitment: peer_commitment,
+                    },
+                );
+                if !whole {
+                    debug!(
+                        "Neighbor sync with {peer}: page {page} kept in part, at the bounds of \
+                         what an exchange gathers and the node holds of answers; the rest in a \
+                         later exchange"
+                    );
+                    end = ExchangeEnd::Stopped;
+                    break;
                 }
             }
             Some(ReplicationMessageBody::NeighborSyncPageResponse(
@@ -945,17 +1226,36 @@ async fn exchange_paged(
             }
             Some(_) => {
                 warn!("Unexpected response type from {peer} during sync");
+                if page == 0 {
+                    sync_peers.mark_single_next(*peer);
+                }
                 end = ExchangeEnd::Failed;
                 break;
             }
             None => {
+                // A first page left unanswered: the agent it was sent on may
+                // be left from a connection that has ended, and the peer
+                // rolled back. Its next exchange is a single message, which
+                // every release reads.
+                if page == 0 {
+                    sync_peers.mark_single_next(*peer);
+                }
                 end = ExchangeEnd::Failed;
                 break;
             }
         }
         page += 1;
     }
+    // Every round run, yet the peer has pages past those an exchange follows.
+    if end == ExchangeEnd::Complete
+        && gathered
+            .pages()
+            .is_some_and(|pages| pages > MAX_NEIGHBOR_SYNC_PAGES)
+    {
+        end = ExchangeEnd::Stopped;
+    }
 
+    let (answer, held) = gathered.into_parts();
     let (pages_answered, peer_pages, replica_received, paid_received) =
         answer.as_ref().map_or((0, 0, 0, 0), |answer| {
             (
@@ -971,6 +1271,7 @@ async fn exchange_paged(
         cycle,
         end = ?end,
         pages_sent = own_pages,
+        pages_announced = announced,
         pages_received = peer_pages,
         pages_answered,
         replica_hints_sent = hints.replica.len(),
@@ -981,6 +1282,10 @@ async fn exchange_paged(
         paid_pages_sent = paid_pages.0,
         replica_pages_received = replica_pages.1,
         paid_pages_received = paid_pages.1,
+        held_bytes = held.bytes(),
+        received_held_bytes = sync_peers.received().held(),
+        received_most_held_bytes = sync_peers.received().most_held(),
+        elapsed_ms = started.elapsed().as_millis(),
         "Neighbor-sync paged exchange"
     );
 
@@ -989,6 +1294,7 @@ async fn exchange_paged(
         hints,
         replica_answered,
         answer,
+        held,
     }
 }
 
@@ -1025,6 +1331,7 @@ pub fn record_successful_sync(state: &mut NeighborSyncState, peer: &PeerId) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::replication::config::NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES;
     use crate::replication::protocol::NeighborSyncResponse;
     use crate::replication::types::PeerSyncRecord;
     use std::collections::HashMap;
@@ -1974,27 +2281,294 @@ mod tests {
         assert_eq!(hints.page(MAX_NEIGHBOR_SYNC_PAGES, 1).len(), 0);
     }
 
-    /// A single message carries every hint up to its budget: the replica
-    /// hints first.
+    /// A single message carries every hint up to its budget; past it, a
+    /// window of the budget, each list its share.
     #[test]
     fn a_single_message_carries_the_hints_up_to_its_budget() {
+        let budget = max_exchange_keys(SyncForm::Single);
+        assert_eq!(budget, NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES / KEY_BYTES);
         let small = hints_of(5, 6);
-        let all = small.single_message();
-        assert_eq!((all.replica.len(), all.paid.len()), (5, 6));
+        let (all, next) = small.clone().window(budget, WindowStart::default());
+        assert_eq!(
+            (all.replica, all.paid, next),
+            (small.replica, small.paid, None)
+        );
 
-        let budget = NEIGHBOR_SYNC_SINGLE_MESSAGE_BYTES / KEY_BYTES;
         let mut large = hints_of(0, 0);
         large.replica = vec![[1; 32]; budget - 10];
         large.paid = vec![[2; 32]; 30];
-        let sent = large.single_message();
-        assert_eq!(sent.replica.len(), budget - 10);
-        assert_eq!(sent.paid.len(), 10);
-        assert_eq!(sent.len(), budget);
+        let (sent, next) = large.window(budget, WindowStart::default());
+        assert_eq!(sent.replica.len() + sent.paid.len(), budget);
+        assert!(!sent.paid.is_empty(), "the paid hints have their share");
+        assert!(next.is_some(), "the next exchange goes on from there");
     }
 
+    /// Hints over what an exchange carries are cut to a window of exactly
+    /// that many keys, each list's share in proportion to its length, and the
+    /// windows from each one's next start go round every key of both lists
+    /// in as many exchanges as it takes to go round once.
     #[test]
-    fn the_page_size_is_8192_keys() {
-        assert_eq!(NEIGHBOR_SYNC_PAGE_BYTES / KEY_BYTES, 8_192);
+    fn windows_go_round_both_lists() {
+        let all = hints_of(500, 100);
+        let max_keys = 256;
+        let mut start = WindowStart {
+            replica: 777,
+            paid: 1_000_003,
+        };
+        let (mut replica_seen, mut paid_seen) = (HashSet::new(), HashSet::new());
+        // 213 replica hints and 43 paid ones a window: three go round both.
+        for _ in 0..3 {
+            let (window, next) = all.clone().window(max_keys, start);
+            assert_eq!((window.replica.len(), window.paid.len()), (213, 43));
+            assert_eq!(window.bytes(), max_keys * KEY_BYTES);
+            replica_seen.extend(window.replica.iter().copied());
+            paid_seen.extend(window.paid.iter().copied());
+            start = next.expect("not all fit");
+        }
+        assert_eq!(replica_seen.len(), 500);
+        assert_eq!(paid_seen.len(), 100);
+
+        // A window takes each list's next keys in order, wrapping round.
+        let (window, next) = all.clone().window(
+            max_keys,
+            WindowStart {
+                replica: 400,
+                paid: 90,
+            },
+        );
+        let mut replica = all.replica[400..].to_vec();
+        replica.extend_from_slice(&all.replica[..113]);
+        let mut paid = all.paid[90..].to_vec();
+        paid.extend_from_slice(&all.paid[..33]);
+        assert_eq!((window.replica, window.paid), (replica, paid));
+        assert_eq!(
+            next,
+            Some(WindowStart {
+                replica: 113,
+                paid: 33
+            })
+        );
+
+        // One list alone takes the whole window; a list with any keys gets
+        // at least one.
+        let (window, _) = hints_of(300, 0).window(max_keys, WindowStart::default());
+        assert_eq!((window.replica.len(), window.paid.len()), (256, 0));
+        let (window, _) = hints_of(1, 1_000).window(max_keys, WindowStart::default());
+        assert_eq!((window.replica.len(), window.paid.len()), (1, 255));
+    }
+
+    /// What a responder holds for an exchange is at most the pages it
+    /// serves: a set over 256 pages is cut to its window, whose pages carry
+    /// exactly the window's keys; a set that fits is served as it is, page
+    /// for page.
+    #[test]
+    fn a_served_set_holds_no_more_than_its_pages() {
+        let page_keys = 3;
+        let max_keys = MAX_NEIGHBOR_SYNC_PAGES as usize * page_keys;
+        let (window, _) = hints_of(1_000, 200).window(max_keys, WindowStart::default());
+        assert!(window.bytes() <= MAX_NEIGHBOR_SYNC_PAGES as usize * page_keys * KEY_BYTES);
+        assert_eq!(window.page_count(page_keys), MAX_NEIGHBOR_SYNC_PAGES);
+        let mut served = Vec::new();
+        for page in 0..MAX_NEIGHBOR_SYNC_PAGES {
+            let page = window.page(page, page_keys);
+            served.extend_from_slice(page.replica);
+            served.extend_from_slice(page.paid);
+        }
+        let mut held = window.replica.clone();
+        held.extend_from_slice(&window.paid);
+        assert_eq!(served, held, "every key held is served, in order");
+
+        let fits = hints_of(400, 100);
+        let (same, next) = fits.clone().window(max_keys, WindowStart::default());
+        assert!(next.is_none());
+        for page in 0..MAX_NEIGHBOR_SYNC_PAGES {
+            assert_eq!(same.page(page, page_keys), fits.page(page, page_keys));
+        }
+    }
+
+    /// A side announces every page its hints take, though an exchange carries
+    /// a window of 256 of them, so the other side, having had every page the
+    /// exchange runs, knows more are to come.
+    #[test]
+    fn a_side_announces_every_page_its_hints_take() {
+        assert_eq!(announced_pages(0, 8_192), 1, "at least one page");
+        assert_eq!(announced_pages(8_192, 8_192), 1);
+        assert_eq!(announced_pages(8_193, 8_192), 2);
+        assert_eq!(announced_pages(usize::MAX, 1), u32::MAX);
+
+        let page_keys = 3;
+        let all = hints_of(1_000, 200);
+        let announced = announced_pages(all.key_count(), page_keys);
+        assert_eq!(announced, 400);
+        let max_keys = MAX_NEIGHBOR_SYNC_PAGES as usize * page_keys;
+        let (window, _) = all.window(max_keys, WindowStart::default());
+        assert_eq!(window.page_count(page_keys), MAX_NEIGHBOR_SYNC_PAGES);
+        assert!(
+            announced > MAX_NEIGHBOR_SYNC_PAGES,
+            "more than the window serves"
+        );
+
+        let fits = hints_of(4, 1);
+        assert_eq!(
+            announced_pages(fits.key_count(), page_keys),
+            fits.page_count(page_keys),
+            "hints that fit announce the pages they are served on"
+        );
+    }
+
+    /// A peer that isn't connected gets a single message, as does one marked
+    /// after an unanswered first page, for one exchange; a connected peer
+    /// gets pages exactly when its agent names a release that reads them.
+    #[test]
+    fn a_peer_is_paged_only_on_a_paging_agent() {
+        let paging = "node/0.23.0+ds.17";
+        let before = "node/0.23.0+ds.15";
+        assert_eq!(form_for(Some(paging), false, 17), SyncForm::Paged);
+        assert_eq!(form_for(Some(before), false, 17), SyncForm::Single);
+        assert_eq!(form_for(Some(before), false, 15), SyncForm::Paged);
+        assert_eq!(
+            form_for(None, false, 0),
+            SyncForm::Single,
+            "not connected: of unknown release"
+        );
+
+        let peers = SyncPeers::default();
+        let peer = peer_id_from_byte(7);
+        peers.mark_single_next(peer);
+        let next = |peers: &SyncPeers| form_for(Some(paging), peers.take_single_next(&peer), 17);
+        assert_eq!(
+            next(&peers),
+            SyncForm::Single,
+            "after an unanswered first page, a single message"
+        );
+        assert_eq!(next(&peers), SyncForm::Paged, "for one exchange only");
+    }
+
+    fn page_of(keys: usize, pages: u32) -> AnsweredPage {
+        AnsweredPage {
+            pages,
+            replica_hints: vec![[3; 32]; keys / 2],
+            paid_hints: vec![[4; 32]; keys - keys / 2],
+            bootstrapping: false,
+            commitment: None,
+        }
+    }
+
+    /// A requester takes a peer's pages however large the peer cuts them,
+    /// up to what one exchange gathers, and keeps the start of the page that
+    /// passes it, its replica hints first.
+    #[test]
+    fn an_exchange_gathers_pages_of_any_size_up_to_its_bound() {
+        let budget = Arc::new(ReceivedHints::new(2 * MAX_EXCHANGE_KEYS * KEY_BYTES));
+        let mut gathered = GatheredAnswer::default();
+        assert!(
+            gathered.take(&budget, page_of(MAX_PAGE_KEYS + 1_808, 300)),
+            "a page larger than this node's is taken whole"
+        );
+        let mut whole = true;
+        let mut pages = 1;
+        while whole {
+            whole = gathered.take(&budget, page_of(MAX_PAGE_KEYS, 300));
+            pages += 1;
+            assert!(pages <= 300);
+        }
+        let (answer, held) = gathered.into_parts();
+        let answer = answer.expect("answered");
+        assert_eq!(
+            answer.replica_hints.len() + answer.paid_hints.len(),
+            MAX_EXCHANGE_KEYS,
+            "no more than an exchange gathers"
+        );
+        assert_eq!(held.bytes(), MAX_EXCHANGE_KEYS * KEY_BYTES);
+        assert_eq!(answer.pages_answered, pages);
+    }
+
+    /// Four exchanges at once, each with a peer sending 256 full pages,
+    /// hold no more of the answers than the node's budget: each stops
+    /// following its peer once the budget is spent, short of its last page,
+    /// so the peer isn't counted as drained, and gives its keys back once
+    /// dropped.
+    #[test]
+    fn exchanges_at_once_hold_no_more_than_the_budget() {
+        let budget = Arc::new(ReceivedHints::new(NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES));
+        let mut exchanges: Vec<(GatheredAnswer, bool)> =
+            (0..4).map(|_| (GatheredAnswer::default(), true)).collect();
+        for _ in 0..MAX_NEIGHBOR_SYNC_PAGES {
+            for (gathered, following) in &mut exchanges {
+                if *following {
+                    *following =
+                        gathered.take(&budget, page_of(MAX_PAGE_KEYS, MAX_NEIGHBOR_SYNC_PAGES));
+                }
+            }
+            assert!(budget.held() <= NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES);
+        }
+        assert!(budget.most_held() <= NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES);
+        let ended: Vec<SyncExchange> = exchanges
+            .into_iter()
+            .map(|(gathered, following)| {
+                assert!(!following, "stopped short of the peer's last page");
+                let (answer, held) = gathered.into_parts();
+                SyncExchange {
+                    end: ExchangeEnd::Stopped,
+                    hints: hints_of(0, 0),
+                    replica_answered: 0,
+                    answer,
+                    held,
+                }
+            })
+            .collect();
+        for exchange in &ended {
+            assert!(!exchange.received_last_page(), "not drained");
+            assert!(!exchange_earns_cooldown(exchange));
+        }
+        drop(ended);
+        assert_eq!(budget.held(), 0, "given back once the hints are admitted");
+    }
+
+    fn answered(pages_answered: u32, pages: u32) -> SyncAnswer {
+        SyncAnswer {
+            replica_hints: Vec::new(),
+            paid_hints: Vec::new(),
+            bootstrapping: false,
+            commitment: None,
+            pages_answered,
+            pages,
+        }
+    }
+
+    fn exchange_of(end: ExchangeEnd, answer: Option<SyncAnswer>) -> SyncExchange {
+        SyncExchange {
+            end,
+            hints: hints_of(5, 2),
+            replica_answered: 2,
+            answer,
+            held: HeldAnswer::default(),
+        }
+    }
+
+    /// Only a complete exchange puts its peer on the cooldown: one that ended
+    /// part way, busy, failed or stopped, leaves the peer to the next cycle,
+    /// whose snapshot picks it again.
+    #[test]
+    fn only_a_complete_exchange_earns_the_cooldown() {
+        let peer = peer_id_from_byte(9);
+        let cooldown = Duration::from_hours(1);
+        for (end, again) in [
+            (ExchangeEnd::Busy, true),
+            (ExchangeEnd::Failed, true),
+            (ExchangeEnd::Stopped, true),
+            (ExchangeEnd::Complete, false),
+        ] {
+            let pages_answered = if end == ExchangeEnd::Complete { 4 } else { 2 };
+            let exchange = exchange_of(end, Some(answered(pages_answered, 4)));
+            let mut state = NeighborSyncState::new_cycle(vec![peer]);
+            let _ = select_sync_batch(&mut state, 4, cooldown);
+            record_exchange(&mut state, &peer, &exchange);
+            let mut next_cycle = NeighborSyncState::new_cycle(vec![peer]);
+            next_cycle.last_sync_times = state.last_sync_times.clone();
+            let batch = select_sync_batch(&mut next_cycle, 4, cooldown);
+            assert_eq!(batch.contains(&peer), again, "{end:?}");
+        }
     }
 
     /// Only the replica hints of pages the peer answered get repair proofs:
@@ -2002,27 +2576,13 @@ mod tests {
     #[test]
     fn only_the_answered_pages_replica_hints_get_proofs() {
         let hints = hints_of(5, 2);
-        let exchange = SyncExchange {
-            end: ExchangeEnd::Failed,
-            replica_answered: 2,
-            hints: hints.clone(),
-            answer: None,
-        };
+        let exchange = exchange_of(ExchangeEnd::Failed, None);
         assert_eq!(exchange.answered_replica_hints(), &hints.replica[..2]);
         assert!(!exchange.received_last_page());
 
         let complete = SyncExchange {
-            end: ExchangeEnd::Complete,
             replica_answered: 99,
-            hints: hints.clone(),
-            answer: Some(SyncAnswer {
-                replica_hints: Vec::new(),
-                paid_hints: Vec::new(),
-                bootstrapping: false,
-                commitment: None,
-                pages_answered: 1,
-                pages: 1,
-            }),
+            ..exchange_of(ExchangeEnd::Complete, Some(answered(1, 1)))
         };
         assert_eq!(complete.answered_replica_hints(), &hints.replica[..]);
         assert!(complete.received_last_page());
@@ -2032,6 +2592,20 @@ mod tests {
             ..complete
         };
         assert!(!busy.received_last_page(), "busy before the last page");
+        let stopped = SyncExchange {
+            end: ExchangeEnd::Stopped,
+            ..busy
+        };
+        assert!(
+            !stopped.received_last_page(),
+            "stopped before the last page"
+        );
+    }
+
+    #[test]
+    fn the_page_size_is_8192_keys() {
+        assert_eq!(NEIGHBOR_SYNC_PAGE_BYTES / KEY_BYTES, 8_192);
+        assert_eq!(MAX_EXCHANGE_KEYS, 256 * 8_192);
     }
 
     /// The close groups proofs are recorded with are the ones the hints were

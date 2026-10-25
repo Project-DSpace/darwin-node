@@ -99,7 +99,7 @@ use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
 use crate::replication::storage_commitment_audit::PointerBindings;
-use crate::replication::sync_pages::{ExchangesInProgress, ServedHintSets, ServedHints, SyncForms};
+use crate::replication::sync_pages::{HeldProofs, ServedHintSets, ServedHints, SyncPeers};
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
@@ -1174,6 +1174,18 @@ const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING: usize = NEIGHBOR_SYNC_RESPONDER_W
 /// last is answered, and the responder lets the slot go before it answers.
 const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 1;
 
+/// Neighbour-sync requests admitted at once across peers:
+/// [`NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING`], or, in a `test-utils` build,
+/// the limit a test set ([`crate::test_seams::SYNC_ADMISSION_LIMIT`]), so that
+/// a run can push requesters past a responder's limit with a few nodes.
+fn neighbor_sync_admission_limit() -> usize {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(limit) = crate::test_seams::sync_admission_limit() {
+        return limit;
+    }
+    NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING
+}
+
 /// Busy answers to sync page requests in flight at once: as many as requests
 /// admitted. A request refused when this many are already being sent, or
 /// while one to the same peer is, gets no answer, as every refused request
@@ -1831,12 +1843,13 @@ pub struct ReplicationEngine {
     neighbor_sync_busy_replies: Arc<Semaphore>,
     /// Per-peer busy answers in flight, for flood-fair busy answers.
     neighbor_sync_busy_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
-    /// What each peer last showed of whether it reads paged sync.
-    sync_forms: Arc<SyncForms>,
+    /// What this node keeps of its sync exchanges with each peer: those in
+    /// progress, as requester, the peers whose next exchange is a single
+    /// message, where the next window of the hints it sends each starts, and
+    /// what it holds of their answers.
+    sync_peers: Arc<SyncPeers>,
     /// The hints this node holds, as responder, for paged exchanges in progress.
     served_hint_sets: Arc<ServedHintSets>,
-    /// The peers this node has a sync exchange in progress with, as requester.
-    exchanges_in_progress: Arc<ExchangesInProgress>,
     /// Bounded worker permits for expensive fresh-offer handling.
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     /// Admission permits bounding offers running on a worker or queued for one.
@@ -1993,14 +2006,13 @@ impl ReplicationEngine {
                 NEIGHBOR_SYNC_RESPONDER_WORKER_LIMIT,
             )),
             neighbor_sync_responder_admission_semaphore: Arc::new(Semaphore::new(
-                NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+                neighbor_sync_admission_limit(),
             )),
             neighbor_sync_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             neighbor_sync_busy_replies: Arc::new(Semaphore::new(NEIGHBOR_SYNC_BUSY_REPLIES)),
             neighbor_sync_busy_inflight: Arc::new(RwLock::new(HashMap::new())),
-            sync_forms: Arc::new(SyncForms::default()),
+            sync_peers: Arc::new(SyncPeers::default()),
             served_hint_sets: Arc::new(ServedHintSets::default()),
-            exchanges_in_progress: Arc::new(ExchangesInProgress::default()),
             fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
             fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
             fresh_offer_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
@@ -2101,7 +2113,7 @@ impl ReplicationEngine {
     ) -> neighbor_sync::ExchangeReport {
         // Its turn, after any exchange of the sync rounds with the peer.
         let _turn = loop {
-            if let Some(turn) = self.exchanges_in_progress.try_start(*peer) {
+            if let Some(turn) = self.sync_peers.try_start(*peer) {
                 break turn;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2133,6 +2145,7 @@ impl ReplicationEngine {
             hints,
             commitment,
             form,
+            &self.sync_peers,
         )
         .await;
         let report = neighbor_sync::ExchangeReport::of(&exchange, form);
@@ -2172,10 +2185,18 @@ impl ReplicationEngine {
     }
 
     /// Test-only: whether this node would page its next exchange with `peer`.
+    /// Like an exchange, it spends a "single message next" mark.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn pages_to_for_test(&self, peer: &PeerId) -> bool {
-        neighbor_sync::sync_form_for(peer, &self.p2p_node, &self.sync_forms).await
+        neighbor_sync::sync_form_for(peer, &self.p2p_node, &self.sync_peers).await
             == neighbor_sync::SyncForm::Paged
+    }
+
+    /// Test-only: whether this node holds a repair proof that it hinted `key`
+    /// to `peer`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn has_repair_proof_for_test(&self, peer: &PeerId, key: &XorName) -> bool {
+        self.repair_proofs.read().await.has_proof(peer, key)
     }
 
     /// Test-only: take every neighbour-sync admission permit, so that sync
@@ -3248,7 +3269,7 @@ impl ReplicationEngine {
         let neighbor_sync_responder_inflight = Arc::clone(&self.neighbor_sync_responder_inflight);
         let neighbor_sync_busy_replies = Arc::clone(&self.neighbor_sync_busy_replies);
         let neighbor_sync_busy_inflight = Arc::clone(&self.neighbor_sync_busy_inflight);
-        let sync_forms = Arc::clone(&self.sync_forms);
+        let sync_peers = Arc::clone(&self.sync_peers);
         let served_hint_sets = Arc::clone(&self.served_hint_sets);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
         let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
@@ -3304,7 +3325,7 @@ impl ReplicationEngine {
             neighbor_sync_responder_inflight,
             neighbor_sync_busy_replies,
             neighbor_sync_busy_inflight,
-            sync_forms,
+            sync_peers,
             served_hint_sets,
             fresh_offer_worker_semaphore,
             fresh_offer_admission_semaphore,
@@ -3549,7 +3570,7 @@ impl ReplicationEngine {
                                 if let Some(pointers) = &handler_context.pointers {
                                     pointers.forget_peer(&peer_id);
                                 }
-                                handler_context.sync_forms.forget(&peer_id);
+                                handler_context.sync_peers.forget(&peer_id);
                                 handler_context.served_hint_sets.forget(&peer_id);
                                 update_bootstrap_after_peer_removed(
                                     &peer_id,
@@ -3611,8 +3632,7 @@ impl ReplicationEngine {
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let detached_task_tracker = self.detached_task_tracker.clone();
-        let sync_forms = Arc::clone(&self.sync_forms);
-        let exchanges_in_progress = Arc::clone(&self.exchanges_in_progress);
+        let sync_peers = Arc::clone(&self.sync_peers);
         // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
         // (we initiated, they piggybacked theirs). Carry a gossip-audit trigger
         // here too so a peer that only ever answers — never initiates sync —
@@ -3672,8 +3692,7 @@ impl ReplicationEngine {
                         &gossip_audit,
                         pointers.as_ref(),
                         &disk_retention,
-                        &sync_forms,
-                        &exchanges_in_progress,
+                        &sync_peers,
                     ) => {}
                 }
             }
@@ -4313,8 +4332,7 @@ impl ReplicationEngine {
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
-        let sync_forms = Arc::clone(&self.sync_forms);
-        let exchanges_in_progress = Arc::clone(&self.exchanges_in_progress);
+        let sync_peers = Arc::clone(&self.sync_peers);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -4375,7 +4393,7 @@ impl ReplicationEngine {
                 // hints for bootstrap as this one would.
                 let mut planned = Vec::with_capacity(batch.len());
                 for peer in batch {
-                    let Some(turn) = exchanges_in_progress.try_start(*peer) else {
+                    let Some(turn) = sync_peers.try_start(*peer) else {
                         debug!(
                             "Bootstrap sync with {peer}: an exchange with it is in progress \
                              already"
@@ -4396,7 +4414,7 @@ impl ReplicationEngine {
                             .await
                         }
                     };
-                    let form = neighbor_sync::sync_form_for(peer, &p2p, &sync_forms).await;
+                    let form = neighbor_sync::sync_form_for(peer, &p2p, &sync_peers).await;
                     planned.push((*peer, hints, form, turn));
                 }
                 let sync_futures = planned.into_iter().map(|(peer, hints, form, turn)| {
@@ -4407,6 +4425,7 @@ impl ReplicationEngine {
                         .map(|binding| binding.commitment().clone());
                     let p2p = &p2p;
                     let config = &config;
+                    let sync_peers = &sync_peers;
                     async move {
                         let exchange = neighbor_sync::exchange(
                             &peer,
@@ -4416,6 +4435,7 @@ impl ReplicationEngine {
                             hints,
                             commitment,
                             form,
+                            sync_peers,
                         )
                         .await;
                         drop(turn);
@@ -4824,7 +4844,7 @@ struct ReplicationMessageHandlerContext {
     neighbor_sync_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     neighbor_sync_busy_replies: Arc<Semaphore>,
     neighbor_sync_busy_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
-    sync_forms: Arc<SyncForms>,
+    sync_peers: Arc<SyncPeers>,
     served_hint_sets: Arc<ServedHintSets>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_admission_semaphore: Arc<Semaphore>,
@@ -5443,10 +5463,6 @@ async fn handle_replication_message(
             dispatch_paid_notify(*source, notify, ctx, received_at).await
         }
         ReplicationMessageBody::NeighborSyncRequest(request) => {
-            // A single message: whatever its release, the peer is sending
-            // what a node of a release before pages sends, so it gets single
-            // messages until it shows otherwise.
-            ctx.sync_forms.note(*source, false);
             let bootstrapping = *ctx.is_bootstrapping.read().await;
             // Phase-3 storage-bound audit: store the sender's
             // commitment for use as `expected_commitment_hash` in
@@ -7087,7 +7103,7 @@ async fn dispatch_neighbor_sync_request(
         &ctx.neighbor_sync_responder_admission_semaphore,
         &ctx.neighbor_sync_responder_inflight,
         &source,
-        NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+        neighbor_sync_admission_limit(),
         NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
     )
     .await
@@ -7117,6 +7133,7 @@ async fn dispatch_neighbor_sync_request(
     let sync_history = Arc::clone(&ctx.sync_history);
     let sync_cycle_epoch = Arc::clone(&ctx.sync_cycle_epoch);
     let repair_proofs = Arc::clone(&ctx.repair_proofs);
+    let sync_peers = Arc::clone(&ctx.sync_peers);
     let request_timeout = ctx.config.verification_request_timeout;
     let rr_message_id = rr_message_id.map(ToOwned::to_owned);
     ctx.detached_task_tracker.spawn(async move {
@@ -7160,6 +7177,7 @@ async fn dispatch_neighbor_sync_request(
             &sync_history,
             &sync_cycle_epoch,
             &repair_proofs,
+            &sync_peers,
             my_commitment,
             request_id,
             rr_message_id.as_deref(),
@@ -7187,6 +7205,7 @@ async fn handle_neighbor_sync_request(
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
+    sync_peers: &SyncPeers,
     my_commitment: Option<StorageCommitment>,
     request_id: u64,
     rr_message_id: Option<&str>,
@@ -7204,7 +7223,8 @@ async fn handle_neighbor_sync_request(
     let sender_in_rt = p2p_node.dht_manager().is_in_routing_table(source).await;
 
     // Build response (outbound hints): one scan, and a single message, which
-    // is what a requester that sends one reads.
+    // is what a requester that sends one reads: the next window of the hints,
+    // when they come to more than it carries.
     let hints = neighbor_sync::build_sync_hints_for_peer(
         source,
         storage,
@@ -7214,7 +7234,12 @@ async fn handle_neighbor_sync_request(
         config.paid_list_close_group_size,
     )
     .await;
-    let sent = hints.single_message();
+    let hints = sync_peers.window(
+        source,
+        hints,
+        neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Single),
+    );
+    let sent = hints.all();
     let sent_replica_hints = sent.replica.to_vec();
     let response = NeighborSyncResponse {
         replica_hints: sent_replica_hints.clone(),
@@ -7299,6 +7324,11 @@ async fn handle_neighbor_sync_request(
 /// in a later cycle, instead of waiting out its deadline and charging this
 /// node for the silence. Only a peer that sent a page gets these answers, so
 /// every one is a message it reads.
+///
+/// A request after an exchange's first shows that the page before it arrived,
+/// since its requester asks for a page only once the last is answered: the
+/// repair proofs held back for that page are recorded first, whatever this
+/// request is then answered.
 async fn dispatch_neighbor_sync_page(
     source: PeerId,
     request: protocol::NeighborSyncPageRequest,
@@ -7307,8 +7337,16 @@ async fn dispatch_neighbor_sync_page(
     received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // A peer that sends a page reads them.
-    ctx.sync_forms.note(source, true);
+    if request.page > 0 {
+        if let Some(held) = ctx.served_hint_sets.take_proofs(
+            &source,
+            request.cycle,
+            Instant::now(),
+            ctx.config.neighbor_sync_page_timeout,
+        ) {
+            record_held_proofs(source, held, ctx);
+        }
+    }
     if request.page == 0 {
         // As for a single request: the requester's commitment, on the first
         // page only, verified before it is stored.
@@ -7330,7 +7368,7 @@ async fn dispatch_neighbor_sync_page(
         &ctx.neighbor_sync_responder_admission_semaphore,
         &ctx.neighbor_sync_responder_inflight,
         &source,
-        NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+        neighbor_sync_admission_limit(),
         NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
     )
     .await
@@ -7373,6 +7411,24 @@ async fn dispatch_neighbor_sync_page(
         .await;
     });
     Ok(())
+}
+
+/// Record, in the background, the repair proofs held back for a page that
+/// arrived: the replica hints on it.
+fn record_held_proofs(source: PeerId, held: HeldProofs, ctx: &ReplicationMessageHandlerContext) {
+    let repair_proofs = Arc::clone(&ctx.repair_proofs);
+    let sync_cycle_epoch = Arc::clone(&ctx.sync_cycle_epoch);
+    ctx.detached_task_tracker.spawn(async move {
+        let keys = held.hints.page(held.page, held.page_keys).replica.to_vec();
+        record_sent_replica_hints(
+            &source,
+            &held.hints,
+            &keys,
+            &repair_proofs,
+            &sync_cycle_epoch,
+        )
+        .await;
+    });
 }
 
 /// Answer a page request busy in the background, within
@@ -7448,8 +7504,11 @@ async fn send_sync_page_busy(
 ///
 /// The worker and the admission slot are let go before the answer is sent,
 /// so the requester's next page, sent once this answer arrives, finds the
-/// requester's slot free. The proofs of the hints on the page are recorded
-/// only once the answer is sent.
+/// requester's slot free. The repair proofs of the replica hints on the page
+/// are held back until the requester's next request of the exchange shows the
+/// page arrived ([`dispatch_neighbor_sync_page`]); the last page's get none
+/// from the exchange, since nothing follows it. (This node's own exchanges
+/// with the requester record proofs for the same keys when it answers them.)
 #[allow(clippy::too_many_lines)]
 async fn serve_neighbor_sync_page(
     source: PeerId,
@@ -7593,9 +7652,16 @@ async fn serve_neighbor_sync_page(
     } else {
         None
     };
-    let rounds = served.pages.max(request.pages);
-    if page.saturating_add(1) >= rounds {
+    let rounds = sync_pages::exchange_rounds(served.announced, request.pages);
+    let waits = sync_pages::proofs_wait_for_next_page(page, rounds);
+    if !waits {
         ctx.served_hint_sets.finish(&source, cycle);
+    }
+    // Held before the answer goes, so the requester's next request, sent once
+    // the answer arrives, finds them.
+    let holds_proofs = waits && sender_in_rt && !request.bootstrapping && !replica_sent.is_empty();
+    if holds_proofs {
+        ctx.served_hint_sets.hold_proofs(&source, cycle, page);
     }
     debug!(
         target: "ant_node::replication::neighbor_sync",
@@ -7603,6 +7669,7 @@ async fn serve_neighbor_sync_page(
         cycle,
         page,
         pages = served.pages,
+        pages_announced = served.announced,
         requester_pages = request.pages,
         replica_hints = replica_sent.len(),
         paid_hints = paid_sent.len(),
@@ -7611,8 +7678,8 @@ async fn serve_neighbor_sync_page(
     let body = ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Page {
         cycle,
         page,
-        pages: served.pages,
-        replica_hints: replica_sent.clone(),
+        pages: served.announced,
+        replica_hints: replica_sent,
         paid_hints: paid_sent,
         bootstrapping: is_bootstrapping,
         commitment,
@@ -7629,20 +7696,16 @@ async fn serve_neighbor_sync_page(
         None,
     )
     .await;
-    if sent && sender_in_rt && !request.bootstrapping {
-        record_sent_replica_hints(
-            &source,
-            &served.hints,
-            &replica_sent,
-            &ctx.repair_proofs,
-            &ctx.sync_cycle_epoch,
-        )
-        .await;
+    if !sent && holds_proofs {
+        ctx.served_hint_sets.drop_proofs(&source, cycle, page);
     }
 }
 
 /// Build this node's hints for `source`'s exchange `cycle`, once, at its
-/// first page, and hold them for its other pages.
+/// first page, and hold them for its other pages: only the window of them
+/// this exchange serves, at most 256 pages, with no spare capacity. Its pages
+/// announce the pages of all of them
+/// ([`neighbor_sync::announced_pages`]).
 async fn build_served_hints(
     source: &PeerId,
     cycle: u64,
@@ -7659,9 +7722,18 @@ async fn build_served_hints(
     )
     .await;
     let page_keys = neighbor_sync::page_keys();
+    let all_keys = hints.key_count();
+    let mut hints = ctx.sync_peers.window(
+        source,
+        hints,
+        neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Paged),
+    );
+    hints.shrink_to_fit();
+    let pages = hints.page_count(page_keys);
     let served = ServedHints {
         cycle,
-        pages: hints.page_count(page_keys),
+        pages,
+        announced: neighbor_sync::announced_pages(all_keys, page_keys).max(pages),
         page_keys,
         hints: Arc::new(hints),
     };
@@ -7673,10 +7745,12 @@ async fn build_served_hints(
         source = %source,
         cycle,
         pages = served.pages,
+        pages_announced = served.announced,
         replica_hints = served.hints.replica.len(),
         paid_hints = served.hints.paid.len(),
         held_sets,
         held_bytes,
+        received_held_bytes = ctx.sync_peers.received().held(),
         elapsed_ms = started.elapsed().as_millis(),
         "Neighbor-sync hint set built"
     );
@@ -8420,8 +8494,7 @@ async fn run_neighbor_sync_round(
     gossip_audit: &GossipAuditTrigger,
     pointers: Option<&Arc<pointer::PointerReplication>>,
     disk_retention: &retention::DiskRetention,
-    sync_forms: &Arc<SyncForms>,
-    exchanges_in_progress: &Arc<ExchangesInProgress>,
+    sync_peers: &Arc<SyncPeers>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -8484,8 +8557,9 @@ async fn run_neighbor_sync_round(
         let mut state = sync_state.write().await;
         if state.is_cycle_complete() {
             // Preserve cooldown and bootstrap-claim tracking across cycles.
-            // Claims have a 24h lifecycle vs 10-20 min cycles — dropping them
-            // would reset the abuse detection timer every cycle.
+            // Claims have a 24h lifecycle vs cycles of up to five rounds of
+            // 10-20 min each — dropping them would reset the abuse detection
+            // timer every cycle.
             let old_sync_times = std::mem::take(&mut state.last_sync_times);
             let old_bootstrap_claims = std::mem::take(&mut state.bootstrap_claims);
             let old_bootstrap_claim_history = std::mem::take(&mut state.bootstrap_claim_history);
@@ -8538,7 +8612,7 @@ async fn run_neighbor_sync_round(
     for peer in &batch {
         // One exchange at a time with a peer: one in progress already (the
         // bootstrap sync's) leaves this one to a later cycle.
-        let Some(_turn) = exchanges_in_progress.try_start(*peer) else {
+        let Some(_turn) = sync_peers.try_start(*peer) else {
             debug!("Neighbor sync with {peer}: an exchange with it is in progress already");
             sync_state.write().await.remove_peer(peer);
             continue;
@@ -8557,7 +8631,7 @@ async fn run_neighbor_sync_round(
                 .await
             }
         };
-        let form = neighbor_sync::sync_form_for(peer, p2p_node, sync_forms).await;
+        let form = neighbor_sync::sync_form_for(peer, p2p_node, sync_peers).await;
         let exchange = neighbor_sync::exchange(
             peer,
             p2p_node,
@@ -8566,6 +8640,7 @@ async fn run_neighbor_sync_round(
             hints,
             my_commitment.clone(),
             form,
+            sync_peers,
         )
         .await;
 
@@ -8601,11 +8676,8 @@ async fn run_neighbor_sync_round(
             };
 
             // Attempt sync with the replacement peer (if one was found).
-            let replacement = replacement.and_then(|peer| {
-                exchanges_in_progress
-                    .try_start(peer)
-                    .map(|turn| (peer, turn))
-            });
+            let replacement =
+                replacement.and_then(|peer| sync_peers.try_start(peer).map(|turn| (peer, turn)));
             if let Some((replacement_peer, _replacement_turn)) = replacement {
                 let hints = neighbor_sync::build_sync_hints_for_peer(
                     &replacement_peer,
@@ -8617,7 +8689,7 @@ async fn run_neighbor_sync_round(
                 )
                 .await;
                 let form =
-                    neighbor_sync::sync_form_for(&replacement_peer, p2p_node, sync_forms).await;
+                    neighbor_sync::sync_form_for(&replacement_peer, p2p_node, sync_peers).await;
                 let replacement_exchange = neighbor_sync::exchange(
                     &replacement_peer,
                     p2p_node,
@@ -8626,6 +8698,7 @@ async fn run_neighbor_sync_round(
                     hints,
                     my_commitment.clone(),
                     form,
+                    sync_peers,
                 )
                 .await;
 
@@ -8660,7 +8733,9 @@ async fn run_neighbor_sync_round(
 /// Process an exchange the peer answered: record the sync, check for
 /// bootstrap claim abuse, and admit inbound hints, from every page the peer
 /// answered. Only the replica hints this node sent on those pages get repair
-/// proofs.
+/// proofs. Only a complete exchange puts the peer on the sync cooldown
+/// ([`neighbor_sync::exchange_earns_cooldown`]): one that ended part way
+/// leaves the peer to its next cycle, as a first page answered busy does.
 #[allow(clippy::too_many_arguments)]
 async fn handle_sync_response(
     self_id: &PeerId,
@@ -8703,11 +8778,13 @@ async fn handle_sync_response(
         maybe_trigger_gossip_audit(gossip_audit, peer, target).await;
     }
 
-    // Record successful sync.
+    // The cooldown, for a complete exchange only.
     {
         let mut state = sync_state.write().await;
-        neighbor_sync::record_successful_sync(&mut state, peer);
+        neighbor_sync::record_exchange(&mut state, peer, exchange);
     }
+    // Sync history, for a partial exchange too: the peer received the
+    // hints of the pages it answered, and its repair proofs mature with it.
     {
         let mut history = sync_history.write().await;
         let record = history.entry(*peer).or_insert(PeerSyncRecord {

@@ -54,9 +54,14 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// `saorsa-core` admits a peer to the DHT only when its agent starts with `node/`, so a node
 /// that lost the prefix would stop being routed to. The version is this build's rather than
 /// the transport's, because it is the one a peer needs in order to tell which release it is
-/// talking to.
+/// talking to. In a `test-utils` build a test may set the release it names
+/// ([`crate::test_seams::ANNOUNCED_RELEASE`]); nothing else reads that.
 fn user_agent() -> String {
-    format!("node/{}", env!("CARGO_PKG_VERSION"))
+    #[cfg(any(test, feature = "test-utils"))]
+    let version = crate::test_seams::announced_version(env!("CARGO_PKG_VERSION"));
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let version = env!("CARGO_PKG_VERSION");
+    format!("node/{version}")
 }
 
 /// Builder for constructing an Ant node.

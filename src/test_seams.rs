@@ -11,13 +11,17 @@
 //! [`PREFIX`].
 //!
 //! A seam for a value the node doesn't have yet is added here in the change
-//! that brings the value, with the harness's runs that set it, as the paged
-//! neighbour sync's two are, for the `paged` run, whose lists take more than
-//! one page: still to come is how long a "full" notice stays fresh, for a run
-//! in which a node's mark as full lapses. Each is compiled only with
-//! `test-utils` and named under [`PREFIX`], so the Build workflow's check
-//! covers it, and the harness refuses a run that needs a seam with a binary
-//! that lacks it, as it refuses the `full` run without [`FREE_SPACE_FILE`].
+//! that brings the value, with the harness's runs that set it, as paged
+//! neighbour sync's are: the page size, so a run's few records take more than
+//! one page; the release a node announces, so this tree's nodes, which
+//! announce the last release's version until a release is cut, name the
+//! release that reads pages; and the requests a node admits at once, so a few
+//! nodes push a responder past its limit. Still to come is how long a "full"
+//! notice stays fresh, for a run in which a node's mark as full lapses. Each
+//! is compiled only with `test-utils` and named under [`PREFIX`], so the Build
+//! workflow's check covers it, and the harness refuses a run that needs a seam
+//! with a binary that lacks it, as it refuses the `full` run without
+//! [`FREE_SPACE_FILE`].
 
 use std::io;
 use std::path::Path;
@@ -43,6 +47,25 @@ pub const SYNC_PAGE_BYTES: &str = "ANT_TEST_SEAM_SYNC_PAGE_BYTES";
 /// that they page to each other. A value that isn't a whole number is ignored.
 pub const SYNC_PAGES_FROM_RELEASE: &str = "ANT_TEST_SEAM_SYNC_PAGES_FROM_RELEASE";
 
+/// The release this node announces in its user agent.
+///
+/// Its `+ds.<n>` build number, in place of the one in this build's version:
+/// the agent reads `node/<version>+ds.<n>`. Only the agent: the node's
+/// version everywhere else, its upgrades and what it logs and reports, stays
+/// this build's. Nodes built from a tree between releases announce the last
+/// release's version, which reads no pages; the harness sets this to the
+/// release that reads pages on this tree's nodes, so they page to each other
+/// and to no node of the release before. A value that isn't a whole number is
+/// ignored.
+pub const ANNOUNCED_RELEASE: &str = "ANT_TEST_SEAM_ANNOUNCED_RELEASE";
+
+/// Neighbour-sync requests a node admits at once, across peers.
+///
+/// In place of the responder's limit of 8: a whole number, at least 1. A small
+/// limit has a few requesters push a responder past it, so its pages are
+/// answered busy. A value that isn't such a number is ignored.
+pub const SYNC_ADMISSION_LIMIT: &str = "ANT_TEST_SEAM_SYNC_ADMISSION_LIMIT";
+
 /// One key's bytes: the smallest page the page-size seam takes.
 const KEY_BYTES: usize = 32;
 
@@ -64,6 +87,35 @@ fn parse_sync_page_bytes(value: &str) -> Option<usize> {
 pub(crate) fn sync_pages_from_release() -> Option<u64> {
     let value = std::env::var(SYNC_PAGES_FROM_RELEASE).ok()?;
     value.trim().parse::<u64>().ok()
+}
+
+/// `version` as this node announces it: with the release a test set for this
+/// process ([`ANNOUNCED_RELEASE`]) as its `+ds.<n>`, or as it is.
+#[must_use]
+pub fn announced_version(version: &str) -> String {
+    std::env::var(ANNOUNCED_RELEASE)
+        .ok()
+        .and_then(|release| release.trim().parse::<u64>().ok())
+        .map_or_else(
+            || version.to_string(),
+            |release| with_release(version, release),
+        )
+}
+
+/// `version` with `release` as its `+ds.<n>`, in place of any build part.
+fn with_release(version: &str, release: u64) -> String {
+    let base = version.split('+').next().unwrap_or(version);
+    format!("{base}+ds.{release}")
+}
+
+/// The admission limit a test set for this process, if it set a valid one.
+pub(crate) fn sync_admission_limit() -> Option<usize> {
+    let value = std::env::var(SYNC_ADMISSION_LIMIT).ok()?;
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit >= 1)
 }
 
 /// Names a file holding the free space the node reads for its partition.
@@ -172,9 +224,31 @@ mod tests {
 
     #[test]
     fn every_seam_starts_with_the_prefix() {
-        for seam in [FREE_SPACE_FILE, SYNC_PAGE_BYTES, SYNC_PAGES_FROM_RELEASE] {
+        for seam in [
+            FREE_SPACE_FILE,
+            SYNC_PAGE_BYTES,
+            SYNC_PAGES_FROM_RELEASE,
+            ANNOUNCED_RELEASE,
+            SYNC_ADMISSION_LIMIT,
+        ] {
             assert!(seam.starts_with(PREFIX), "{seam}");
         }
+    }
+
+    /// The announced release replaces only the build part of the version, so
+    /// the agent still parses as a node's of that release.
+    #[test]
+    fn an_announced_release_replaces_the_build_part_only() {
+        assert_eq!(with_release("0.23.0+ds.15", 17), "0.23.0+ds.17");
+        assert_eq!(with_release("0.23.0", 17), "0.23.0+ds.17");
+        assert_eq!(with_release("0.24.1+ds.15.2", 18), "0.24.1+ds.18");
+        let agent = format!("node/{}", with_release(env!("CARGO_PKG_VERSION"), 17));
+        assert!(crate::replication::sync_pages::agent_reads_pages(
+            &agent, 17
+        ));
+        assert!(!crate::replication::sync_pages::agent_reads_pages(
+            &agent, 18
+        ));
     }
 
     #[test]

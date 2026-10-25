@@ -538,6 +538,16 @@ impl RepairProofs {
             })
     }
 
+    /// Whether a proof that `peer` was hinted `key` is held, mature or not
+    /// (tests only).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn has_proof(&self, peer: &PeerId, key: &XorName) -> bool {
+        self.proofs_by_key
+            .get(key)
+            .is_some_and(|entry| entry.peer_proofs.contains_key(peer))
+    }
+
     /// Remove all repair proofs for a key, e.g. after local deletion.
     pub fn remove_key(&mut self, key: &XorName) {
         self.proofs_by_key.remove(key);

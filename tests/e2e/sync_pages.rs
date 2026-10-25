@@ -4,20 +4,21 @@
 //! page, and serves each page from them; both hint lists run over several
 //! pages here through the page-size seam (`ANT_TEST_SEAM_SYNC_PAGE_BYTES`, in
 //! `src/test_seams.rs`). A page it can't take is answered busy, never left
-//! unanswered. Whether a node pages to a peer follows the release the peer's
-//! user agent names.
+//! unanswered, and the busy answer costs it none of the requester's trust. The
+//! repair proofs of a page wait for the requester's next page. Whether a node
+//! pages to a peer follows the release the peer's user agent names.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::testnet::TestNetworkConfig;
 use super::TestHarness;
-use ant_node::replication::config::REPLICATION_PROTOCOL_ID;
+use ant_node::replication::config::{NEIGHBOR_SYNC_PAGES_FROM_RELEASE, REPLICATION_PROTOCOL_ID};
 use ant_node::replication::protocol::{
     NeighborSyncPageRequest, NeighborSyncPageResponse, NeighborSyncRequest, ReplicationMessage,
     ReplicationMessageBody,
 };
 use ant_node::storage::XorName;
-use ant_node::test_seams::{SYNC_PAGES_FROM_RELEASE, SYNC_PAGE_BYTES};
+use ant_node::test_seams::{ANNOUNCED_RELEASE, SYNC_PAGES_FROM_RELEASE, SYNC_PAGE_BYTES};
 use ant_node::ReplicationConfig;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
@@ -40,6 +41,12 @@ const BUSY_RETRIES: usize = 20;
 const BUSY_RETRY_PAUSE: Duration = Duration::from_millis(250);
 /// Well inside the requester's wait: a busy answer is sent at once.
 const BUSY_ANSWERED_WITHIN: Duration = Duration::from_secs(5);
+/// How far a trust score may move in a test with no event against the peer:
+/// its decay toward neutral over a few seconds is far less, and one charged
+/// timeout moves it by about 0.06.
+const TRUST_TOLERANCE: f64 = 1e-3;
+/// How long a test waits for repair proofs recorded in the background.
+const PROOFS_WITHIN: Duration = Duration::from_secs(10);
 
 /// Sets a seam for the test, and clears it when the test ends, passing or not.
 struct Seam(&'static str);
@@ -87,6 +94,45 @@ fn page_request(cycle: u64, page: u32) -> ReplicationMessageBody {
         bootstrapping: false,
         commitment: None,
     })
+}
+
+/// This build's release: `n` of its `+ds.<n>` version.
+fn own_release() -> u64 {
+    env!("CARGO_PKG_VERSION")
+        .split("+ds.")
+        .nth(1)
+        .and_then(|release| release.split('.').next())
+        .and_then(|release| release.parse().ok())
+        .expect("a +ds version")
+}
+
+/// Whether `node` holds a repair proof that it hinted `key` to `peer`, waiting
+/// up to [`PROOFS_WITHIN`] for proofs recorded in the background when
+/// `expected`.
+async fn proof_held(
+    harness: &TestHarness,
+    node: usize,
+    peer: &PeerId,
+    key: &XorName,
+    expected: bool,
+) -> bool {
+    let engine = harness
+        .test_node(node)
+        .and_then(|node| node.replication_engine.as_ref())
+        .expect("engine");
+    let deadline = Instant::now()
+        + if expected {
+            PROOFS_WITHIN
+        } else {
+            Duration::ZERO
+        };
+    loop {
+        let held = engine.has_repair_proof_for_test(peer, key).await;
+        if held == expected || Instant::now() >= deadline {
+            return held;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn as_page_answer(body: ReplicationMessageBody) -> NeighborSyncPageResponse {
@@ -297,7 +343,8 @@ async fn a_requester_pages_its_hints_and_reads_every_page_of_the_answer() {
 
 /// A page refused at admission, the responder busy with other requesters, is
 /// answered busy at once: the request gets an answer, so the requester
-/// charges the responder nothing for silence, and syncs again later.
+/// charges the responder nothing for silence (its trust in the responder is
+/// unchanged), and syncs again later.
 #[tokio::test]
 #[serial]
 async fn a_page_refused_at_admission_is_answered_busy_at_once() {
@@ -315,6 +362,7 @@ async fn a_page_refused_at_admission_is_answered_busy_at_once() {
 
     let held = engine.hold_neighbor_sync_admission();
     assert!(!held.is_empty());
+    let trust_before = requester.peer_trust(&responder);
     let asked = Instant::now();
     let answer = as_page_answer(ask(requester, &responder, page_request(3, 0)).await);
     assert!(
@@ -326,6 +374,11 @@ async fn a_page_refused_at_admission_is_answered_busy_at_once() {
         "answered at once, not left to time out: {:?}",
         asked.elapsed()
     );
+    let trust_after = requester.peer_trust(&responder);
+    assert!(
+        (trust_after - trust_before).abs() < TRUST_TOLERANCE,
+        "the requester's trust in the responder moved from {trust_before} to {trust_after}"
+    );
 
     // Admission free again: the next exchange is served.
     drop(held);
@@ -333,6 +386,116 @@ async fn a_page_refused_at_admission_is_answered_busy_at_once() {
         page_answer(requester, &responder, 4, 0).await,
         NeighborSyncPageResponse::Page { cycle: 4, .. }
     ));
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A requester whose own paged exchange is answered busy, the responder's
+/// admission full, ends the exchange and leaves the peer to a later cycle:
+/// its engine charges the responder nothing, so its trust in the responder
+/// is no lower afterwards.
+#[tokio::test]
+#[serial]
+async fn a_busy_answer_to_a_requesters_exchange_costs_the_responder_no_trust() {
+    let _page = Seam::set(SYNC_PAGE_BYTES, SMALL_PAGE_BYTES);
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    give_keys(&harness, RESPONDER, 4, 3).await;
+    give_keys(&harness, REQUESTER, 5, 0).await;
+    let responder = peer_of(&harness, RESPONDER);
+    let requester_node = harness.test_node(REQUESTER).expect("node");
+    let requester = requester_node.p2p_node.as_ref().expect("p2p");
+    let requester_engine = requester_node.replication_engine.as_ref().expect("engine");
+    let responder_engine = harness
+        .test_node(RESPONDER)
+        .and_then(|node| node.replication_engine.as_ref())
+        .expect("engine");
+
+    let held = responder_engine.hold_neighbor_sync_admission();
+    assert!(!held.is_empty());
+    let trust_before = requester.peer_trust(&responder);
+    let report = requester_engine.sync_with_peer_now(&responder, true).await;
+    assert!(report.busy && !report.complete, "{report:?}");
+    assert_eq!(report.pages_answered, 0, "{report:?}");
+    let trust_after = requester.peer_trust(&responder);
+    assert!(
+        trust_after > trust_before - TRUST_TOLERANCE,
+        "the requester's trust in the responder fell from {trust_before} to {trust_after}"
+    );
+    drop(held);
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// The repair proofs of a page's replica hints wait for the requester's next
+/// request of the exchange, which shows the page arrived: recorded then, even
+/// when that request is answered busy; the last page's get none.
+#[tokio::test]
+#[serial]
+async fn a_pages_proofs_wait_for_the_requesters_next_page() {
+    let _page = Seam::set(SYNC_PAGE_BYTES, SMALL_PAGE_BYTES);
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    // Five records: three pages of two keys.
+    give_keys(&harness, RESPONDER, 5, 0).await;
+    let responder = peer_of(&harness, RESPONDER);
+    let requester_id = peer_of(&harness, REQUESTER);
+    let requester = harness
+        .test_node(REQUESTER)
+        .and_then(|node| node.p2p_node.as_ref())
+        .expect("requester");
+    let engine = harness
+        .test_node(RESPONDER)
+        .and_then(|node| node.replication_engine.as_ref())
+        .expect("engine");
+    let page_keys = |answer: NeighborSyncPageResponse| match answer {
+        NeighborSyncPageResponse::Page {
+            pages,
+            replica_hints,
+            ..
+        } => (pages, replica_hints),
+        NeighborSyncPageResponse::Busy { .. } => unreachable!("busy answers are asked again"),
+    };
+
+    let cycle = 0xB0B;
+    let (pages, first) = page_keys(page_answer(requester, &responder, cycle, 0).await);
+    assert_eq!((pages, first.len()), (3, SMALL_PAGE_KEYS));
+    for key in &first {
+        assert!(
+            !proof_held(&harness, RESPONDER, &requester_id, key, false).await,
+            "no proof before the requester shows the page arrived"
+        );
+    }
+
+    // The next page, refused at admission: answered busy, and the first
+    // page's proofs recorded all the same.
+    let admission = engine.hold_neighbor_sync_admission();
+    let busy = as_page_answer(ask(requester, &responder, page_request(cycle, 1)).await);
+    assert!(
+        matches!(busy, NeighborSyncPageResponse::Busy { page: 1, .. }),
+        "{busy:?}"
+    );
+    drop(admission);
+    for key in &first {
+        assert!(
+            proof_held(&harness, RESPONDER, &requester_id, key, true).await,
+            "the page arrived: its proofs are recorded"
+        );
+    }
+
+    // The rest of the exchange: the middle page's proofs come with the last
+    // page's request; the last page's keys get none.
+    let (_, middle) = page_keys(page_answer(requester, &responder, cycle, 1).await);
+    let (_, last) = page_keys(page_answer(requester, &responder, cycle, 2).await);
+    assert_eq!((middle.len(), last.len()), (SMALL_PAGE_KEYS, 1));
+    for key in &middle {
+        assert!(proof_held(&harness, RESPONDER, &requester_id, key, true).await);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !proof_held(&harness, RESPONDER, &requester_id, &last[0], false).await,
+        "nothing follows the last page, so its keys get no proof"
+    );
 
     harness.teardown().await.expect("teardown");
 }
@@ -367,8 +530,9 @@ async fn a_page_that_waited_too_long_is_answered_busy() {
 }
 
 /// Whether a node pages to a peer follows the release the peer's user agent
-/// names: these nodes' agents name the release before pages, so they get
-/// single messages, unless a test says pages start at that release.
+/// names, decided again for each exchange: these nodes' agents name this
+/// build's release, so they get pages when pages start at that release, and
+/// single messages when they start at the next.
 #[tokio::test]
 #[serial]
 async fn a_node_pages_to_a_peer_whose_agent_names_a_paging_release() {
@@ -396,23 +560,72 @@ async fn a_node_pages_to_a_peer_whose_agent_names_a_paging_release() {
         ReplicationMessageBody::NeighborSyncResponse(_)
     ));
 
-    assert!(
-        !engine.pages_to_for_test(&responder).await,
-        "a peer of the release before pages gets single messages"
-    );
-    let own_release = env!("CARGO_PKG_VERSION")
-        .split("+ds.")
-        .nth(1)
-        .expect("a +ds version")
-        .to_string();
+    let own = own_release();
     {
-        let _from = Seam::set(SYNC_PAGES_FROM_RELEASE, &own_release);
+        let _from = Seam::set(SYNC_PAGES_FROM_RELEASE, &(own + 1).to_string());
+        assert!(
+            !engine.pages_to_for_test(&responder).await,
+            "a peer of the release before pages gets single messages"
+        );
+    }
+    {
+        let _from = Seam::set(SYNC_PAGES_FROM_RELEASE, &own.to_string());
         assert!(engine.pages_to_for_test(&responder).await);
     }
-    assert!(
-        !engine.pages_to_for_test(&responder).await,
-        "decided again for each exchange"
+    {
+        let _from = Seam::set(SYNC_PAGES_FROM_RELEASE, &(own + 1).to_string());
+        assert!(
+            !engine.pages_to_for_test(&responder).await,
+            "decided again for each exchange"
+        );
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Nodes that announce the release nodes page from, through the
+/// announced-release seam, page to each other with no other seam: the agent
+/// each announces names that release.
+#[tokio::test]
+#[serial]
+async fn nodes_announcing_the_paging_release_page_to_each_other() {
+    let _announced = Seam::set(
+        ANNOUNCED_RELEASE,
+        &NEIGHBOR_SYNC_PAGES_FROM_RELEASE.to_string(),
     );
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let responder = peer_of(&harness, RESPONDER);
+    let requester_node = harness.test_node(REQUESTER).expect("node");
+    let requester = requester_node.p2p_node.as_ref().expect("p2p");
+    let engine = requester_node.replication_engine.as_ref().expect("engine");
+
+    // Connected, so the peer's agent is known.
+    let answered = ask(
+        requester,
+        &responder,
+        ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
+            replica_hints: Vec::new(),
+            paid_hints: Vec::new(),
+            bootstrapping: false,
+            commitment: None,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        answered,
+        ReplicationMessageBody::NeighborSyncResponse(_)
+    ));
+    let agent = requester
+        .transport()
+        .peer_user_agent(&responder)
+        .await
+        .expect("connected");
+    assert!(
+        agent.ends_with(&format!("+ds.{NEIGHBOR_SYNC_PAGES_FROM_RELEASE}")),
+        "{agent}"
+    );
+    assert!(engine.pages_to_for_test(&responder).await);
 
     harness.teardown().await.expect("teardown");
 }

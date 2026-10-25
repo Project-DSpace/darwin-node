@@ -80,6 +80,38 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # A node pages its neighbour-sync hints to a peer whose user agent names
+      # NEIGHBOR_SYNC_PAGES_FROM_RELEASE (src/replication/config.rs) or a later
+      # release, and a node that can't read pages leaves them unanswered. So
+      # the release that carries pages must be numbered at least that, or its
+      # nodes would never page to each other; and every release numbered from
+      # it on must carry pages, or nodes would page to one that can't read
+      # them. Checked against this tag, and every release tag before it.
+      - name: Check the release nodes page from
+        run: |
+          tag="$GITHUB_REF_NAME"
+          release="${tag##*+ds.}"
+          from=$(sed -nE 's/^pub const NEIGHBOR_SYNC_PAGES_FROM_RELEASE: u64 = ([0-9]+);.*$/\1/p' \
+            src/replication/config.rs)
+          if [[ ! "$from" =~ ^[0-9]+$ ]]; then
+            echo "::error::src/replication/config.rs has no NEIGHBOR_SYNC_PAGES_FROM_RELEASE this step can read"
+            exit 1
+          fi
+          if (( release < from )); then
+            echo "::error::$tag is release $release; nodes page to release $from and later (NEIGHBOR_SYNC_PAGES_FROM_RELEASE), so its nodes would not page to each other"
+            exit 1
+          fi
+          git fetch --quiet --no-tags --depth=1 origin '+refs/tags/v*:refs/tags/v*'
+          for earlier in $(git tag --list 'v*+ds.*'); do
+            number="${earlier##*+ds.}"
+            [[ "$number" =~ ^[0-9]+$ ]] || continue
+            if (( number >= from )) && ! git show "$earlier:src/replication/config.rs" 2>/dev/null \
+                | grep -q NEIGHBOR_SYNC_PAGES_FROM_RELEASE; then
+              echo "::error::$earlier is release $number, at or after release $from, which nodes page to, and carries no paged sync"
+              exit 1
+            fi
+          done
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
         with:

@@ -962,8 +962,10 @@ pub struct NeighborSyncResponse {
 /// the last is answered, so a responder never has two pages of one requester
 /// at once. Each asks for the responder's page of the same number, which the
 /// responder serves from the hints it built once for this exchange, at its
-/// first page. The exchange runs as many pages as the side with more has; a
-/// side out of pages sends empty ones.
+/// first page. The exchange runs as many pages as the side with more has, up
+/// to 256; a side out of pages sends empty ones. A side whose hints take more
+/// than 256 pages sends a window of 256 pages of them in each exchange, and
+/// announces all its pages, so the other side knows more are to come.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeighborSyncPageRequest {
     /// The requester's number for this exchange: every page of it carries the
@@ -971,7 +973,8 @@ pub struct NeighborSyncPageRequest {
     pub cycle: u64,
     /// This page's number, from 0.
     pub page: u32,
-    /// How many pages the requester's hints take, at least 1.
+    /// How many pages the requester's hints take, at least 1: all of them,
+    /// more than this exchange carries when they come to more than 256.
     pub pages: u32,
     /// The requester's replica hints on this page: keys it believes the
     /// responder should hold.
@@ -995,8 +998,9 @@ pub enum NeighborSyncPageResponse {
         cycle: u64,
         /// Echo of the request's page number.
         page: u32,
-        /// How many pages the responder's hints take, at least 1; the same on
-        /// every page of an exchange.
+        /// How many pages the responder's hints take, at least 1: all of
+        /// them, more than this exchange carries when they come to more than
+        /// 256; the same on every page of an exchange.
         pages: u32,
         /// The responder's replica hints on this page.
         replica_hints: Vec<XorName>,
