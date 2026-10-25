@@ -400,9 +400,12 @@ jobs:
 
       # The digest this run pushed, read back from the registry. release.yml
       # copies exactly this image to :latest, and latest.yml copies only an
-      # image this record or the attestation below names, never what the
-      # commit's tag names, so a later run that pushes the same commit tag
-      # again (a reuse_build run, say) can't change what :latest gets.
+      # image this record or the attestation below names (or, for a
+      # withdrawal to an image a release put on :latest before this
+      # workflow attested its images, docker/release-images, copied from
+      # these records), never what the commit's tag names, so a later run
+      # that pushes the same commit tag again (a reuse_build run, say) can't
+      # change what :latest gets.
       - name: Record the image digest
         id: digest
         run: |
@@ -426,7 +429,8 @@ jobs:
       # that started the run. As for any public repository, Sigstore's public
       # instance signs it; it is kept in GitHub's attestations API, not pushed
       # to the registry. latest.yml takes an image only from a run a push to
-      # main started, by this record or the artifact above.
+      # main started, by this record or the artifact above (or
+      # docker/release-images, for a withdrawal, as above).
       - name: Attest the image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

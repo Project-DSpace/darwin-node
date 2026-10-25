@@ -27,19 +27,21 @@
 # made from the tagged commit when it was pushed to main, forward only: it
 # refuses unless :latest's node is older than the release's, or :latest
 # already has that image (a re-run after the move, which leaves it as it
-# is). Only latest.yml, run by hand from main and approved in the same
-# release environment, also moves :latest: to a new image with the node
-# release :latest has, a published release's (an image release), or back to
-# an image :latest held before (a withdrawal, once the withdrawn release is
+# is). Only latest.yml, run by hand from main and approved in the latest
+# environment, also moves :latest: to a new image with the node release
+# :latest has, a published release's (an image release), or back to an
+# image :latest held before (a withdrawal, once the withdrawn release is
 # deleted on GitHub). A re-run of this workflow's latest job can't undo
 # either.
 #
 # Runs of this workflow and latest.yml share one concurrency group, which
 # keeps one run going and at most one waiting: a run queued while one is
 # waiting cancels the waiting one, so of three tags pushed close together
-# the second one's run is cancelled. Re-run a cancelled run with
-# `gh run rerun <id>`, and see latest.yml's header before dispatching it
-# while a release runs.
+# the second one's run is cancelled. A cancelled Release run publishes
+# nothing, so after pushing a tag check that its run is going
+# (`gh run list --workflow release.yml`), and re-run a cancelled run with
+# `gh run rerun <id>`. See latest.yml's header before dispatching it while
+# a release runs.
 
 name: Release
 
