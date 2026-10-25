@@ -1,0 +1,198 @@
+# ADR-0024: Full, not faulty, and the falling erase floor
+
+- **Status:** Proposed
+- **Date:** 2026-10-25
+- **Decision owners:** darwin-node maintainers
+- **Reviewers:** <pending>
+- **Supersedes:** none
+- **Superseded by:** none
+- **Related:** amends ADR-0003 (full-node detection, penalisation and eviction) and
+  ADR-0022 (the unheld-chunk penalty restored on every lane); builds on ADR-0005
+  Amendment 1 and ADR-0003 Amendment 1 (records outside the retention width kept while the
+  disk has room, erased under disk pressure beyond ten times the distance to the 7th-nearest
+  peer)
+
+## Context
+
+Since ADR-0003 a node that can't take new records is treated as a dishonest one: its close
+group checks it for each record written near it, it answers that it lacks the record, and
+the unheld-chunk penalty is charged until the node is evicted from routing. ADR-0022
+restored that penalty on every lane and removed the switch that had held it off. A node
+whose disk is full is therefore penalised for being full, and evicted, however honestly it
+keeps and proves what it holds.
+
+The erase floor of ADR-0003 Amendment 1 lets a node under disk pressure erase records far
+from it: beyond ten times the distance to its 7th-nearest peer, each after its current
+close group proves possession. On a node with many peers nearby, little is that far, so a
+disk can reach the full line while it still holds extra copies it could give up safely.
+And the clock that starts when a record leaves the node's range lived only in memory: a
+restart stopped the floor from erasing anything for the three-day out-of-range wait.
+
+## Decision Drivers
+
+- A node that is full keeps serving and proving what it holds; it should not be charged
+  for refusing what it can't store.
+- Copies stay at the close group's 7 while nodes fill: a full node's place is taken by the
+  next nearest, not left empty.
+- Nothing inside a node's retention width is ever erased, and every erasure keeps its
+  possession check.
+- Replies older nodes read keep their shape; a new message goes only to peers that read
+  it.
+
+## Considered Options
+
+1. Keep ADR-0003: penalise and evict full nodes.
+2. A grace period: let a full node answer "absent" for a while, then charge it.
+3. A full node says so, renewing the notice while it stays full; its peers widen their
+   windows around it and waive the absent-key penalty for it in one bounded case.
+
+## Decision
+
+Option 3, with a falling erase floor so a node gives up every extra copy it safely can
+before it is full.
+
+### The falling floor
+
+Under disk pressure the erase floor falls as free space does:
+
+| Free space below | Records may be erased beyond |
+|---|---|
+| 10% | 10 times the distance to the node's 7th-nearest peer |
+| 7.5% | 5 times |
+| 5% | 2 times |
+| 2.5% | the edge of the node's own range: every out-of-range record past its wait |
+
+- Each step also fires once free bytes are at or below the full line plus one 4 MiB chunk,
+  so on a partition too small for a step's share to clear the line (under about 40 GiB for
+  the last step with a 1 GiB line), the steps collapse in order onto the line and the last
+  one always runs before the node is full.
+- At the edge of the node's range no distance is kept, but nothing for which the node is
+  among the retention width's nearest (9, more with full peers among them) is ever
+  eligible.
+- Free space is the smaller of the free share of bytes and the free share of inodes, where
+  the filesystem counts inodes. Free inodes below 2.5% count as being at the full line.
+- A failed proof of possession is not penalised for a key beyond ten times the distance
+  to the 7th-nearest peer, whatever the step: the node's routing table may not know which
+  nodes are nearest a key that far away.
+
+### Erasure in two phases, in its own task
+
+The prune passes run in a task of their own after each neighbour-sync cycle. An eligible
+record is first selected, and from then on named in no replica hint this node sends; it
+is erased only in a pass of a later cycle, after its possession check, and never while
+this node answered "present" for it within the fetch window (the verification and fetch
+timeouts plus the longest retry wait, 345 s). A node therefore never hints a record and
+then answers that it lacks it.
+
+### Out-of-range clocks that survive restarts
+
+Each held record's and pointer's out-of-range start time is kept in wall-clock seconds in
+`{root}/out_of_range.mdb`, written at the end of each prune pass and loaded at start. A
+time in the future counts as now; a record back in range or no longer held is cleared; a
+missing or unreadable table starts every clock now, as before.
+
+### Full, not faulty
+
+A node is **full** when it is at the full line and its last prune passes, at the floor's
+last step, erased nothing and left nothing selected for erasure untried: a record
+whose possession check failed is tried again later, and doesn't keep a node from being
+full. Then it:
+
+- prices no new data: a quote for data it doesn't hold is refused with the existing
+  `QuoteFailed`. A chunk it holds is still answered as already stored, so nobody pays for
+  it again, and an update of a pointer it holds is still quoted;
+- refuses every new record, fresh offers with the existing `Rejected`;
+- takes updates and repairs of pointers it holds, which use no new space;
+- keeps serving and proving what it holds: its audit and possession replies keep their
+  format, real digests for held keys and the absent digest for others;
+- tells its peers with a one-way `FullNotice`, appended to the replication messages and
+  sent only to peers whose user agent names the release that reads it, or that sent one
+  themselves, renewed every 10 minutes while it stays full;
+- logs one line on entering ("Node full: since <unix seconds>") and one on leaving;
+- leaves "full" only with 256 MiB of free bytes above the line (and, where inodes are
+  counted, 65,536 inodes above their line), so the state doesn't flap.
+
+### How other nodes treat a full node
+
+- A peer is marked full only from its own notice. The mark lapses 40 minutes (two of the
+  longest neighbour-sync intervals) after the last notice unless renewed.
+- With f peers marked full among a key's nearest, replica hints and fresh offers go to the
+  7 + f nearest, and a node admits and keeps the key while it is among the 9 + f nearest,
+  both at most 20. The full node stays responsible for what it holds; the nodes standing
+  in for it are in range, not erase candidates.
+- Erasing a copy near full nodes needs 6 proofs from the 7 nearest nodes not marked full.
+  A full node that lacks the key is neither a proof nor a veto; one that holds it still
+  proves it; the erasing node never counts itself. The marks are read again just before
+  deleting.
+
+### The one waiver of the unheld-chunk penalty (amends ADR-0022)
+
+The penalty stays on every lane, with no switch and no environment override. A checker
+waives the per-key absent penalty only when all of these hold:
+
+- the peer's own "full" notice is fresh (younger than 40 minutes);
+- the peer answered that it lacks the key (the absent digest, "not found", or a denial);
+  no answer, a wrong digest or any other failure is charged;
+- the check isn't pinned to the peer's commitment (subtree audits are charged);
+- the checker has never seen the peer prove it holds the key (a matched digest, or a fetch
+  served with the right bytes);
+- on the possession check after a write, the peer's own quote isn't among the paid quotes
+  of the write's proof: a node paid for a record it then can't take is charged.
+
+Every lane asks one function, `FullView::waives_unheld_penalty`, at one reviewed site. The
+bound on how long a node may answer "full" without the penalty is how long one notice
+stays fresh: a node that keeps renewing it, prices nothing and passes audits of what it
+holds is never penalised for being full.
+
+### Amends ADR-0003
+
+A full node is no longer treated as a dishonest one while it says it is full. Its close
+group still checks it, and still charges it for anything outside the waiver above. Nodes
+of earlier releases drop the notice, keep charging a full node and don't widen their
+windows until they update.
+
+## Consequences
+
+### Positive
+
+- A full node keeps its place, its reputation and its data; copies stay at 7 around it.
+- Every extra copy that can be given up safely is given up before a node is full, on small
+  partitions too.
+- A restart no longer resets the out-of-range wait.
+- A node out of inodes refuses new data before payment instead of failing the write after
+  it.
+
+### Negative / Trade-offs
+
+- Capacity is still set by the smallest disks: filling is graceful until most of a key's
+  nearest nodes are full.
+- Stand-ins for a full node hold copies a little farther out; when the node leaves "full",
+  those become ordinary out-of-range copies, erased only through the possession-checked
+  prune.
+- The first start into this release has no saved clocks: for up to three days a node at
+  the line may be full while it holds copies it could erase later. No data is lost.
+- The record of keys a peer was seen proving is process-local: a restart forgets it, so
+  the waiver may apply to a key the peer proved before the restart.
+
+### Neutral / Operational
+
+- The prune-pass line reports the floor's step, the records selected for erasure, held
+  records with a peer marked full in their window, the keys verification found with fewer
+  than 4 holders, and whether the node is full.
+
+## Validation
+
+- Unit tests: the floor's steps and the clamp on 15, 20, 40 and 80 GB partitions
+  (`retention.rs`); the inode share; leaving "full"; the widened groups and the six-proof
+  rule with 1 to 4 of 7 peers full, a lapsed mark and a full holder (`pruning.rs`); the
+  two phases and the clocks (`erasure.rs`); the marks, the waiver on each lane
+  (`full.rs`, `tests/fork_pins.rs`); the notice's encoding and an older node dropping it
+  (`protocol.rs`).
+- The census pins each lane's one waiver site and the lane it names
+  (`retention/census.rs`).
+- Integration tests on simulated small partitions with the shipped line
+  (`tests/small_disks.rs`), and the quote, pointer and possession paths of a full node.
+
+## Notes for AI-assisted work
+
+AI tools may help draft this ADR, but **must not mark it Accepted without human review**.
