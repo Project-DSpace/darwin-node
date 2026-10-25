@@ -165,6 +165,11 @@ expect "the vendored ant-protocol's tests left out" \
     "test job no longer runs every test (missing: run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml)"
 
 fresh
+edit "${TEST}" '        run: python3 scripts/test_mixed_versions_verdicts.py' '        run: "true"'
+expect "the harness's verdict tests left out" \
+    "test job no longer runs every test (missing: run: python3 scripts/test_mixed_versions_verdicts.py)"
+
+fresh
 edit "${TEST}" '        run: cargo test --locked -p ant-listings' '        run: "true"'
 expect "the vendored ant-listings' tests left out" \
     "test job no longer runs every test (missing: run: cargo test --locked -p ant-listings)"

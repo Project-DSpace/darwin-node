@@ -1,5 +1,5 @@
-# Runs the test suite: the library and binaries, the vendored crates' own
-# tests, then each integration test.
+# Runs the test suite: the mixed-version harness's verdicts, the library and
+# binaries, the vendored crates' own tests, then each integration test.
 # Kept apart from build.yml so a failing test doesn't stop the image from
 # being built. A release waits for both: release.yml publishes only once the
 # tagged commit's newest Test run (from its push to main, or one run by hand
@@ -76,6 +76,12 @@ jobs:
       - name: Test the workflow check
         shell: bash
         run: bash scripts/test_check_workflows.sh
+
+      # The mixed-version harness's verdicts on made-up results: what a mixed
+      # run is measured against, and what fails it (see the script). The
+      # harness itself runs by hand, before a node release's canary.
+      - name: Test the mixed-version harness's verdicts
+        run: python3 scripts/test_mixed_versions_verdicts.py
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch

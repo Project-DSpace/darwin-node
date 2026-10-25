@@ -311,8 +311,11 @@ never ran.
   `scripts/test_mixed_versions.py` runs this tree's nodes and the previous
   release's on one local network, each joining a network of the other, with
   paid uploads between, and fails on a message that didn't decode, on
-  penalties heavier than with the previous release alone, or on a message
+  penalties heavier than in two runs of the previous release alone, on a
+  failure reason those runs never charged a role with, or on a message
   family that stopped reaching nodes; run it before a node release's canary.
+  The Test workflow tests what fails a run, on made-up results
+  (`scripts/test_mixed_versions_verdicts.py`).
   Builds with the `test-utils` feature, which the harness uses, have test
   seams (`src/test_seams.rs`), such as one that makes a node's disk read as
   full; the Build workflow checks that the image's node has none, and the

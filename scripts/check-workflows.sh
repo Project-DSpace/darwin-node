@@ -17,9 +17,10 @@
 #   test.yml names "Test by hand": one without the listings cross-test,
 #   which runs only weekly or when a run by hand asks for it;
 # - test.yml's test job runs every test: the library and binaries, the
-#   vendored ant-listings' and ant-protocol's own tests, and every target in
-#   tests/ (each file, and each folder with a mod.rs), so the Test run a
-#   release waits for has run every pin;
+#   vendored ant-listings' and ant-protocol's own tests, every target in
+#   tests/ (each file, and each folder with a mod.rs), and the mixed-version
+#   harness's verdict tests, so the Test run a release waits for has run
+#   every pin;
 # - its publish job runs in the release environment and needs build and
 #   checks;
 # - its latest job needs checks and publish;
@@ -211,6 +212,7 @@ else
         'run: cargo test --locked --features test-utils --lib --bins' \
         'run: cargo test --locked -p ant-listings' \
         'run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml' \
+        'run: python3 scripts/test_mixed_versions_verdicts.py' \
         'for target in tests/*.rs tests/*/mod.rs; do' \
         'cargo test --locked --features test-utils --test "$name" "${args[@]}" || failed+=("$name")'; do
         if ! grep -qF -- "${line}" <<<"${test_job}"; then

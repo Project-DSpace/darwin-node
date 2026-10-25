@@ -15,7 +15,8 @@ a client pays (`darwin-harness upload`), and read back at the end
 
 The runs (`--runs`):
 
-  all-old        the previous release throughout: the baseline
+  all-old        the previous release throughout: the baseline, run
+                 --baselines times (all-old, all-old-2, ...)
   new-hosts-old  this tree's devnet and incumbents; the previous release joins
   old-hosts-new  the previous release's devnet and incumbents; this tree joins
   all-new        this tree throughout (not run unless asked for)
@@ -30,16 +31,20 @@ group, and still held at the end by a majority of the nodes that stored it
 record to age, so the nodes nearest it now are counted but not required);
 and every standalone node received neighbour sync.
 
-Each mixed run must also show no penalty heavier than the all-old run's: the
+Each mixed run must also show no penalty heavier than the all-old runs': the
 penalties (saorsa-core's trust events that lower a peer's score) that the
 devnet's nodes, the incumbents and the joiners charge the incumbents and the
 joiners, counted for each pair of roles and each reason, may exceed the
-all-old run's count by --penalty-slack, or by --penalty-ratio of it if that
-is more. The devnet's nodes answer no replication, so every release finds
-them silent: penalties on them are reported, not compared. So are the
-penalties for not holding a record whose PUT the node refused; the refused
-PUTs are compared instead, the same way. And the message shapes: each role
-received every message family it received at least SHAPE_FLOOR times in the
+highest all-old count by --penalty-slack (with a single all-old run, by
+--penalty-ratio of its count instead, if that is more). And no new failure
+reason: a reason no all-old run charged the incumbents (or the joiners)
+with may come to --new-reason-allowance against them, and no more. The
+devnet's nodes answer no replication, so every release finds them silent:
+penalties on them are reported, not compared. So are the penalties for not
+holding a record whose PUT the node refused; the refused PUTs are compared
+instead, the same way. The penalties one release's nodes charge the
+other's are reported by reason. And the message shapes: each role received
+every message family it received at least SHAPE_FLOOR times in every
 all-old run, and a family that only this tree knows (--new-only-family)
 reached nodes of this tree and no others.
 
@@ -62,7 +67,8 @@ binaries instead. Where memory is short for the release profile's link,
 under the work folder (target/mv/runs/<time> unless --work names one); the
 summary is summary.json there. Exits 0 when every run passes.
 
-With the defaults a run takes about 30 minutes, most of it --observe-minutes.
+With the defaults a run takes about 30 minutes, most of it --observe-minutes,
+and the harness makes four: two all-old runs, then the two mixed ones.
 The standalone nodes run in testnet mode, which binds every interface; on a
 desktop whose firewall asks about that, --network-mode development keeps them
 on loopback. A run during which the machine stood still (asleep, say) fails
@@ -97,14 +103,35 @@ MAJORITY = 4
 RECORD_SIZES = [4096, 65536, 1048576, 4194304]
 
 # How far a mixed run's penalties (or refused PUTs) may exceed the all-old
-# run's before the run fails: by PENALTY_SLACK, or by PENALTY_RATIO of the
-# all-old count if that is more. Counts vary between runs of one release: a
-# possession check that times out on a busy machine charges its peer twice,
-# and in five runs of v0.23.0+ds.15 a pair of roles' count for one reason
-# varied by up to 9. A message one release can't read fails every exchange
-# of it, tens to hundreds in a run, and leaves decode failures besides.
+# runs' before the run fails, for each pair of roles and reason: by
+# PENALTY_SLACK above the highest all-old count. Counts vary between runs of
+# one release: a possession check that times out on a busy machine charges
+# its peer twice. In six runs of v0.23.0+ds.15 against itself (two harness
+# runs of three runs each, on one machine), one pair of roles' count for one
+# reason ranged from 0 to 10, and a mixed run's exceeded its all-old run's by
+# up to 9. A message one release can't read fails every exchange of it, tens
+# to hundreds in a run, and leaves decode failures besides.
 PENALTY_SLACK = 10
-PENALTY_RATIO = 1.0
+
+# Against a single all-old run, a count may also exceed it by this share of
+# it, if that is more than PENALTY_SLACK. None until a spread in proportion
+# to the count is measured: the counts compared in the six runs were 12 or
+# fewer, and spread within the slack.
+PENALTY_RATIO = 0.0
+
+# Penalties for a reason no all-old run charged a role with (the incumbents,
+# or the joiners), from any observer: a new failure reason, failed when
+# there are more than this against that role. In the six runs above,
+# measured as the harness measures them (each mixed run against the all-old
+# run made with it), such a reason came to at most 2.
+NEW_REASON_ALLOWANCE = 3
+
+# All-old runs the mixed runs are measured against (all-old, all-old-2, ...).
+# A role's zero for a reason in one all-old run can be noise: of the 30
+# comparisons of one of the six runs against another, 2 would have failed as
+# a new reason (application failures on the incumbents, none in one run, 4
+# and 10 in others); of the 60 against two of them, none.
+BASELINES = 2
 
 # A run fails when the machine stood still this long, asleep say: every
 # node's timers jump at once then, and the run can't be compared.
@@ -156,6 +183,8 @@ UNANSWERED_KIND = {"Sync with": "neighbour sync", "Verification request to": "ve
 POSSESSION_FAILED = re.compile(r"Possession check: ([0-9a-f]{64}) failed to prove possession "
                                r"for ([0-9a-f]{64})")
 RUNS = ("all-old", "new-hosts-old", "old-hosts-new", "all-new", "full")
+# The all-old runs: all-old, and all-old-2 on when there are more.
+BASELINE_RUN = re.compile(r"all-old(?:-([2-9]|[1-9][0-9]+))?")
 
 
 def log(message):
@@ -630,8 +659,10 @@ def analyze(run):
     window = run["window"]
     folder = run["folder"]
     roles = {peer: "devnet" for peer in run["devnet_peers"]}
+    releases = {peer: run["network"] for peer in run["devnet_peers"]}
     for node in run["nodes"]:
         roles[node["peer_id"]] = node["role"]
+        releases[node["peer_id"]] = node["release"]
     for uploads in run["uploads"]:
         roles.setdefault(uploads["client"], "client")
     full_peers = {node["peer_id"] for node in run["nodes"] if node["full"]}
@@ -647,16 +678,18 @@ def analyze(run):
         role = roles.get(peer, "other")
         refusals[role] = refusals.get(role, 0) + 1
 
-    sources = [("devnet", "devnet", folder / "devnet.log")]
-    sources += [(node["name"], node["role"], folder / node["log"]) for node in run["nodes"]]
+    sources = [("devnet", "devnet", run["network"], folder / "devnet.log")]
+    sources += [(node["name"], node["role"], node["release"], folder / node["log"])
+                for node in run["nodes"]]
     decode_failures = []
     unanswered = {}
     penalties = {}
     penalties_on_full = {}
     penalties_on_refusals = {}
+    between_releases = {}
     traffic = {}
     audits = {}
-    for source, role, path in sources:
+    for source, role, release, path in sources:
         traffic_groups = {}
         audit_groups = {}
         possession_failed = None
@@ -697,6 +730,13 @@ def analyze(run):
                 key = (role, roles.get(target, "other"), reason)
                 count, total = book.get(key, (0, 0.0))
                 book[key] = (count + 1, total + weight)
+                # One release's nodes charging the other's, whatever the
+                # book: what the rule for messages between nodes governs.
+                if (roles.get(target) in ("incumbent", "joiner")
+                        and releases.get(target, release) != release):
+                    key = (release, releases[target], reason)
+                    count, total = between_releases.get(key, (0, 0.0))
+                    between_releases[key] = (count + 1, total + weight)
         if source != "devnet":
             traffic[source] = merge_counters(traffic_groups)
             audits[source] = merge_counters(audit_groups)
@@ -715,6 +755,7 @@ def analyze(run):
         "penalties": penalties,
         "penalties_on_full": penalties_on_full,
         "penalties_on_refusals": penalties_on_refusals,
+        "between_releases": between_releases,
         "refusals": refusals,
         "traffic": traffic,
         "audits": audits,
@@ -744,10 +785,39 @@ def received_families(result, role):
     return families
 
 
+def is_baseline(name):
+    return BASELINE_RUN.fullmatch(name) is not None
+
+
+def runs_in(work):
+    """The finished runs in a work folder, the all-old runs first."""
+    found = {path.name for path in work.iterdir() if (path / "run.json").exists()}
+    baselines = sorted((name for name in found if is_baseline(name)),
+                       key=lambda name: int(BASELINE_RUN.fullmatch(name).group(1) or 1))
+    return baselines + [name for name in RUNS if name in found and not is_baseline(name)]
+
+
+def limit(bases, args):
+    """The most a mixed run may count, for one pair of roles and reason (or
+    one role's refused PUTs), against the all-old runs' counts: the highest
+    plus the slack, or against a single all-old run, its count plus the slack
+    or the ratio's share of it, if that is more."""
+    top = max(bases)
+    if len(bases) == 1:
+        return top + max(args.penalty_slack, math.ceil(top * args.penalty_ratio))
+    return top + args.penalty_slack
+
+
+def against(bases):
+    if len(bases) == 1:
+        return f"{bases[0]} in the all-old run"
+    return f"at most {max(bases)} in the {len(bases)} all-old runs ({', '.join(map(str, bases))})"
+
+
 def verdicts(results, args):
     """Every failure, as text; empty when every run passed."""
     failures = []
-    baseline = results.get("all-old")
+    baselines = [result for name, result in results.items() if is_baseline(name)]
     for name, result in results.items():
         if result["stalled_seconds"] > STALL_LIMIT:
             failures.append(f"{name}: the machine stood still for {result['stalled_seconds']} s "
@@ -782,8 +852,13 @@ def verdicts(results, args):
             for family in ("neighbor_sync_request", "neighbor_sync_response"):
                 if families.get(family, 0) == 0:
                     failures.append(f"{name}: the {role}s received no {family}")
-        if baseline is None or name == "all-old" or name == "full":
+        if not baselines or is_baseline(name) or name == "full":
             continue
+        # The reasons the all-old runs charged each role with, from any
+        # observer: one they never did is a new failure reason.
+        known = {(target, reason) for baseline in baselines
+                 for (_, target, reason) in baseline["penalties"]}
+        new_reasons = {}
         for key, (count, _) in sorted(result["penalties"].items()):
             observer, target, reason = key
             # The devnet's nodes run no replication, so every release's
@@ -791,23 +866,31 @@ def verdicts(results, args):
             # are reported, not compared.
             if target not in ("incumbent", "joiner"):
                 continue
-            base, _ = baseline["penalties"].get(key, (0, 0.0))
-            if count > base + max(args.penalty_slack, math.ceil(base * args.penalty_ratio)):
+            if (target, reason) not in known:
+                new_reasons[(target, reason)] = new_reasons.get((target, reason), 0) + count
+                continue
+            bases = [baseline["penalties"].get(key, (0, 0.0))[0] for baseline in baselines]
+            if count > limit(bases, args):
                 failures.append(f"{name}: {count} {reason} penalties by {observer}s on "
-                                f"{target}s, against {base} in the all-old run")
+                                f"{target}s, against {against(bases)}")
+        for (target, reason), count in sorted(new_reasons.items()):
+            if count > args.new_reason_allowance:
+                failures.append(f"{name}: {count} {reason} penalties on {target}s, a new "
+                                f"failure reason: no all-old run charged {target}s with it")
         for role in ("incumbent", "joiner"):
             count = result["refusals"].get(role, 0)
-            base = baseline["refusals"].get(role, 0)
-            if count > base + max(args.penalty_slack, math.ceil(base * args.penalty_ratio)):
+            bases = [baseline["refusals"].get(role, 0) for baseline in baselines]
+            if count > limit(bases, args):
                 failures.append(f"{name}: the {role}s refused {count} paid PUTs, against "
-                                f"{base} in the all-old run")
+                                f"{against(bases)}")
         for role in ("incumbent", "joiner"):
-            before = received_families(baseline, role)
+            befores = [received_families(baseline, role) for baseline in baselines]
             now = received_families(result, role)
-            for family, count in sorted(before.items()):
-                if count >= SHAPE_FLOOR and now.get(family, 0) == 0:
+            for family in sorted(set().union(*befores)):
+                fewest = min(before.get(family, 0) for before in befores)
+                if fewest >= SHAPE_FLOOR and now.get(family, 0) == 0:
                     failures.append(f"{name}: the {role}s received no {family}, which "
-                                    f"they did {count} times in the all-old run")
+                                    f"they did {fewest} times or more in every all-old run")
         for family in args.new_only_family:
             reached_new = 0
             for node, counters in result["traffic"].items():
@@ -823,8 +906,22 @@ def verdicts(results, args):
     return failures
 
 
-def report(results):
+def report(results, args):
     lines = []
+    baselines = [name for name in results if is_baseline(name)]
+    if len(baselines) > 1:
+        lines.append(f"Mixed runs are measured against {len(baselines)} all-old runs "
+                     f"({', '.join(baselines)}): a pair of roles' penalties for a reason "
+                     f"may exceed the highest of their counts by {args.penalty_slack}.")
+    elif baselines:
+        ratio = (f", or by {args.penalty_ratio:g} times it if that is more"
+                 if args.penalty_ratio > 0 else "")
+        lines.append(f"Mixed runs are measured against one all-old run: a pair of roles' "
+                     f"penalties for a reason may exceed its count by {args.penalty_slack}"
+                     f"{ratio}.")
+    if baselines:
+        lines.append(f"A reason no all-old run charged a role with may come to "
+                     f"{args.new_reason_allowance} against it.")
     for name, result in results.items():
         lines.append(f"\n== {name} ==")
         for role, ran in result["ran"].items():
@@ -843,6 +940,13 @@ def report(results):
             lines.append("penalties for not holding a record whose PUT the node refused:")
             for key, (count, weight) in sorted(result["penalties_on_refusals"].items()):
                 lines.append(f"  {key[0]:>9} -> {key[1]:<9} {key[2]:<19} {count:>5} "
+                             f"{weight:8.2f}")
+        if result["between_releases"]:
+            lines.append("penalties one release's nodes charged the other's "
+                         "(observer's release -> target's, reason: count, weight):")
+            for (observer, target, reason), (count, weight) in sorted(
+                    result["between_releases"].items()):
+                lines.append(f"  {observer:>9} -> {target:<9} {reason:<19} {count:>5} "
                              f"{weight:8.2f}")
         if result["penalties_on_full"]:
             lines.append("penalties on full nodes:")
@@ -869,7 +973,7 @@ def report(results):
     return "\n".join(lines)
 
 
-def summary_json(results, failures, releases):
+def summary_json(results, failures, releases, args):
     def plain(result):
         return {
             "decode_failures": result["decode_failures"],
@@ -886,6 +990,10 @@ def summary_json(results, failures, releases):
                                    "weight": w}
                                   for (o, t, r), (c, w) in
                                   sorted(result["penalties_on_full"].items())],
+            "between_releases": [{"observer_release": o, "target_release": t, "reason": r,
+                                  "count": c, "weight": w}
+                                 for (o, t, r), (c, w) in
+                                 sorted(result["between_releases"].items())],
             "traffic": result["traffic"],
             "audits": result["audits"],
             "held_by_storers": [record["held_by_storers"] for record in result["checks"]],
@@ -896,6 +1004,11 @@ def summary_json(results, failures, releases):
         }
     return {
         "releases": releases,
+        "measured_against": [name for name in results if is_baseline(name)],
+        "thresholds": {"penalty_slack": args.penalty_slack,
+                       "penalty_ratio": args.penalty_ratio,
+                       "new_reason_allowance": args.new_reason_allowance,
+                       "shape_floor": SHAPE_FLOOR, "stall_limit": STALL_LIMIT},
         "runs": {name: plain(result) for name, result in results.items()},
         "failures": failures,
         "passed": not failures,
@@ -919,6 +1032,10 @@ def main():
     parser.add_argument("--runs", default="all-old,new-hosts-old,old-hosts-new",
                         help="the runs, in order (all-old first: the others are measured "
                         f"against it); any of {', '.join(RUNS)}")
+    parser.add_argument("--baselines", type=int, default=BASELINES,
+                        help="how many all-old runs to make (all-old, all-old-2, ...): "
+                        "the mixed runs are measured against all of them "
+                        f"(default {BASELINES})")
     parser.add_argument("--incumbents", type=int, default=8)
     parser.add_argument("--joiners", type=int, default=8)
     parser.add_argument("--records-before", type=int, default=8,
@@ -937,11 +1054,14 @@ def main():
     parser.add_argument("--full", type=int, default=0,
                         help="joiners of the full run whose disk reads as full (adds the run)")
     parser.add_argument("--penalty-slack", type=int, default=PENALTY_SLACK,
-                        help="penalties a mixed run may count above the all-old run, for "
-                        f"each pair of roles and reason (default {PENALTY_SLACK})")
+                        help="penalties a mixed run may count above the highest all-old "
+                        f"count, for each pair of roles and reason (default {PENALTY_SLACK})")
     parser.add_argument("--penalty-ratio", type=float, default=PENALTY_RATIO,
-                        help="or this share of the all-old run's count, if more "
-                        f"(default {PENALTY_RATIO})")
+                        help="against a single all-old run, or this share of its count, if "
+                        f"more (default {PENALTY_RATIO})")
+    parser.add_argument("--new-reason-allowance", type=int, default=NEW_REASON_ALLOWANCE,
+                        help="penalties a mixed run may count against a role for a reason no "
+                        f"all-old run charged that role with (default {NEW_REASON_ALLOWANCE})")
     parser.add_argument("--new-only-family", action="append", default=[],
                         help="a message family (as the traffic summary names it) only this "
                         "tree knows: no node of the previous release may receive it")
@@ -955,7 +1075,7 @@ def main():
     args = parser.parse_args()
     if args.analyze:
         work = Path(args.analyze)
-        found = [name for name in RUNS if (work / name / "run.json").exists()]
+        found = runs_in(work)
         if not found:
             raise HarnessError(f"no runs in {work}")
         return conclude(work, found, args)
@@ -970,6 +1090,11 @@ def main():
         parser.error("the full run needs --full N, with N of the joiners full")
     if args.observe_minutes < 5:
         parser.error("observe for 5 minutes or more: nodes log their traffic every 5")
+    if args.baselines < 1:
+        parser.error("--baselines must be 1 or more")
+    if "all-old" in runs:
+        at = runs.index("all-old") + 1
+        runs[at:at] = [f"all-old-{number}" for number in range(2, args.baselines + 1)]
     if shutil.which("anvil") is None:
         raise HarnessError("anvil (Foundry) is not on PATH: the devnet's chain needs it")
 
@@ -1011,16 +1136,15 @@ def main():
     }
     keep_awake()
     for name in runs:
-        network_release, joiner_release = plans[name]
+        network_release, joiner_release = plans["all-old" if is_baseline(name) else name]
         run_one(name, network_release, joiner_release, args, harness, work / name)
         log(f"{name}: done")
     (work / "releases.json").write_text(json.dumps(
         {release.name: {"version": release.version, "from": release.label,
                         "seams": release.seams} for release in releases}, indent=2))
     # Every run in the work folder: one run again into a folder whose other
-    # runs passed is measured against the same all-old run.
-    return conclude(work, [name for name in RUNS if (work / name / "run.json").exists()],
-                    args)
+    # runs passed is measured against the same all-old runs.
+    return conclude(work, runs_in(work), args)
 
 
 def conclude(work, runs, args):
@@ -1028,9 +1152,9 @@ def conclude(work, runs, args):
     writes summary.json."""
     results = {name: analyze(load_run(work / name)) for name in runs}
     failures = verdicts(results, args)
-    print(report(results))
+    print(report(results, args))
     releases = json.loads((work / "releases.json").read_text())
-    summary = summary_json(results, failures, releases)
+    summary = summary_json(results, failures, releases, args)
     (work / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     if failures:
         print("\nFAILED:")
