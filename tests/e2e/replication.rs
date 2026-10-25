@@ -1159,8 +1159,10 @@ async fn self_closeness_gate_accepts_responsible_rejects_far_node() {
 /// - `test_audit_challenge_multi_key` (Section 18 #11): an audit of two held
 ///   keys and one absent returns their digests and the absent sentinel, in
 ///   order;
-/// - `test_verification_with_paid_list_check`: a verification reports a held,
-///   paid key as present and paid;
+/// - `test_verification_with_paid_list_check`,
+///   `test_verification_request_returns_presence`: a verification reports a
+///   held, paid key as present and paid, and a key A doesn't hold as absent
+///   and unpaid (quorum repair counts these answers);
 /// - `test_fresh_offer_with_empty_pop_rejected` (Section 18 #2), and
 ///   `test_fresh_offer_with_mismatched_content_address_rejected`: fresh
 ///   offers with no proof of payment, or under an address that isn't their
@@ -1282,7 +1284,8 @@ async fn replication_protocol_answers() {
         other => panic!("audit: expected Digests, got {other:?}"),
     }
 
-    // test_verification_with_paid_list_check
+    // test_verification_with_paid_list_check and
+    // test_verification_request_returns_presence
     let content = b"paid test data";
     let address = compute_address(content);
     storage_a.put(&address, content).await.expect("put");
@@ -1291,17 +1294,26 @@ async fn replication_protocol_answers() {
         .await
         .expect("paid_list insert");
     let request = VerificationRequest {
-        keys: vec![address],
-        paid_list_check_indices: vec![0],
+        keys: vec![address, [0xBB; 32]],
+        paid_list_check_indices: vec![0, 1],
     };
     match ask_a(55, ReplicationMessageBody::VerificationRequest(request))
         .await
         .body
     {
         ReplicationMessageBody::VerificationResponse(resp) => {
-            assert_eq!(resp.results.len(), 1);
+            assert_eq!(resp.results.len(), 2);
             assert!(resp.results[0].present, "verification: key present");
             assert_eq!(resp.results[0].paid, Some(true), "verification: key paid");
+            assert!(
+                !resp.results[1].present,
+                "verification: a key A doesn't hold is absent"
+            );
+            assert_eq!(
+                resp.results[1].paid,
+                Some(false),
+                "verification: a key nobody paid for is unpaid"
+            );
         }
         other => panic!("verification: expected VerificationResponse, got {other:?}"),
     }
