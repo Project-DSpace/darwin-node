@@ -24,6 +24,8 @@ fn offer(version: &str) -> UpgradeInfo {
         download_url: BAD_URL.to_string(),
         signature_url: BAD_URL.to_string(),
         release_notes: String::new(),
+        published_at: None,
+        archive_size: None,
     }
 }
 

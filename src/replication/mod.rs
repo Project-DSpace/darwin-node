@@ -38,6 +38,10 @@ pub mod storage_commitment_audit;
 pub mod subtree;
 pub mod types;
 
+/// The line every commitment tick logs (`commitment_tick_tests.rs`).
+#[cfg(all(test, feature = "logging"))]
+mod commitment_tick_tests;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -2061,6 +2065,7 @@ impl ReplicationEngine {
             &self.config,
         )
         .await
+        .map(|_| ())
     }
 
     /// Test-only: directly seed this node's cached commitment for `peer`,
@@ -3702,7 +3707,7 @@ impl ReplicationEngine {
             // unchanged — preserving the reloaded current pin; otherwise the
             // reloaded roots stay answerable as retained slots until their gossip
             // TTL lapses. Persistence is handled by the retention-persist loop.
-            if let Err(e) = rebuild_and_rotate_commitment(
+            match rebuild_and_rotate_commitment(
                 &storage,
                 pointer_store.as_ref(),
                 &identity,
@@ -3712,9 +3717,11 @@ impl ReplicationEngine {
             )
             .await
             {
-                warn!("Initial commitment build failed: {e}");
-            } else {
-                sync_trigger.notify_one();
+                Ok(tick) => {
+                    tick.log("Storage commitment built at start");
+                    sync_trigger.notify_one();
+                }
+                Err(e) => warn!("Initial commitment build failed: {e}"),
             }
             loop {
                 tokio::select! {
@@ -3722,7 +3729,10 @@ impl ReplicationEngine {
                     () = tokio::time::sleep(
                         std::time::Duration::from_secs(COMMITMENT_ROTATION_INTERVAL_SECS)
                     ) => {
-                        if let Err(e) = rebuild_and_rotate_commitment(
+                        // One info line every tick, rotated or not, so the
+                        // hourly tick can be seen on a node whose records
+                        // didn't change.
+                        match rebuild_and_rotate_commitment(
                             &storage,
                             pointer_store.as_ref(),
                             &identity,
@@ -3730,7 +3740,8 @@ impl ReplicationEngine {
                             &p2p,
                             &config,
                         ).await {
-                            warn!("Commitment rotation failed: {e}");
+                            Ok(tick) => tick.log(COMMITMENT_TICK_LINE),
+                            Err(e) => warn!("Commitment rotation failed: {e}"),
                         }
                         // Piggyback a sweep of expired recent_provers
                         // entries on the rotation tick (same cadence,
@@ -6544,11 +6555,16 @@ async fn handle_fresh_offer(
     // check (passing results only, so freed space is detected promptly), and the
     // store path keeps its own check as defence-in-depth.
     if let Err(e) = ctx.storage.check_capacity() {
-        info!(
-            target: "ant_node::storage::disk_precheck",
-            key = %hex::encode(key),
-            "Rejecting fresh replication offer before payment verification: {e}"
-        );
+        // One line every few minutes: at the full line every offer is refused.
+        static REFUSED: crate::logging::Repeats = crate::logging::Repeats::new();
+        if let Some(held_back) = REFUSED.admit() {
+            info!(
+                target: "ant_node::storage::disk_precheck",
+                key = %hex::encode(key),
+                held_back,
+                "Rejecting fresh replication offer before payment verification: {e}"
+            );
+        }
         send_replication_response(
             source,
             p2p_node,
@@ -9456,10 +9472,16 @@ async fn execute_single_fetch(
                         // valid source must serve identical content, so trying
                         // the next one cannot cure a local error — it only
                         // re-downloads the same chunk into the same store.
-                        warn!(
-                            "Failed to store fetched record {}: {e}",
-                            hex::encode(resp_key)
-                        );
+                        // One line every few minutes, as a full disk fails
+                        // every write.
+                        static FAILED: crate::logging::Repeats = crate::logging::Repeats::new();
+                        if let Some(held_back) = FAILED.admit() {
+                            warn!(
+                                held_back,
+                                "Failed to store fetched record {}: {e}",
+                                hex::encode(resp_key)
+                            );
+                        }
                         return FetchOutcome {
                             key,
                             result: FetchResult::LocalWriteFailed,
@@ -10445,6 +10467,54 @@ async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
     }
 }
 
+/// The message of the line every hourly commitment tick logs.
+const COMMITMENT_TICK_LINE: &str = "Storage commitment tick";
+
+/// What one commitment tick left the node advertising, for its log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitmentTick {
+    /// K, the number of records the current commitment commits to: 0 when
+    /// the node has none.
+    key_count: u32,
+    /// Of those, pointers.
+    pointers: usize,
+    /// Whether this tick signed a new commitment.
+    rotated: bool,
+    /// The current commitment's hash, if there is one.
+    hash: Option<[u8; 32]>,
+}
+
+impl CommitmentTick {
+    /// The node has no commitment after this tick.
+    const NONE: Self = Self {
+        key_count: 0,
+        pointers: 0,
+        rotated: false,
+        hash: None,
+    };
+
+    /// The tick of a node keeping `built`, unchanged.
+    fn unchanged(built: &commitment_state::BuiltCommitment) -> Self {
+        Self {
+            key_count: built.commitment().key_count,
+            pointers: built.tree().pointer_count(),
+            rotated: false,
+            hash: Some(built.hash()),
+        }
+    }
+
+    fn log(&self, message: &str) {
+        let hash = self.hash.map_or_else(|| "none".to_string(), hex::encode);
+        info!(
+            key_count = self.key_count,
+            pointers = self.pointers,
+            rotated = self.rotated,
+            hash = %hash,
+            "{message}"
+        );
+    }
+}
+
 /// Read the current key set, build + sign a fresh
 /// `StorageCommitment`, and rotate it into `state` as the new `current`.
 /// The prior `current` is demoted to `previous`; the prior `previous` is
@@ -10458,9 +10528,11 @@ async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
 /// `(address, pointer_leaf_hash(address))` (ADR-0016), so they are audited and
 /// priced exactly as chunks are.
 ///
-/// Skips (returns `Ok(())`) if the key set is empty — no commitment to
-/// rotate. The auditor side handles "no commitment for this peer" by
-/// falling back to the legacy plain-digest audit path.
+/// Retires the current commitment (returns [`CommitmentTick::NONE`]) if the
+/// key set is empty — no commitment to rotate. The auditor side handles "no
+/// commitment for this peer" by falling back to the legacy plain-digest
+/// audit path. Returns what the node advertises after this tick, for the
+/// line every tick logs.
 async fn rebuild_and_rotate_commitment(
     storage: &Arc<ChunkStore>,
     pointers: Option<&PointerStore>,
@@ -10468,7 +10540,7 @@ async fn rebuild_and_rotate_commitment(
     state: &Arc<ResponderCommitmentState>,
     p2p: &Arc<P2PNode>,
     config: &Arc<ReplicationConfig>,
-) -> Result<()> {
+) -> Result<CommitmentTick> {
     // `all_keys()` is what the store can answer for: it already drops a file marked suspect or
     // known-wrong, so a name that cannot be read is not offered here. It is NOT the commitment
     // set — that is narrowed to the keys this node is still responsible for, by the filter a
@@ -10542,7 +10614,7 @@ async fn rebuild_and_rotate_commitment(
              (stays answerable until its gossip TTL lapses, bytes still on disk)"
         );
         state.retire_current();
-        return Ok(());
+        return Ok(CommitmentTick::NONE);
     }
 
     // Cap to MAX_COMMITMENT_KEY_COUNT for v12 (responder must not commit
@@ -10628,7 +10700,7 @@ async fn rebuild_and_rotate_commitment(
             // committed key set is frozen here for many rotations. Without this,
             // the no-op guard would pin a stale slot — and its key — forever.
             state.age_out();
-            return Ok(());
+            return Ok(CommitmentTick::unchanged(&current));
         }
     }
 
@@ -10646,12 +10718,12 @@ async fn rebuild_and_rotate_commitment(
     )
     .map_err(|e| Error::Crypto(format!("commitment build: {e}")))?;
 
-    let hash = hex::encode(built.hash());
-    let key_count = built.commitment().key_count;
-    let pointer_count = built.tree().pointer_count();
+    let tick = CommitmentTick {
+        rotated: true,
+        ..CommitmentTick::unchanged(&built)
+    };
     state.rotate(built);
-    info!("Storage commitment rotated: hash={hash} key_count={key_count} pointers={pointer_count}");
-    Ok(())
+    Ok(tick)
 }
 
 #[cfg(test)]

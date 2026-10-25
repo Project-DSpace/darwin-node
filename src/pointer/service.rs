@@ -377,13 +377,19 @@ impl PointerService {
             // charge is taken at the commit; this only avoids paying to find
             // out the disk is full.
             if let Err(e) = chunks.check_capacity_for(POINTER_WIRE_LEN as u64) {
-                let addr = hex::encode(address);
-                info!(
-                    target: "ant_node::storage::disk_precheck",
-                    addr = %addr,
-                    kind = "pointer",
-                    "Rejecting pointer PUT before payment verification: {e}"
-                );
+                // One line every few minutes: at the full line every PUT is
+                // refused.
+                static REFUSED: crate::logging::Repeats = crate::logging::Repeats::new();
+                if let Some(held_back) = REFUSED.admit() {
+                    let addr = hex::encode(address);
+                    info!(
+                        target: "ant_node::storage::disk_precheck",
+                        addr = %addr,
+                        kind = "pointer",
+                        held_back,
+                        "Rejecting pointer PUT before payment verification: {e}"
+                    );
+                }
                 return Some(PointerPutResponse::Error(ProtocolError::StorageFailed(
                     e.to_string(),
                 )));

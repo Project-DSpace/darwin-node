@@ -55,8 +55,33 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// that lost the prefix would stop being routed to. The version is this build's rather than
 /// the transport's, because it is the one a peer needs in order to tell which release it is
 /// talking to.
-fn user_agent() -> String {
-    format!("node/{}", env!("CARGO_PKG_VERSION"))
+///
+/// The image marker, when the node has one ([`image_marker`]), follows the release in the
+/// version's build metadata: `node/0.23.0+ds.16.image.<commit>`. The node census reads a node's
+/// release as the semver after `node/` and the `ds.<n>` its build metadata starts with, so it
+/// still reads the release, and can count the nodes whose image gave no marker.
+fn user_agent(image: Option<&str>) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    image.map_or_else(
+        || format!("node/{version}"),
+        |marker| {
+            let separator = if version.contains('+') { '.' } else { '+' };
+            format!("node/{version}{separator}image.{marker}")
+        },
+    )
+}
+
+/// The image marker this node reports: what `ANT_IMAGE_VERSION` gives (`--image-version`), if
+/// it is what the storage-node image passes, the 40 lowercase hex digits of the darwin-node
+/// commit the image was built from. Images before the one that ships darwin-nodes, whose node
+/// manager deletes a node's data on a nearly full disk, pass none.
+pub(crate) fn image_marker(given: Option<&str>) -> Option<&str> {
+    given.filter(|marker| {
+        marker.len() == 40
+            && marker
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// Builder for constructing an Ant node.
@@ -126,6 +151,18 @@ impl NodeBuilder {
         let peer_id = identity.peer_id().to_hex();
 
         info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
+
+        // One line at start: the image marker, or that there is none.
+        if let Some(marker) = image_marker(self.config.image_version.as_deref()) {
+            info!(image_version = marker, "Image marker");
+        } else {
+            warn!(
+                "No image marker (ANT_IMAGE_VERSION): if this node runs in a storage-node \
+                 container, that container's node manager may delete a node's data when the \
+                 disk is nearly full; pull the new image (docker compose pull, then docker \
+                 compose up -d)"
+            );
+        }
 
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
@@ -361,7 +398,8 @@ impl NodeBuilder {
             }
         }
 
-        core_config.custom_user_agent = Some(user_agent());
+        core_config.custom_user_agent =
+            Some(user_agent(image_marker(config.image_version.as_deref())));
 
         // Persist close group peers + trust scores across restarts.
         // Default to root_dir (alongside node_identity.key) when not explicitly set.
@@ -803,22 +841,31 @@ impl RunningNode {
                     upgrader = upgrader.with_binary_cache(BinaryCache::new(cache_dir));
                 }
 
-                // Add randomized jitter before the first upgrade check to prevent all nodes
-                // from hitting the GitHub API simultaneously when started together.
+                // The first check comes a few minutes after start, at a random point, so a
+                // node that restarted while waiting for a release takes it when it is due
+                // rather than an hour later, and nodes started together don't all check at
+                // once.
                 {
-                    let jitter_duration = jittered_interval(monitor.check_interval());
+                    let first_check = first_upgrade_check_delay();
                     let first_check_time = chrono::Utc::now()
-                        + chrono::Duration::from_std(jitter_duration).unwrap_or_else(|e| {
+                        + chrono::Duration::from_std(first_check).unwrap_or_else(|e| {
                             warn!("chrono::Duration::from_std failed for jitter ({e}), defaulting to 1 minute");
                             chrono::Duration::minutes(1)
                         });
                     info!(
-                        "First upgrade check scheduled for {} (jitter: {}s)",
+                        "First upgrade check scheduled for {} (in {}s)",
                         first_check_time.to_rfc3339(),
-                        jitter_duration.as_secs()
+                        first_check.as_secs()
                     );
-                    tokio::time::sleep(jitter_duration).await;
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = tokio::time::sleep(first_check) => {}
+                    }
                 }
+
+                // The node has started cleanly: the shared cache keeps the archives of the
+                // running and previous versions, and of any newer one, and no others.
+                prune_upgrade_cache(upgrader.current_version().clone()).await;
 
                 loop {
                     tokio::select! {
@@ -826,6 +873,9 @@ impl RunningNode {
                             break;
                         }
                         result = monitor.check_for_ready_upgrade() => {
+                            // An upgrade the disk had no room for: the version, and the
+                            // bytes needed and free.
+                            let mut skipped_for_space = None;
                             match result {
                                 Ok(Some(upgrade_info)) => {
                                     info!(
@@ -856,6 +906,10 @@ impl RunningNode {
                                         Ok(UpgradeResult::NoUpgrade) => {
                                             info!("Already running latest version");
                                         }
+                                        Ok(UpgradeResult::NotEnoughSpace { needed, available }) => {
+                                            skipped_for_space =
+                                                Some((upgrade_info.version.clone(), needed, available));
+                                        }
                                         Err(e) => {
                                             error!("Error during upgrade process: {}", e);
                                         }
@@ -875,6 +929,29 @@ impl RunningNode {
                                 Err(e) => {
                                     warn!("Error during upgrade process: {}", e);
                                 }
+                            }
+                            // An upgrade skipped for space says so in one line, with the
+                            // next check, a check interval later.
+                            if let Some((version, needed, available)) = skipped_for_space {
+                                let next = jittered_interval(monitor.check_interval());
+                                let next_check = chrono::Utc::now()
+                                    + chrono::Duration::from_std(next)
+                                        .unwrap_or_else(|_| chrono::Duration::hours(1));
+                                warn!(
+                                    "Upgrade to {version} skipped this cycle: {} MiB free on the \
+                                     disk the node's binary is on, {} MiB needed (the archive and \
+                                     twice the binary); next check at {}",
+                                    available / crate::storage::MIB,
+                                    needed.div_ceil(crate::storage::MIB),
+                                    next_check.to_rfc3339()
+                                );
+                                tokio::select! {
+                                    () = shutdown.cancelled() => {
+                                        break;
+                                    }
+                                    () = tokio::time::sleep(next) => {}
+                                }
+                                continue;
                             }
                             // If an upgrade is pending, sleep for exactly the remaining
                             // rollout delay so the node restarts at its scheduled time
@@ -1329,6 +1406,40 @@ async fn next_routing_event<T: Clone>(events: &mut broadcast::Receiver<T>) -> Op
     }
 }
 
+/// The earliest the first upgrade check comes after start.
+const FIRST_UPGRADE_CHECK_EARLIEST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The latest the first upgrade check comes after start.
+const FIRST_UPGRADE_CHECK_LATEST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// When the first upgrade check comes after start: at a random point between
+/// [`FIRST_UPGRADE_CHECK_EARLIEST`] and [`FIRST_UPGRADE_CHECK_LATEST`].
+fn first_upgrade_check_delay() -> std::time::Duration {
+    rand::thread_rng().gen_range(FIRST_UPGRADE_CHECK_EARLIEST..=FIRST_UPGRADE_CHECK_LATEST)
+}
+
+/// Prunes the shared upgrade cache to the archives of the running version,
+/// the one before it and any newer one ([`BinaryCache::prune`]), logging what
+/// it deleted.
+async fn prune_upgrade_cache(running: semver::Version) {
+    let Ok(cache_dir) = upgrade_cache_dir() else {
+        return;
+    };
+    let cache = BinaryCache::new(cache_dir);
+    match tokio::task::spawn_blocking(move || cache.prune(&running)).await {
+        Ok(Ok(deleted)) if !deleted.is_empty() => {
+            let deleted: Vec<String> = deleted.iter().map(ToString::to_string).collect();
+            info!(
+                "Upgrade cache: deleted the archives of {}, older than the running and previous versions",
+                deleted.join(", ")
+            );
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => warn!("Upgrade cache: could not prune it: {e}"),
+        Err(e) => warn!("Upgrade cache: the prune task failed: {e}"),
+    }
+}
+
 /// Apply ±5% jitter to a base interval to prevent thundering-herd behaviour
 /// when multiple nodes check for upgrades on the same schedule.
 fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
@@ -1427,11 +1538,84 @@ mod tests {
         };
 
         // What it tells every peer, in the user agent saorsa-core sends with each signed
-        // message: this build's version under the `node/` prefix, and nothing after it.
+        // message: this build's version under the `node/` prefix, and nothing after it
+        // when it has no image marker.
         let agent = node.p2p_node.config().user_agent();
         assert_eq!(agent, format!("node/{}", env!("CARGO_PKG_VERSION")));
-        assert_eq!(agent, user_agent());
+        assert_eq!(agent, user_agent(None));
         node.shutdown.cancel();
+    }
+
+    /// The image marker the image passes reaches the user agent saorsa-core sends with every
+    /// signed message; anything else given in its place is left out.
+    #[test]
+    fn the_image_marker_reaches_the_user_agent() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = local_node_config(dir.path(), 0);
+        config.image_version = Some(MARKER.to_string());
+        let core = NodeBuilder::build_core_config(&config).expect("core config");
+        assert_eq!(core.user_agent(), user_agent(Some(MARKER)));
+        assert!(core.user_agent().ends_with(&format!("image.{MARKER}")));
+
+        config.image_version = Some("not a commit".to_string());
+        let core = NodeBuilder::build_core_config(&config).expect("core config");
+        assert_eq!(core.user_agent(), user_agent(None));
+    }
+
+    /// The commit an image passes: 40 lowercase hex digits.
+    const MARKER: &str = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
+
+    #[test]
+    fn only_a_commit_is_an_image_marker() {
+        assert_eq!(image_marker(Some(MARKER)), Some(MARKER));
+        for given in [
+            "",
+            "9757a72",
+            "9757A72AFBF6B56617D2BE28573CB8D4B3FB2F65",
+            "9757a72afbf6b56617d2be28573cb8d4b3fb2f650",
+            "9757a72afbf6b56617d2be28573cb8d4b3fb2f6 ",
+            "9757a72afbf6b56617d2be28573cb8d4b3fb2f6.",
+            "g757a72afbf6b56617d2be28573cb8d4b3fb2f65",
+        ] {
+            assert_eq!(image_marker(Some(given)), None, "{given:?}");
+        }
+        assert_eq!(image_marker(None), None);
+    }
+
+    /// The release a node's user agent gives, read as darwin-client's node census reads it
+    /// (`listings_census::supports_feed`): the semver after `node/`, and the number after the
+    /// `ds.` its build metadata starts with.
+    fn census_release(agent: &str) -> Option<u64> {
+        let version = semver::Version::parse(agent.strip_prefix("node/")?).ok()?;
+        version
+            .build
+            .as_str()
+            .strip_prefix("ds.")?
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// A marked user agent is still `node/` and a semver, with the release where the node
+    /// census reads it, so the census reads a marked node's release as an unmarked one's.
+    #[test]
+    fn the_node_census_reads_the_release_of_a_marked_user_agent() {
+        let plain = user_agent(None);
+        let marked = user_agent(Some(MARKER));
+        assert!(marked.starts_with("node/"), "{marked}");
+        let release = census_release(&plain);
+        assert!(
+            release.is_some(),
+            "this build's version gives no ds release: {plain}"
+        );
+        assert_eq!(census_release(&marked), release, "{marked}");
+        let version = semver::Version::parse(marked.strip_prefix("node/").unwrap()).unwrap();
+        assert_eq!(
+            version.build.as_str().rsplit('.').next(),
+            Some(MARKER),
+            "the marker ends the build metadata"
+        );
     }
 
     /// A node with chunks in a store this build cannot read STARTS, however it is
@@ -2154,13 +2338,35 @@ mod tests {
     }
 
     /// The prefix is what keeps this node in its peers' routing tables, and the version is
-    /// this build's, with nothing after it.
+    /// this build's, with nothing after it but the image marker.
     #[test]
     fn the_user_agent_is_this_builds_version_under_the_node_prefix() {
         assert_eq!(
-            super::user_agent(),
+            super::user_agent(None),
             format!("node/{}", env!("CARGO_PKG_VERSION"))
         );
-        assert!(super::user_agent().starts_with("node/"));
+        assert!(super::user_agent(None).starts_with("node/"));
+        let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
+        assert_eq!(
+            super::user_agent(Some(marker)),
+            format!("node/{}.image.{marker}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// The first upgrade check comes a few minutes after start, at a random point, rather
+    /// than an hour later.
+    #[test]
+    fn the_first_upgrade_check_comes_one_to_five_minutes_after_start() {
+        let delays: Vec<u64> = (0..1000)
+            .map(|_| super::first_upgrade_check_delay().as_secs())
+            .collect();
+        assert!(
+            delays.iter().all(|secs| (60..=300).contains(secs)),
+            "{delays:?}"
+        );
+        assert!(
+            delays.iter().any(|secs| *secs < 120) && delays.iter().any(|secs| *secs > 240),
+            "spread over the window"
+        );
     }
 }

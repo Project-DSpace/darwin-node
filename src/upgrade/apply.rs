@@ -23,6 +23,21 @@ use tar::Archive;
 /// Maximum allowed upgrade archive size (200 MiB).
 pub(super) const MAX_ARCHIVE_SIZE_BYTES: usize = 200 * 1024 * 1024;
 
+/// The free space an upgrade needs before it starts: the archive, and the
+/// binary twice, extracted and as the backup of the running one. An archive
+/// whose size the release doesn't give counts as the largest one downloaded.
+fn space_needed(archive_size: Option<u64>, binary_len: u64) -> u64 {
+    archive_size
+        .unwrap_or(MAX_ARCHIVE_SIZE_BYTES as u64)
+        .saturating_add(binary_len.saturating_mul(2))
+}
+
+/// The running binary's size; the largest archive downloaded if it can't be
+/// read.
+fn binary_len(binary: &Path) -> u64 {
+    fs::metadata(binary).map_or(MAX_ARCHIVE_SIZE_BYTES as u64, |meta| meta.len())
+}
+
 /// Exit code that signals the service manager to restart the process.
 ///
 /// On Windows, `trigger_restart` exits with this code instead of using
@@ -176,6 +191,15 @@ impl AutoApplyUpgrader {
         let binary_dir = current_binary
             .parent()
             .ok_or_else(|| Error::Upgrade("Cannot determine binary directory".to_string()))?;
+
+        // The upgrade's own writes come first: a disk that can't take them
+        // skips this cycle, before anything is downloaded or written.
+        let needed = space_needed(info.archive_size, binary_len(&current_binary));
+        if let Ok(available) = crate::storage::available_space(binary_dir) {
+            if available < needed {
+                return Ok(UpgradeResult::NotEnoughSpace { needed, available });
+            }
+        }
 
         // Create temp directory for upgrade.
         //
@@ -907,3 +931,21 @@ mod tests {
 /// The downgrade guard with this fork's `+ds` builds (`apply/ds_ordering.rs`).
 #[cfg(test)]
 mod ds_ordering;
+
+#[cfg(test)]
+mod space_tests {
+    use super::{space_needed, MAX_ARCHIVE_SIZE_BYTES};
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn an_upgrade_needs_the_archive_and_twice_the_binary() {
+        assert_eq!(space_needed(Some(20 * MIB), 60 * MIB), 140 * MIB);
+        // An archive of unknown size counts as the largest one downloaded.
+        assert_eq!(
+            space_needed(None, 60 * MIB),
+            MAX_ARCHIVE_SIZE_BYTES as u64 + 120 * MIB
+        );
+        assert_eq!(space_needed(Some(u64::MAX), u64::MAX), u64::MAX);
+    }
+}

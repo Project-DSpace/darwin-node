@@ -8,6 +8,7 @@
 use crate::error::{Error, Result};
 use crate::logging::debug;
 use crate::upgrade::monitor::{Asset, GitHubRelease};
+use chrono::{DateTime, TimeDelta, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -31,6 +32,10 @@ struct CachedReleases {
     repo: String,
     /// When the releases were fetched (seconds since UNIX epoch).
     fetched_at_epoch_secs: u64,
+    /// GitHub's clock less the fetching machine's, in seconds, from the
+    /// answer's `Date`. Missing from a cache a node before it wrote.
+    #[serde(default)]
+    github_clock_offset_secs: Option<i64>,
     /// The cached release objects.
     releases: Vec<CachedRelease>,
 }
@@ -42,6 +47,8 @@ struct CachedRelease {
     name: String,
     body: String,
     prerelease: bool,
+    #[serde(default)]
+    published_at: Option<DateTime<Utc>>,
     assets: Vec<CachedAsset>,
 }
 
@@ -50,6 +57,8 @@ struct CachedRelease {
 struct CachedAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +72,7 @@ impl From<&GitHubRelease> for CachedRelease {
             name: r.name.clone(),
             body: r.body.clone(),
             prerelease: r.prerelease,
+            published_at: r.published_at,
             assets: r.assets.iter().map(CachedAsset::from).collect(),
         }
     }
@@ -75,6 +85,7 @@ impl From<CachedRelease> for GitHubRelease {
             name: c.name,
             body: c.body,
             prerelease: c.prerelease,
+            published_at: c.published_at,
             assets: c.assets.into_iter().map(Asset::from).collect(),
         }
     }
@@ -85,6 +96,7 @@ impl From<&Asset> for CachedAsset {
         Self {
             name: a.name.clone(),
             browser_download_url: a.browser_download_url.clone(),
+            size: a.size,
         }
     }
 }
@@ -94,6 +106,7 @@ impl From<CachedAsset> for Asset {
         Self {
             name: c.name,
             browser_download_url: c.browser_download_url,
+            size: c.size,
         }
     }
 }
@@ -110,11 +123,12 @@ impl ReleaseCache {
     }
 
     /// Return the cached releases if the cache file exists, belongs to the
-    /// same repo, and has not expired.  Returns `None` on any error (missing,
-    /// corrupted, expired, wrong repo) — callers should fall back to the
-    /// network in that case.
+    /// same repo, and has not expired, with GitHub's clock less the fetching
+    /// machine's when the cache holds it.  Returns `None` on any error
+    /// (missing, corrupted, expired, wrong repo) — callers should fall back
+    /// to the network in that case.
     #[must_use]
-    pub fn read_if_valid(&self, repo: &str) -> Option<Vec<GitHubRelease>> {
+    pub fn read_if_valid(&self, repo: &str) -> Option<(Vec<GitHubRelease>, Option<TimeDelta>)> {
         let data = fs::read_to_string(self.cache_file()).ok()?;
         let cached: CachedReleases = serde_json::from_str(&data).ok()?;
 
@@ -137,13 +151,14 @@ impl ReleaseCache {
             return None;
         }
 
-        Some(
+        Some((
             cached
                 .releases
                 .into_iter()
                 .map(GitHubRelease::from)
                 .collect(),
-        )
+            cached.github_clock_offset_secs.map(TimeDelta::seconds),
+        ))
     }
 
     /// Acquire the exclusive cache lock, re-check the cache, and return
@@ -161,10 +176,14 @@ impl ReleaseCache {
     /// # Errors
     ///
     /// Returns an error if the lock file cannot be created or acquired.
+    #[allow(clippy::type_complexity)]
     pub fn lock_and_recheck(
         &self,
         repo: &str,
-    ) -> Result<(ReleaseCacheLockGuard, Option<Vec<GitHubRelease>>)> {
+    ) -> Result<(
+        ReleaseCacheLockGuard,
+        Option<(Vec<GitHubRelease>, Option<TimeDelta>)>,
+    )> {
         let lock_path = self.lock_file();
         let lock = File::create(&lock_path)
             .map_err(|e| Error::Upgrade(format!("Failed to create release cache lock: {e}")))?;
@@ -185,14 +204,19 @@ impl ReleaseCache {
     ///
     /// Returns an error if the lock cannot be acquired or the file cannot be
     /// written.
-    pub fn write(&self, repo: &str, releases: &[GitHubRelease]) -> Result<()> {
+    pub fn write(
+        &self,
+        repo: &str,
+        releases: &[GitHubRelease],
+        github_clock_offset: Option<TimeDelta>,
+    ) -> Result<()> {
         let lock_path = self.lock_file();
         let lock = File::create(&lock_path)
             .map_err(|e| Error::Upgrade(format!("Failed to create release cache lock: {e}")))?;
         lock.lock_exclusive()
             .map_err(|e| Error::Upgrade(format!("Failed to acquire release cache lock: {e}")))?;
 
-        let result = self.write_inner(repo, releases);
+        let result = self.write_inner(repo, releases, github_clock_offset);
 
         drop(lock); // Dropping the file releases the exclusive lock
         result
@@ -210,13 +234,19 @@ impl ReleaseCache {
         _guard: ReleaseCacheLockGuard,
         repo: &str,
         releases: &[GitHubRelease],
+        github_clock_offset: Option<TimeDelta>,
     ) -> Result<()> {
-        self.write_inner(repo, releases)
+        self.write_inner(repo, releases, github_clock_offset)
     }
 
     // -- private helpers -----------------------------------------------------
 
-    fn write_inner(&self, repo: &str, releases: &[GitHubRelease]) -> Result<()> {
+    fn write_inner(
+        &self,
+        repo: &str,
+        releases: &[GitHubRelease],
+        github_clock_offset: Option<TimeDelta>,
+    ) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| Error::Upgrade(format!("System clock error: {e}")))?
@@ -225,6 +255,7 @@ impl ReleaseCache {
         let cached = CachedReleases {
             repo: repo.to_string(),
             fetched_at_epoch_secs: now,
+            github_clock_offset_secs: github_clock_offset.map(|offset| offset.num_seconds()),
             releases: releases.iter().map(CachedRelease::from).collect(),
         };
 
@@ -279,9 +310,11 @@ mod tests {
             name: "Release 1.2.0".to_string(),
             body: "Notes".to_string(),
             prerelease: false,
+            published_at: None,
             assets: vec![Asset {
                 name: "ant-node-x86_64-linux.tar.gz".to_string(),
                 browser_download_url: "https://example.com/bin".to_string(),
+                size: None,
             }],
         }]
     }
@@ -291,9 +324,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = ReleaseCache::new(tmp.path().to_path_buf(), Duration::from_mins(5));
 
-        cache.write("owner/repo", &sample_releases()).unwrap();
+        cache.write("owner/repo", &sample_releases(), None).unwrap();
 
-        let loaded = cache.read_if_valid("owner/repo").unwrap();
+        let (loaded, _) = cache.read_if_valid("owner/repo").unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].tag_name, "v1.2.0");
         assert_eq!(loaded[0].assets.len(), 1);
@@ -306,7 +339,7 @@ mod tests {
         // TTL of 0 seconds — anything written is immediately expired
         let cache = ReleaseCache::new(tmp.path().to_path_buf(), Duration::from_secs(0));
 
-        cache.write("owner/repo", &sample_releases()).unwrap();
+        cache.write("owner/repo", &sample_releases(), None).unwrap();
 
         assert!(cache.read_if_valid("owner/repo").is_none());
     }
@@ -316,7 +349,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = ReleaseCache::new(tmp.path().to_path_buf(), Duration::from_mins(5));
 
-        cache.write("owner/repo", &sample_releases()).unwrap();
+        cache.write("owner/repo", &sample_releases(), None).unwrap();
 
         assert!(cache.read_if_valid("other/repo").is_none());
     }
@@ -329,6 +362,44 @@ mod tests {
         fs::write(cache.cache_file(), "not valid json!!!").unwrap();
 
         assert!(cache.read_if_valid("owner/repo").is_none());
+    }
+
+    /// A release's publication time, its archive's size and GitHub's clock
+    /// survive the cache, and a cache written before them reads with none.
+    #[test]
+    fn publication_size_and_github_clock_survive_the_cache() {
+        let tmp = TempDir::new().unwrap();
+        let cache = ReleaseCache::new(tmp.path().to_path_buf(), Duration::from_mins(5));
+        let mut releases = sample_releases();
+        let published = DateTime::parse_from_rfc3339("2026-10-25T14:03:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        releases[0].published_at = Some(published);
+        releases[0].assets[0].size = Some(17_000_000);
+        cache
+            .write("owner/repo", &releases, Some(TimeDelta::seconds(-42)))
+            .unwrap();
+        let (loaded, offset) = cache.read_if_valid("owner/repo").unwrap();
+        assert_eq!(loaded[0].published_at, Some(published));
+        assert_eq!(loaded[0].assets[0].size, Some(17_000_000));
+        assert_eq!(offset, Some(TimeDelta::seconds(-42)));
+
+        // As a node up to ds.15 writes it.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        fs::write(
+            cache.cache_file(),
+            format!(
+                r#"{{"repo":"owner/repo","fetched_at_epoch_secs":{now},"releases":[{{"tag_name":"v1.2.0","name":"n","body":"b","prerelease":false,"assets":[{{"name":"a","browser_download_url":"u"}}]}}]}}"#
+            ),
+        )
+        .unwrap();
+        let (loaded, offset) = cache.read_if_valid("owner/repo").unwrap();
+        assert_eq!(loaded[0].published_at, None);
+        assert_eq!(loaded[0].assets[0].size, None);
+        assert_eq!(offset, None);
     }
 
     #[test]

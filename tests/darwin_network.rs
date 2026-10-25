@@ -166,12 +166,9 @@ fn the_image_runs_the_darwin_network() {
 /// Variables the image gives every node before the node reads them, each
 /// with what it is for. A node ignores a variable it doesn't read. Once the
 /// node reads one, the test below fails until it is taken off this list, so
-/// the test then checks it as it checks the rest.
-const GIVEN_BEFORE_THE_NODE_READS_THEM: &[(&str, &str)] = &[(
-    "ANT_IMAGE_VERSION",
-    "the image marker: the commit the image was built from, so a node can \
-     tell that its node manager deletes no node's data",
-)];
+/// the test then checks it as it checks the rest. None now: the image marker,
+/// `ANT_IMAGE_VERSION`, left the list when nodes began to report it.
+const GIVEN_BEFORE_THE_NODE_READS_THEM: &[(&str, &str)] = &[];
 
 #[test]
 fn every_variable_the_image_sets_is_one_the_node_reads() {

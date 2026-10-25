@@ -146,8 +146,11 @@ In the folder with `docker-compose.yml`:
 - **Status:** `docker exec storage-node nodes status`, or
   `http://127.0.0.1:12600/console` on the server (from elsewhere:
   `ssh -L 12600:127.0.0.1:12600 you@server`).
-- **Updates:** the nodes install signed releases themselves (hourly checks,
-  then up to 24 hours' delay). The rest of the container, the node manager
+- **Updates:** the nodes install signed releases themselves: each checks
+  within minutes of starting and hourly after, and takes a release at its
+  own point in the 24 hours after the release's publication (nodes up to
+  ds.15: in the 24 hours after they first see it, starting again at a
+  restart). The rest of the container, the node manager
   among it, changes only with a new image: `docker compose pull`, then
   `docker compose up -d`. Pull at least once if
   `docker exec storage-node darwin-nodes --version` fails: your image still
@@ -177,9 +180,14 @@ In the folder with `docker-compose.yml`:
 - **At 1 GiB free or less**, `docker exec storage-node nodes status` warns,
   and at 500 MiB or less it reports the disk as critical. The node manager
   deletes no node's data, however little space is left.
-- **At 500 MiB free**, nodes stop taking new data: they refuse to store a
-  record that would leave less. To store more, add disk or lower
-  `NODE_COUNT`.
+- **At 1 GiB free**, nodes stop taking new data: they refuse to store a
+  record that would leave less (nodes up to ds.15 did so at 500 MiB). Their
+  logs give way there too: each node deletes its oldest log files first,
+  then writes only warnings and errors into the room that frees, and nothing
+  once none are left to delete; when the disk has room again it logs how
+  many lines it dropped. To store more, add disk or lower `NODE_COUNT`.
+- **Logs:** each node's files in `logs/node-<id>/logs/` start anew at 50 MiB
+  or each hour and take at most 500 MiB in all, the oldest deleted first.
 - **Older images** (where `docker exec storage-node darwin-nodes --version`
   fails) run Autonomi's node manager, which at 500 MiB free evicts the node
   holding the least data (never the last one): it deletes that node's data

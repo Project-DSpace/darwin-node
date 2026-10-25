@@ -129,6 +129,7 @@ const LEGACY_LEFTOVER: &str = "Part of removing, once the chunk store has opened
      every chunk the node kept was in the file store and every chunk it gave up was proven \
      held by its close group. Anything else there is kept.";
 const UPGRADE_CACHE: &str = "Upgrade cache files; no record data.";
+const LOG_FILES: &str = "The node's own log files, never record data.";
 const LISTING_METADATA: &str = "Listing metadata, not record data.";
 
 /// Every reviewed site. See the module documentation for what is counted.
@@ -221,6 +222,20 @@ const ERASE_SITES: &[EraseSite] = &[
         "delete",
         1,
         LISTING_METADATA,
+    ),
+    site(
+        "src/log_files.rs",
+        "LogFiles::delete_oldest_closed",
+        "remove_file",
+        1,
+        LOG_FILES,
+    ),
+    site(
+        "src/log_files.rs",
+        "LogFiles::enforce_limits",
+        "remove_file",
+        1,
+        LOG_FILES,
     ),
     site(
         "src/node.rs",
@@ -548,6 +563,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "remove_file",
         2,
         UPGRADE_CACHE,
+    ),
+    site(
+        "src/upgrade/binary_cache.rs",
+        "BinaryCache::prune",
+        "remove_file",
+        1,
+        "Archives of versions older than the running and previous ones, after a clean \
+         start; upgrade cache files, no record data.",
     ),
     site(
         "src/upgrade/binary_cache.rs",

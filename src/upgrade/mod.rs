@@ -50,6 +50,10 @@ pub struct UpgradeInfo {
     pub signature_url: String,
     /// Release notes.
     pub release_notes: String,
+    /// When the release was published, by GitHub's clock, if known.
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The size of the archive to download, if GitHub gave it.
+    pub archive_size: Option<u64>,
 }
 
 /// Result of an upgrade operation.
@@ -70,6 +74,14 @@ pub enum UpgradeResult {
     },
     /// No upgrade available.
     NoUpgrade,
+    /// The disk lacks the free space the upgrade's own writes need, so this
+    /// cycle is skipped; nothing was downloaded or changed.
+    NotEnoughSpace {
+        /// Bytes the upgrade needs: the archive plus twice the binary.
+        needed: u64,
+        /// Bytes free on the disk the binary is on.
+        available: u64,
+    },
 }
 
 /// Upgrade orchestrator with rollback support.
@@ -504,6 +516,8 @@ mod tests {
             download_url: "test".to_string(),
             signature_url: "test.sig".to_string(),
             release_notes: "Old".to_string(),
+            published_at: None,
+            archive_size: None,
         };
 
         let result = upgrader.validate_upgrade(&info);
@@ -526,6 +540,8 @@ mod tests {
             download_url: "test".to_string(),
             signature_url: "test.sig".to_string(),
             release_notes: "Same".to_string(),
+            published_at: None,
+            archive_size: None,
         };
 
         let result = upgrader.validate_upgrade(&info);
@@ -542,6 +558,8 @@ mod tests {
             download_url: "test".to_string(),
             signature_url: "test.sig".to_string(),
             release_notes: "New".to_string(),
+            published_at: None,
+            archive_size: None,
         };
 
         let result = upgrader.validate_upgrade(&info);
@@ -639,6 +657,8 @@ mod tests {
             download_url: "https://example.com/binary".to_string(),
             signature_url: "https://example.com/binary.sig".to_string(),
             release_notes: "Bug fixes and improvements".to_string(),
+            published_at: None,
+            archive_size: None,
         };
 
         assert_eq!(info.version, Version::new(1, 2, 3));

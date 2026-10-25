@@ -157,6 +157,13 @@ pub struct NodeConfig {
     /// Log level.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// The image marker: the darwin-node commit the storage-node image this
+    /// node runs in was built from, which that image passes in
+    /// `ANT_IMAGE_VERSION` (`--image-version`). The node reports it in its
+    /// user agent. Never read from a config file.
+    #[serde(skip)]
+    pub image_version: Option<String>,
 }
 
 /// Configuration for the ADR-0015 WebRTC Direct browser listener.
@@ -595,6 +602,7 @@ impl Default for NodeConfig {
             close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
             log_level: default_log_level(),
+            image_version: None,
         }
     }
 }
@@ -740,10 +748,12 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_verify_on_read")]
     pub verify_on_read: bool,
 
-    /// Minimum free disk space (in MiB) to preserve on the storage partition.
+    /// Minimum free disk space (in MiB) to preserve on the storage partition:
+    /// the node's full line.
     ///
     /// Writes are refused when available space drops below this threshold,
-    /// preventing the node from filling the disk completely.  Default: 500 MiB.
+    /// preventing the node from filling the disk completely, and the node's
+    /// log files give way at it. Default: 1024 MiB (1 GiB).
     #[serde(default = "default_disk_reserve_mb")]
     pub disk_reserve_mb: u64,
 }
@@ -758,9 +768,9 @@ impl Default for StorageConfig {
     }
 }
 
-/// Default: 500 MiB — matches `DEFAULT_DISK_RESERVE` in `storage`.
+/// Default: 1 GiB, in MiB — matches `DEFAULT_DISK_RESERVE` in `storage`.
 const fn default_disk_reserve_mb() -> u64 {
-    500
+    crate::storage::DEFAULT_DISK_RESERVE / crate::storage::MIB
 }
 
 const fn default_storage_enabled() -> bool {
@@ -951,6 +961,24 @@ rewards_address = "0x0000000000000000000000000000000000000001"
 
     use super::*;
     use serial_test::serial;
+
+    /// A node takes new data down to 1 GiB free unless its config file sets
+    /// another line, which is honoured.
+    #[test]
+    fn the_full_line_is_1_gib_unless_a_config_file_sets_another() {
+        assert_eq!(crate::storage::DEFAULT_DISK_RESERVE, 1024 * 1024 * 1024);
+        assert_eq!(StorageConfig::default().disk_reserve_mb, 1024);
+        assert_eq!(NodeConfig::default().storage.disk_reserve_mb, 1024);
+        assert_eq!(
+            crate::storage::ChunkStoreConfig::default().disk_reserve,
+            crate::storage::DEFAULT_DISK_RESERVE
+        );
+        let empty: NodeConfig = toml::from_str("").expect("an empty config");
+        assert_eq!(empty.storage.disk_reserve_mb, 1024);
+        let own: NodeConfig =
+            toml::from_str("[storage]\ndisk_reserve_mb = 500").expect("an operator's line");
+        assert_eq!(own.storage.disk_reserve_mb, 500);
+    }
 
     #[test]
     fn test_default_config_has_cache_capacity() {

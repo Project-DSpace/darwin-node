@@ -10,6 +10,8 @@ mod platform;
 
 use ant_node::config::BootstrapSource;
 #[cfg(feature = "logging")]
+use ant_node::log_files::{LineFormat, LogFiles, TagLevels};
+#[cfg(feature = "logging")]
 use ant_node::logging::WithBuildInfo;
 use ant_node::NodeBuilder;
 use clap::Parser;
@@ -61,31 +63,27 @@ fn init_logging(
             guard = None;
             Box::new(fmt::layer().json().event_format(json_event_format()))
         }
+        // Size-capped files that give way at the full line
+        // (ant_node::log_files); each line goes to them marked with its level.
         (CliLogFormat::Text, Some(dir)) => {
-            let file_appender = tracing_appender::rolling::Builder::new()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .max_log_files(log_max_files)
-                .filename_prefix("ant-node")
-                .filename_suffix("log")
-                .build(dir)?;
-            let (non_blocking, g) = tracing_appender::non_blocking(file_appender);
+            let files = LogFiles::open(&dir, log_max_files, LineFormat::Text)?;
+            let (non_blocking, g) = tracing_appender::non_blocking(files);
             guard = Some(g);
-            Box::new(fmt::layer().with_writer(non_blocking).with_ansi(false))
+            Box::new(
+                fmt::layer()
+                    .with_writer(TagLevels(non_blocking))
+                    .with_ansi(false),
+            )
         }
         (CliLogFormat::Json, Some(dir)) => {
-            let file_appender = tracing_appender::rolling::Builder::new()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .max_log_files(log_max_files)
-                .filename_prefix("ant-node")
-                .filename_suffix("log")
-                .build(dir)?;
-            let (non_blocking, g) = tracing_appender::non_blocking(file_appender);
+            let files = LogFiles::open(&dir, log_max_files, LineFormat::Json)?;
+            let (non_blocking, g) = tracing_appender::non_blocking(files);
             guard = Some(g);
             Box::new(
                 fmt::layer()
                     .json()
                     .event_format(json_event_format())
-                    .with_writer(non_blocking)
+                    .with_writer(TagLevels(non_blocking))
                     .with_ansi(false),
             )
         }

@@ -280,7 +280,11 @@ never ran.
   keeps every folder set aside. `tests/darwin_image.rs` pins
   the manager's install, the registry's place, the marker's path, every
   deletion and every move the image's scripts make, each with its reason,
-  and the set-aside folders' place beyond every sweep.
+  and the set-aside folders' place beyond every sweep. Nodes after ds.15
+  report the marker in their user agent, after the release
+  (`node/<version>.image.<commit>`), where the node census still reads the
+  release, and log a line at start when they have none; tests in
+  `src/node.rs` pin both.
 - **Releases are Linux x86_64 only**, built and signed by
   `.github/workflows/release.yml`. Auto-upgrade reads this repository's
   releases without credentials, and orders `+ds.N` builds by their number,
@@ -312,14 +316,16 @@ never ran.
   `cargo build --release --locked --bin ant-node`, and check it for test
   seams before packaging it.
 - **Three crates are vendored**, each with a `VENDORED.md` saying what it
-  is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
-  its only change; `vendor/webrtc` is webrtc 0.14.0, whose
-  `RTCDtlsTransport::stop()` cancels a DTLS handshake still in progress;
-  and `vendor/ant-listings` is darwin-listings 0.3.1, unchanged: the
-  envelope format, listings, their payment checks, the listings protocol
-  and its change feeds. `[patch.crates-io]` puts the first two in place of the
-  crates.io releases. `vendor/ant-listings` and `vendor/ant-protocol` are
-  workspace members, so their own tests run under this repository's
+  is: `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
+  `VENDORED.md` lists, `PRICE_MULTIPLIER` and the functions that price a
+  record by its size, which nothing uses yet; `vendor/webrtc` is webrtc
+  0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
+  in progress; and `vendor/ant-listings` is darwin-listings 0.3.1,
+  unchanged: the envelope format, listings, their payment checks, the
+  listings protocol and its change feeds. `[patch.crates-io]` puts the
+  first two in place of the crates.io releases. `vendor/ant-listings` and
+  `vendor/ant-protocol` are workspace members, so their own tests run
+  under this repository's
   `Cargo.lock` in the Test workflow (`cargo test --locked -p ant-listings`,
   `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml`),
   and the Build workflow checks `vendor/ant-listings`' git objects against
@@ -995,6 +1001,11 @@ To prevent **network collapse** from simultaneous upgrades, ant-node implements 
 **How Staged Rollout Works:**
 - Each node adds a **random delay** (0-24 hours) before applying upgrades
 - Delay is deterministically derived from node ID (consistent but distributed)
+- In this fork the delay counts from the release's publication, by GitHub's
+  clock (the `Date` of its answer), so a node that restarts while waiting
+  keeps its time; a release without a publication time, or with one in the
+  future, counts from when the node first sees it. A node's first check
+  comes 1 to 5 minutes after it starts, then one every check interval.
 - Critical security updates can override with shorter delay windows
 - Network maintains minimum online node threshold during rollout
 

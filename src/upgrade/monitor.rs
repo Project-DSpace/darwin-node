@@ -14,6 +14,7 @@ use crate::upgrade::release_cache::ReleaseCache;
 use crate::upgrade::rollout::StagedRollout;
 use crate::upgrade::traffic;
 use crate::upgrade::UpgradeInfo;
+use chrono::{DateTime, TimeDelta, Utc};
 use semver::Version;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
@@ -29,6 +30,10 @@ pub struct GitHubRelease {
     pub body: String,
     /// Whether this is a pre-release.
     pub prerelease: bool,
+    /// When the release was published, by GitHub's clock; `None` for one
+    /// that isn't, or read from a cache a node before this field wrote.
+    #[serde(default)]
+    pub published_at: Option<DateTime<Utc>>,
     /// Attached binary assets.
     pub assets: Vec<Asset>,
 }
@@ -40,6 +45,9 @@ pub struct Asset {
     pub name: String,
     /// Direct download URL.
     pub browser_download_url: String,
+    /// The asset's size in bytes, as GitHub gives it.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// Monitors GitHub releases for new versions.
@@ -58,10 +66,16 @@ pub struct UpgradeMonitor {
     staged_rollout: Option<StagedRollout>,
     /// Disk cache for GitHub release metadata (shared across instances).
     release_cache: Option<ReleaseCache>,
-    /// When the current pending upgrade was first detected.
-    pending_upgrade_detected: Option<Instant>,
+    /// When the pending upgrade is due: its publication plus this node's
+    /// rollout offset, or, without a publication time, when this process
+    /// first saw it plus the offset.
+    pending_ready_at: Option<Instant>,
     /// The version of the pending upgrade (for tracking rollout state).
     pending_upgrade_version: Option<Version>,
+    /// GitHub's clock less this machine's, from the `Date` of the latest
+    /// answer from GitHub this node saw, its own or one a node on this
+    /// machine cached. `None` until there is one: the local clock is used.
+    github_clock_offset: Option<TimeDelta>,
 }
 
 impl UpgradeMonitor {
@@ -94,8 +108,9 @@ impl UpgradeMonitor {
             client,
             staged_rollout: None,
             release_cache: None,
-            pending_upgrade_detected: None,
+            pending_ready_at: None,
             pending_upgrade_version: None,
+            github_clock_offset: None,
         }
     }
 
@@ -151,8 +166,9 @@ impl UpgradeMonitor {
             client,
             staged_rollout: None,
             release_cache: None,
-            pending_upgrade_detected: None,
+            pending_ready_at: None,
             pending_upgrade_version: None,
+            github_clock_offset: None,
         }
     }
 
@@ -196,18 +212,27 @@ impl UpgradeMonitor {
     ///
     /// Returns an error if the GitHub API request fails.
     pub async fn check_for_updates(&self) -> Result<Option<UpgradeInfo>> {
+        self.fetch_upgrade().await.map(|(info, _)| info)
+    }
+
+    /// As [`Self::check_for_updates`], with GitHub's clock less this
+    /// machine's when the answer, fresh or cached, carried GitHub's `Date`.
+    async fn fetch_upgrade(&self) -> Result<(Option<UpgradeInfo>, Option<TimeDelta>)> {
         // Try the shared disk cache first (lock-free fast path)
         if let Some(ref cache) = self.release_cache {
-            if let Some(cached_releases) = cache.read_if_valid(&self.repo) {
+            if let Some((cached_releases, offset)) = cache.read_if_valid(&self.repo) {
                 info!(
                     "Using cached release info ({} releases)",
                     cached_releases.len()
                 );
-                return Ok(select_upgrade_from_releases(
-                    &cached_releases,
-                    &self.current_version,
-                    self.channel,
-                    self.pending_upgrade_version.as_ref(),
+                return Ok((
+                    select_upgrade_from_releases(
+                        &cached_releases,
+                        &self.current_version,
+                        self.channel,
+                        self.pending_upgrade_version.as_ref(),
+                    ),
+                    offset,
                 ));
             }
 
@@ -220,44 +245,53 @@ impl UpgradeMonitor {
                     .await
                     .map_err(|e| Error::Upgrade(format!("Cache lock task failed: {e}")))??;
 
-            if let Some(cached_releases) = rechecked {
+            if let Some((cached_releases, offset)) = rechecked {
                 info!(
                     "Using cached release info after lock ({} releases)",
                     cached_releases.len()
                 );
-                return Ok(select_upgrade_from_releases(
-                    &cached_releases,
-                    &self.current_version,
-                    self.channel,
-                    self.pending_upgrade_version.as_ref(),
+                return Ok((
+                    select_upgrade_from_releases(
+                        &cached_releases,
+                        &self.current_version,
+                        self.channel,
+                        self.pending_upgrade_version.as_ref(),
+                    ),
+                    offset,
                 ));
             }
 
             info!("No valid cache under lock, fetching from API");
 
             // Fetch from API while holding the lock
-            let releases = self.fetch_releases_from_api().await?;
+            let (releases, offset) = self.fetch_releases_from_api().await?;
 
             // Write fresh results under the lock for other nodes
-            if let Err(e) = cache.write_under_lock(lock_guard, &self.repo, &releases) {
+            if let Err(e) = cache.write_under_lock(lock_guard, &self.repo, &releases, offset) {
                 warn!("Failed to write release cache: {e}");
             }
 
-            return Ok(select_upgrade_from_releases(
-                &releases,
-                &self.current_version,
-                self.channel,
-                self.pending_upgrade_version.as_ref(),
+            return Ok((
+                select_upgrade_from_releases(
+                    &releases,
+                    &self.current_version,
+                    self.channel,
+                    self.pending_upgrade_version.as_ref(),
+                ),
+                offset,
             ));
         }
 
         // No cache configured — fetch directly
-        let releases = self.fetch_releases_from_api().await?;
-        Ok(select_upgrade_from_releases(
-            &releases,
-            &self.current_version,
-            self.channel,
-            self.pending_upgrade_version.as_ref(),
+        let (releases, offset) = self.fetch_releases_from_api().await?;
+        Ok((
+            select_upgrade_from_releases(
+                &releases,
+                &self.current_version,
+                self.channel,
+                self.pending_upgrade_version.as_ref(),
+            ),
+            offset,
         ))
     }
 
@@ -266,19 +300,28 @@ impl UpgradeMonitor {
     /// This method:
     /// 1. Checks GitHub for available updates
     /// 2. If staged rollout is enabled and an upgrade is found:
-    ///    - Starts tracking the upgrade detection time
-    ///    - Returns `None` until the calculated delay has passed
+    ///    - Works out when this node is due to apply it: the release's
+    ///      publication plus the node's rollout offset, by GitHub's clock
+    ///      (its `Date`, or the local clock without one), so a restart
+    ///      doesn't start the delay again. Without a publication time, or
+    ///      with one later than GitHub's now, the offset counts from when this
+    ///      process first saw the release, as before.
+    ///    - Returns `None` until then
     ///    - Returns the upgrade info once the node is ready to apply it
     ///
     /// # Errors
     ///
     /// Returns an error if the GitHub API request fails.
     pub async fn check_for_ready_upgrade(&mut self) -> Result<Option<UpgradeInfo>> {
-        let upgrade_info = self.check_for_updates().await?;
+        let (upgrade_info, offset) = self.fetch_upgrade().await?;
+        if offset.is_some() {
+            self.github_clock_offset = offset;
+        }
 
         let Some(info) = upgrade_info else {
-            // No upgrade available - reset tracking state
-            self.pending_upgrade_detected = None;
+            // No upgrade available, or the pending one was withdrawn: reset
+            // tracking state
+            self.pending_ready_at = None;
             self.pending_upgrade_version = None;
             return Ok(None);
         };
@@ -299,16 +342,30 @@ impl UpgradeMonitor {
             .as_ref()
             .is_none_or(|v| *v != info.version);
 
-        if is_new_version {
-            // New version detected - start rollout timer
-            self.pending_upgrade_detected = Some(Instant::now());
-            self.pending_upgrade_version = Some(info.version.clone());
+        let delay = rollout.calculate_delay_for_version(&info.version);
+        let now = Instant::now();
+        let github_now = Utc::now() + self.github_clock_offset.unwrap_or_default();
+        let ready_at = match ready_after_publication(info.published_at, github_now, delay) {
+            Some(remaining) => now + remaining,
+            // No publication time, or one in the future: the offset counts
+            // from when this process first saw the version.
+            None => match self.pending_ready_at {
+                Some(ready_at) if !is_new_version => ready_at,
+                _ => now + delay,
+            },
+        };
+        self.pending_upgrade_version = Some(info.version.clone());
+        self.pending_ready_at = Some(ready_at);
 
-            let delay = rollout.calculate_delay_for_version(&info.version);
-            let restart_time = chrono::Utc::now()
-                + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
+        if is_new_version {
+            let remaining = ready_at.saturating_duration_since(now);
+            let restart_time =
+                Utc::now() + TimeDelta::from_std(remaining).unwrap_or_else(|_| TimeDelta::hours(1));
             info!(
                 new_version = %info.version,
+                published_at = %info
+                    .published_at
+                    .map_or_else(|| "unknown".to_string(), |at| at.to_rfc3339()),
                 delay_hours = delay.as_secs() / 3600,
                 delay_minutes = (delay.as_secs() % 3600) / 60,
                 "New version detected, staged rollout delay calculated"
@@ -319,24 +376,14 @@ impl UpgradeMonitor {
             );
         }
 
-        // Calculate if we're past the rollout delay
-        let Some(detected_at) = self.pending_upgrade_detected else {
-            // Should not happen, but handle gracefully
-            warn!("Pending upgrade detected but no timestamp recorded");
-            return Ok(Some(info));
-        };
-
-        let delay = rollout.calculate_delay_for_version(&info.version);
-        let elapsed = detected_at.elapsed();
-
-        if elapsed >= delay {
+        if now >= ready_at {
             info!(
                 version = %info.version,
                 "Staged rollout delay elapsed, ready to upgrade"
             );
             Ok(Some(info))
         } else {
-            let remaining = delay.saturating_sub(elapsed);
+            let remaining = ready_at.saturating_duration_since(now);
             debug!(
                 "Staged rollout: {}h {}m remaining before upgrade to {}",
                 remaining.as_secs() / 3600,
@@ -347,8 +394,9 @@ impl UpgradeMonitor {
         }
     }
 
-    /// Fetch releases from the GitHub API.
-    async fn fetch_releases_from_api(&self) -> Result<Vec<GitHubRelease>> {
+    /// Fetch releases from the GitHub API, with GitHub's clock less this
+    /// machine's when the answer carries a `Date` that parses.
+    async fn fetch_releases_from_api(&self) -> Result<(Vec<GitHubRelease>, Option<TimeDelta>)> {
         let api_url = format!("https://api.github.com/repos/{}/releases", self.repo);
         debug!("Checking for updates from: {}", api_url);
 
@@ -371,6 +419,13 @@ impl UpgradeMonitor {
             )));
         }
 
+        let offset = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|date| date.to_str().ok())
+            .and_then(parse_http_date)
+            .map(|github_now| github_now - Utc::now());
+
         // V2-834: materialise the body so its size is observable, then parse.
         let body = match response.bytes().await {
             Ok(body) => body,
@@ -380,8 +435,9 @@ impl UpgradeMonitor {
             }
         };
         traffic::record_rx(traffic::UpgradeFetch::Manifest, body.len());
-        serde_json::from_slice(&body)
-            .map_err(|e| Error::Network(format!("Failed to parse releases: {e}")))
+        let releases = serde_json::from_slice(&body)
+            .map_err(|e| Error::Network(format!("Failed to parse releases: {e}")))?;
+        Ok((releases, offset))
     }
 
     /// Get the remaining time until this node should upgrade.
@@ -389,18 +445,10 @@ impl UpgradeMonitor {
     /// Returns `None` if no upgrade is pending or staged rollout is disabled.
     #[must_use]
     pub fn time_until_upgrade(&self) -> Option<Duration> {
-        let rollout = self.staged_rollout.as_ref()?;
-        let version = self.pending_upgrade_version.as_ref()?;
-        let detected_at = self.pending_upgrade_detected?;
-
-        let delay = rollout.calculate_delay_for_version(version);
-        let elapsed = detected_at.elapsed();
-
-        if elapsed >= delay {
-            Some(Duration::ZERO)
-        } else {
-            Some(delay.saturating_sub(elapsed))
-        }
+        self.staged_rollout.as_ref()?;
+        self.pending_upgrade_version.as_ref()?;
+        let ready_at = self.pending_ready_at?;
+        Some(ready_at.saturating_duration_since(Instant::now()))
     }
 
     /// Check if staged rollout is enabled.
@@ -457,8 +505,32 @@ impl UpgradeMonitor {
             download_url: binary_asset.browser_download_url.clone(),
             signature_url: sig_asset.browser_download_url.clone(),
             release_notes: release.body.clone(),
+            published_at: release.published_at,
+            archive_size: binary_asset.size,
         })
     }
+}
+
+/// How long until a node whose rollout offset is `delay` takes a release
+/// published at `published`, counting from the publication, when `now` is
+/// GitHub's: zero once it is due. `None` without a publication time, or with
+/// one later than `now`; the offset then counts from when the node first saw
+/// the release.
+fn ready_after_publication(
+    published: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    delay: Duration,
+) -> Option<Duration> {
+    let published = published.filter(|published| *published <= now)?;
+    let due = published + TimeDelta::from_std(delay).ok()?;
+    Some((due - now).to_std().unwrap_or(Duration::ZERO))
+}
+
+/// An HTTP `Date` header (`Sun, 25 Oct 2026 14:03:07 GMT`), as UTC.
+fn parse_http_date(date: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(date)
+        .ok()
+        .map(|date| date.with_timezone(&Utc))
 }
 
 /// Check whether a version is eligible for the given upgrade channel.
@@ -574,6 +646,8 @@ fn select_upgrade_from_releases(
             download_url: binary_asset.browser_download_url.clone(),
             signature_url: sig_asset.browser_download_url.clone(),
             release_notes: release.body.clone(),
+            published_at: release.published_at,
+            archive_size: binary_asset.size,
         };
 
         let should_replace = best.as_ref().is_none_or(|b| candidate.version > b.version);
@@ -843,26 +917,32 @@ mod tests {
             Asset {
                 name: "ant-node-cli-linux-x64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/linux".to_string(),
+                size: None,
             },
             Asset {
                 name: "ant-node-cli-linux-x64.tar.gz.sig".to_string(),
                 browser_download_url: "https://example.com/linux.sig".to_string(),
+                size: None,
             },
             Asset {
                 name: "ant-node-cli-macos-arm64.tar.gz".to_string(),
                 browser_download_url: "https://example.com/macos".to_string(),
+                size: None,
             },
             Asset {
                 name: "ant-node-cli-macos-arm64.tar.gz.sig".to_string(),
                 browser_download_url: "https://example.com/macos.sig".to_string(),
+                size: None,
             },
             Asset {
                 name: "ant-node-cli-windows-x64.zip".to_string(),
                 browser_download_url: "https://example.com/windows".to_string(),
+                size: None,
             },
             Asset {
                 name: "ant-node-cli-windows-x64.zip.sig".to_string(),
                 browser_download_url: "https://example.com/windows.sig".to_string(),
+                size: None,
             },
         ];
 
@@ -939,14 +1019,17 @@ mod tests {
             name: "Release 1.1.0".to_string(),
             body: "New features".to_string(),
             prerelease: false,
+            published_at: None,
             assets: vec![
                 Asset {
                     name: archive_name.clone(),
                     browser_download_url: "https://example.com/binary".to_string(),
+                    size: None,
                 },
                 Asset {
                     name: format!("{archive_name}.sig"),
                     browser_download_url: "https://example.com/binary.sig".to_string(),
+                    size: None,
                 },
             ],
         };
@@ -973,6 +1056,7 @@ mod tests {
             name: "Release 1.0.0".to_string(),
             body: "Current version".to_string(),
             prerelease: false,
+            published_at: None,
             assets: vec![],
         };
 
@@ -995,6 +1079,7 @@ mod tests {
             name: "Release 1.0.0".to_string(),
             body: "Old version".to_string(),
             prerelease: false,
+            published_at: None,
             assets: vec![],
         };
 
@@ -1020,6 +1105,7 @@ mod tests {
             name: "Beta Release".to_string(),
             body: "Beta features".to_string(),
             prerelease: true,
+            published_at: None,
             assets: vec![],
         };
 
@@ -1085,6 +1171,7 @@ mod tests {
             name: "Invalid Release".to_string(),
             body: "Invalid".to_string(),
             prerelease: false,
+            published_at: None,
             assets: vec![],
         };
 
@@ -1108,14 +1195,17 @@ mod tests {
                 name: "beta".to_string(),
                 body: "beta".to_string(),
                 prerelease: true,
+                published_at: None,
                 assets: vec![
                     Asset {
                         name: bin_name.clone(),
                         browser_download_url: "https://example.com/beta".to_string(),
+                        size: None,
                     },
                     Asset {
                         name: format!("{bin_name}.sig"),
                         browser_download_url: "https://example.com/beta.sig".to_string(),
+                        size: None,
                     },
                 ],
             },
@@ -1124,14 +1214,17 @@ mod tests {
                 name: "stable".to_string(),
                 body: "stable".to_string(),
                 prerelease: false,
+                published_at: None,
                 assets: vec![
                     Asset {
                         name: bin_name.clone(),
                         browser_download_url: "https://example.com/stable".to_string(),
+                        size: None,
                     },
                     Asset {
                         name: format!("{bin_name}.sig"),
                         browser_download_url: "https://example.com/stable.sig".to_string(),
+                        size: None,
                     },
                 ],
             },
@@ -1160,14 +1253,17 @@ mod tests {
                 name: "stable".to_string(),
                 body: "stable".to_string(),
                 prerelease: false,
+                published_at: None,
                 assets: vec![
                     Asset {
                         name: bin_name.clone(),
                         browser_download_url: "https://example.com/stable".to_string(),
+                        size: None,
                     },
                     Asset {
                         name: format!("{bin_name}.sig"),
                         browser_download_url: "https://example.com/stable.sig".to_string(),
+                        size: None,
                     },
                 ],
             },
@@ -1176,14 +1272,17 @@ mod tests {
                 name: "beta".to_string(),
                 body: "beta".to_string(),
                 prerelease: true,
+                published_at: None,
                 assets: vec![
                     Asset {
                         name: bin_name.clone(),
                         browser_download_url: "https://example.com/beta".to_string(),
+                        size: None,
                     },
                     Asset {
                         name: format!("{bin_name}.sig"),
                         browser_download_url: "https://example.com/beta.sig".to_string(),
+                        size: None,
                     },
                 ],
             },
@@ -1210,14 +1309,17 @@ mod tests {
             name: tag.to_string(),
             body: format!("notes for {tag}"),
             prerelease: tag.contains('-'),
+            published_at: None,
             assets: vec![
                 Asset {
                     name: bin_name.clone(),
                     browser_download_url: format!("https://example.com/{tag}"),
+                    size: None,
                 },
                 Asset {
                     name: format!("{bin_name}.sig"),
                     browser_download_url: format!("https://example.com/{tag}.sig"),
+                    size: None,
                 },
             ],
         }
@@ -1362,3 +1464,8 @@ mod tests {
 /// How this fork's `+ds` builds are ordered (`monitor/ds_ordering.rs`).
 #[cfg(test)]
 mod ds_ordering;
+
+/// When a node takes a release, counted from its publication
+/// (`monitor/timing.rs`).
+#[cfg(test)]
+mod timing;
