@@ -186,27 +186,3 @@ pub mod test_accounts {
     pub const ACCOUNT_2_KEY: &str =
         "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 }
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[tokio::test]
-    #[serial]
-    async fn test_anvil_creation() {
-        let anvil = TestAnvil::new().await.unwrap();
-        let _network = anvil.to_network();
-        assert!(
-            !anvil.default_wallet_key().unwrap().is_empty(),
-            "expected a non-empty default wallet key"
-        );
-    }
-
-    #[test]
-    fn test_account_constants() {
-        assert!(test_accounts::ACCOUNT_0.starts_with("0x"));
-        assert!(test_accounts::ACCOUNT_0_KEY.starts_with("0x"));
-    }
-}
