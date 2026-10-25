@@ -591,7 +591,10 @@ fn folders_set_aside_are_out_of_every_sweeps_reach() {
         // dated now, and retire moves nowhere else.
         let retires = words(command).iter().any(|word| word == "retire");
         if command.contains(r#""$RETIRED/"#) {
-            assert!(retires, "a move into $RETIRED that isn't a retire: {command}");
+            assert!(
+                retires,
+                "a move into $RETIRED that isn't a retire: {command}"
+            );
         }
         if retires && !command.starts_with("retire() ") {
             let call = &command[command.find("retire ").unwrap()..];
