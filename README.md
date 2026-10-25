@@ -305,6 +305,39 @@ never ran.
   New connections over saorsa-core's rate per IP are only logged, and
   unpaid storage and quote requests aren't limited; see [Rate
   Limiting](#rate-limiting).
+- **Neighbour sync is paged** (from ds.17). A node's hints for a neighbour,
+  the keys it believes the neighbour should hold and the paid-list keys it
+  should track, went in one message capped at 10 MiB and never split, about
+  327,000 keys: a node with more could no longer build it, and its sync
+  stopped. Between nodes of ds.17 and later, each side's hints go in pages of
+  up to 256 KiB of keys (8,192), replica hints first, each page its own
+  request and answer carrying the exchange's number and "page n of N", the
+  next sent only once the last is answered, up to 256 pages a side, and one
+  exchange at a time with each neighbour. The responder builds its hints for
+  the requester once, at the first page, from one snapshot of its routing
+  table, and serves every page from them; what it holds for exchanges in
+  progress comes to at most 64 MiB of keys beyond one exchange, and is
+  dropped after each exchange's last page or once its requester stops asking.
+  A page it can't take now, refused at admission (1 a peer, 8 in all, as
+  before) or left waiting 15 seconds for a worker, is answered busy: the
+  requester ends the exchange and syncs again in a later cycle, where an
+  unanswered request would have counted against the responder. A requester
+  waits 30 seconds for each page, sync's own deadline. Repair proofs are
+  recorded only for the keys of pages that were answered, and a node
+  bootstrapping counts a neighbour as done only once that neighbour's last
+  page has arrived. A node pages to a peer whose user agent names ds.17 or
+  later (`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`), decided again for each
+  exchange: from the agent of the peer's connection, or, while it isn't
+  connected, from the last sync message it sent. Any other peer, one of
+  unknown release among them, gets a single message, as before, carrying at
+  most 9 MiB of keys so that it can always be built. Scans of a node's keys,
+  for hints and for the hourly rebuild of its storage commitment, compute
+  close groups from one routing snapshot, off the async workers, instead of a
+  routing-table lookup for every key. Tests: `tests/wire_format.rs` pins the
+  two new messages' bytes, and `src/replication/protocol.rs` that a node of
+  ds.15 refuses them whole; `tests/e2e/sync_pages.rs` runs paged exchanges
+  between nodes: both lists over several pages from one scan, busy answers at
+  admission and after a wait, and paging chosen by the peer's agent.
 - **Messages between nodes keep their bytes.** `tests/wire_format.rs` pins
   the bytes of every replication message, and of every variant of the
   replies, as ds.15 writes them, and fails when a message or a reply gains
@@ -325,16 +358,21 @@ never ran.
   penalties, for any pair of roles and reason, more than 10 above the
   highest count in two runs of the previous release alone (the spread
   measured between such runs); on more than 3 penalties for a failure
-  reason those runs never charged a role with; or on a message family that
-  stopped reaching nodes. Run it before a node release's canary.
+  reason those runs never charged a role with; on a message family that
+  stopped reaching nodes; or on a node paging its sync hints to a node of
+  the previous release. With `--paged` it adds a run of this tree's nodes
+  alone, two keys to a sync page, which must show both hint lists going over
+  more than one page each way, each responder's hints built once per
+  exchange, and pages served in order. Run it before a node release's canary.
   Its report and summary.json list every count measured against those runs,
   with the excess over them and the limit, within the limit or not.
   The Test workflow tests what fails a run, on made-up results
   (`scripts/test_mixed_versions_verdicts.py`).
   Builds with the `test-utils` feature, which the harness uses, have test
   seams (`src/test_seams.rs`), such as one that makes a node's disk read as
-  full; the Build workflow checks that the image's node has none, and the
-  Release workflow that the node releases install has none, before it is
+  full, and two for paged sync, the page size and the release from which a
+  node pages; the Build workflow checks that the image's node has none, and
+  the Release workflow that the node releases install has none, before it is
   packaged and signed.
 
 ---
@@ -1386,7 +1424,7 @@ What is limited:
 | Watches on a node's listing change feed | `ListingService::changes` in `src/listings/service.rs` | 4 at once, each for 3 minutes or until its reader's next request; a fifth is refused, its request answered |
 | Records read for one change feed request | `ListingService::changes` in `src/listings/service.rs` | 4,096, of which at most 256 are sent |
 | Listing checks after their schedule has run out | `ListingService::recheck_slot` in `src/listings/service.rs` | 60 an hour per node, a minute apart; each envelope's for at most 7 days |
-| Replication requests from other nodes: chunk fetches, verification, neighbour sync, paid notifications, fresh offers and audits | `src/replication/mod.rs`, and `src/replication/config.rs` for audits | for each kind, in all and per peer; any more are turned away |
+| Replication requests from other nodes: chunk fetches, verification, neighbour sync, paid notifications, fresh offers and audits | `src/replication/mod.rs`, and `src/replication/config.rs` for audits | for each kind, in all and per peer; any more are turned away, a neighbour-sync page with a busy answer |
 | Pointer requests from other nodes | `src/replication/pointer.rs` | fetch and state requests: 128 admitted in all and 16 from one peer, 32 of them served at once, any more dropped; fresh offers: 16 verified at once, any more dropped |
 
 Logged only: saorsa-core's transport counts new connections, per IP and in
