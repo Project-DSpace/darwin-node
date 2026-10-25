@@ -5,7 +5,8 @@
 //! pages here through the page-size seam (`ANT_TEST_SEAM_SYNC_PAGE_BYTES`, in
 //! `src/test_seams.rs`). A page it can't take is answered busy, never left
 //! unanswered, and the busy answer costs it none of the requester's trust. The
-//! repair proofs of a page wait for the requester's next page. Whether a node
+//! repair proofs of a page wait for the requester's next page. A single
+//! request a paging peer sends is answered busy too. Whether a node
 //! pages to a peer follows the release the peer's user agent names.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -626,6 +627,98 @@ async fn nodes_announcing_the_paging_release_page_to_each_other() {
         "{agent}"
     );
     assert!(engine.pages_to_for_test(&responder).await);
+
+    harness.teardown().await.expect("teardown");
+}
+
+fn single_request() -> ReplicationMessageBody {
+    ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
+        replica_hints: Vec::new(),
+        paid_hints: Vec::new(),
+        bootstrapping: false,
+        commitment: None,
+    })
+}
+
+/// How long the test waits for an answer that a responder of an older
+/// release's peer never sends.
+const UNANSWERED_WITHIN: Duration = Duration::from_secs(3);
+
+/// A single request refused at admission, from a peer whose agent names a
+/// release that reads pages (as a paging requester's fallback after an
+/// unanswered page is), is answered busy at once, as a page is: the request
+/// is answered, so the requester's charged send charges the responder
+/// nothing. A peer of an older release, which can't read the busy answer,
+/// gets no answer, as before.
+#[tokio::test]
+#[serial]
+async fn a_single_request_refused_at_admission_is_answered_busy_to_a_paging_peer() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let responder = peer_of(&harness, RESPONDER);
+    let requester = harness
+        .test_node(REQUESTER)
+        .and_then(|node| node.p2p_node.as_ref())
+        .expect("requester");
+    let engine = harness
+        .test_node(RESPONDER)
+        .and_then(|node| node.replication_engine.as_ref())
+        .expect("engine");
+    let own = own_release();
+
+    // Connected, so the responder knows the requester's agent.
+    let _ = ask(requester, &responder, single_request()).await;
+
+    let held = engine.hold_neighbor_sync_admission();
+    assert!(!held.is_empty());
+    {
+        let _from = Seam::set(SYNC_PAGES_FROM_RELEASE, &own.to_string());
+        let trust_before = requester.peer_trust(&responder);
+        let asked = Instant::now();
+        let answer = ask(requester, &responder, single_request()).await;
+        assert!(
+            matches!(
+                answer,
+                ReplicationMessageBody::NeighborSyncPageResponse(
+                    NeighborSyncPageResponse::Busy { .. }
+                )
+            ),
+            "{answer:?}"
+        );
+        assert!(
+            asked.elapsed() < BUSY_ANSWERED_WITHIN,
+            "answered at once, not left to time out: {:?}",
+            asked.elapsed()
+        );
+        let trust_after = requester.peer_trust(&responder);
+        assert!(
+            (trust_after - trust_before).abs() < TRUST_TOLERANCE,
+            "the requester's trust in the responder moved from {trust_before} to {trust_after}"
+        );
+    }
+    {
+        let _from = Seam::set(SYNC_PAGES_FROM_RELEASE, &(own + 1).to_string());
+        let encoded = ReplicationMessage {
+            request_id: rand::random(),
+            body: single_request(),
+        }
+        .encode()
+        .expect("encode");
+        let unanswered = requester
+            .send_request(
+                &responder,
+                REPLICATION_PROTOCOL_ID,
+                encoded,
+                UNANSWERED_WITHIN,
+            )
+            .await;
+        assert!(
+            unanswered.is_err(),
+            "an older release's request is dropped with no answer: {:?}",
+            unanswered.map(|response| ReplicationMessage::decode(&response.data))
+        );
+    }
+    drop(held);
 
     harness.teardown().await.expect("teardown");
 }

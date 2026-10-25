@@ -357,7 +357,7 @@ fn take_wrapping(list: &[XorName], start: usize, count: usize) -> Vec<XorName> {
 }
 
 /// Where a window of `count` keys from `start` (modulo `len`) ends, wrapping.
-fn advance(start: usize, count: usize, len: usize) -> usize {
+pub(crate) fn advance(start: usize, count: usize, len: usize) -> usize {
     if len == 0 {
         0
     } else {
@@ -742,13 +742,17 @@ pub(crate) enum ExchangeEnd {
     /// exchange, or holds across its exchanges, was reached. The rest of the
     /// peer's hints come in a later exchange.
     Stopped,
+    /// The peer's single answer came to as many keys as a single message
+    /// carries: a responder cuts its hints to a window that size when they
+    /// come to more, and says nothing of the rest, so more may be to come.
+    Windowed,
 }
 
 /// Whether an exchange puts its peer on the sync cooldown: only one that
-/// ended complete. One that ended part way, busy, failed or stopped after
-/// some pages, leaves the peer to be synced again in its next cycle, as a
-/// first page answered busy does, so the hints of the pages that weren't
-/// exchanged wait no longer than that.
+/// ended complete. One that ended part way, busy, failed, stopped after
+/// some pages or windowed, leaves the peer to be synced again in its next
+/// cycle, as a first page answered busy does, so the hints of the pages that
+/// weren't exchanged wait no longer than that.
 pub(crate) fn exchange_earns_cooldown(exchange: &SyncExchange) -> bool {
     exchange.end == ExchangeEnd::Complete
 }
@@ -792,6 +796,9 @@ pub(crate) struct SyncExchange {
     /// How many of `hints.replica`, from the first, went out on a page the
     /// peer answered: the only ones whose repair proof may be recorded.
     pub(crate) replica_answered: usize,
+    /// How many of `hints.paid`, from the first, went out on a page the peer
+    /// answered.
+    pub(crate) paid_answered: usize,
     /// The peer's answer, if it answered a page.
     pub(crate) answer: Option<SyncAnswer>,
     /// The keys of a paged answer, held against what the node holds of its
@@ -951,8 +958,8 @@ pub(crate) async fn exchange(
     sync_peers: &SyncPeers,
 ) -> SyncExchange {
     let all_keys = hints.key_count();
-    let hints = sync_peers.window(peer, hints, max_exchange_keys(form));
-    match form {
+    let (hints, cut) = sync_peers.window(peer, hints, max_exchange_keys(form));
+    let exchange = match form {
         SyncForm::Single => {
             exchange_single(peer, p2p_node, config, is_bootstrapping, hints, commitment).await
         }
@@ -969,7 +976,13 @@ pub(crate) async fn exchange(
             )
             .await
         }
+    };
+    // The window moves on by what the peer answered, so what it didn't goes
+    // first in the next exchange with it.
+    if let Some(cut) = cut {
+        cut.commit(exchange.replica_answered, exchange.paid_answered);
     }
+    exchange
 }
 
 /// Most keys this node sends a peer in one exchange in `form`: 256 pages, or
@@ -1053,6 +1066,7 @@ async fn exchange_single(
     let started = Instant::now();
     let sent = hints.all();
     let replica_sent = sent.replica.len();
+    let paid_sent = sent.paid.len();
     let body = ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
         replica_hints: sent.replica.to_vec(),
         paid_hints: sent.paid.to_vec(),
@@ -1067,6 +1081,7 @@ async fn exchange_single(
         Silence::Charged,
     )
     .await;
+    let mut busy = false;
     let answer = match answered {
         Some(ReplicationMessageBody::NeighborSyncResponse(response)) => Some(SyncAnswer {
             replica_hints: response.replica_hints,
@@ -1076,17 +1091,22 @@ async fn exchange_single(
             pages_answered: 1,
             pages: 1,
         }),
+        // A responder that reads pages answers a single request it can't
+        // take busy, as it does a page, whatever cycle and page it names.
+        Some(ReplicationMessageBody::NeighborSyncPageResponse(
+            NeighborSyncPageResponse::Busy { .. },
+        )) => {
+            debug!("Neighbor sync with {peer}: answered busy; trying again in a later cycle");
+            busy = true;
+            None
+        }
         Some(_) => {
             warn!("Unexpected response type from {peer} during sync");
             None
         }
         None => None,
     };
-    let end = if answer.is_some() {
-        ExchangeEnd::Complete
-    } else {
-        ExchangeEnd::Failed
-    };
+    let end = single_end(answer.as_ref(), busy);
     debug!(
         target: "ant_node::replication::neighbor_sync",
         peer = %peer,
@@ -1098,12 +1118,33 @@ async fn exchange_single(
         elapsed_ms = started.elapsed().as_millis(),
         "Neighbor-sync single exchange"
     );
+    let delivered = answer.is_some();
     SyncExchange {
         end,
-        replica_answered: if answer.is_some() { replica_sent } else { 0 },
+        replica_answered: if delivered { replica_sent } else { 0 },
+        paid_answered: if delivered { paid_sent } else { 0 },
         hints,
         answer,
         held: HeldAnswer::default(),
+    }
+}
+
+/// How a single exchange ended, with the peer's `answer`, if it answered, or
+/// answered `busy`. An answer of as many keys as a single message carries
+/// ([`max_exchange_keys`]) is windowed: a responder cuts hints that come to
+/// more to a window of exactly that many, so the peer may have more, and is
+/// not counted as drained. One of fewer is complete.
+pub(crate) fn single_end(answer: Option<&SyncAnswer>, busy: bool) -> ExchangeEnd {
+    match answer {
+        Some(answer)
+            if answer.replica_hints.len() + answer.paid_hints.len()
+                >= max_exchange_keys(SyncForm::Single) =>
+        {
+            ExchangeEnd::Windowed
+        }
+        Some(_) => ExchangeEnd::Complete,
+        None if busy => ExchangeEnd::Busy,
+        None => ExchangeEnd::Failed,
     }
 }
 
@@ -1127,6 +1168,7 @@ async fn exchange_paged(
     let announced = announced_pages(all_keys, page_keys).max(own_pages);
     let mut gathered = GatheredAnswer::default();
     let mut replica_answered = 0usize;
+    let mut paid_answered = 0usize;
     let mut end = ExchangeEnd::Complete;
     // Pages of each list sent and received, for the exchange's log line.
     let mut replica_pages = (0u32, 0u32);
@@ -1197,6 +1239,7 @@ async fn exchange_paged(
                     paid_pages.1 += 1;
                 }
                 replica_answered += sent.replica.len();
+                paid_answered += sent.paid.len();
                 let whole = gathered.take(
                     sync_peers.received(),
                     AnsweredPage {
@@ -1293,6 +1336,7 @@ async fn exchange_paged(
         end,
         hints,
         replica_answered,
+        paid_answered,
         answer,
         held,
     }
@@ -2512,6 +2556,7 @@ mod tests {
                     end: ExchangeEnd::Stopped,
                     hints: hints_of(0, 0),
                     replica_answered: 0,
+                    paid_answered: 0,
                     answer,
                     held,
                 }
@@ -2541,6 +2586,7 @@ mod tests {
             end,
             hints: hints_of(5, 2),
             replica_answered: 2,
+            paid_answered: 0,
             answer,
             held: HeldAnswer::default(),
         }
@@ -2557,6 +2603,7 @@ mod tests {
             (ExchangeEnd::Busy, true),
             (ExchangeEnd::Failed, true),
             (ExchangeEnd::Stopped, true),
+            (ExchangeEnd::Windowed, true),
             (ExchangeEnd::Complete, false),
         ] {
             let pages_answered = if end == ExchangeEnd::Complete { 4 } else { 2 };
@@ -2600,6 +2647,38 @@ mod tests {
             !stopped.received_last_page(),
             "stopped before the last page"
         );
+    }
+
+    /// A single answer filled to what a single message carries may be a
+    /// window of more: its peer isn't drained, and is synced again next
+    /// cycle. One below that is complete, and a busy answer is busy.
+    #[test]
+    fn a_single_answer_filled_to_the_cap_owes_more() {
+        let cap = max_exchange_keys(SyncForm::Single);
+        let key = [7u8; 32];
+        let with = |replica: usize, paid: usize| SyncAnswer {
+            replica_hints: vec![key; replica],
+            paid_hints: vec![key; paid],
+            ..answered(1, 1)
+        };
+        for (answer, end) in [
+            (with(cap - 40, 40), ExchangeEnd::Windowed),
+            (with(cap, 0), ExchangeEnd::Windowed),
+            (with(0, cap), ExchangeEnd::Windowed),
+            (with(cap - 41, 40), ExchangeEnd::Complete),
+            (with(0, 0), ExchangeEnd::Complete),
+        ] {
+            let got = single_end(Some(&answer), false);
+            assert_eq!(got, end);
+            let exchange = exchange_of(got, Some(answer));
+            assert_eq!(
+                exchange.received_last_page(),
+                end == ExchangeEnd::Complete,
+                "{end:?}"
+            );
+        }
+        assert_eq!(single_end(None, true), ExchangeEnd::Busy);
+        assert_eq!(single_end(None, false), ExchangeEnd::Failed);
     }
 
     #[test]

@@ -317,8 +317,15 @@ never ran.
   more than one exchange carries (256 pages, or the 9 MiB of keys of a
   single message) go a window at a time: each exchange with that neighbour,
   as requester or responder, carries the next keys of each list, each list
-  its share in proportion to its length, round and round, so every key goes
-  out within the exchanges it takes to go round once. A side's pages
+  its share in proportion to its length, round and round. The window moves
+  on by the keys that arrived (the requester's on the pages the responder
+  answered, the responder's on the pages the requester's later requests
+  show arrived, and a single message's once it is answered or sent), so
+  keys an exchange that ended part way didn't deliver go first in the next;
+  after 3 exchanges in a row deliver none, the window moves on a few keys,
+  so one stuck range can't hold it. A requester that gets a single answer of
+  as many keys as a single message carries counts the neighbour as having
+  more, not done. A side's pages
   announce every page its hints take, so the other side, having had the 256
   an exchange runs, knows more are to come. The responder builds its hints
   for the requester once, at the first page, from one snapshot of its
@@ -334,16 +341,24 @@ never ran.
   refused at admission (1 a peer, 8 in all, as before), left waiting
   15 seconds for a worker, or of an exchange whose hints it doesn't hold, is
   answered busy: the requester ends the exchange and syncs again in a later
-  cycle. Pages go on the peer's connection without trust reporting, so
+  cycle. So is a single request refused at admission or left waiting, when
+  the requester's agent names a release that reads pages (one falling back
+  to a single message after an unanswered page); a requester of an older
+  release gets no answer, as before. Pages go on the peer's connection without trust reporting, so
   silence, a timeout or an answer that doesn't decode never counts against
   the responder. A requester waits 30 seconds for each page, sync's own
   deadline. Only a complete exchange puts the neighbour on the sync
   cooldown; one that ended part way, busy, failed or stopped, leaves it to
-  the next cycle. Repair proofs are recorded only for the keys of pages that
-  arrived: the requester's for the pages the responder answered, the
-  responder's once the requester's next request of the exchange shows the
-  page arrived (the last page's keys get none from the exchange; the node's
-  own exchanges with that neighbour, as requester, record them). A node
+  the next cycle. Repair proofs are recorded only for acknowledged delivery:
+  the requester's for the pages the responder answered, the responder's once
+  the requester's next request of the exchange shows the page arrived. The
+  last page's keys get none from the exchange, so in a one-page exchange,
+  today's usual one, the responder records none; it does where it hints the
+  same keys as requester of its own exchanges with that neighbour, which
+  neighbour selection doesn't promise for every pair. Accepted: fewer audits
+  of such a pair, never a penalty for keys not known to have arrived; the
+  mixed-version harness reports audits per exchange, so the drop is
+  measured. A node
   bootstrapping counts a neighbour as done only once that neighbour's last
   announced page has arrived. A node pages to a peer whose user agent names
   ds.17 or later (`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`), decided again for
@@ -362,7 +377,8 @@ never ran.
   bytes, and `src/replication/protocol.rs` that a node of ds.15 refuses them
   whole; `tests/e2e/sync_pages.rs` runs paged exchanges between nodes: both
   lists over several pages from one scan, busy answers at admission and
-  after a wait with the requester's trust in the responder unchanged, a
+  after a wait with the requester's trust in the responder unchanged (and a
+  single request from a peer that reads pages, at admission), a
   page's repair proofs waiting for the requester's next page, paging chosen
   by the peer's agent, and nodes announcing ds.17 paging to each other.
 - **Messages between nodes keep their bytes.** `tests/wire_format.rs` pins

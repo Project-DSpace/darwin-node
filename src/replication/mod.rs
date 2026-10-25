@@ -7088,6 +7088,30 @@ async fn handle_paid_notify(
     Ok(())
 }
 
+/// Whether `peer`'s connection names a release that reads paged sync, and so
+/// reads a busy answer ([`NeighborSyncPageResponse::Busy`]) to a single
+/// request too.
+async fn peer_reads_sync_pages(p2p_node: &Arc<P2PNode>, peer: &PeerId) -> bool {
+    p2p_node
+        .transport()
+        .peer_user_agent(peer)
+        .await
+        .is_some_and(|agent| {
+            sync_pages::agent_reads_pages(&agent, sync_pages::pages_from_release())
+        })
+}
+
+/// The cycle and page a busy answer to a single request names: a single
+/// request has neither, and its requester reads any busy answer as busy.
+const SINGLE_REQUEST_BUSY: (u64, u32) = (0, 0);
+
+/// Take a single neighbour-sync request.
+///
+/// A request refused at admission, or shed as stale, is answered busy when
+/// its requester reads pages ([`peer_reads_sync_pages`]), as a page is, so a
+/// requester that falls back to a single message after an unanswered page
+/// isn't left to time out and charge this node for the silence. A requester
+/// of an older release gets no answer, as before busy answers.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_neighbor_sync_request(
     source: PeerId,
@@ -7114,11 +7138,21 @@ async fn dispatch_neighbor_sync_request(
                 ReplicationResponderClass::NeighborSync,
                 failure.reason.into(),
             );
-            warn!(
-                responder_class = "neighbor_sync",
-                source = %source,
-                "Neighbor-sync response dropped at admission: {failure}"
-            );
+            if peer_reads_sync_pages(&ctx.p2p_node, &source).await {
+                warn!(
+                    responder_class = "neighbor_sync",
+                    source = %source,
+                    "Neighbor-sync request answered busy at admission: {failure}"
+                );
+                let (cycle, page) = SINGLE_REQUEST_BUSY;
+                answer_sync_page_busy(ctx, source, cycle, page, request_id, rr_message_id).await;
+            } else {
+                warn!(
+                    responder_class = "neighbor_sync",
+                    source = %source,
+                    "Neighbor-sync response dropped at admission: {failure}"
+                );
+            }
             return Ok(());
         }
     };
@@ -7136,9 +7170,9 @@ async fn dispatch_neighbor_sync_request(
     let sync_peers = Arc::clone(&ctx.sync_peers);
     let request_timeout = ctx.config.verification_request_timeout;
     let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    let busy_ctx = ctx.clone();
     ctx.detached_task_tracker.spawn(async move {
-        let _guard = guard;
-        let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
+        let Ok(worker_permit) = worker_semaphore.acquire_owned().await else {
             debug!(
                 responder_class = "neighbor_sync",
                 source = %source,
@@ -7148,14 +7182,38 @@ async fn dispatch_neighbor_sync_request(
         };
         if request_is_stale(received_at, request_timeout) {
             audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::NeighborSync);
-            debug!(
-                responder_class = "neighbor_sync",
-                source = %source,
-                request_age_ms = received_at.elapsed().as_millis(),
-                "Stale neighbor-sync request shed at dequeue"
-            );
+            drop(worker_permit);
+            drop(guard);
+            if peer_reads_sync_pages(&p2p_node, &source).await {
+                debug!(
+                    responder_class = "neighbor_sync",
+                    source = %source,
+                    request_age_ms = received_at.elapsed().as_millis(),
+                    "Stale neighbor-sync request answered busy at dequeue"
+                );
+                let (cycle, page) = SINGLE_REQUEST_BUSY;
+                answer_sync_page_busy(
+                    &busy_ctx,
+                    source,
+                    cycle,
+                    page,
+                    request_id,
+                    rr_message_id.as_deref(),
+                )
+                .await;
+            } else {
+                debug!(
+                    responder_class = "neighbor_sync",
+                    source = %source,
+                    request_age_ms = received_at.elapsed().as_millis(),
+                    "Stale neighbor-sync request shed at dequeue"
+                );
+            }
             return;
         }
+        // The admission slot and the worker are held until the answer is
+        // handled.
+        let _held = (guard, worker_permit);
         // A peer whose sync request is admitted and fresh gets our pointer
         // hints as well, including a node that is bootstrapping, which is how
         // it learns the pointers it should hold. Only such a request: each
@@ -7234,7 +7292,7 @@ async fn handle_neighbor_sync_request(
         config.paid_list_close_group_size,
     )
     .await;
-    let hints = sync_peers.window(
+    let (hints, cut) = sync_peers.window(
         source,
         hints,
         neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Single),
@@ -7259,6 +7317,15 @@ async fn handle_neighbor_sync_request(
         None,
     )
     .await;
+    // The window moves on only once the response went: otherwise the next
+    // exchange with the requester takes the same keys.
+    if let Some(cut) = cut {
+        if response_sent {
+            cut.commit(hints.replica.len(), hints.paid.len());
+        } else {
+            cut.commit(0, 0);
+        }
+    }
 
     // Process inbound hints only if sender is in LocalRT (Rule 4-6).
     if !sender_in_rt {
@@ -7328,7 +7395,8 @@ async fn handle_neighbor_sync_request(
 /// A request after an exchange's first shows that the page before it arrived,
 /// since its requester asks for a page only once the last is answered: the
 /// repair proofs held back for that page are recorded first, whatever this
-/// request is then answered.
+/// request is then answered, and the pages that arrived are what the
+/// requester's window moves on by once the exchange's set is dropped.
 async fn dispatch_neighbor_sync_page(
     source: PeerId,
     request: protocol::NeighborSyncPageRequest,
@@ -7338,6 +7406,8 @@ async fn dispatch_neighbor_sync_page(
     rr_message_id: Option<&str>,
 ) -> Result<()> {
     if request.page > 0 {
+        ctx.served_hint_sets
+            .note_arrived(&source, request.cycle, request.page);
         if let Some(held) = ctx.served_hint_sets.take_proofs(
             &source,
             request.cycle,
@@ -7506,9 +7576,13 @@ async fn send_sync_page_busy(
 /// so the requester's next page, sent once this answer arrives, finds the
 /// requester's slot free. The repair proofs of the replica hints on the page
 /// are held back until the requester's next request of the exchange shows the
-/// page arrived ([`dispatch_neighbor_sync_page`]); the last page's get none
-/// from the exchange, since nothing follows it. (This node's own exchanges
-/// with the requester record proofs for the same keys when it answers them.)
+/// page arrived ([`dispatch_neighbor_sync_page`]): proofs are kept only for
+/// acknowledged delivery. The last page's keys, in a one-page exchange every
+/// key served, get none from the exchange, since nothing follows it; they get
+/// proofs only where this node hints them as the requester of its own
+/// exchanges with the peer, which neighbour selection doesn't promise. That
+/// costs audits of the pair, never a penalty for keys not known to have
+/// arrived (the README's "Messages between nodes").
 #[allow(clippy::too_many_lines)]
 async fn serve_neighbor_sync_page(
     source: PeerId,
@@ -7705,7 +7779,8 @@ async fn serve_neighbor_sync_page(
 /// first page, and hold them for its other pages: only the window of them
 /// this exchange serves, at most 256 pages, with no spare capacity. Its pages
 /// announce the pages of all of them
-/// ([`neighbor_sync::announced_pages`]).
+/// ([`neighbor_sync::announced_pages`]). The window moves on by the pages the
+/// requester showed arrived, when the set is dropped.
 async fn build_served_hints(
     source: &PeerId,
     cycle: u64,
@@ -7723,7 +7798,7 @@ async fn build_served_hints(
     .await;
     let page_keys = neighbor_sync::page_keys();
     let all_keys = hints.key_count();
-    let mut hints = ctx.sync_peers.window(
+    let (mut hints, cut) = ctx.sync_peers.window(
         source,
         hints,
         neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Paged),
@@ -7738,7 +7813,7 @@ async fn build_served_hints(
         hints: Arc::new(hints),
     };
     ctx.served_hint_sets
-        .insert(*source, served.clone(), Instant::now());
+        .insert(*source, served.clone(), cut, Instant::now());
     let (held_sets, held_bytes) = ctx.served_hint_sets.held();
     debug!(
         target: "ant_node::replication::neighbor_sync",

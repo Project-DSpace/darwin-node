@@ -20,6 +20,8 @@
 //! Hints for a peer that come to more than one exchange carries are sent a
 //! window at a time ([`WindowStart`]): each exchange with the peer, as
 //! requester or responder, takes the next keys of each list, round and round.
+//! The window moves on by the keys that were delivered ([`WindowCut::commit`]),
+//! so an exchange that ends part way leaves the rest of its window to the next.
 //!
 //! A responder builds its hints for a requester once, at the exchange's first
 //! page, keeps only the window it serves, and serves every page of the
@@ -41,7 +43,7 @@ use crate::replication::config::{
     MAX_NEIGHBOR_SYNC_PAGES, NEIGHBOR_SYNC_HINT_SETS_MAX_BYTES, NEIGHBOR_SYNC_PAGES_FROM_RELEASE,
     NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES,
 };
-use crate::replication::neighbor_sync::{PeerSyncHints, WindowStart};
+use crate::replication::neighbor_sync::{advance, PeerSyncHints, WindowStart};
 
 /// Most peers whose next window, or whose "single message next", a node
 /// keeps. Only routing-table peers sync, and a routing-table removal forgets
@@ -52,6 +54,11 @@ const MAX_PEERS_KEPT: usize = 4096;
 
 /// Bytes of one key.
 const KEY_BYTES: usize = 32;
+
+/// Exchanges with a peer in a row that deliver none of a window's keys before
+/// the window's start is moved on a little ([`WindowCut::commit`]), so a range
+/// whose first page is persistently refused can't hold the window in place.
+const STALLS_BEFORE_SHIFT: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Which peers read pages
@@ -107,8 +114,93 @@ pub fn agent_reads_pages(user_agent: &str, from_release: u64) -> bool {
 pub(crate) struct SyncPeers {
     exchanges: Mutex<HashSet<PeerId>>,
     single_next: Mutex<HashSet<PeerId>>,
-    windows: Mutex<HashMap<PeerId, WindowStart>>,
+    windows: Windows,
     received: Arc<ReceivedHints>,
+}
+
+/// Where the next window of each peer's hints starts.
+type Windows = Arc<Mutex<HashMap<PeerId, PeerWindow>>>;
+
+/// Where the next window of a peer's hints starts, and how many exchanges in a
+/// row delivered none of their window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PeerWindow {
+    start: WindowStart,
+    stalls: u32,
+}
+
+/// A window cut from a peer's hints ([`SyncPeers::window`]). The peer's next
+/// window was moved on past the whole of it when it was cut, so an exchange
+/// running at the same time takes the keys after it; once the exchange ends,
+/// [`Self::commit`] moves it back to just past the keys that were delivered.
+#[derive(Debug)]
+pub(crate) struct WindowCut {
+    windows: Windows,
+    peer: PeerId,
+    start: WindowStart,
+    next: WindowStart,
+    /// Keys of each list the window took, and the list's length.
+    replica: (usize, usize),
+    paid: (usize, usize),
+}
+
+impl WindowCut {
+    /// The exchange delivered the first `replica` replica keys and the first
+    /// `paid` paid keys of the window: the peer's next window starts just
+    /// past them, so keys the exchange didn't deliver go first in the next.
+    /// Nothing changes if another exchange cut the peer's window since. When
+    /// [`STALLS_BEFORE_SHIFT`] exchanges in a row delivered none, the start
+    /// moves on by a few keys, at most about one page of the window.
+    pub(crate) fn commit(self, replica: usize, paid: usize) {
+        let replica = replica.min(self.replica.0);
+        let paid = paid.min(self.paid.0);
+        let mut windows = self.windows.lock();
+        let Some(window) = windows.get_mut(&self.peer) else {
+            return;
+        };
+        if window.start != self.next {
+            return;
+        }
+        if replica + paid > 0 {
+            window.stalls = 0;
+            window.start = WindowStart {
+                replica: advance(self.start.replica, replica, self.replica.1),
+                paid: advance(self.start.paid, paid, self.paid.1),
+            };
+            return;
+        }
+        window.stalls = window.stalls.saturating_add(1);
+        if window.stalls < STALLS_BEFORE_SHIFT {
+            window.start = self.start;
+            return;
+        }
+        window.stalls = 0;
+        let mut rng = rand::thread_rng();
+        let mut shift = |take: usize| {
+            if take == 0 {
+                0
+            } else {
+                rng.gen_range(1..=(take / MAX_NEIGHBOR_SYNC_PAGES as usize).max(1))
+            }
+        };
+        let replica_shift = shift(self.replica.0);
+        let paid_shift = shift(self.paid.0);
+        window.start = WindowStart {
+            replica: advance(self.start.replica, replica_shift, self.replica.1),
+            paid: advance(self.start.paid, paid_shift, self.paid.1),
+        };
+    }
+
+    /// Commit the keys on the first `pages` pages of `page_keys` keys of
+    /// `hints`, the window: its replica keys first, then its paid keys.
+    pub(crate) fn commit_pages(self, hints: &PeerSyncHints, pages: u32, page_keys: usize) {
+        let keys = usize::try_from(pages)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(page_keys);
+        let replica = keys.min(hints.replica.len());
+        let paid = (keys - replica).min(hints.paid.len());
+        self.commit(replica, paid);
+    }
 }
 
 /// An exchange in progress with one peer; dropping it ends the exchange.
@@ -130,7 +222,7 @@ impl SyncPeers {
         Self {
             exchanges: Mutex::new(HashSet::new()),
             single_next: Mutex::new(HashSet::new()),
-            windows: Mutex::new(HashMap::new()),
+            windows: Arc::new(Mutex::new(HashMap::new())),
             received: Arc::new(ReceivedHints::new(received_max_bytes)),
         }
     }
@@ -174,48 +266,67 @@ impl SyncPeers {
     /// The hints this node sends `peer` in one exchange, of at most
     /// `max_keys` keys: all of them, or, when they come to more, the next
     /// window of them ([`PeerSyncHints::window`]), from where the last
-    /// exchange with the peer, as requester or responder, left off. Logs a
-    /// warning with both counts when the hints don't all fit.
+    /// exchange with the peer, as requester or responder, left off, with the
+    /// cut to [`WindowCut::commit`] once the exchange ends. Logs a warning
+    /// with both counts when the hints don't all fit.
     pub(crate) fn window(
         &self,
         peer: &PeerId,
         hints: PeerSyncHints,
         max_keys: usize,
-    ) -> PeerSyncHints {
+    ) -> (PeerSyncHints, Option<WindowCut>) {
         let (replica_total, paid_total) = (hints.replica.len(), hints.paid.len());
         let total = replica_total + paid_total;
         if total <= max_keys {
-            return hints;
+            return (hints, None);
         }
         let mut windows = self.windows.lock();
-        let start = windows.get(peer).copied().unwrap_or_else(|| {
+        let kept = windows.get(peer).copied().unwrap_or_else(|| {
             // A peer's first window starts at a random place, so a node that
             // restarts doesn't send the same keys first every time.
             let mut rng = rand::thread_rng();
-            WindowStart {
-                replica: rng.gen(),
-                paid: rng.gen(),
+            PeerWindow {
+                start: WindowStart {
+                    replica: rng.gen(),
+                    paid: rng.gen(),
+                },
+                stalls: 0,
             }
         });
+        let start = kept.start;
         let (window, next) = hints.window(max_keys, start);
-        if let Some(next) = next {
+        let cut = next.map(|next| {
             if windows.len() >= MAX_PEERS_KEPT && !windows.contains_key(peer) {
                 if let Some(evicted) = windows.keys().next().copied() {
                     windows.remove(&evicted);
                 }
             }
-            windows.insert(*peer, next);
-        }
+            windows.insert(
+                *peer,
+                PeerWindow {
+                    start: next,
+                    stalls: kept.stalls,
+                },
+            );
+            WindowCut {
+                windows: Arc::clone(&self.windows),
+                peer: *peer,
+                start,
+                next,
+                replica: (window.replica.len(), replica_total),
+                paid: (window.paid.len(), paid_total),
+            }
+        });
         drop(windows);
         warn!(
             "Neighbor sync with {peer}: {total} hints ({replica_total} replica, {paid_total} \
              paid), more than one exchange carries; this one carries {} ({} replica, {} paid), \
-             and the next goes on from where it ends",
+             and the next goes on from where its delivery ends",
             window.replica.len() + window.paid.len(),
             window.replica.len(),
             window.paid.len(),
         );
-        window
+        (window, cut)
     }
 
     /// What the node holds of its peers' answers.
@@ -362,6 +473,12 @@ struct Held {
     inbound_rejected: bool,
     /// The page whose repair proofs wait for the requester's next request.
     proofs: Option<u32>,
+    /// Pages the requester's later requests showed arrived: pages
+    /// `0..arrived`.
+    arrived: u32,
+    /// The window the hints were cut to, if they were: committed with the
+    /// pages that arrived when the set is dropped.
+    cut: Option<WindowCut>,
 }
 
 /// The hint sets a responder holds, one per requester with a paged exchange
@@ -381,9 +498,13 @@ struct HeldSets {
 }
 
 impl HeldSets {
+    /// Drop `peer`'s set, moving its window on by the pages that arrived.
     fn drop_set(&mut self, peer: &PeerId) -> bool {
         if let Some(held) = self.sets.remove(peer) {
             self.bytes = self.bytes.saturating_sub(held.bytes);
+            if let Some(cut) = held.cut {
+                cut.commit_pages(&held.served.hints, held.arrived, held.served.page_keys);
+            }
             true
         } else {
             false
@@ -457,8 +578,15 @@ impl ServedHintSets {
         inner.sets.is_empty() || inner.bytes < self.max_bytes
     }
 
-    /// Hold `served` for `peer`, in place of any set it had.
-    pub(crate) fn insert(&self, peer: PeerId, served: ServedHints, now: Instant) {
+    /// Hold `served` for `peer`, in place of any set it had, with the window
+    /// `cut` its hints were cut to, if they were.
+    pub(crate) fn insert(
+        &self,
+        peer: PeerId,
+        served: ServedHints,
+        cut: Option<WindowCut>,
+        now: Instant,
+    ) {
         let bytes = served.hints.bytes();
         let mut inner = self.inner.lock();
         inner.drop_set(&peer);
@@ -472,6 +600,8 @@ impl ServedHintSets {
                 last_used: now,
                 inbound_rejected: false,
                 proofs: None,
+                arrived: 0,
+                cut,
             },
         );
     }
@@ -485,6 +615,17 @@ impl ServedHintSets {
             .is_some_and(|held| held.served.cycle == cycle)
         {
             inner.drop_set(peer);
+        }
+    }
+
+    /// Note that `peer`'s request for `page` of exchange `cycle` arrived,
+    /// which its requester sends only once every page before it arrived.
+    pub(crate) fn note_arrived(&self, peer: &PeerId, cycle: u64, page: u32) {
+        let mut inner = self.inner.lock();
+        if let Some(held) = inner.sets.get_mut(peer) {
+            if held.served.cycle == cycle {
+                held.arrived = held.arrived.max(page.min(held.served.pages));
+            }
         }
     }
 
@@ -589,6 +730,7 @@ pub(crate) fn proofs_wait_for_next_page(page: u32, rounds: u32) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::ant_protocol::XorName;
     use crate::replication::neighbor_sync::RoutingSnapshot;
 
     fn peer(byte: u8) -> PeerId {
@@ -715,7 +857,7 @@ mod tests {
             bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
             let id = PeerId::from_bytes(bytes);
             peers.mark_single_next(id);
-            let _ = peers.window(&id, hints(3, 0), 2);
+            let _cut = peers.window(&id, hints(3, 0), 2);
         }
         assert_eq!(peers.single_next.lock().len(), MAX_PEERS_KEPT);
         assert_eq!(peers.windows.lock().len(), MAX_PEERS_KEPT);
@@ -745,7 +887,9 @@ mod tests {
         let (mut replica_seen, mut paid_seen) = (HashSet::new(), HashSet::new());
         // 213 replica and 43 paid hints a window: 3 windows go round both.
         for _ in 0..3 {
-            let window = peers.window(&a, all.clone(), max_keys);
+            let (window, cut) = peers.window(&a, all.clone(), max_keys);
+            cut.expect("cut")
+                .commit(window.replica.len(), window.paid.len());
             assert_eq!(window.replica.len() + window.paid.len(), max_keys);
             assert!(!window.paid.is_empty(), "the paid hints have a share");
             replica_seen.extend(window.replica.iter().copied());
@@ -756,8 +900,120 @@ mod tests {
 
         // Hints that fit go whole, and leave the peer's window where it was.
         let few = hints(10, 5);
-        let sent = peers.window(&a, few.clone(), max_keys);
+        let (sent, cut) = peers.window(&a, few.clone(), max_keys);
+        assert!(cut.is_none());
         assert_eq!((sent.replica, sent.paid), (few.replica, few.paid));
+    }
+
+    fn index_of(list: &[XorName], key: &XorName) -> usize {
+        list.iter()
+            .position(|k| k == key)
+            .expect("a key of the list")
+    }
+
+    /// Where `window` starts in each list of `all`.
+    fn starts_of(all: &PeerSyncHints, window: &PeerSyncHints) -> (usize, usize) {
+        (
+            index_of(&all.replica, &window.replica[0]),
+            index_of(&all.paid, &window.paid[0]),
+        )
+    }
+
+    /// A window moves on by the keys that were delivered: an exchange stopped
+    /// after `k` pages makes the next window start `k` pages on, one that
+    /// delivered all of it by the whole window, and one that delivered
+    /// nothing leaves it where it was, until several in a row move it a
+    /// little.
+    #[test]
+    fn a_window_moves_on_by_what_was_delivered() {
+        let page_keys = 4;
+        let all = hints(500, 100);
+        let a = peer(1);
+
+        // Stopped after 3 pages: 12 replica keys delivered, no paid ones.
+        let peers = SyncPeers::default();
+        let (window, cut) = peers.window(&a, all.clone(), 256);
+        let first = starts_of(&all, &window);
+        cut.expect("cut").commit_pages(&window, 3, page_keys);
+        let (window, cut) = peers.window(&a, all.clone(), 256);
+        assert_eq!(
+            starts_of(&all, &window),
+            ((first.0 + 12) % 500, first.1),
+            "on by the 3 pages delivered, no paid key among them"
+        );
+
+        // Delivered whole: on by the whole window, 213 replica and 43 paid.
+        let start = starts_of(&all, &window);
+        cut.expect("cut")
+            .commit(window.replica.len(), window.paid.len());
+        let (window, cut) = peers.window(&a, all.clone(), 256);
+        assert_eq!(
+            starts_of(&all, &window),
+            ((start.0 + 213) % 500, (start.1 + 43) % 100)
+        );
+
+        // Delivered nothing: the same window again, until the stalls move it.
+        let start = starts_of(&all, &window);
+        cut.expect("cut").commit(0, 0);
+        for _ in 1..STALLS_BEFORE_SHIFT {
+            let (window, cut) = peers.window(&a, all.clone(), 256);
+            assert_eq!(starts_of(&all, &window), start);
+            cut.expect("cut").commit(0, 0);
+        }
+        let (window, _) = peers.window(&a, all.clone(), 256);
+        let shifted = starts_of(&all, &window);
+        // 213 replica and 43 paid keys a window: at most one key of each.
+        assert_eq!(
+            shifted,
+            ((start.0 + 1) % 500, (start.1 + 1) % 100),
+            "moved on a little after the stalls"
+        );
+
+        // A cut made while another exchange's is out isn't moved back by
+        // the earlier one.
+        let peers = SyncPeers::default();
+        let (window, first_cut) = peers.window(&a, all.clone(), 256);
+        let start = starts_of(&all, &window);
+        let (_, second_cut) = peers.window(&a, all.clone(), 256);
+        first_cut.expect("cut").commit(0, 0);
+        second_cut.expect("cut").commit(213, 43);
+        let (window, _) = peers.window(&a, all.clone(), 256);
+        assert_eq!(starts_of(&all, &window).0, (start.0 + 426) % 500);
+    }
+
+    /// A responder's set moves the requester's window on by the pages the
+    /// requester's later requests showed arrived, once the set is dropped.
+    #[test]
+    fn a_served_window_moves_on_by_the_pages_that_arrived() {
+        let all = hints(600, 1);
+        let a = peer(1);
+        let peers = SyncPeers::default();
+        let sets = ServedHintSets::new(1 << 20);
+        let now = Instant::now();
+
+        let (window, cut) = peers.window(&a, all.clone(), 512);
+        let start = starts_of(&all, &window).0;
+        sets.insert(
+            a,
+            ServedHints {
+                cycle: 5,
+                hints: Arc::new(window),
+                page_keys: 2,
+                pages: 256,
+                announced: 301,
+            },
+            cut,
+            now,
+        );
+        sets.note_arrived(&a, 5, 1);
+        sets.note_arrived(&a, 6, 9);
+        sets.note_arrived(&a, 5, 4);
+        sets.note_arrived(&a, 5, 3);
+        // The requester gave up after its request for page 4: pages 0 to 3
+        // arrived.
+        assert!(sets.get(&a, 5, now + IDLE * 2, IDLE).is_none());
+        let (window, _) = peers.window(&a, all.clone(), 512);
+        assert_eq!(starts_of(&all, &window).0, (start + 8) % 600);
     }
 
     #[test]
@@ -784,7 +1040,7 @@ mod tests {
         let now = Instant::now();
         let a = peer(1);
         assert!(sets.get(&a, 5, now, IDLE).is_none());
-        sets.insert(a, served(5, 10), now);
+        sets.insert(a, served(5, 10), None, now);
         assert_eq!(sets.held(), (1, 320));
         assert_eq!(sets.built(), 1);
         let got = sets.get(&a, 5, now, IDLE).expect("held for exchange 5");
@@ -794,13 +1050,13 @@ mod tests {
         assert!(sets.get(&a, 6, now, IDLE).is_none());
         assert_eq!(sets.held(), (0, 0));
 
-        sets.insert(a, served(7, 4), now);
+        sets.insert(a, served(7, 4), None, now);
         sets.finish(&a, 8);
         assert_eq!(sets.held().0, 1, "finishing another exchange keeps it");
         sets.finish(&a, 7);
         assert_eq!(sets.held(), (0, 0));
 
-        sets.insert(a, served(9, 4), now);
+        sets.insert(a, served(9, 4), None, now);
         sets.forget(&a);
         assert_eq!(sets.held(), (0, 0));
     }
@@ -810,7 +1066,7 @@ mod tests {
         let sets = ServedHintSets::new(1 << 20);
         let start = Instant::now();
         let a = peer(1);
-        sets.insert(a, served(5, 10), start);
+        sets.insert(a, served(5, 10), None, start);
         assert!(sets.get(&a, 5, start + IDLE / 2, IDLE).is_some());
         // Used at IDLE / 2: still held just before IDLE after that.
         assert!(sets.get(&a, 5, start + IDLE, IDLE).is_some());
@@ -825,12 +1081,12 @@ mod tests {
         let now = Instant::now();
         assert!(sets.may_build(now, IDLE), "nothing held");
         // One set larger than the whole budget is still served alone.
-        sets.insert(peer(1), served(1, 40), now);
+        sets.insert(peer(1), served(1, 40), None, now);
         assert!(!sets.may_build(now, IDLE), "over the budget");
         sets.finish(&peer(1), 1);
-        sets.insert(peer(2), served(2, 4), now);
+        sets.insert(peer(2), served(2, 4), None, now);
         assert!(sets.may_build(now, IDLE), "under the budget");
-        sets.insert(peer(3), served(3, 6), now);
+        sets.insert(peer(3), served(3, 6), None, now);
         assert_eq!(sets.held(), (2, 320));
         assert!(!sets.may_build(now, IDLE), "at the budget");
     }
@@ -840,7 +1096,7 @@ mod tests {
         let sets = ServedHintSets::new(1 << 20);
         let now = Instant::now();
         let a = peer(1);
-        sets.insert(a, served(5, 10), now);
+        sets.insert(a, served(5, 10), None, now);
         assert!(!sets.note_inbound(&a, 5, false));
         assert!(sets.note_inbound(&a, 5, true));
         assert!(
@@ -860,13 +1116,13 @@ mod tests {
         let sets = ServedHintSets::new(1 << 20);
         let now = Instant::now();
         let a = peer(1);
-        sets.insert(a, served(5, 10), now);
+        sets.insert(a, served(5, 10), None, now);
         sets.hold_proofs(&a, 5, 0);
         assert!(
             sets.take_proofs(&a, 6, now, IDLE).is_none(),
             "another exchange's request shows nothing of this one"
         );
-        sets.insert(a, served(5, 10), now);
+        sets.insert(a, served(5, 10), None, now);
         sets.hold_proofs(&a, 5, 2);
         let taken = sets.take_proofs(&a, 5, now, IDLE).expect("held for page 2");
         assert_eq!((taken.page, taken.page_keys), (2, 2));
@@ -884,7 +1140,7 @@ mod tests {
         let sets = ServedHintSets::new(1 << 20);
         let start = Instant::now();
         let a = peer(1);
-        sets.insert(a, served(5, 10), start);
+        sets.insert(a, served(5, 10), None, start);
         sets.hold_proofs(&a, 5, 1);
         sets.drop_proofs(&a, 5, 0);
         assert!(
