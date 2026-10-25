@@ -137,6 +137,16 @@ async fn main() -> color_eyre::Result<()> {
     // Build configuration
     let (config, bootstrap_source) = cli.into_config()?;
 
+    // The log files give way at the full line from here, before the chunk
+    // store opens and its capacity guard takes over.
+    ant_node::storage::register_full_line(
+        config.root_dir.clone(),
+        config
+            .storage
+            .disk_reserve_mb
+            .saturating_mul(ant_node::storage::MIB),
+    );
+
     match &bootstrap_source {
         BootstrapSource::Cli => {
             ant_node::logging::info!(

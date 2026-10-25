@@ -94,15 +94,88 @@ static FULL_LINE_GUARD: std::sync::Mutex<Option<std::sync::Weak<CapacityGuard>>>
 /// again first when that measurement is older than `max_age`, so a caller
 /// asking for every log line makes at most one query per `max_age`.
 ///
-/// `None` when no store is open, or when the query fails.
+/// Before a store opens, it is the free space on the partition of the data
+/// folder and the full line the node was started with
+/// ([`register_full_line`]), queried at most once per `max_age`: a node's
+/// logs give way at the line while a start-up migration or index rebuild
+/// runs, as they do once the store is open.
+///
+/// `None` when neither is known, or when the query fails.
 #[must_use]
 pub fn full_line_reading(max_age: Duration) -> Option<SpaceReading> {
     let guard = FULL_LINE_GUARD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .and_then(std::sync::Weak::upgrade)?;
-    guard.reading(max_age)
+        .and_then(std::sync::Weak::upgrade);
+    guard.map_or_else(
+        || {
+            FULL_LINE_BEFORE_STORE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .and_then(|start| start.reading(max_age))
+        },
+        |guard| guard.reading(max_age),
+    )
+}
+
+/// The data folder and full line a node starts with, read by
+/// [`full_line_reading`] until its chunk store opens.
+static FULL_LINE_BEFORE_STORE: std::sync::Mutex<Option<StartLine>> = std::sync::Mutex::new(None);
+
+/// Register the node's data folder and full line, read until its store opens.
+///
+/// `root_dir` is the data folder and `line` the full line
+/// (`storage.disk_reserve_mb`), for [`full_line_reading`] to read before the
+/// chunk store opens. The node's main does this once its config is read.
+pub fn register_full_line(root_dir: PathBuf, line: u64) {
+    *FULL_LINE_BEFORE_STORE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(StartLine::new(root_dir, line));
+}
+
+/// Free space on a data folder's partition against a full line, read at most
+/// once per `max_age`.
+struct StartLine {
+    root_dir: PathBuf,
+    line: u64,
+    free: u64,
+    measured_at: Option<Instant>,
+    measurements: u64,
+}
+
+impl StartLine {
+    /// Set in every measurement this gives, so none equals one a chunk
+    /// store's guard gives once it takes over.
+    const MEASUREMENT_MARK: u64 = 1 << 63;
+
+    const fn new(root_dir: PathBuf, line: u64) -> Self {
+        Self {
+            root_dir,
+            line,
+            free: 0,
+            measured_at: None,
+            measurements: 0,
+        }
+    }
+
+    fn reading(&mut self, max_age: Duration) -> Option<SpaceReading> {
+        let fresh = self.measured_at.is_some_and(|t| t.elapsed() < max_age);
+        if !fresh {
+            // On a first start the data folder may not exist yet: its
+            // nearest existing parent is on the partition it will be on.
+            let existing = self.root_dir.ancestors().find(|dir| dir.exists())?;
+            self.free = super::available_space(existing).ok()?;
+            self.measured_at = Some(Instant::now());
+            self.measurements = self.measurements.wrapping_add(1);
+        }
+        Some(SpaceReading {
+            free: self.free,
+            line: self.line,
+            measurement: Self::MEASUREMENT_MARK | self.measurements,
+        })
+    }
 }
 
 /// One reading of the storage partition's free space, as
@@ -3300,6 +3373,27 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::mpsc::{self, Sender};
     use std::thread::JoinHandle;
+
+    /// Before a store opens, the full line read is the one the node was
+    /// started with, against the free space on its data folder's partition,
+    /// read again only once the reading is older than asked; a folder not
+    /// made yet reads its nearest existing parent.
+    #[test]
+    fn the_full_line_before_the_store_opens_reads_the_data_folders_partition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut start = StartLine::new(
+            dir.path().join("not-yet").join("node"),
+            7 * crate::storage::MIB,
+        );
+        let first = start.reading(Duration::from_secs(60)).expect("a reading");
+        assert_eq!(first.line, 7 * crate::storage::MIB);
+        assert!(first.free > 0);
+        assert_ne!(first.measurement & StartLine::MEASUREMENT_MARK, 0);
+        let cached = start.reading(Duration::from_secs(60)).expect("a reading");
+        assert_eq!(cached.measurement, first.measurement, "not queried again");
+        let again = start.reading(Duration::ZERO).expect("a reading");
+        assert_ne!(again.measurement, first.measurement, "queried again");
+    }
 
     /// A directory flush that fails must say so.
     ///
