@@ -1565,6 +1565,7 @@ impl PaymentVerifier {
     /// already as a payment fact, which can only accept: a quote they don't
     /// pay is read from the vault, which every refusal comes from (see
     /// [`SettlementReads`]).
+    #[allow(clippy::too_many_lines)]
     async fn verify_evm_payment(
         &self,
         target: &PaymentTarget,
@@ -1674,7 +1675,7 @@ impl PaymentVerifier {
             for (candidate, _) in read_empty {
                 let paid_price = candidate.quote.price;
                 let candidate_peer = *candidate.encoded_peer_id.as_bytes();
-                let read = again.recv().await;
+                let read = again.recv().await.flatten();
                 let settled = self
                     .settlement_read_again(candidate, read)
                     .and_then(|settlement| Self::check_median_settlement(candidate, settlement));
@@ -1894,11 +1895,12 @@ impl PaymentVerifier {
 
     /// The record of `candidate`'s quote as read once more, after it read
     /// empty (see [`SettlementReads::settlements_again_later`]): `read` is
-    /// that read's answer, or `None` if it never came.
+    /// that read's answer, or `None` if it never came (or, in a test, was
+    /// left to the test's own settlement).
     fn settlement_read_again(
         &self,
         candidate: LegacyMedianCandidate<'_>,
-        read: Option<Option<crate::payment::settlement::RecordRead>>,
+        read: Option<crate::payment::settlement::RecordRead>,
     ) -> Result<Settlement> {
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(settlement) = self.test_settlement(candidate) {
@@ -1907,11 +1909,11 @@ impl PaymentVerifier {
         #[cfg(not(any(test, feature = "test-utils")))]
         let _ = candidate;
         match read {
-            Some(Some(Ok(answered))) => Ok(answered.value),
-            Some(Some(Err(e))) => Err(Error::Payment(format!(
+            Some(Ok(answered)) => Ok(answered.value),
+            Some(Err(e)) => Err(Error::Payment(format!(
                 "completedPayments lookup failed: {e}"
             ))),
-            Some(None) | None => Err(Error::Payment(
+            None => Err(Error::Payment(
                 "completedPayments lookup failed: the read again did not come back".into(),
             )),
         }

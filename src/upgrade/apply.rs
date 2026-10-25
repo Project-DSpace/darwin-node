@@ -25,7 +25,9 @@ use tar::Archive;
 pub(super) const MAX_ARCHIVE_SIZE_BYTES: usize = 200 * 1024 * 1024;
 
 /// The room an upgrade keeps above [`OLD_MANAGER_LINE`] once its own writes
-/// are made, for the node's other writes meanwhile. With a release's sizes
+/// are made.
+///
+/// It is for the node's other writes meanwhile. With a release's sizes
 /// (an upgrade needing about 140 MiB), a node at the full line (1 GiB free)
 /// still upgrades: 500 + 256 + 140 MiB is under 1 GiB.
 pub const UPGRADE_SPACE_MARGIN: u64 = 256 * MIB;

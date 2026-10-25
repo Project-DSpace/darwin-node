@@ -86,8 +86,9 @@ pub const GIB: u64 = 1024 * MIB;
 pub const DEFAULT_DISK_RESERVE: u64 = GIB;
 
 /// The free space at which the node manager of images before darwin-nodes
-/// deleted a node's data. A node's own writes keep clear of it: its upgrades
-/// leave room above it (`crate::upgrade::UPGRADE_SPACE_MARGIN`).
+/// deleted a node's data.
+///
+/// A node's own writes keep clear of it: its upgrades leave room above it (`crate::upgrade::UPGRADE_SPACE_MARGIN`).
 pub const OLD_MANAGER_LINE: u64 = 500 * MIB;
 
 /// Free bytes on the partition holding `path`, as the node's disk checks read

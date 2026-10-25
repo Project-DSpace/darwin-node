@@ -1058,10 +1058,10 @@ impl SettlementReads {
         };
         loop {
             #[cfg(test)]
-            #[allow(clippy::panic)]
-            if self.panic_next_send.swap(false, Ordering::SeqCst) {
-                panic!("a send of queued reads panicked, as a test asked");
-            }
+            assert!(
+                !self.panic_next_send.swap(false, Ordering::SeqCst),
+                "a send of queued reads panicked, as a test asked"
+            );
             let mut batches = Vec::new();
             while !reads.is_empty() {
                 let rest = reads.split_off(reads.len().min(MAX_BATCH));
