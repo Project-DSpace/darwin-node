@@ -692,7 +692,8 @@ def load_run(folder):
     record["uploads"] = [json.loads((folder / name).read_text()) for name in record["uploads"]]
     record["checks"] = [json.loads((folder / name).read_text()) for name in record["checks"]]
     record["phase_checks"] = {
-        phase: [json.loads((folder / name).read_text()) for name in names]
+        phase: [found for name in names
+                for found in json.loads((folder / name).read_text())["records"]]
         for phase, names in record.get("phase_checks", {}).items()}
     return record
 
