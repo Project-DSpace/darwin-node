@@ -341,7 +341,9 @@ def build_new(args):
     if args.new_bin:
         return Path(args.new_bin)
     cargo_build(REPO, ["ant-node", "ant-devnet", "darwin-harness"], args.profile, args.cargo_arg)
-    return REPO / "target" / profile_dir(args.profile)
+    # Where cargo put them: CARGO_TARGET_DIR when set, as on a build machine.
+    target = Path(os.environ.get("CARGO_TARGET_DIR") or REPO / "target")
+    return target / profile_dir(args.profile)
 
 
 def build_old(args, cache):
