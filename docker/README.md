@@ -175,17 +175,39 @@ In the folder with `docker-compose.yml`:
 ## When the disk fills
 
 - **Nodes keep every record while the disk has room.** Below 10% free, a node
-  may erase records far from it that nearer nodes hold, until 15% is free;
-  while the network is small none are that far, so the disk keeps filling.
+  may erase records far from it that its nearer nodes prove they hold, until
+  15% is free, farthest first. From ds.17 the reach grows as free space
+  falls: records beyond 10 times the distance to the node's 7th-nearest peer
+  below 10% free, 5 times below 7.5%, 2 times below 5%, and every record
+  outside the node's own range below 2.5%. Each step also fires once free
+  space is down to the full line plus 4 MiB, so on a small disk (under about
+  40 GiB) they all run before the node is full. A record leaves a node's
+  range only after 3 days out of it, and that wait survives restarts from
+  ds.17. Nodes up to ds.16 stop at 10 times, and never erase while the
+  network is small.
+- **Free inodes count as free space** from ds.17: the smaller share of free
+  bytes and free inodes drives the steps above, and below 2.5% free inodes a
+  node is at the full line. Suggested for a disk of its own: XFS, or ext4
+  made with `-i 4096`, so inodes don't run out before bytes.
 - **At 1 GiB free or less**, `docker exec storage-node nodes status` warns,
   and at 500 MiB or less it reports the disk as critical. The node manager
   deletes no node's data, however little space is left.
 - **At 1 GiB free**, nodes stop taking new data: they refuse to store a
-  record that would leave less (nodes up to ds.15 did so at 500 MiB). Their
-  logs give way there too: each node deletes its oldest log files first,
-  then writes only warnings and errors into the room that frees, and nothing
-  once none are left to delete; when the disk has room again it logs how
-  many lines it dropped. To store more, add disk or lower `NODE_COUNT`.
+  record that would leave less (nodes up to ds.15 did so at 500 MiB). From
+  ds.17 they stop pricing new data there too, so no client pays them for a
+  record they couldn't keep. Their logs give way there too: each node
+  deletes its oldest log files first, then writes only warnings and errors
+  into the room that frees, and nothing once none are left to delete; when
+  the disk has room again it logs how many lines it dropped.
+- **Full, not faulty** (from ds.17): a node at the line with nothing left it
+  may erase is full. It keeps serving and proving what it holds, takes
+  updates of the pointers it holds, refuses new records, and tells its
+  peers, who stop charging it for the records it can't take and send them
+  to the next nearest node instead. It logs `Node full: since ...` on
+  entering and `Node full: no longer` on leaving, which it does once 256 MiB
+  above the line is free again, and `nodes status` lists the full nodes.
+  Nodes up to ds.16 keep charging a full node until they update. To store
+  more, add disk or lower `NODE_COUNT`.
 - **Logs:** each node's files in `logs/node-<id>/logs/` start anew at 50 MiB
   or each hour and take at most 500 MiB in all, the oldest deleted first.
 - **Older images** (where `docker exec storage-node darwin-nodes --version`

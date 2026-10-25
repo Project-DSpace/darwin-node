@@ -9,12 +9,55 @@
 # the disk was nearly full, does nothing now: this image's manager evicts no
 # node, and the container's start dismisses the nodes an earlier one evicted.
 # It stays for the operators and scripts that still run it.
+#
+# `nodes status`, as typed, also lists the nodes that are full (from ds.17),
+# and since when, from the line each node logs on entering and leaving "full"
+# (`Node full: since <unix seconds>, at the full line by <bytes|inodes> ...`,
+# then `Node full: no longer ...`). `--json` and every other command print the
+# manager's output alone.
 set -euo pipefail
+
+LOGS=/data/logs                      # node-<id>/logs: one node's log files
 
 if [[ "${1:-}" == clear-evicted ]]; then
     echo "No removed nodes to clear: this image's node manager deletes no node's data," \
         "and nodes an earlier one evicted are dismissed when the container starts"
     exit 0
+fi
+
+# The last "Node full:" line in a node's log files, oldest file first.
+last_full_line() {
+    local file line="" last=""
+    while IFS= read -r file; do
+        line=$(grep -h "Node full: " "$1/$file" 2>/dev/null | tail -n 1) || true
+        [[ -n $line ]] && last=$line
+    done < <(ls -1tr "$1" 2>/dev/null)
+    printf '%s' "$last"
+}
+
+full_nodes() {
+    local dir node line since by when
+    for dir in "$LOGS"/node-*/logs; do
+        [[ -d $dir ]] || continue
+        node=${dir%/logs}
+        node=${node##*/}
+        line=$(last_full_line "$dir")
+        [[ $line == *"Node full: since "* ]] || continue
+        since=${line##*Node full: since }
+        since=${since%%,*}
+        by=${line##*at the full line by }
+        by=${by%% *}
+        when=$(date -u -d "@$since" '+%Y-%m-%d %H:%M UTC' 2>/dev/null) || when=$since
+        echo "$node: full since $when, at the full line by $by: it keeps serving and" \
+            "proving what it holds, and takes no new data"
+    done
+}
+
+if [[ $# -eq 1 && $1 == status ]]; then
+    code=0
+    setpriv --reuid="$PUID" --regid="$PGID" --clear-groups darwin-nodes status || code=$?
+    full_nodes
+    exit "$code"
 fi
 
 exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups darwin-nodes "$@"
