@@ -220,7 +220,8 @@ never ran.
   shared by 2 or more nodes. It keeps the registry where `ant` did
   (`/data/manager/ant/node_registry.json`), and passes nodes the same
   arguments. At its first start the entrypoint dismisses, once, the nodes
-  `ant` evicted, whose data is gone, and new nodes take their places up to
+  `ant` evicted, whose data `ant` deleted (anything left of it moves to
+  `/data/unregistered/`), and new nodes take their places up to
   `NODE_COUNT`; node folders no registered node has move to
   `/data/unregistered/`, beside `/data/retired/`, which no image's sweep
   of retired folders reaches, ds.15's included, so nothing deletes them.
@@ -232,8 +233,9 @@ never ran.
   identity; on a nearly full 1.5 GB disk nothing is evicted or
   deleted, and the manager's health report keeps the fields the server
   watchdog reads; a `/data` written by ds.15's image keeps every node's id,
-  port, data and identity; and ds.15's image started again on a `/data`
-  this image wrote keeps every folder set aside. `tests/darwin_image.rs` pins
+  port, data and identity, with what is left of an evicted node's folder set
+  aside; and ds.15's image started again on a `/data` this image wrote
+  keeps every folder set aside. `tests/darwin_image.rs` pins
   the manager's install, the registry's place, the marker's path, every
   deletion and every move the image's scripts make, each with its reason,
   and the set-aside folders' place beyond every sweep.

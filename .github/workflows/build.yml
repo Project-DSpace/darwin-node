@@ -362,8 +362,9 @@ jobs:
       # going back to the image before, which keeps every folder set aside, a
       # nearly full disk on which nothing is evicted or deleted and the health
       # checks keep the fields the server watchdog reads, and the move from
-      # the image before (Autonomi's node manager): every node kept, and the
-      # nodes it evicted dismissed once.
+      # the image before (Autonomi's node manager): every node kept, the nodes
+      # it evicted dismissed once, and what is left of an evicted node's folder
+      # set aside.
       - name: Smoke test
         run: bash docker/smoke-test.sh "$IMAGE:${{ github.sha }}"
 

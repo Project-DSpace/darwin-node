@@ -186,7 +186,10 @@ In the folder with `docker-compose.yml`:
   and logs `Evicted node`. Pull the new image ([Updates](#day-to-day)). At
   its first start, nodes evicted before are dismissed (`Dismissing node-2,
   which an earlier node manager evicted ...`) and new nodes take their
-  places up to `NODE_COUNT`. `nodes clear-evicted` does nothing any more.
+  places up to `NODE_COUNT`. If that manager could not delete an evicted
+  node's data, the line says so, and the folder is set aside in
+  `unregistered/` ([Set-aside folders](#day-to-day)). `nodes clear-evicted`
+  does nothing any more.
 
 ## Relaying
 

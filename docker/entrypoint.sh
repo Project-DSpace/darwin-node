@@ -196,14 +196,20 @@ free_port() {
 }
 
 # The node manager of earlier images, Autonomi's `ant` 0.3.9, evicted a node
-# when the disk was nearly full: it deleted the node's data and kept the node
-# in the registry, marked evicted. This image's manager never starts such a
-# node, so each is dismissed once, here: taken out of the registry, its data
-# being gone already, and replaced by a new node below while NODE_COUNT asks
-# for one. Its logs are retired, and anything left of its data folder is set
-# aside with the unregistered folders at the end, so no node takes it over.
+# when the disk was nearly full: it marked the node evicted in the registry,
+# then deleted the node's data folder. The mark stays when that delete fails
+# (`ant` logs "Disk space was NOT reclaimed") or stops partway, so an evicted
+# node's folder can still be there. This image's manager never starts such a
+# node, so each is dismissed once, here: taken out of the registry, and
+# replaced by a new node below while NODE_COUNT asks for one. Its logs are
+# retired, and whatever is left of its data folder is set aside with the
+# unregistered folders at the end, so no node takes it over.
 for id in $(registered '.nodes | to_entries | map(select(.value.eviction != null)) | .[].key'); do
-    echo "Dismissing node-$id, which an earlier node manager evicted when the disk was nearly full, deleting its data"
+    if [[ -d "$NODES/node-$id" ]]; then
+        echo "Dismissing node-$id, which an earlier node manager evicted when the disk was nearly full; its data folder was not fully deleted and is set aside in $UNREGISTERED"
+    else
+        echo "Dismissing node-$id, which an earlier node manager evicted when the disk was nearly full, deleting its data"
+    fi
     manager dismiss "$id" >/dev/null
     if [[ -d "$LOGS/node-$id" ]]; then retire "$LOGS/node-$id" "$RETIRED/$(date -u +%Y%m%dT%H%M%S)-node-$id-logs"; fi
 done
@@ -264,7 +270,7 @@ while :; do
 done
 
 # Node folders no registered node has (taken over from the old layout beyond
-# NODE_COUNT, or left from a node an earlier manager evicted) are set aside in
+# NODE_COUNT, or left of a node an earlier manager evicted) are set aside in
 # $UNREGISTERED, which neither this image nor an earlier one deletes: such a
 # folder can hold a node's identity and data, and only the operator knows
 # whether it is needed.

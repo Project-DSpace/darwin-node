@@ -33,9 +33,10 @@
 # reads, and nothing is evicted or deleted, and `nodes clear-evicted` does
 # nothing; a /data written by the release before, whose node manager was
 # Autonomi's `ant` 0.3.9, keeps every node's id, port, data and identity, with
-# nothing retired; nodes that manager evicted are dismissed once, and
-# NODE_COUNT is made up with new nodes; a data folder mounted noexec is
-# refused;
+# nothing retired; nodes that manager evicted are dismissed once, each with a
+# line that says whether its data folder was deleted, what is left of one is
+# set aside in /data/unregistered, and NODE_COUNT is made up with new nodes; a
+# data folder mounted noexec is refused;
 # production mode warns above 2 nodes; the old PublicNode RPC_URL is pointed
 # out; an RPC_URL of only spaces leaves the image's RPCs in place;
 # ANT_RELAY_SERVING=false reaches every node and switches its relay server
@@ -460,6 +461,13 @@ sudo mkdir "$WORK/evicted"
 docker exec evicting tar -C /data --exclude=./filler -cf - . | sudo tar -C "$WORK/evicted" --numeric-owner -xpf -
 docker rm -f evicting >/dev/null
 mark_folders "$WORK/evicted"
+# That manager marked a node evicted before deleting its data folder, and
+# kept the mark when the delete failed or stopped partway. The first evicted
+# node's folder is put back, as such a delete leaves it; the second's is gone.
+leftover_id=${evicted_ids%% *}
+deleted_id=${evicted_ids##* }
+sudo mkdir -p "$WORK/evicted/nodes/node-$leftover_id"
+sudo sh -c "echo kept > $WORK/evicted/nodes/node-$leftover_id/smoke-kept"
 docker run -d --name dismissing "${COMMON[@]}" -e MANAGER_PORT=12608 -e NODE_COUNT=3 -e PORT_START=10980 \
     -e BOOTSTRAP_PEERS="$IP:10900" -v "$WORK/evicted:/data" "$IMAGE" >/dev/null
 wait_for dismissing 'Running 3 node' 1 90 || fail "the image did not run 3 nodes in place of the evicted ones"
@@ -467,10 +475,17 @@ for id in $evicted_ids; do
     (( $(count dismissing "^Dismissing node-$id, which an earlier node manager evicted") == 1 )) || fail "node-$id was not dismissed with its line"
     [[ "$(registry "$WORK/evicted" ".nodes | has(\"$id\")")" == false ]] || fail "node-$id is still registered"
 done
+(( $(count dismissing "^Dismissing node-$leftover_id, .*; its data folder was not fully deleted and is set aside in /data/unregistered\$") == 1 )) \
+    || fail "node-$leftover_id, whose data folder was left, was not dismissed with the line that says so"
+(( $(count dismissing "^Dismissing node-$deleted_id, .*, deleting its data\$") == 1 )) \
+    || fail "node-$deleted_id, whose data folder was deleted, was not dismissed with the line that says so"
 (( $(count dismissing '^Dismissing node-') == 2 )) || fail "other nodes were dismissed"
 [[ "$(registry "$WORK/evicted" '[.nodes[] | select(.eviction != null)] | length')" == 0 ]] || fail "the registry still marks a node evicted"
 [[ "$(registry "$WORK/evicted" ".nodes[\"$kept_id\"].node_port")" == "$kept_port" ]] || fail "node-$kept_id lost its port"
 (( $(marked_folders "$WORK/evicted") == 1 )) || fail "node-$kept_id's data folder was deleted"
+sudo sh -c "cat $WORK/evicted/unregistered/*-node-$leftover_id/smoke-kept" >/dev/null \
+    || fail "what was left of node-$leftover_id's data folder was not kept in /data/unregistered"
+(( $(count dismissing '^Setting aside ') == 1 )) || fail "a folder other than node-$leftover_id's was set aside"
 (( $(count dismissing 'Added node on UDP port') == 2 )) || fail "the 2 evicted nodes were not replaced with new ones"
 for id in $(registry "$WORK/evicted" '.nodes | keys[]'); do
     [[ " $evicted_ids " != *" $id "* ]] || fail "node-$id, which was evicted, is registered again"
@@ -479,6 +494,7 @@ sudo sh -c "ls -d $WORK/evicted/retired/*-node-*-logs" >/dev/null || fail "the e
 docker restart -t 120 dismissing >/dev/null
 wait_for dismissing 'Running 3 node' 2 90 || fail "the nodes did not start after a restart"
 (( $(count dismissing '^Dismissing node-') == 2 )) || fail "nodes were dismissed again after a restart"
+(( $(count dismissing '^Setting aside ') == 1 )) || fail "a folder was set aside again after a restart"
 has_marker dismissing 3 || fail "not every node has the image marker: $(node_markers dismissing | tr '\n' ' ')"
 docker rm -f dismissing >/dev/null
 

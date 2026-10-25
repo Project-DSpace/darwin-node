@@ -388,9 +388,10 @@ const DELETIONS: &[Reviewed] = &[
         command: r#"manager dismiss "$id" >/dev/null"#,
         count: 2,
         reason: "Takes a node out of the registry and leaves its folders: a node an earlier \
-                 manager evicted, whose data that manager deleted, dismissed once at this image's \
-                 first start; and a node above a lowered NODE_COUNT, whose folders are then \
-                 retired for 3 days.",
+                 manager evicted, whose data that manager deleted or failed to, dismissed once at \
+                 this image's first start, anything left of its folder then set aside with the \
+                 unregistered folders; and a node above a lowered NODE_COUNT, whose folders are \
+                 then retired for 3 days.",
     },
     Reviewed {
         file: "docker/entrypoint.sh",
@@ -430,8 +431,9 @@ const MOVES: &[Reviewed] = &[
         command: r#"if [[ -d "$LOGS/node-$id" ]]; then retire "$LOGS/node-$id" "$RETIRED/$(date -u +%Y%m%dT%H%M%S)-node-$id-logs"; fi"#,
         count: 1,
         reason: "The logs of a node an earlier manager evicted, dismissed once: retired, so \
-                 swept 3 days later. That manager deleted its data; anything left of its \
-                 folder is set aside with the unregistered folders.",
+                 swept 3 days later. That manager marked the node evicted, then deleted its \
+                 data, a delete that can fail or stop partway; anything left of its folder is \
+                 set aside with the unregistered folders, never retired.",
     },
     Reviewed {
         file: "docker/entrypoint.sh",
