@@ -663,16 +663,60 @@ async fn a_slow_rpcs_call_goes_to_the_next_as_well_on_a_stores_path() {
     assert_eq!(read.value, paid(&PAYEE, AMOUNT));
     assert_eq!(read.rpc, 1, "answered by the second RPC");
     assert!(took >= PUT_SECOND_RPC_AFTER, "{took:?}");
-    // The second answered while the first's call was still pending: had the
-    // read waited for that call to time out, the first would be held off.
-    assert!(
-        !reads.pool.rpcs()[0].held_off(Instant::now()),
-        "the first RPC's call didn't time out"
-    );
 
     reads.settlement([0x77; 32], Lane::Put).await.unwrap();
     assert_eq!(stalled.record_reads().len(), 1, "not asked first again");
     assert_eq!(good.record_reads().len(), 2);
+}
+
+/// A call left unanswered when another RPC answered first, after the time a
+/// store's read waits before asking the next RPC as well, counts as a failed
+/// call and holds its RPC off, as one that timed out would: a stalled first
+/// RPC shows in the figures, and isn't asked first again.
+#[tokio::test]
+async fn a_call_left_unanswered_by_a_stalled_rpc_is_counted_and_held_off() {
+    use crate::payment::traffic::counts;
+
+    let chain = chain_paying_quote();
+    let stalled = mock::provider(&chain, Spec::stalled()).await;
+    let good = mock::provider(&chain, Spec::default()).await;
+    let reads = mock::reads(&[&stalled, &good]);
+    let errors = counts(EvmRpcCall::CompletedPayments).1;
+    let read = reads.settlement(QUOTE, Lane::Put).await.unwrap();
+    assert_eq!(read.rpc, 1);
+    assert!(reads.pool.rpcs()[0].held_off(Instant::now()));
+    assert!(!reads.pool.rpcs()[1].held_off(Instant::now()));
+    assert!(counts(EvmRpcCall::CompletedPayments).1 > errors);
+}
+
+/// A call that only lost a race, started less than the store's wait before
+/// the other RPC answered, is neither counted as failed nor held off.
+#[tokio::test]
+async fn a_call_that_only_lost_a_race_is_not_held_off() {
+    let chain = chain_paying_quote();
+    // The first answers 400 ms after the second is asked as well; the second
+    // takes a second, so its call is left unanswered 400 ms old.
+    let slow = mock::provider(
+        &chain,
+        Spec {
+            delay: PUT_SECOND_RPC_AFTER + Duration::from_millis(400),
+            ..Spec::default()
+        },
+    )
+    .await;
+    let late = mock::provider(
+        &chain,
+        Spec {
+            delay: Duration::from_secs(1),
+            ..Spec::default()
+        },
+    )
+    .await;
+    let reads = mock::reads(&[&slow, &late]);
+    assert_eq!(reads.settlement(QUOTE, Lane::Put).await.unwrap().rpc, 0);
+    assert_eq!(late.record_reads().len(), 1, "the second was asked as well");
+    assert!(!reads.pool.rpcs()[0].held_off(Instant::now()));
+    assert!(!reads.pool.rpcs()[1].held_off(Instant::now()));
 }
 
 /// Nobody waits on a background read, so its calls get their whole time,
@@ -968,6 +1012,63 @@ async fn a_batch_answered_busy_call_by_call_goes_to_the_next_rpc() {
         good.record_reads()
     );
     assert!(reads.pool.rpcs()[0].held_off(Instant::now()));
+}
+
+/// A batch no RPC answers in time, while calls on their own are answered:
+/// each read of it is made on its own, and every one is answered.
+#[tokio::test]
+async fn a_batch_no_rpc_answers_in_time_is_read_call_by_call() {
+    let quotes: Vec<[u8; 32]> = (1..=11u8).map(|i| [i; 32]).collect();
+    let chain = chain_paying(&quotes);
+    let provider = mock::provider(
+        &chain,
+        Spec {
+            delay: Duration::from_millis(200),
+            batches: Batches::Stall,
+            ..Spec::default()
+        },
+    )
+    .await;
+    let reads = mock::reads(&[&provider]);
+    for read in queue_behind_one(&reads, &quotes).await {
+        assert_eq!(read.unwrap().value, paid(&PAYEE, AMOUNT));
+    }
+    let calls = provider.record_reads();
+    let batches: HashSet<usize> = calls
+        .iter()
+        .filter(|call| call.batch > 1)
+        .map(|call| call.request)
+        .collect();
+    assert_eq!(batches.len(), PAYMENT_READ_ROUNDS as usize, "{calls:?}");
+    let alone = calls.iter().filter(|call| call.batch == 1).count();
+    assert_eq!(alone, quotes.len(), "the first, and each of the ten alone");
+}
+
+/// A batch every RPC answers busy is refused: its reads are not made one at
+/// a time, which would only add to a busy RPC's load.
+#[tokio::test]
+async fn a_batch_every_rpc_answers_busy_is_not_read_call_by_call() {
+    let quotes: Vec<[u8; 32]> = (1..=6u8).map(|i| [i; 32]).collect();
+    let chain = chain_paying(&quotes);
+    let busy = mock::provider(
+        &chain,
+        Spec {
+            delay: Duration::from_millis(200),
+            batches: Batches::EachBusy,
+            ..Spec::default()
+        },
+    )
+    .await;
+    let reads = mock::reads(&[&busy]);
+    let made = queue_behind_one(&reads, &quotes).await;
+    assert!(made[0].is_ok(), "the first, on its own, answered");
+    assert!(made[1..].iter().all(Result::is_err), "{made:?}");
+    let alone = busy
+        .record_reads()
+        .iter()
+        .filter(|call| call.batch == 1)
+        .count();
+    assert_eq!(alone, 1, "only the first went on its own");
 }
 
 /// Read-only, against the live chain: a past payment of the production

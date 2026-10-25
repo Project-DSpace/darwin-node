@@ -248,6 +248,8 @@ pub enum Batches {
     /// Every call answered busy, each with its own error, as a provider
     /// limiting its rate answers.
     EachBusy,
+    /// Taken and never answered, while calls on their own are answered.
+    Stall,
 }
 
 /// How a provider behaves.
@@ -393,6 +395,10 @@ pub async fn provider(chain: &Arc<Mutex<Chain>>, spec: Spec) -> Provider {
                         Act::Answer => {
                             if request.is_array() {
                                 match spec.batches {
+                                    Batches::Stall => {
+                                        std::future::pending::<()>().await;
+                                        return;
+                                    }
                                     Batches::Answer => Value::Array(
                                         calls
                                             .iter()

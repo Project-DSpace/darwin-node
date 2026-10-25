@@ -144,6 +144,12 @@ const BLOCKS_CAPACITY: usize = 1_024;
 /// one as refused.
 const MAX_BATCH: usize = 32;
 
+/// The reads of a batch no RPC answered in time are made one at a time, at
+/// most this many at once. Claude's proposal: an RPC that stalled is sent a
+/// few calls, not a whole batch's worth at once; a batch of `MAX_BATCH`
+/// answered in about a second a call is read in about 8 seconds.
+const SINGLES_AFTER_TIMED_OUT_BATCH: usize = 4;
+
 /// `completedPayments(bytes32)`'s selector: the first four bytes of the
 /// Keccak-256 hash of that signature.
 const COMPLETED_PAYMENTS_SELECTOR: [u8; 4] = [0xfe, 0x3c, 0x80, 0x6e];
@@ -430,6 +436,8 @@ impl Pool {
             (index, outcome)
         };
         let mut pending = FuturesUnordered::new();
+        // The calls in flight: each RPC's index, and when its call started.
+        let mut in_flight: Vec<(usize, Instant)> = Vec::new();
         let mut next = 0;
         let mut second_at = None;
         let mut last = CallError::Failed("no RPC answered".into());
@@ -440,6 +448,7 @@ impl Pool {
                 };
                 next += 1;
                 pending.push(start(index));
+                in_flight.push((index, Instant::now()));
                 second_at = call
                     .lane
                     .second_rpc_after()
@@ -453,38 +462,44 @@ impl Pool {
                 }
             };
             tokio::select! {
-                Some((index, outcome)) = pending.next() => match outcome {
-                    Ok(value) => {
-                        self.answered.store(index, Ordering::Relaxed);
-                        if let Some(rpc) = rpcs.get(index) {
-                            rpc.answered();
-                        }
-                        return Ok(Answered { value, rpc: index });
-                    }
-                    Err(CallError::BatchRefused(why)) => {
-                        if let Some(rpc) = rpcs.get(index) {
-                            rpc.refused_a_batch();
-                        }
-                        return Err(CallError::BatchRefused(why));
-                    }
-                    Err(error) => {
-                        if error.holds_off() {
+                Some((index, outcome)) = pending.next() => {
+                    in_flight.retain(|(flying, _)| *flying != index);
+                    match outcome {
+                        Ok(value) => {
+                            self.answered.store(index, Ordering::Relaxed);
                             if let Some(rpc) = rpcs.get(index) {
-                                rpc.hold_off();
+                                rpc.answered();
                             }
+                            Self::abandon(rpcs, &in_flight, call);
+                            return Ok(Answered { value, rpc: index });
                         }
-                        debug!(
-                            "{:?} call failed on RPC {index} of {}: {error}",
-                            call.kind,
-                            rpcs.len()
-                        );
-                        last = error;
-                        // A failed call moves on to the next RPC at once.
-                        if let Some(&index) = order.get(next) {
-                            next += 1;
-                            pending.push(start(index));
-                            second_at =
-                                call.lane.second_rpc_after().map(|after| Instant::now() + after);
+                        Err(CallError::BatchRefused(why)) => {
+                            if let Some(rpc) = rpcs.get(index) {
+                                rpc.refused_a_batch();
+                            }
+                            Self::abandon(rpcs, &in_flight, call);
+                            return Err(CallError::BatchRefused(why));
+                        }
+                        Err(error) => {
+                            if error.holds_off() {
+                                if let Some(rpc) = rpcs.get(index) {
+                                    rpc.hold_off();
+                                }
+                            }
+                            debug!(
+                                "{:?} call failed on RPC {index} of {}: {error}",
+                                call.kind,
+                                rpcs.len()
+                            );
+                            last = error;
+                            // A failed call moves on to the next RPC at once.
+                            if let Some(&index) = order.get(next) {
+                                next += 1;
+                                pending.push(start(index));
+                                in_flight.push((index, Instant::now()));
+                                second_at =
+                                    call.lane.second_rpc_after().map(|after| Instant::now() + after);
+                            }
                         }
                     }
                 },
@@ -497,10 +512,38 @@ impl Pool {
                         );
                         next += 1;
                         pending.push(start(index));
+                        in_flight.push((index, Instant::now()));
                         second_at = call.lane.second_rpc_after().map(|after| Instant::now() + after);
                     }
                 }
             }
+        }
+    }
+
+    /// The calls a round leaves unanswered when another RPC's answer ends
+    /// it, `in_flight`: those that had gone at least the lane's time before
+    /// the next RPC is asked as well are counted as failed calls in the RPC
+    /// traffic figures, and their RPCs held off, as a call that timed out
+    /// would be. One started more recently only lost a race, and is neither.
+    fn abandon(rpcs: &[Rpc], in_flight: &[(usize, Instant)], call: &Call<'_>) {
+        let Some(slow) = call.lane.second_rpc_after() else {
+            return;
+        };
+        let now = Instant::now();
+        for (index, started) in in_flight {
+            if now.saturating_duration_since(*started) < slow {
+                continue;
+            }
+            if let Some(rpc) = rpcs.get(*index) {
+                rpc.hold_off();
+            }
+            traffic::record(call.kind, false);
+            debug!(
+                "{:?} call left unanswered on RPC {index} of {} after {:?}",
+                call.kind,
+                rpcs.len(),
+                now.saturating_duration_since(*started)
+            );
         }
     }
 
@@ -1086,7 +1129,7 @@ impl SettlementReads {
     /// Send one batch of record reads, or a single read on its own. Calls a
     /// batch's answer leaves out, or answers with anything but a record, are
     /// read again on their own, and so is every call of a batch the RPC
-    /// refuses.
+    /// refuses or no RPC answers in time.
     async fn send_reads(self: &Arc<Self>, lane: Lane, reads: Vec<QueuedRead>) {
         if reads.len() == 1 || self.pool.first_refuses_batches() {
             futures::future::join_all(reads.into_iter().map(|read| async move {
@@ -1160,8 +1203,18 @@ impl SettlementReads {
                     self.read_alone_later(read, lane);
                 }
             }
-            // Every RPC busy or stalled: one call at a time would fare no
-            // better.
+            // No RPC answered the batch in time: a batch of up to
+            // `MAX_BATCH` calls can take longer than one call, so each read
+            // goes on its own, a few at a time, in a task of its own.
+            Err(CallError::TimedOut) => {
+                debug!(
+                    "A batch of {} payment reads went unanswered in time; reading them one by one",
+                    reads.len()
+                );
+                self.read_alone_later_few_at_a_time(reads, lane);
+            }
+            // Every RPC busy: each is held off, and one call at a time would
+            // only add to its load.
             Err(error) => {
                 let why = error.to_string();
                 for read in reads {
@@ -1169,6 +1222,25 @@ impl SettlementReads {
                 }
             }
         }
+    }
+
+    /// Read each of `reads` on its own, at most
+    /// [`SINGLES_AFTER_TIMED_OUT_BATCH`] at once, in a task of their own, so
+    /// the queue goes on and an RPC that stalled isn't sent every call of
+    /// the batch at once.
+    fn read_alone_later_few_at_a_time(self: &Arc<Self>, reads: Vec<QueuedRead>, lane: Lane) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            futures::stream::iter(reads)
+                .for_each_concurrent(SINGLES_AFTER_TIMED_OUT_BATCH, |read| {
+                    let this = Arc::clone(&this);
+                    async move {
+                        let answer = this.read_alone(read.quote_hash, lane).await;
+                        let _ = read.reply.send(answer);
+                    }
+                })
+                .await;
+        });
     }
 
     /// Read `read` on its own, in a task of its own, so the queue goes on.
