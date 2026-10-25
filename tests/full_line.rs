@@ -380,7 +380,23 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
     }
 
     // The upgrade's check lets it through at the line: it reaches its
-    // download, which fails here, having no release to fetch.
+    // download, which fails here, having no release to fetch. The check
+    // counts the running binary twice, and the running binary is this test's,
+    // a debug build many times a release's size, so the partition gives the
+    // check back the difference: it sees what it would beside a release-sized
+    // binary.
+    let running = std::fs::metadata(AutoApplyUpgrader::current_binary_path().unwrap())
+        .unwrap()
+        .len();
+    let debug_build_slack = 2 * running.saturating_sub(BINARY);
+    let others = partition.others.load(Ordering::SeqCst);
+    assert!(
+        others >= debug_build_slack,
+        "the test's binary, {running} bytes, is too large for its partition"
+    );
+    partition
+        .others
+        .fetch_sub(debug_build_slack, Ordering::SeqCst);
     let upgrade = UpgradeInfo {
         version: semver::Version::parse("0.23.0+ds.99").unwrap(),
         download_url: "not a url".to_string(),
@@ -399,6 +415,9 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
         }
         other => panic!("at the line the upgrade must reach its download: {other:?}"),
     }
+    partition
+        .others
+        .fetch_add(debug_build_slack, Ordering::SeqCst);
     // Its writes, at a release's sizes, leave the disk clear of the old
     // manager's line.
     let upgrade_dir = nodes[0].root.join("upgrade");

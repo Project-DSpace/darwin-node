@@ -214,6 +214,13 @@ name = "test_seams"
 path = "tests/test_seams.rs"
 required-features = ["test-utils"]
 
+# Two nodes at the full line on one small partition. Alone in its process, as
+# it sets the free-space seam.
+[[test]]
+name = "full_line"
+path = "tests/full_line.rs"
+required-features = ["test-utils"]
+
 [[test]]
 name = "webrtc_direct_devnet"
 path = "tests/webrtc_direct_devnet.rs"
