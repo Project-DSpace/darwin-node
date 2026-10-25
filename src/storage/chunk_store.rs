@@ -38,7 +38,7 @@
 use crate::ant_protocol::{XorName, MAX_CHUNK_SIZE, XORNAME_LEN};
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, trace, warn};
-use crate::storage::StorageStats;
+use crate::storage::{Inodes, StorageStats};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -293,6 +293,37 @@ struct CapacitySnapshot {
     /// How many measurements have been taken: tells a reader of
     /// [`SpaceReading`] which one it has.
     measurements: u64,
+    /// Free inodes at `measured_at`, where the filesystem counts them.
+    inodes: Option<Inodes>,
+}
+
+/// Why a node is full: what put it at the full line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullTrigger {
+    /// Free bytes: no more than the line and one chunk.
+    Bytes,
+    /// Free inodes: below the falling floor's last step's share.
+    Inodes,
+}
+
+impl FullTrigger {
+    /// The word logs and status use for it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Inodes => "inodes",
+        }
+    }
+}
+
+/// A node's "full" state: since when, and what put it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullState {
+    /// When the node became full, by the wall clock.
+    pub since: std::time::SystemTime,
+    /// What put it at the line.
+    pub trigger: FullTrigger,
 }
 
 /// Size-aware free-space predicate with a short-lived cache.
@@ -309,6 +340,10 @@ struct CapacityGuard {
     reserve: u64,
     /// The cached measurement.
     snapshot: parking_lot::Mutex<CapacitySnapshot>,
+    /// Whether the node is full, and since when. While it is, no new
+    /// record is admitted, whatever free space a measurement finds, until the
+    /// erasure task says the node has left "full".
+    full: parking_lot::Mutex<Option<FullState>>,
 }
 
 impl CapacitySnapshot {
@@ -332,8 +367,24 @@ impl CapacityGuard {
                 written_since: 0,
                 in_flight: 0,
                 measurements: 0,
+                inodes: None,
             }),
+            full: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The node's "full" state, if it is full.
+    fn full_state(&self) -> Option<FullState> {
+        *self.full.lock()
+    }
+
+    /// The refusal for a new record while the node is full.
+    fn full_refusal(state: FullState) -> Error {
+        Error::Storage(format!(
+            "Insufficient disk space: this node is full (at the full line by {}), and takes \
+             no new data until it has room above the line again",
+            state.trigger.as_str()
+        ))
     }
 
     /// The free space and the line, measuring again first if the last
@@ -360,14 +411,15 @@ impl CapacityGuard {
             .saturating_add(ALLOC_UNIT)
     }
 
-    /// Free bytes right now, or `None` if the question could not be answered.
+    /// Free bytes and inodes right now, or `None` if the question could not be
+    /// answered.
     ///
     /// Deliberately separate from [`Self::measure`], which folds a failure into an error
     /// the caller cannot tell from "below the reserve".
-    fn measure_available(&self) -> Option<u64> {
+    fn measure_available(&self) -> Option<(u64, Option<Inodes>)> {
         let mut snapshot = self.snapshot.lock();
         match self.measure(&mut snapshot) {
-            Ok(()) => Some(snapshot.free_estimate()),
+            Ok(()) => Some((snapshot.free_estimate(), snapshot.inodes)),
             Err(_) => None,
         }
     }
@@ -377,6 +429,7 @@ impl CapacityGuard {
         let available = super::available_space(&self.dir)
             .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
         snapshot.available = available;
+        snapshot.inodes = super::free_inodes(&self.dir);
         // Reservations survive: their bytes are not on the platter yet, so the fresh
         // measurement does not include them.
         snapshot.written_since = 0;
@@ -390,12 +443,17 @@ impl CapacityGuard {
     /// Only *passing* results are cached, so a low-space condition is rechecked on every
     /// call and freed space is noticed promptly.
     fn admit(&self, snapshot: &mut CapacitySnapshot, needed: u64) -> Result<()> {
+        if let Some(state) = self.full_state() {
+            return Err(Self::full_refusal(state));
+        }
         let want = self.reserve.saturating_add(Self::charge(needed));
 
         let cache_fresh = snapshot
             .measured_at
             .is_some_and(|t| t.elapsed().as_secs() < DISK_CHECK_INTERVAL_SECS);
-        if cache_fresh && snapshot.free_estimate() >= want {
+        let inodes_short =
+            |snapshot: &CapacitySnapshot| snapshot.inodes.is_some_and(Inodes::at_the_line);
+        if cache_fresh && snapshot.free_estimate() >= want && !inodes_short(snapshot) {
             return Ok(());
         }
 
@@ -410,7 +468,48 @@ impl CapacityGuard {
                 bytes_to_gib(self.reserve),
             )));
         }
+        if let Some(inodes) = snapshot.inodes.filter(|inodes| inodes.at_the_line()) {
+            // Out of inodes counts as being at the line: the write would take one
+            // the filesystem may not have, after the node had been paid for it.
+            return Err(Error::Storage(format!(
+                "Insufficient disk space: {} of {} inodes free, below {}.{}% of the partition's. \
+                 Free inodes or move the node to a filesystem with more to continue storing chunks.",
+                inodes.free,
+                inodes.total,
+                crate::storage::INODES_AT_THE_LINE_PER_MILLE / 10,
+                crate::storage::INODES_AT_THE_LINE_PER_MILLE % 10,
+            )));
+        }
         Ok(())
+    }
+
+    /// Admit a write of `needed` bytes that replaces a record of the same size
+    /// already on disk, and charge it: it needs room only for its temporary
+    /// file, not room above the line, and is admitted while the node is full.
+    ///
+    /// For an update of a pointer the node holds, which takes no new space
+    /// once its temporary file has replaced the old one.
+    fn reserve_replacement(self: &Arc<Self>, needed: u64) -> Result<Reservation> {
+        {
+            let mut snapshot = self.snapshot.lock();
+            let want = Self::charge(needed);
+            if snapshot.free_estimate() < want {
+                self.measure(&mut snapshot)?;
+                if snapshot.free_estimate() < want {
+                    return Err(Error::Storage(format!(
+                        "Insufficient disk space: {} bytes available, {want} needed for the \
+                         temporary file of a replacing write",
+                        snapshot.free_estimate()
+                    )));
+                }
+            }
+            snapshot.in_flight = snapshot.in_flight.saturating_add(want);
+        }
+        Ok(Reservation {
+            capacity: Arc::clone(self),
+            bytes: needed,
+            settled: false,
+        })
     }
 
     /// Drop the cached measurement so the next question hits the filesystem.
@@ -1969,13 +2068,69 @@ impl ChunkStore {
     /// well succeed on the next pass.
     #[must_use]
     pub fn capacity_verdict(&self) -> crate::storage::CapacityVerdict {
+        if self.capacity.full_state().is_some() {
+            return crate::storage::CapacityVerdict::Full;
+        }
         match self.capacity.measure_available() {
-            Some(available) if available < self.capacity.reserve => {
+            Some((available, inodes))
+                if available < self.capacity.reserve || inodes.is_some_and(Inodes::at_the_line) =>
+            {
                 crate::storage::CapacityVerdict::Full
             }
             Some(_) => crate::storage::CapacityVerdict::Writable,
             None => crate::storage::CapacityVerdict::Unknown,
         }
+    }
+
+    /// The full line: the free bytes this store keeps unused.
+    #[must_use]
+    pub fn full_line(&self) -> u64 {
+        self.capacity.reserve
+    }
+
+    /// Whether the node is full, and since when. While it is, the store
+    /// admits no new record ([`Self::check_capacity`], [`Self::put`] and the
+    /// pointer store's charges refuse), and the node prices no new data.
+    #[must_use]
+    pub fn full_state(&self) -> Option<FullState> {
+        self.capacity.full_state()
+    }
+
+    /// Whether the node is full (see [`Self::full_state`]).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.capacity.full_state().is_some()
+    }
+
+    /// Enter "full", put there by `trigger`. Returns the state when the node
+    /// was not full before; the caller logs the change.
+    pub(crate) fn enter_full(&self, trigger: FullTrigger) -> Option<FullState> {
+        let state = FullState {
+            since: std::time::SystemTime::now(),
+            trigger,
+        };
+        let mut full = self.capacity.full.lock();
+        let entered = full.is_none();
+        if entered {
+            *full = Some(state);
+        }
+        drop(full);
+        entered.then_some(state)
+    }
+
+    /// Leave "full". Returns the state the node was in, if it was full.
+    pub(crate) fn leave_full(&self) -> Option<FullState> {
+        self.capacity.full.lock().take()
+    }
+
+    /// Mark the node full or not, for a test that needs a full node without
+    /// filling a disk. Tests only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_full_for_test(&self, trigger: Option<FullTrigger>) {
+        *self.capacity.full.lock() = trigger.map(|trigger| FullState {
+            since: std::time::SystemTime::now(),
+            trigger,
+        });
     }
 
     /// The free space on this store's partition and its full line, as
@@ -2006,6 +2161,19 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if the disk cannot take `bytes` more.
     pub(crate) fn reserve(&self, bytes: u64) -> Result<Reservation> {
         self.capacity.reserve(bytes)
+    }
+
+    /// Charge `bytes` for a write that replaces a record of the same size this
+    /// node holds, such as an update of a held pointer: it takes no new space
+    /// once its temporary file replaces the old record, so it needs room only
+    /// for that file, not room above the line, and is taken while the node is
+    /// full.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the disk cannot take the temporary file.
+    pub(crate) fn reserve_replacement(&self, bytes: u64) -> Result<Reservation> {
+        self.capacity.reserve_replacement(bytes)
     }
 
     /// Credit `bytes` deleted from the pointer store back to the disk budget.

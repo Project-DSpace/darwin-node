@@ -11,13 +11,16 @@
 //! [`PREFIX`].
 //!
 //! A seam for a value the node doesn't have yet is added here in the change
-//! that brings the value, with the harness's runs that set it: the size of a
-//! neighbour-sync page, for a run whose lists take more than one page, and how
-//! long a "full" notice stays fresh, for a run in which a node's mark as full
-//! lapses. Each is compiled only with `test-utils` and named under
-//! [`PREFIX`], so the Build workflow's check covers it, and the harness
-//! refuses such a run with a binary that lacks the seam, as it refuses the
-//! `full` run without [`FREE_SPACE_FILE`].
+//! that brings the value: how long a "full" notice stays fresh
+//! ([`FULL_FRESHNESS_SECS`]), for a run in which a node's mark as full must
+//! lapse within the run, and the first release a full node tells it is full
+//! ([`FULL_NOTICE_FROM_RELEASE`]), which the harness's `full` run sets so that
+//! nodes of a tree between releases tell each other; still to come is the
+//! size of a neighbour-sync page, for a run whose lists take more than one
+//! page. Each is compiled only with `test-utils` and named under [`PREFIX`],
+//! so the Build workflow's check covers it, and the harness refuses a run that
+//! needs a seam with a binary that lacks it, as it refuses the `full` run
+//! without [`FREE_SPACE_FILE`].
 
 use std::io;
 use std::path::Path;
@@ -31,10 +34,22 @@ pub const PREFIX: &str = "ANT_TEST_SEAM_";
 /// it in place of the partition's own: the chunk store's capacity check, the
 /// listing store's map size, and the disk-pressure state. The file holds the
 /// free bytes, then, optionally, the partition's size in bytes (otherwise its
-/// real size is read), separated by white space. The test rewrites the file
-/// to fill or free the disk while the node runs. A file that can't be read or
-/// parsed is a failed measurement, as a failed `statvfs` is.
+/// real size is read), then, optionally, the free inodes and the partition's
+/// inodes (otherwise the reading counts no inodes), separated by white space.
+/// The test rewrites the file to fill or free the disk while the node runs. A
+/// file that can't be read or parsed is a failed measurement, as a failed
+/// `statvfs` is.
 pub const FREE_SPACE_FILE: &str = "ANT_TEST_SEAM_FREE_SPACE_FILE";
+
+/// How long, in whole seconds, a "full" notice from a peer stays fresh.
+///
+/// In place of
+/// [`FULL_NOTICE_FRESHNESS`](crate::replication::full::FULL_NOTICE_FRESHNESS),
+/// on the node that holds the marks; a full node renews its notice at a
+/// quarter of the value it reads here, so a run sets the same on every node.
+/// A short value lets a run see a mark lapse once the full node stops renewing
+/// it. A value that isn't a whole number of seconds, at least 4, is ignored.
+pub const FULL_FRESHNESS_SECS: &str = "ANT_TEST_SEAM_FULL_FRESHNESS_SECS";
 
 /// Free and total bytes a test set for the storage partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +58,43 @@ pub struct FreeSpace {
     pub free: u64,
     /// The partition's size, if the test set one.
     pub total: Option<u64>,
+    /// Free and total inodes, if the test set them.
+    pub inodes: Option<(u64, u64)>,
+}
+
+/// The first release whose nodes this node sends its "full" notice to.
+///
+/// Its `+ds.<n>` build number, in place of
+/// [`FULL_NOTICE_FROM_RELEASE`](crate::replication::full::FULL_NOTICE_FROM_RELEASE).
+/// Nodes built from a tree between releases announce the last release's
+/// version; a run of such nodes alone sets this to that release, or lower, so
+/// that a full one tells the others. A value that isn't a whole number is
+/// ignored.
+pub const FULL_NOTICE_FROM_RELEASE: &str = "ANT_TEST_SEAM_FULL_NOTICE_FROM_RELEASE";
+
+/// The notice's release a test set for this process, if it set a valid one.
+pub(crate) fn full_notice_from_release() -> Option<u64> {
+    let value = std::env::var(FULL_NOTICE_FROM_RELEASE).ok()?;
+    value.trim().parse::<u64>().ok()
+}
+
+/// The shortest "full" freshness the seam takes, in seconds: a renewal every
+/// second at a quarter of it.
+const MIN_FULL_FRESHNESS_SECS: u64 = 4;
+
+/// How long a "full" notice stays fresh, if a test set a valid value.
+pub(crate) fn full_freshness() -> Option<std::time::Duration> {
+    let value = std::env::var(FULL_FRESHNESS_SECS).ok()?;
+    parse_full_freshness(&value)
+}
+
+fn parse_full_freshness(value: &str) -> Option<std::time::Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|secs| *secs >= MIN_FULL_FRESHNESS_SECS)
+        .map(std::time::Duration::from_secs)
 }
 
 /// The free space a test set for this process: `None` when the seam isn't
@@ -79,13 +131,21 @@ fn parse_free_space(text: &str) -> Result<FreeSpace, String> {
         [free] => Ok(FreeSpace {
             free: number(free)?,
             total: None,
+            inodes: None,
         }),
         [free, total] => Ok(FreeSpace {
             free: number(free)?,
             total: Some(number(total)?),
+            inodes: None,
+        }),
+        [free, total, free_inodes, inodes] => Ok(FreeSpace {
+            free: number(free)?,
+            total: Some(number(total)?),
+            inodes: Some((number(free_inodes)?, number(inodes)?)),
         }),
         _ => Err(format!(
-            "expected the free bytes and, optionally, the partition's size; found {} field(s)",
+            "expected the free bytes and, optionally, the partition's size, then its free \
+             and total inodes; found {} field(s)",
             fields.len()
         )),
     }
@@ -102,17 +162,27 @@ mod tests {
             parse_free_space("1048576\n"),
             Ok(FreeSpace {
                 free: 1_048_576,
-                total: None
+                total: None,
+                inodes: None,
             })
         );
         assert_eq!(
             parse_free_space(" 0  21474836480 "),
             Ok(FreeSpace {
                 free: 0,
-                total: Some(21_474_836_480)
+                total: Some(21_474_836_480),
+                inodes: None,
             })
         );
-        for bad in ["", "full", "-1", "1 2 3", "1.5"] {
+        assert_eq!(
+            parse_free_space("5 10 100 4000"),
+            Ok(FreeSpace {
+                free: 5,
+                total: Some(10),
+                inodes: Some((100, 4000)),
+            })
+        );
+        for bad in ["", "full", "-1", "1 2 3", "1.5", "1 2 3 4 5", "1 2 x 4"] {
             assert!(parse_free_space(bad).is_err(), "{bad:?} was read");
         }
     }
@@ -131,6 +201,27 @@ mod tests {
 
     #[test]
     fn every_seam_starts_with_the_prefix() {
-        assert!(FREE_SPACE_FILE.starts_with(PREFIX));
+        for seam in [
+            FREE_SPACE_FILE,
+            FULL_FRESHNESS_SECS,
+            FULL_NOTICE_FROM_RELEASE,
+        ] {
+            assert!(seam.starts_with(PREFIX), "{seam}");
+        }
+    }
+
+    #[test]
+    fn a_full_freshness_is_whole_seconds_of_at_least_four() {
+        assert_eq!(
+            parse_full_freshness("8"),
+            Some(std::time::Duration::from_secs(8))
+        );
+        assert_eq!(
+            parse_full_freshness(" 4\n"),
+            Some(std::time::Duration::from_secs(4))
+        );
+        for ignored in ["", "3", "0", "-8", "8s", "8.5"] {
+            assert_eq!(parse_full_freshness(ignored), None, "{ignored:?}");
+        }
     }
 }
