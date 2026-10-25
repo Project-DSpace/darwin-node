@@ -392,6 +392,85 @@ async fn a_read_whose_caller_goes_away_still_lands() {
     assert_eq!(provider.record_reads().len(), 1);
 }
 
+/// A send of queued reads that panics frees its lane: the reads it carried
+/// are told at once that they were dropped, and the next read in the lane is
+/// sent.
+#[tokio::test]
+async fn a_send_of_queued_reads_that_panics_frees_its_lane() {
+    let chain = chain_paying_quote();
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let reads = mock::reads(&[&provider]);
+
+    reads.panic_next_send.store(true, Ordering::SeqCst);
+    let dropped = tokio::time::timeout(
+        Duration::from_secs(5),
+        reads.queued_record(QUOTE, Lane::Put),
+    )
+    .await
+    .expect("told at once");
+    assert!(
+        matches!(&dropped, Err(why) if why == "the read was dropped"),
+        "{dropped:?}"
+    );
+    assert!(!reads.queues[Lane::Put.index()].lock().in_flight);
+
+    let read = tokio::time::timeout(Duration::from_secs(5), reads.settlement(QUOTE, Lane::Put))
+        .await
+        .expect("the lane is free")
+        .unwrap();
+    assert_eq!(read.value, paid(&PAYEE, AMOUNT));
+    assert_eq!(provider.record_reads().len(), 1);
+}
+
+/// Records read again later come back in the order asked.
+#[tokio::test]
+async fn records_read_again_later_come_back_in_order() {
+    let chain = chain_paying_quote();
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let reads = mock::reads(&[&provider]);
+
+    let unpaid = [0x24; 32];
+    let mut again = reads.settlements_again_later(
+        vec![Some((unpaid, 0)), None, Some((QUOTE, 0))],
+        Lane::Put,
+        Duration::from_millis(100),
+    );
+    assert!(again
+        .recv()
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .value
+        .is_empty());
+    assert!(again.recv().await.unwrap().is_none());
+    let read = again.recv().await.unwrap().unwrap().unwrap();
+    assert_eq!(read.value, paid(&PAYEE, AMOUNT));
+    assert!(again.recv().await.is_none(), "nothing more");
+    assert_eq!(provider.record_reads().len(), 2);
+}
+
+/// Records read again later are read and kept as facts even when their
+/// caller has gone during the pause, as when a PUT's deadline falls.
+#[tokio::test]
+async fn records_read_again_later_land_when_their_caller_has_gone() {
+    let chain = chain_paying_quote();
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let reads = mock::reads(&[&provider]);
+
+    drop(reads.settlements_again_later(
+        vec![Some((QUOTE, 0))],
+        Lane::Put,
+        Duration::from_millis(100),
+    ));
+    let started = Instant::now();
+    while reads.fact(&QUOTE).is_none() {
+        assert!(started.elapsed() < Duration::from_secs(5), "never kept");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(reads.fact(&QUOTE), Some(paid(&PAYEE, AMOUNT)));
+}
+
 /// Reads made while one is in flight wait for it, then go as one batch.
 #[tokio::test]
 async fn reads_queued_while_one_is_in_flight_go_as_one_batch() {

@@ -70,7 +70,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 /// How long a released client waits for a node's answer to a store.
@@ -781,6 +781,30 @@ struct Queue {
     waiting: Vec<QueuedRead>,
 }
 
+/// A lane's queue being sent. Dropped before the sending is done, as when
+/// the task sending it panics or is cancelled, it frees the lane and drops
+/// the reads waiting in it: each of their callers gets "the read was
+/// dropped" at once, and the next read queued is sent.
+struct Sending {
+    reads: Arc<SettlementReads>,
+    lane: Lane,
+    done: bool,
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let waiting = {
+            let mut queue = self.reads.queues[self.lane.index()].lock();
+            queue.in_flight = false;
+            std::mem::take(&mut queue.waiting)
+        };
+        drop(waiting);
+    }
+}
+
 /// One record read waiting to be sent.
 struct QueuedRead {
     quote_hash: [u8; 32],
@@ -806,6 +830,9 @@ pub struct SettlementReads {
     receipt_flights: [Arc<Flights<ReceiptRead>>; Lane::COUNT],
     /// Record reads waiting to go out, by lane.
     queues: [Mutex<Queue>; Lane::COUNT],
+    /// Tests only: make the next send of queued reads panic.
+    #[cfg(test)]
+    panic_next_send: std::sync::atomic::AtomicBool,
 }
 
 impl SettlementReads {
@@ -821,6 +848,8 @@ impl SettlementReads {
             record_flights: [Flights::new(), Flights::new()],
             receipt_flights: [Flights::new(), Flights::new()],
             queues: [Mutex::new(Queue::default()), Mutex::new(Queue::default())],
+            #[cfg(test)]
+            panic_next_send: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -952,6 +981,38 @@ impl SettlementReads {
         self.settled(quote_hash, &answered)
     }
 
+    /// The records of `quotes` read once more, after `pause`, each as
+    /// [`Self::settlement_again`] reads it (a quote hash and the RPC that
+    /// answered it empty), in a task of their own. The pause and the reads
+    /// go on if the caller goes away, as when a PUT's deadline falls
+    /// meanwhile, so a payment they find is still kept as a fact for the
+    /// client's next try. The answers come back in the order of `quotes`; a
+    /// `None` in `quotes` is answered `None`, with no read.
+    pub fn settlements_again_later(
+        self: &Arc<Self>,
+        quotes: Vec<Option<([u8; 32], usize)>>,
+        lane: Lane,
+        pause: Duration,
+    ) -> mpsc::Receiver<Option<RecordRead>> {
+        let (sender, receiver) = mpsc::channel(quotes.len().max(1));
+        let reads = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(pause).await;
+            for quote in quotes {
+                let read = match quote {
+                    Some((quote_hash, after)) => {
+                        Some(reads.settlement_again(quote_hash, lane, after).await)
+                    }
+                    None => None,
+                };
+                // The caller may have gone; the read is kept as a fact all
+                // the same.
+                let _ = sender.send(read).await;
+            }
+        });
+        receiver
+    }
+
     /// The record of `quote_hash` from an answer the pool took, kept as a
     /// fact if it is a payment.
     fn settled(&self, quote_hash: [u8; 32], answered: &Answered<Value>) -> RecordRead {
@@ -987,9 +1048,20 @@ impl SettlementReads {
     }
 
     /// Send `reads`, then whatever queued meanwhile, until the queue is
-    /// empty.
+    /// empty. If this ends any other way (a panic, or the runtime shutting
+    /// down), [`Sending`] frees the lane, so later reads are still sent.
     async fn send_queued(self: Arc<Self>, lane: Lane, mut reads: Vec<QueuedRead>) {
+        let mut sending = Sending {
+            reads: Arc::clone(&self),
+            lane,
+            done: false,
+        };
         loop {
+            #[cfg(test)]
+            #[allow(clippy::panic)]
+            if self.panic_next_send.swap(false, Ordering::SeqCst) {
+                panic!("a send of queued reads panicked, as a test asked");
+            }
             let mut batches = Vec::new();
             while !reads.is_empty() {
                 let rest = reads.split_off(reads.len().min(MAX_BATCH));
@@ -1004,6 +1076,7 @@ impl SettlementReads {
             let mut queue = self.queues[lane.index()].lock();
             if queue.waiting.is_empty() {
                 queue.in_flight = false;
+                sending.done = true;
                 return;
             }
             reads = std::mem::take(&mut queue.waiting);

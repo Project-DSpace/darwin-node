@@ -1647,7 +1647,10 @@ impl PaymentVerifier {
         // pause, before the store is refused. Not before the other candidates
         // have been tried, so a paid one is never held up by an unpaid one.
         // The read again is a read of its own, on a fresh connection, at the
-        // RPC after the one that answered empty.
+        // RPC after the one that answered empty. The pause and the reads run
+        // in a task of their own, so a PUT's deadline falling meanwhile
+        // doesn't stop them: a payment they find is kept as a fact, and the
+        // client's next try passes on it.
         if verified_paid_quote.is_none() && !read_empty.is_empty() {
             debug!(
                 "{} payment record(s) for {} read empty; reading them again in {:?}",
@@ -1655,14 +1658,26 @@ impl PaymentVerifier {
                 hex::encode(xorname),
                 EMPTY_PAYMENT_RECHECK_DELAY
             );
-            tokio::time::sleep(EMPTY_PAYMENT_RECHECK_DELAY).await;
-            for (candidate, rpc) in read_empty {
+            let quotes = read_empty
+                .iter()
+                .map(|(candidate, rpc)| {
+                    #[cfg(any(test, feature = "test-utils"))]
+                    if self.test_settlement(*candidate).is_some() {
+                        return None;
+                    }
+                    Some((candidate.quote.hash().0, *rpc))
+                })
+                .collect();
+            let mut again =
+                self.reads
+                    .settlements_again_later(quotes, lane, EMPTY_PAYMENT_RECHECK_DELAY);
+            for (candidate, _) in read_empty {
                 let paid_price = candidate.quote.price;
                 let candidate_peer = *candidate.encoded_peer_id.as_bytes();
-                let settled = match self.settlement_again(candidate, lane, rpc).await {
-                    Ok(settlement) => Self::check_median_settlement(candidate, settlement),
-                    Err(err) => Err(err),
-                };
+                let read = again.recv().await;
+                let settled = self
+                    .settlement_read_again(candidate, read)
+                    .and_then(|settlement| Self::check_median_settlement(candidate, settlement));
                 match settled {
                     Ok(settled_amount) => {
                         info!(
@@ -1877,24 +1892,29 @@ impl PaymentVerifier {
         }
     }
 
-    /// The record of `candidate`'s quote read once more, after it read empty
-    /// at RPC `rpc`: a read of its own, at the next RPC, on a fresh
-    /// connection.
-    async fn settlement_again(
+    /// The record of `candidate`'s quote as read once more, after it read
+    /// empty (see [`SettlementReads::settlements_again_later`]): `read` is
+    /// that read's answer, or `None` if it never came.
+    fn settlement_read_again(
         &self,
         candidate: LegacyMedianCandidate<'_>,
-        lane: Lane,
-        rpc: usize,
+        read: Option<Option<crate::payment::settlement::RecordRead>>,
     ) -> Result<Settlement> {
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(settlement) = self.test_settlement(candidate) {
             return Ok(settlement);
         }
-        self.reads
-            .settlement_again(candidate.quote.hash().0, lane, rpc)
-            .await
-            .map(|answered| answered.value)
-            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let _ = candidate;
+        match read {
+            Some(Some(Ok(answered))) => Ok(answered.value),
+            Some(Some(Err(e))) => Err(Error::Payment(format!(
+                "completedPayments lookup failed: {e}"
+            ))),
+            Some(None) | None => Err(Error::Payment(
+                "completedPayments lookup failed: the read again did not come back".into(),
+            )),
+        }
     }
 
     /// Tests only: the settlement a test set for `candidate`'s quote, in
