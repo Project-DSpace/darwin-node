@@ -439,8 +439,13 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
     folder.mkdir(parents=True)
     env = dict(os.environ, RUST_LOG=LOG_FILTER, NO_COLOR="1",
                XDG_DATA_HOME=str(folder / "xdg"))
-    # Nodes started by the harness never upgrade themselves: their first
-    # check for a release would be a year away.
+    # Nodes started by the harness don't upgrade themselves. A node of ds.15
+    # or earlier first checks for a release a check interval after it
+    # starts, a year away here; a later one checks within minutes, and takes
+    # a release at its publication plus its rollout offset, somewhere in a
+    # window of a year here. A run's nodes are of the newest published
+    # release or newer, so no check finds a newer one unless one is published
+    # during the run.
     node_config = folder / "node.toml"
     node_config.write_text("[upgrade]\ncheck_interval_hours = 8760\n"
                            "staged_rollout_hours = 8760\n")

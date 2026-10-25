@@ -33,14 +33,17 @@ fn release(tag: &str) -> GitHubRelease {
         name: tag.to_string(),
         body: format!("notes for {tag}"),
         prerelease: false,
+        published_at: None,
         assets: vec![
             Asset {
                 name: binary.clone(),
                 browser_download_url: format!("https://example.com/{tag}"),
+                size: None,
             },
             Asset {
                 name: format!("{binary}.sig"),
                 browser_download_url: format!("https://example.com/{tag}.sig"),
+                size: None,
             },
         ],
     }

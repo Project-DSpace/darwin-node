@@ -146,8 +146,11 @@ In the folder with `docker-compose.yml`:
 - **Status:** `docker exec storage-node nodes status`, or
   `http://127.0.0.1:12600/console` on the server (from elsewhere:
   `ssh -L 12600:127.0.0.1:12600 you@server`).
-- **Updates:** the nodes install signed releases themselves (hourly checks,
-  then up to 24 hours' delay). The rest of the container, the node manager
+- **Updates:** the nodes install signed releases themselves: each checks
+  within minutes of starting and hourly after, and takes a release at its
+  own point in the 24 hours after the release's publication (nodes up to
+  ds.15: in the 24 hours after they first see it, starting again at a
+  restart). The rest of the container, the node manager
   among it, changes only with a new image: `docker compose pull`, then
   `docker compose up -d`. Pull at least once if
   `docker exec storage-node darwin-nodes --version` fails: your image still

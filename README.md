@@ -961,6 +961,11 @@ To prevent **network collapse** from simultaneous upgrades, ant-node implements 
 **How Staged Rollout Works:**
 - Each node adds a **random delay** (0-24 hours) before applying upgrades
 - Delay is deterministically derived from node ID (consistent but distributed)
+- In this fork the delay counts from the release's publication, by GitHub's
+  clock (the `Date` of its answer), so a node that restarts while waiting
+  keeps its time; a release without a publication time, or with one in the
+  future, counts from when the node first sees it. A node's first check
+  comes 1 to 5 minutes after it starts, then one every check interval.
 - Critical security updates can override with shorter delay windows
 - Network maintains minimum online node threshold during rollout
 

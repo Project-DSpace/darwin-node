@@ -841,21 +841,26 @@ impl RunningNode {
                     upgrader = upgrader.with_binary_cache(BinaryCache::new(cache_dir));
                 }
 
-                // Add randomized jitter before the first upgrade check to prevent all nodes
-                // from hitting the GitHub API simultaneously when started together.
+                // The first check comes a few minutes after start, at a random point, so a
+                // node that restarted while waiting for a release takes it when it is due
+                // rather than an hour later, and nodes started together don't all check at
+                // once.
                 {
-                    let jitter_duration = jittered_interval(monitor.check_interval());
+                    let first_check = first_upgrade_check_delay();
                     let first_check_time = chrono::Utc::now()
-                        + chrono::Duration::from_std(jitter_duration).unwrap_or_else(|e| {
+                        + chrono::Duration::from_std(first_check).unwrap_or_else(|e| {
                             warn!("chrono::Duration::from_std failed for jitter ({e}), defaulting to 1 minute");
                             chrono::Duration::minutes(1)
                         });
                     info!(
-                        "First upgrade check scheduled for {} (jitter: {}s)",
+                        "First upgrade check scheduled for {} (in {}s)",
                         first_check_time.to_rfc3339(),
-                        jitter_duration.as_secs()
+                        first_check.as_secs()
                     );
-                    tokio::time::sleep(jitter_duration).await;
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = tokio::time::sleep(first_check) => {}
+                    }
                 }
 
                 loop {
@@ -1365,6 +1370,18 @@ async fn next_routing_event<T: Clone>(events: &mut broadcast::Receiver<T>) -> Op
             }
         }
     }
+}
+
+/// The earliest the first upgrade check comes after start.
+const FIRST_UPGRADE_CHECK_EARLIEST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The latest the first upgrade check comes after start.
+const FIRST_UPGRADE_CHECK_LATEST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// When the first upgrade check comes after start: at a random point between
+/// [`FIRST_UPGRADE_CHECK_EARLIEST`] and [`FIRST_UPGRADE_CHECK_LATEST`].
+fn first_upgrade_check_delay() -> std::time::Duration {
+    rand::thread_rng().gen_range(FIRST_UPGRADE_CHECK_EARLIEST..=FIRST_UPGRADE_CHECK_LATEST)
 }
 
 /// Apply ±5% jitter to a base interval to prevent thundering-herd behaviour
@@ -2277,6 +2294,23 @@ mod tests {
         assert_eq!(
             super::user_agent(Some(marker)),
             format!("node/{}.image.{marker}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// The first upgrade check comes a few minutes after start, at a random point, rather
+    /// than an hour later.
+    #[test]
+    fn the_first_upgrade_check_comes_one_to_five_minutes_after_start() {
+        let delays: Vec<u64> = (0..1000)
+            .map(|_| super::first_upgrade_check_delay().as_secs())
+            .collect();
+        assert!(
+            delays.iter().all(|secs| (60..=300).contains(secs)),
+            "{delays:?}"
+        );
+        assert!(
+            delays.iter().any(|secs| *secs < 120) && delays.iter().any(|secs| *secs > 240),
+            "spread over the window"
         );
     }
 }
