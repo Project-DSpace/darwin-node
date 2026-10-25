@@ -10505,7 +10505,9 @@ impl CommitmentTick {
 
     fn log(&self, message: &str) {
         let hash = self.hash.map_or_else(|| "none".to_string(), hex::encode);
+        // Kept first at the full line (crate::log_files::KEEP_FIRST_TARGETS).
         info!(
+            target: "ant_node::replication::commitment_tick",
             key_count = self.key_count,
             pointers = self.pointers,
             rotated = self.rotated,

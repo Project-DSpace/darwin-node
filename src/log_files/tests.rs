@@ -615,3 +615,45 @@ fn warnings_and_errors_are_marked_to_be_kept_first() {
     assert!(String::from_utf8_lossy(&lines[0][1..]).contains("an error"));
     assert!(lines.iter().all(|line| line.ends_with(b"\n")));
 }
+
+/// The INFO summary lines a canary reads, the browser refusal counts and
+/// the commitment tick, are marked to be kept first, and so written at the
+/// full line, where other INFO lines are dropped.
+#[test]
+fn the_summary_lines_a_canary_reads_are_written_at_the_full_line() {
+    use tracing_subscriber::prelude::*;
+
+    let capture = Capture::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(TagLevels(capture.clone()));
+    let subscriber = tracing_subscriber::registry().with(layer);
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(target: "ant_node::web_rtc::refusals", total = 3, "browser refusals");
+        tracing::info!(target: "ant_node::replication::commitment_tick", "Storage commitment tick");
+        tracing::info!(target: "ant_node::replication", "other news");
+    });
+    let lines = capture.0.lock().unwrap().clone();
+    let tags: Vec<u8> = lines.iter().map(|line| line[0]).collect();
+    assert_eq!(tags, [TAG_KEEP_FIRST, TAG_KEEP_FIRST, TAG_DROP_FIRST]);
+    assert_eq!(
+        KEEP_FIRST_TARGETS,
+        [
+            "ant_node::web_rtc::refusals",
+            "ant_node::replication::commitment_tick"
+        ]
+    );
+
+    // At the full line, the kept lines are written and the other dropped.
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Clock::new();
+    let (_partition, mut files) = at_the_line_with_five_files(dir.path(), &clock, 100 * KIB);
+    for line in &lines {
+        files.write_all(line).unwrap();
+    }
+    files.flush().unwrap();
+    let text = text_of(dir.path());
+    assert!(text.contains("browser refusals"), "{text}");
+    assert!(text.contains("Storage commitment tick"), "{text}");
+    assert!(!text.contains("other news"), "{text}");
+}
