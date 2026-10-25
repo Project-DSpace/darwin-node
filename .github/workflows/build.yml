@@ -160,10 +160,15 @@ jobs:
 
       # The test seams (src/test_seams.rs), which let a test make a node's
       # disk read as full, are compiled only with the test-utils feature: the
-      # binary operators run must hold none of their variables.
+      # binary operators run must hold none of their variables. release.yml
+      # checks the binary nodes install the same way.
       - name: Check the test seams are left out
         shell: bash
         run: |
+          if [[ ! -s target/release/ant-node ]]; then
+            echo "::error::there is no target/release/ant-node to check"
+            exit 1
+          fi
           if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then
             echo "::error::target/release/ant-node holds a test seam (ANT_TEST_SEAM_*): it was built with test-utils"
             exit 1

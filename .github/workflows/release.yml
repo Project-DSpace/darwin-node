@@ -113,6 +113,21 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin ant-node
 
+      # The test seams (src/test_seams.rs), which let a test make a node's
+      # disk read as full, are compiled only with the test-utils feature: the
+      # binary nodes install must hold none of their variables. Checked here,
+      # before the binary is packaged and signed.
+      - name: Check the test seams are left out
+        run: |
+          if [[ ! -s target/release/ant-node ]]; then
+            echo "::error::there is no target/release/ant-node to check"
+            exit 1
+          fi
+          if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then
+            echo "::error::target/release/ant-node holds a test seam (ANT_TEST_SEAM_*): it was built with test-utils"
+            exit 1
+          fi
+
       # What a node runs to see whether a sibling already installed the upgrade.
       - name: Check the binary's version
         env:

@@ -281,6 +281,44 @@ fresh
 edit "${BUILD}" $'          build-args: IMAGE_VERSION=${{ github.sha }}\n' ''
 expect "the image without its marker" "build.yml's image job must pass the image marker"
 
+# The node, for the image and for releases: built with no feature, and
+# checked for test seams after it is built and before it is packaged.
+SEAM_STEP=$'      - name: Check the test seams are left out\n        run: |\n          if [[ ! -s target/release/ant-node ]]; then\n            echo "::error::there is no target/release/ant-node to check"\n            exit 1\n          fi\n          if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then\n            echo "::error::target/release/ant-node holds a test seam (ANT_TEST_SEAM_*): it was built with test-utils"\n            exit 1\n          fi\n\n'
+SEAMS_UNCHECKED="must check the node it built for test seams once, after the build and before the Package step"
+fresh
+edit "${RELEASE}" "${SEAM_STEP}" ''
+expect "the release's node not checked for test seams" "release.yml's build job ${SEAMS_UNCHECKED}"
+
+fresh
+edit "${BUILD}" '          if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then' '          if false; then'
+expect "the image's node not checked for test seams" "build.yml's linux-x64 job ${SEAMS_UNCHECKED}"
+
+fresh
+edit "${RELEASE}" '          if [[ ! -s target/release/ant-node ]]; then' '          if false; then'
+expect "the release's seam check passing with no binary" "release.yml's build job ${SEAMS_UNCHECKED}"
+
+fresh
+edit "${RELEASE}" "${SEAM_STEP}" ''
+edit "${RELEASE}" '      - uses: actions/upload-artifact@' "${SEAM_STEP}"'      - uses: actions/upload-artifact@'
+expect "the release's seam check after its packaging" "release.yml's build job ${SEAMS_UNCHECKED}"
+
+fresh
+edit "${RELEASE}" "${SEAM_STEP}" ''
+edit "${RELEASE}" $'      - name: Build\n' "${SEAM_STEP}"$'      - name: Build\n'
+expect "the release's seam check before its build" "release.yml's build job ${SEAMS_UNCHECKED}"
+
+fresh
+edit "${RELEASE}" 'run: cargo build --release --locked --bin ant-node' \
+    'run: cargo build --release --locked --features test-utils --bin ant-node'
+expect "the release's node built with test-utils" \
+    "release.yml's build job must build the node once, with exactly 'run: cargo build --release --locked --bin ant-node'"
+
+fresh
+edit "${BUILD}" 'run: cargo build --release --locked --bin ant-node' \
+    'run: cargo build --release --locked --bin ant-node --features test-utils'
+expect "the image's node built with test-utils" \
+    "build.yml's linux-x64 job must build the node once, with exactly 'run: cargo build --release --locked --bin ant-node'"
+
 # The filter release.yml's checks job gives gh api --jq to pick the tagged
 # commit's Test run from the runs of test.yml.
 filter=$(awk -v q="'" '

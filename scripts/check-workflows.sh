@@ -30,6 +30,12 @@
 #   once it has checked that commit is on darwin-client's main, and checks
 #   the binary for Autonomi's addresses and the reset and log-forwarding
 #   routes; its image job needs that job and passes the image marker;
+# - build.yml's linux-x64 job, which builds the image's node, and
+#   release.yml's build job, which builds the node releases install, build it
+#   with exactly `cargo build --release --locked --bin ant-node`, so no
+#   feature joins the build unnoticed, and check the binary for the test
+#   seams' variables (src/test_seams.rs) after building it and before
+#   packaging it;
 # - nothing but release.yml's latest job names the image's :latest tag.
 #
 # A release runs release.yml as it is at the tagged commit, so this can't
@@ -249,6 +255,34 @@ else
     fi
 fi
 
+# The node is built the same way for the image (build.yml's linux-x64 job)
+# and for releases (release.yml's build job), with no feature, and each job
+# checks the binary it built for the test seams' variables before packaging
+# it: a build with test-utils has seams a test sets from the environment.
+NODE_BUILD='run: cargo build --release --locked --bin ant-node'
+SEAM_BINARY='if [[ ! -s target/release/ant-node ]]; then'
+SEAM_CHECK='if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then'
+for place in "${BUILD}:linux-x64" "${RELEASE}:build"; do
+    file=${place%:*}
+    name=${place#*:}
+    [[ -f "${file}" ]] || continue
+    where="$(basename "${file}")'s ${name} job"
+    text=$(job "${name}" "${file}" | sed 's/^[[:space:]]*//')
+    builds=$(grep -n 'cargo build' <<<"${text}" || true)
+    if [[ "${builds#*:}" != "${NODE_BUILD}" ]]; then
+        problem "${where} must build the node once, with exactly '${NODE_BUILD}' (it has: $(cut -d: -f2- <<<"${builds}" | tr '\n' ' '))"
+        continue
+    fi
+    built=${builds%%:*}
+    binary=$(grep -nxF -- "${SEAM_BINARY}" <<<"${text}" | cut -d: -f1 | tr '\n' ' ' || true)
+    seam=$(grep -nxF -- "${SEAM_CHECK}" <<<"${text}" | cut -d: -f1 | tr '\n' ' ' || true)
+    package=$(grep -nxF -- '- name: Package' <<<"${text}" | cut -d: -f1 | tr '\n' ' ' || true)
+    if [[ ! "${binary}" =~ ^[0-9]+\ $ || ! "${seam}" =~ ^[0-9]+\ $ || ! "${package}" =~ ^[0-9]+\ $ ]] \
+        || ((built > binary || binary > seam || seam > package)); then
+        problem "${where} must check the node it built for test seams once, after the build and before the Package step (${SEAM_BINARY} ... ${SEAM_CHECK})"
+    fi
+done
+
 # Only release.yml's latest job names the image's :latest tag, outside
 # comments.
 while IFS= read -r hit; do
@@ -271,4 +305,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, and gives the image its marker; only release.yml's latest job moves :latest."
+echo "${DIR}: build.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, and publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with no condition and nothing continuing on error; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, and gives the image its marker; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only release.yml's latest job moves :latest."

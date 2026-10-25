@@ -260,7 +260,9 @@ never ran.
   darwin-client's main, checks the binary, and gives the image its marker.
   A darwin-client change the image needs lands on darwin-client's main
   first, merged with its commits kept; the pin then names the commit as it
-  is there.
+  is there. Both build.yml and release.yml build the node with exactly
+  `cargo build --release --locked --bin ant-node`, and check it for test
+  seams before packaging it.
 - **Three crates are vendored**, each with a `VENDORED.md` saying what it
   is: `vendor/ant-protocol` is ant-protocol 5.0.0 with `PRICE_MULTIPLIER`,
   its only change; `vendor/webrtc` is webrtc 0.14.0, whose
@@ -313,7 +315,9 @@ never ran.
   family that stopped reaching nodes; run it before a node release's canary.
   Builds with the `test-utils` feature, which the harness uses, have test
   seams (`src/test_seams.rs`), such as one that makes a node's disk read as
-  full; the Build workflow checks that the node it builds has none.
+  full; the Build workflow checks that the image's node has none, and the
+  Release workflow that the node releases install has none, before it is
+  packaged and signed.
 
 ---
 
