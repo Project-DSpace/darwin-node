@@ -121,7 +121,10 @@ mod tests {
     async fn get(protocol: &AntProtocol, address: [u8; 32]) -> Option<Vec<u8>> {
         let request = ChunkGetRequest::new(address);
         match ask(protocol, ChunkMessageBody::GetRequest(request)).await {
-            ChunkMessageBody::GetResponse(ChunkGetResponse::Success { address: at, content }) => {
+            ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
+                address: at,
+                content,
+            }) => {
                 assert_eq!(at, address, "the chunk comes back at its address");
                 Some(content.to_vec())
             }
@@ -407,8 +410,8 @@ mod tests {
         let (merkle_content, merkle_proof) = signed_merkle_proof();
         let parsed = deserialize_merkle_proof(&merkle_proof).expect("parse merkle proof");
         let timestamp = parsed.winner_pool.candidate_nodes[0].merkle_payment_timestamp;
-        let per_node = ant_node::payment::pricing::calculate_price(0)
-            * evmlib::common::Amount::from(6u64);
+        let per_node =
+            ant_node::payment::pricing::calculate_price(0) * evmlib::common::Amount::from(6u64);
         protocol.payment_verifier().pool_cache_insert(
             parsed.winner_pool_hash(),
             OnChainPaymentInfo {
@@ -430,7 +433,12 @@ mod tests {
         }
         let cases: Vec<(&str, Vec<u8>, Option<Vec<u8>>, Refusal)> = vec![
             ("no proof", b"no proof".to_vec(), None, Refusal::Required),
-            ("0 bytes", b"empty proof".to_vec(), Some(vec![]), Refusal::Payment),
+            (
+                "0 bytes",
+                b"empty proof".to_vec(),
+                Some(vec![]),
+                Refusal::Payment,
+            ),
             (
                 "garbage",
                 b"garbage proof".to_vec(),

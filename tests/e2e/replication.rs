@@ -23,7 +23,6 @@ use ant_node::replication::protocol::{
 };
 use ant_node::replication::pruning;
 use ant_node::replication::retention::{erase_floor, DiskRetention, DiskSpace};
-use ant_node::replication::scheduling::ReplicationQueues;
 use ant_node::replication::types::{NeighborSyncState, RepairProofs};
 use ant_node::storage::{ChunkStore, XorName};
 use ant_node::ReplicationConfig;
@@ -1242,7 +1241,10 @@ async fn replication_protocol_answers() {
     let c2 = b"audit multi key 2";
     let a1 = compute_address(c1);
     let a2 = compute_address(c2);
-    let paddings: [&[u8]; 2] = [b"audit multi key 3 (padding)", b"audit multi key 4 (padding)"];
+    let paddings: [&[u8]; 2] = [
+        b"audit multi key 3 (padding)",
+        b"audit multi key 4 (padding)",
+    ];
     for padding in paddings {
         storage_a
             .put(&compute_address(padding), padding)
