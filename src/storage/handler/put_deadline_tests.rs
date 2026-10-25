@@ -184,14 +184,14 @@ async fn a_wave_of_puts_verifies_within_the_clients_wait_when_the_first_rpc_neve
         // client's wait: a check past it would be refused.
         assert!(took < PUT_PAYMENT_DEADLINE, "{took:?}");
     }
+    // The receipt is read once for the whole wave. With the first RPC
+    // stalled it answers only once the second is asked, past the receipts'
+    // head start, so the wave's records are read beside it, and whichever
+    // answers first settles each chunk.
     assert_eq!(
         stalled.receipt_reads().len(),
         1,
-        "one call to the stalled RPC"
-    );
-    assert!(
-        good.record_reads().is_empty(),
-        "the receipt settled the wave"
+        "one receipt call to the stalled RPC"
     );
 
     for (content, bundle) in &wave {
@@ -246,6 +246,49 @@ async fn with_every_rpc_stalled_a_put_is_answered_before_the_client_gives_up() {
         "{response:?}"
     );
     assert!(took < CLIENT_STORE_WAIT, "{took:?}");
+}
+
+/// With every RPC slow but answering, a PUT whose proof names a transaction
+/// that doesn't pay its quote still verifies by the record's read, read
+/// empty and then paid, within the PUT's deadline: the record's read starts
+/// beside the proof's receipt after the receipt's short head start, not
+/// once the receipt answers. Read after the receipt, the record's read
+/// empty, the pause and the read again end past the deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_every_rpc_slow_a_put_paid_elsewhere_by_its_receipt_verifies_in_time() {
+    let chain = Chain::shared();
+    let (content, bundle) = chunk(5);
+    let (_, other) = chunk(6);
+    chain.lock().pay(mock::tx(5), vec![bundle.entry()]);
+    chain.lock().pay(mock::tx(6), vec![other.entry()]);
+    let slow = |behind| Spec {
+        behind,
+        delay: Duration::from_millis(2_300),
+        ..Spec::default()
+    };
+    // The first RPC never sees the payment, so the record reads empty there
+    // and is read again at the second.
+    let one = mock::provider(&chain, slow(Duration::from_secs(3_600))).await;
+    let two = mock::provider(&chain, slow(Duration::ZERO)).await;
+    let dir = TempDir::new().unwrap();
+    let handler = handler(&[&one, &two], &dir, false).await;
+
+    let started = Instant::now();
+    let response = put(&handler, &content, &bundle, mock::tx(6)).await;
+    let took = started.elapsed();
+    assert!(
+        matches!(response, ChunkPutResponse::Success { .. }),
+        "{response:?} after {took:?}"
+    );
+    assert!(took < PUT_PAYMENT_DEADLINE, "{took:?}");
+    assert!(
+        !one.receipt_reads().is_empty() || !two.receipt_reads().is_empty(),
+        "the proof's receipt was read"
+    );
+    assert!(
+        !two.record_reads().is_empty(),
+        "the record was read again at the second RPC"
+    );
 }
 
 /// The deadline sits below the client's wait, with room for the request and

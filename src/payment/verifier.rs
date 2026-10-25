@@ -13,7 +13,7 @@ use crate::payment::proof::{
 };
 use crate::payment::settlement::{
     Answered, Lane, Settlement, SettlementReads, EMPTY_PAYMENT_RECHECK_DELAY, PAYMENT_READ_BACKOFF,
-    PAYMENT_READ_ROUNDS,
+    PAYMENT_READ_ROUNDS, PUT_RECEIPTS_HEAD_START,
 };
 use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
 use crate::replication::config::K_BUCKET_SIZE;
@@ -28,6 +28,7 @@ use evmlib::Network as EvmNetwork;
 use evmlib::PaymentQuote;
 use evmlib::ProofOfPayment;
 use evmlib::RewardsAddress;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
@@ -328,6 +329,8 @@ enum CandidateSettlement {
 struct ProofReceipts<'a> {
     tx_hashes: &'a [[u8; 32]],
     read: bool,
+    /// On a store's path, the fill once started, in a task of its own.
+    filling: Option<Shared<BoxFuture<'static, ()>>>,
 }
 
 impl<'a> ProofReceipts<'a> {
@@ -335,6 +338,7 @@ impl<'a> ProofReceipts<'a> {
         Self {
             tx_hashes,
             read: false,
+            filling: None,
         }
     }
 
@@ -347,6 +351,31 @@ impl<'a> ProofReceipts<'a> {
         self.read = true;
         reads.fill_from_receipts(self.tx_hashes, lane).await;
         true
+    }
+
+    /// The fill of the payment facts from the receipts, started the first
+    /// time in a task of its own, for the per-quote reads to start beside it
+    /// after a head start rather than wait for it; it goes on if the check
+    /// ends first, so what it finds is still kept. `None` if the proof names
+    /// no transaction.
+    fn fill_alongside(
+        &mut self,
+        reads: &Arc<SettlementReads>,
+        lane: Lane,
+    ) -> Option<Shared<BoxFuture<'static, ()>>> {
+        if self.tx_hashes.is_empty() {
+            return None;
+        }
+        if self.filling.is_none() {
+            self.read = true;
+            let reads = Arc::clone(reads);
+            let tx_hashes = self.tx_hashes.to_vec();
+            let task = tokio::spawn(async move {
+                reads.fill_from_receipts(&tx_hashes, lane).await;
+            });
+            self.filling = Some(task.map(|_| ()).boxed().shared());
+        }
+        self.filling.clone()
     }
 }
 
@@ -1828,6 +1857,15 @@ impl PaymentVerifier {
     /// refuses: the facts can only accept. A record that reads empty comes
     /// back as [`CandidateSettlement::ReadEmpty`], to be read again.
     ///
+    /// Off a store's path the receipts are read first, and a fact they give
+    /// saves the per-quote read. On a store's path ([`Lane::Put`]) they get
+    /// only a head start ([`PUT_RECEIPTS_HEAD_START`]) before the per-quote
+    /// read starts beside them, so receipts that are slow, or don't pay the
+    /// quote, take little of the store's
+    /// [`PUT_PAYMENT_DEADLINE`](crate::payment::PUT_PAYMENT_DEADLINE):
+    /// whichever settles the quote first counts, and the per-quote read's
+    /// answer stands otherwise.
+    ///
     /// The amount needed is the candidate's `expected_amount`, so a check
     /// that needs a different amount reads the paid amount through this same
     /// path, and a quote with no fact is read, never taken as unpaid.
@@ -1852,7 +1890,11 @@ impl PaymentVerifier {
         if let Some(amount) = self.paid_by_fact(candidate, &quote_hash) {
             return Ok(CandidateSettlement::Paid(amount));
         }
-        if receipts.read_once(&self.reads, lane).await {
+        if lane == Lane::Put {
+            if let Some(filled) = receipts.fill_alongside(&self.reads, lane) {
+                return self.settle_alongside(candidate, quote_hash, filled).await;
+            }
+        } else if receipts.read_once(&self.reads, lane).await {
             if let Some(amount) = self.paid_by_fact(candidate, &quote_hash) {
                 return Ok(CandidateSettlement::Paid(amount));
             }
@@ -1863,6 +1905,53 @@ impl PaymentVerifier {
             .await
             .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
         Self::classify(candidate, &answered)
+    }
+
+    /// On a store's path: `filled`, the fill of the facts from the proof's
+    /// receipts, given [`PUT_RECEIPTS_HEAD_START`], then the per-quote read
+    /// of `candidate`'s quote raced against it if it hasn't finished. A fact
+    /// the fill gives that pays the quote settles it at once; otherwise the
+    /// read's answer stands, unless it would be read again or refused and a
+    /// fact that pays the quote has come in meanwhile. The fill runs in a
+    /// task of its own, so it goes on filling the cache whatever wins.
+    async fn settle_alongside(
+        &self,
+        candidate: LegacyMedianCandidate<'_>,
+        quote_hash: [u8; 32],
+        filled: Shared<BoxFuture<'static, ()>>,
+    ) -> Result<CandidateSettlement> {
+        let fill_done = tokio::time::timeout(PUT_RECEIPTS_HEAD_START, filled.clone())
+            .await
+            .is_ok();
+        if fill_done {
+            if let Some(amount) = self.paid_by_fact(candidate, &quote_hash) {
+                return Ok(CandidateSettlement::Paid(amount));
+            }
+        }
+        let read = self.reads.settlement(quote_hash, Lane::Put);
+        tokio::pin!(read);
+        let answered = if fill_done {
+            read.await
+        } else {
+            tokio::select! {
+                answered = &mut read => answered,
+                () = filled => {
+                    if let Some(amount) = self.paid_by_fact(candidate, &quote_hash) {
+                        return Ok(CandidateSettlement::Paid(amount));
+                    }
+                    read.await
+                }
+            }
+        };
+        let settled = answered
+            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))
+            .and_then(|answered| Self::classify(candidate, &answered));
+        match settled {
+            Ok(CandidateSettlement::Paid(amount)) => Ok(CandidateSettlement::Paid(amount)),
+            other => self
+                .paid_by_fact(candidate, &quote_hash)
+                .map_or(other, |amount| Ok(CandidateSettlement::Paid(amount))),
+        }
     }
 
     /// The amount a payment fact for `quote_hash` paid, if there is one and

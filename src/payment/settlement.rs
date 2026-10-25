@@ -100,6 +100,15 @@ pub const PUT_CALL_TIMEOUT: Duration = Duration::from_millis(2_500);
 /// goes to the next RPC as well. The first good answer counts.
 pub const PUT_SECOND_RPC_AFTER: Duration = Duration::from_secs(2);
 
+/// On a store's path, how long the receipts of a proof's transactions are
+/// read alone before the per-quote read of a quote they haven't settled
+/// starts beside them. Claude's proposal: a receipt from an RPC that answers
+/// in a round trip settles its quotes within it, saving their reads, and
+/// with every RPC slow (about 2.3 s a call) the per-quote read, read empty,
+/// the pause and the read again (about 6.1 s) still end inside
+/// [`PUT_PAYMENT_DEADLINE`].
+pub const PUT_RECEIPTS_HEAD_START: Duration = Duration::from_millis(500);
+
 /// How long one call nobody is waiting on may take: reads for fresh
 /// replication offers, paid-list notices and listings.
 pub const BACKGROUND_CALL_TIMEOUT: Duration = Duration::from_secs(15);
