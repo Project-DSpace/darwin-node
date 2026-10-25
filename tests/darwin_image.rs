@@ -539,6 +539,10 @@ fn moves_something(command: &str) -> bool {
         .any(|word| MOVING_WORDS.contains(&word.as_str()))
 }
 
+/// The entrypoint's loop over the node folders, which sets aside each folder
+/// no registered node has.
+const SET_ASIDE_LOOP: &str = r#"for dir in "$NODES"/node-*; do"#;
+
 /// Folders set aside as unregistered are kept for good. The set-aside loop
 /// moves each to `$UNREGISTERED`, and nothing else moves anything there;
 /// `$UNREGISTERED` is beside `$RETIRED`, not in it, so the sweep of
@@ -562,7 +566,6 @@ fn folders_set_aside_are_out_of_every_sweeps_reach() {
         "the entrypoint doesn't sweep $RETIRED with {SWEEP}"
     );
 
-    const SET_ASIDE_LOOP: &str = r#"for dir in "$NODES"/node-*; do"#;
     assert_eq!(
         entrypoint
             .iter()
@@ -589,14 +592,14 @@ fn folders_set_aside_are_out_of_every_sweeps_reach() {
         );
         // A move into $RETIRED is a deletion put off: only retire makes one,
         // dated now, and retire moves nowhere else.
-        let retires = words(command).iter().any(|word| word == "retire");
+        let by_retire = words(command).iter().any(|word| word == "retire");
         if command.contains(r#""$RETIRED/"#) {
             assert!(
-                retires,
+                by_retire,
                 "a move into $RETIRED that isn't a retire: {command}"
             );
         }
-        if retires && !command.starts_with("retire() ") {
+        if by_retire && !command.starts_with("retire() ") {
             let call = &command[command.find("retire ").unwrap()..];
             assert!(
                 call.contains(r#" "$RETIRED/"#),
