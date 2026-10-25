@@ -317,6 +317,8 @@ never ran.
   penalties heavier than in two runs of the previous release alone, on a
   failure reason those runs never charged a role with, or on a message
   family that stopped reaching nodes; run it before a node release's canary.
+  Its report and summary.json list every count measured against those runs,
+  with the excess over them and the limit, within the limit or not.
   The Test workflow tests what fails a run, on made-up results
   (`scripts/test_mixed_versions_verdicts.py`).
   Builds with the `test-utils` feature, which the harness uses, have test
