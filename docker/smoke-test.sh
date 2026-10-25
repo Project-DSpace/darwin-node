@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests the storage-node image on a small isolated network, never the live one:
 # a seed node with no bootstrap peers, plus test containers that bootstrap only
-# from it. Containers sharing the host network need their own MANAGER_PORT. Run by CI after building the image; needs Docker with host networking,
+# from it. Containers sharing the host network need their own MANAGER_PORT.
+# Run by CI after building the image; needs Docker with host networking,
 # and pulls the image of the release before (PREVIOUS_IMAGE) to test the move
 # from it.
 #
