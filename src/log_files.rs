@@ -15,12 +15,16 @@
 //! keeps unused (`disk_reserve_mb`, 1 GiB unless configured). The writer reads
 //! the free space from the chunk store's capacity guard, which queries the
 //! filesystem at most once every few seconds, and counts its own writes and
-//! deletions since that query. At or below the line, it first deletes its own
-//! oldest closed files; then it writes only warnings and errors, and only into
-//! room it freed itself, and drops every other line. Once nothing is left to
-//! delete, it adds no bytes at all. It counts what it drops, and writes one
-//! line saying so when the disk has room again. Every node on a disk reads the
-//! same partition, so this holds however many nodes share it.
+//! deletions since that query. Once at or below the line, it writes only
+//! warnings and errors and drops every other line. A warning or error with no
+//! room deletes the writer's own oldest closed files to make room for itself;
+//! a dropped line deletes nothing. Once nothing is left to delete, it adds no
+//! bytes at all. It stays so until the free space is above the line by more
+//! than what it freed there (and at least a file's size), so the room it freed
+//! itself never takes it back to writing everything. It counts what it drops,
+//! and writes one line saying so when the disk has room again. Every node on
+//! a disk reads the same partition, so this holds however many nodes share
+//! it.
 
 use crate::storage::{SpaceReading, MIB};
 use std::fs::{self, File, OpenOptions};
@@ -130,6 +134,11 @@ pub struct LogFiles {
     measurement: Option<u64>,
     written_since: u64,
     deleted_since: u64,
+    /// Whether the writer is at the full line: it has had to give way, and
+    /// the disk hasn't had room again since.
+    at_line: bool,
+    /// The bytes the writer deleted since it came to the line.
+    freed_at_line: u64,
     dropped: Dropped,
 }
 
@@ -187,6 +196,8 @@ impl LogFiles {
             measurement: None,
             written_since: 0,
             deleted_since: 0,
+            at_line: false,
+            freed_at_line: 0,
             dropped: Dropped::default(),
         };
         let now = (files.clock)();
@@ -213,7 +224,18 @@ impl LogFiles {
                 self.deleted_since = 0;
             }
             let measured = reading.free.saturating_sub(self.written_since);
-            if measured <= reading.line.saturating_add(need) {
+            if self.at_line {
+                // Room the writer freed itself doesn't count as room again.
+                let clear = reading
+                    .line
+                    .saturating_add(need)
+                    .saturating_add(self.freed_at_line.max(self.limits.segment_max));
+                if measured > clear {
+                    self.at_line = false;
+                    self.freed_at_line = 0;
+                }
+            }
+            if self.at_line || measured <= reading.line.saturating_add(need) {
                 if !self.give_way(reading.line, measured, need, kept_first) {
                     self.dropped.lines += 1;
                     self.dropped.bytes += need;
@@ -233,19 +255,27 @@ impl LogFiles {
         self.append(line);
     }
 
-    /// At the full line: deletes this writer's oldest closed files until the
-    /// free space, with what they freed, is above the line by `need`, or
-    /// until none are left. Whether a line of `need` bytes may then be
-    /// written: only a warning or an error, and only into room freed here.
+    /// At the full line: whether a line of `need` bytes may be written. Only
+    /// a warning or an error may, and only into room above the line; one
+    /// without room deletes this writer's oldest closed files until there is
+    /// room for it, or none are left. Any other line is dropped, deleting
+    /// nothing.
     fn give_way(&mut self, line: u64, measured: u64, need: u64, kept_first: bool) -> bool {
+        self.at_line = true;
+        if !kept_first {
+            return false;
+        }
         let room = |deleted: u64| measured.saturating_add(deleted) > line.saturating_add(need);
         while !room(self.deleted_since) {
             match self.delete_oldest_closed() {
-                Some(freed) => self.deleted_since += freed,
+                Some(freed) => {
+                    self.deleted_since += freed;
+                    self.freed_at_line = self.freed_at_line.saturating_add(freed);
+                }
                 None => break,
             }
         }
-        kept_first && room(self.deleted_since)
+        room(self.deleted_since)
     }
 
     /// Appends `bytes` to the current file, starting a new one first if it is

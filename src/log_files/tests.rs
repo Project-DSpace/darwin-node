@@ -337,13 +337,18 @@ fn at_the_full_line_old_files_go_first_then_only_warnings_are_written() {
     assert_eq!(log_files(dir.path()).len(), 5);
 
     // Each time the disk is at the line (other writers take back whatever
-    // the log files free), the oldest closed file gives way. An info line is
-    // dropped even so; a warning is written into the room freed for it.
-    let steps: [(bool, &str); 4] = [
-        (false, "info, dropped at the line"),
-        (true, "a warning at the line"),
-        (false, "more info, dropped at the line"),
-        (true, "another warning at the line"),
+    // the log files free), an info line is dropped, deleting nothing; a
+    // warning makes room for itself: the oldest closed file gives way, and
+    // the warning is written into the room freed for it.
+    let steps: [(bool, &str); 6] = [
+        // Short, so the four warnings fit the current file beside its 4000
+        // bytes and no new file starts.
+        (false, "info 1"),
+        (true, "warn 2"),
+        (false, "info 3"),
+        (true, "warn 4"),
+        (true, "warn 5"),
+        (true, "warn 6"),
     ];
     for (n, (warning, text)) in steps.into_iter().enumerate() {
         partition.fill_to(line_at);
@@ -353,9 +358,10 @@ fn at_the_full_line_old_files_go_first_then_only_warnings_are_written() {
         } else {
             info(&mut files, text);
         }
-        assert!(
+        assert_eq!(
             !log_files(dir.path()).contains(&oldest),
-            "step {n}: the oldest file gave way"
+            warning,
+            "step {n}: only a warning makes the oldest file give way"
         );
         assert_eq!(
             text_of(dir.path()).contains(text),
@@ -382,6 +388,90 @@ fn at_the_full_line_old_files_go_first_then_only_warnings_are_written() {
         "no byte added at the line"
     );
     assert_eq!(partition.free(), line_at);
+}
+
+/// Five files of 4 lines each (four of them closed) on a partition at the
+/// full line whose other writers don't take back what the writer frees.
+fn at_the_line_with_five_files(dir: &Path, clock: &Clock, line_at: u64) -> (Partition, LogFiles) {
+    let partition = Partition::new(dir, 10 * 1024 * KIB, line_at);
+    let mut files = LogFiles::with_limits(
+        dir,
+        None,
+        LineFormat::Text,
+        Limits {
+            segment_max: 4 * KIB,
+            folder_max: 64 * KIB,
+        },
+        Box::new(partition.clone()),
+        clock.boxed(),
+    )
+    .unwrap();
+    for n in 0..20 {
+        clock.advance(Duration::from_secs(1));
+        info(&mut files, &line_of(1000, char::from(b'a' + n)));
+    }
+    assert_eq!(log_files(dir).len(), 5);
+    partition.fill_to(line_at);
+    (partition, files)
+}
+
+#[test]
+fn at_the_line_the_room_the_writer_freed_is_not_spent_on_info_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Clock::new();
+    let line_at = 100 * KIB;
+    let (partition, mut files) = at_the_line_with_five_files(dir.path(), &clock, line_at);
+
+    // A flood of info lines with a warning now and then. The first warning
+    // frees one file; the room it freed stays free, and goes to warnings,
+    // never to info lines, so no other file gives way.
+    for n in 0..400 {
+        if n % 50 == 0 {
+            warn(&mut files, &format!("warning {n}"));
+        } else {
+            info(&mut files, &format!("info {n} {}", line_of(200, 'i')));
+        }
+    }
+    assert_eq!(log_files(dir.path()).len(), 4, "one file gave way");
+    let text = text_of(dir.path());
+    assert!(!text.contains("info "), "an info line was written");
+    for n in (0..400).step_by(50) {
+        assert!(
+            text.contains(&format!(
+                "warning {n}
+"
+            )),
+            "warning {n}"
+        );
+    }
+    assert!(partition.free() >= line_at);
+}
+
+#[test]
+fn the_writer_leaves_the_line_only_when_real_space_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Clock::new();
+    let line_at = 100 * KIB;
+    let (partition, mut files) = at_the_line_with_five_files(dir.path(), &clock, line_at);
+    warn(&mut files, "a warning that frees a file");
+    assert_eq!(log_files(dir.path()).len(), 4);
+
+    // A little more room than the writer freed, less than a file: still at
+    // the line.
+    partition.fill_to(line_at + 3 * KIB);
+    info(&mut files, "still at the line");
+    assert!(!text_of(dir.path()).contains("still at the line"));
+
+    // Room above the line by more than a file and what the writer freed:
+    // every line is written again, after the line saying what was dropped.
+    partition.fill_to(line_at + 64 * KIB);
+    info(&mut files, "room again");
+    let text = text_of(dir.path());
+    assert!(text.contains("room again"), "{text}");
+    assert!(
+        text.contains("Log lines dropped while the disk was at its full line"),
+        "{text}"
+    );
 }
 
 #[test]
