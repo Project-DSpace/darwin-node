@@ -313,31 +313,58 @@ never ran.
   up to 256 KiB of keys (8,192), replica hints first, each page its own
   request and answer carrying the exchange's number and "page n of N", the
   next sent only once the last is answered, up to 256 pages a side, and one
-  exchange at a time with each neighbour. The responder builds its hints for
-  the requester once, at the first page, from one snapshot of its routing
-  table, and serves every page from them; what it holds for exchanges in
-  progress comes to at most 64 MiB of keys beyond one exchange, and is
-  dropped after each exchange's last page or once its requester stops asking.
-  A page it can't take now, refused at admission (1 a peer, 8 in all, as
-  before) or left waiting 15 seconds for a worker, is answered busy: the
-  requester ends the exchange and syncs again in a later cycle, where an
-  unanswered request would have counted against the responder. A requester
-  waits 30 seconds for each page, sync's own deadline. Repair proofs are
-  recorded only for the keys of pages that were answered, and a node
+  exchange at a time with each neighbour. Hints for a neighbour that come to
+  more than one exchange carries (256 pages, or the 9 MiB of keys of a
+  single message) go a window at a time: each exchange with that neighbour,
+  as requester or responder, carries the next keys of each list, each list
+  its share in proportion to its length, round and round, so every key goes
+  out within the exchanges it takes to go round once. A side's pages
+  announce every page its hints take, so the other side, having had the 256
+  an exchange runs, knows more are to come. The responder builds its hints
+  for the requester once, at the first page, from one snapshot of its
+  routing table, keeps only the window it serves, and serves every page
+  from them; what it holds for exchanges in progress comes to at most 64 MiB
+  of keys, and one more exchange's (at most 256 pages) for each of its two
+  workers, and is dropped after each exchange's last page, when its
+  requester starts another, or once its requester stops asking. A requester
+  takes at most 256 pages of 8,192 keys of a neighbour's answer in one
+  exchange, however the neighbour cuts its pages, and holds at most 64 MiB
+  of keys of answers across its exchanges in progress; past either it stops
+  following the neighbour's pages, and the rest come in a later exchange. A page the responder can't take now,
+  refused at admission (1 a peer, 8 in all, as before), left waiting
+  15 seconds for a worker, or of an exchange whose hints it doesn't hold, is
+  answered busy: the requester ends the exchange and syncs again in a later
+  cycle. Pages go on the peer's connection without trust reporting, so
+  silence, a timeout or an answer that doesn't decode never counts against
+  the responder. A requester waits 30 seconds for each page, sync's own
+  deadline. Only a complete exchange puts the neighbour on the sync
+  cooldown; one that ended part way, busy, failed or stopped, leaves it to
+  the next cycle. Repair proofs are recorded only for the keys of pages that
+  arrived: the requester's for the pages the responder answered, the
+  responder's once the requester's next request of the exchange shows the
+  page arrived (the last page's keys get none from the exchange; the node's
+  own exchanges with that neighbour, as requester, record them). A node
   bootstrapping counts a neighbour as done only once that neighbour's last
-  page has arrived. A node pages to a peer whose user agent names ds.17 or
-  later (`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`), decided again for each
-  exchange: from the agent of the peer's connection, or, while it isn't
-  connected, from the last sync message it sent. Any other peer, one of
-  unknown release among them, gets a single message, as before, carrying at
-  most 9 MiB of keys so that it can always be built. Scans of a node's keys,
-  for hints and for the hourly rebuild of its storage commitment, compute
-  close groups from one routing snapshot, off the async workers, instead of a
-  routing-table lookup for every key. Tests: `tests/wire_format.rs` pins the
-  two new messages' bytes, and `src/replication/protocol.rs` that a node of
-  ds.15 refuses them whole; `tests/e2e/sync_pages.rs` runs paged exchanges
-  between nodes: both lists over several pages from one scan, busy answers at
-  admission and after a wait, and paging chosen by the peer's agent.
+  announced page has arrived. A node pages to a peer whose user agent names
+  ds.17 or later (`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`), decided again for
+  each exchange from the agent of the peer's connection. Any other peer, one
+  that isn't connected or of unknown release among them, gets a single
+  message, as before, which every release reads; sending it connects the
+  peer, so its next exchange reads a fresh agent. So does a peer whose last
+  exchange's first page went unanswered, so an agent left from a connection
+  that has since ended pages it at most once. The Release workflow refuses a
+  tag numbered below `NEIGHBOR_SYNC_PAGES_FROM_RELEASE`, or any earlier
+  release tag at or past it without paged sync, and a unit test ties the
+  constant to this tree's version. Scans of a node's keys, for hints and for
+  the hourly rebuild of its storage commitment, compute close groups from one
+  routing snapshot, off the async workers, instead of a routing-table lookup
+  for every key. Tests: `tests/wire_format.rs` pins the two new messages'
+  bytes, and `src/replication/protocol.rs` that a node of ds.15 refuses them
+  whole; `tests/e2e/sync_pages.rs` runs paged exchanges between nodes: both
+  lists over several pages from one scan, busy answers at admission and
+  after a wait with the requester's trust in the responder unchanged, a
+  page's repair proofs waiting for the requester's next page, paging chosen
+  by the peer's agent, and nodes announcing ds.17 paging to each other.
 - **Messages between nodes keep their bytes.** `tests/wire_format.rs` pins
   the bytes of every replication message, and of every variant of the
   replies, as ds.15 writes them, and fails when a message or a reply gains
@@ -359,21 +386,35 @@ never ran.
   highest count in two runs of the previous release alone (the spread
   measured between such runs); on more than 3 penalties for a failure
   reason those runs never charged a role with; on a message family that
-  stopped reaching nodes; or on a node paging its sync hints to a node of
-  the previous release. With `--paged` it adds a run of this tree's nodes
-  alone, two keys to a sync page, which must show both hint lists going over
-  more than one page each way, each responder's hints built once per
-  exchange, and pages served in order. Run it before a node release's canary.
+  stopped reaching nodes; or, of neighbour sync, on a node paging its hints
+  to a node of the previous release, this tree's nodes not paging to each
+  other, no single message from them to the previous release's nodes, or a
+  requester charging its responder during an exchange the responder
+  answered busy. In every run but the all-old and full ones, this tree's
+  nodes put two keys on a sync page, and, until the release that reads pages
+  is cut, announce that release in their user agent. With `--paged` it adds
+  a run of this tree's nodes alone, their incumbents admitting one sync
+  request at once, which must show both hint lists going over more than one
+  page each way, each responder's hints built once per exchange, pages
+  served in order, and pages answered busy, with no penalty for them; it is
+  measured against the previous release's runs for new failure reasons only.
+  With `--rollback` it adds a run in which one of this tree's nodes is
+  started again on the previous release's binary with its data folder, then
+  on this tree's again: while it ran the previous release, this tree's nodes
+  must send it a single message and no page it answered, at most one page
+  each left unanswered over the connection its earlier process left; once it
+  came back, a page to it, answered. Run it before a node release's canary.
   Its report and summary.json list every count measured against those runs,
   with the excess over them and the limit, within the limit or not.
   The Test workflow tests what fails a run, on made-up results
   (`scripts/test_mixed_versions_verdicts.py`).
   Builds with the `test-utils` feature, which the harness uses, have test
   seams (`src/test_seams.rs`), such as one that makes a node's disk read as
-  full, and two for paged sync, the page size and the release from which a
-  node pages; the Build workflow checks that the image's node has none, and
-  the Release workflow that the node releases install has none, before it is
-  packaged and signed.
+  full, and four for paged sync: the page size, the release from which a
+  node pages, the release a node announces in its user agent, and the sync
+  requests a node admits at once; the Build workflow checks that the image's
+  node has none, and the Release workflow that the node releases install has
+  none, before it is packaged and signed.
 
 ---
 
