@@ -266,7 +266,9 @@ jobs:
       # run made: the build provenance attestation build.yml's image job
       # makes, which doesn't expire, signed for build.yml on main at the
       # commit, by a run a push started, as its certificate says (GitHub's
-      # token sets the certificate; the workflow writes the predicate); or
+      # token sets the certificate; the workflow writes the predicate), and,
+      # unless the run is a withdrawal, by the Build run found above, any
+      # attempt of it (the certificate's run URI); or
       # the run's storage-node-digest artifact, kept 30 days, which must
       # name the digest while it is kept. An image from before the Build
       # workflow attested its images has the artifact alone; for a
@@ -283,10 +285,17 @@ jobs:
         env:
           RUN: ${{ steps.build_run.outputs.run }}
         run: |
-          attested=$(gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GH_REPO" \
+          if [[ "$WITHDRAW" != true ]]; then
+            from_run="https://github.com/$GH_REPO/actions/runs/$RUN/"
+            attested_by="by Build run $RUN; its attempt is not compared, since a re-run attempt builds the same commit"
+          else
+            from_run="https://github.com/$GH_REPO/actions/runs/"
+            attested_by="by any Build run of that push, not tied to Build run $RUN, since a withdrawal may go back to an older image of the commit"
+          fi
+          attested=$({ gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GH_REPO" \
             --signer-workflow "$GH_REPO/.github/workflows/build.yml" \
-            --source-ref refs/heads/main --source-digest "$COMMIT" --format json \
-            --jq '[.[].verificationResult.signature.certificate | select(.buildTrigger == "push") | .runInvocationURI] | first // empty' || true)
+            --source-ref refs/heads/main --source-digest "$COMMIT" --format json || true; } \
+            | jq -r --arg from "$from_run" '[.[]?.verificationResult.signature.certificate | select(.buildTrigger == "push" and (.runInvocationURI | startswith($from))) | .runInvocationURI] | first // empty' || true)
           kept=$(gh api "repos/$GH_REPO/actions/runs/$RUN/artifacts" \
             --jq '[.artifacts[] | select(.name == "storage-node-digest" and (.expired | not))] | length')
           recorded=""
@@ -319,7 +328,7 @@ jobs:
           echo "record=$record" >> "$GITHUB_OUTPUT"
           {
             if [[ -n "$attested" ]]; then
-              echo "- $DIGEST is attested as built by build.yml from the push of $COMMIT to main ($attested)."
+              echo "- $DIGEST is attested as built by build.yml from the push of $COMMIT to main ($attested), $attested_by."
             else
               echo "- No attestation from the push of $COMMIT to main verifies $DIGEST (an image from before the Build workflow attested its images)."
             fi
@@ -438,7 +447,7 @@ jobs:
             {
               echo "- A withdrawal, to $held."
               if [[ -z "$by_latest" && "$RECORD" == attestation ]]; then
-                echo "- The Build run's record of the digest that Release run moved the latest tag to has expired, and docker/release-images doesn't list it: any image attested as built by the push of $COMMIT to main is taken, as without withdraw."
+                echo "- The Build run's record of the digest that Release run moved the latest tag to has expired, and docker/release-images doesn't list it: any image attested as built by the push of $COMMIT to main is taken, by any Build run of that push, not tied to Build run $RUN."
               fi
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -480,14 +489,21 @@ jobs:
       # from an image with a marker to one with none, whose node manager is
       # Autonomi's (it deletes a node's data when its disk runs low, with no
       # possession check), is refused unless allow_unmarked is set: only
-      # withdrawing the first image release needs that. The image's node
+      # withdrawing the first image release needs that. A withdrawal to an
+      # older node goes ahead only once the withdrawn release, the one
+      # :latest's node belongs to, is deleted (or a draft or a pre-release),
+      # so nodes still waiting to install it drop it and its Release run
+      # can't move :latest to it again; any other answer from GitHub
+      # refuses it. A withdrawal to the same node (an image release going
+      # back) keeps that release published. The image's node
       # must still be a published release: the checks job checked it before
       # the approval, and a release can be withdrawn while a run waits for
       # it. Then, before :latest moves, the summary names the digest it had
       # and the one it gets, and, when the image it had has a record that
       # doesn't expire, the command that moves it back: its attestation, or
       # its line in docker/release-images as main had it when the run was
-      # dispatched. Without one, a withdrawal to that image is refused once
+      # dispatched, with allow_unmarked when the image before has no marker
+      # and the new one has one. Without one, a withdrawal to that image is refused once
       # its Build run's storage-node-digest artifact has expired, and the
       # summary says so.
       - name: Check the image against latest's, and write the summary
@@ -515,6 +531,21 @@ jobs:
           if [[ "$order" == "older than" && "$WITHDRAW" != true ]]; then
             echo "::error::$IMAGE@$DIGEST runs $VERSION, older than $IMAGE:latest's $current_version: only a withdrawal (withdraw) may move it back"
             exit 1
+          fi
+          withdrawn=""
+          if [[ "$order" == "older than" ]]; then
+            withdrawn="v${current_version#ant-node }"
+            if ! withdrawn_state=$(gh api "repos/$GH_REPO/releases/tags/$withdrawn" \
+                --jq 'if .draft or .prerelease then "a draft or a pre-release" else "published" end' 2>"$RUNNER_TEMP/withdrawn.err"); then
+              withdrawn_state="not known to be gone ($(tr -s '\n' ' ' <"$RUNNER_TEMP/withdrawn.err"))"
+              if grep -qF 'HTTP 404' "$RUNNER_TEMP/withdrawn.err"; then
+                withdrawn_state=deleted
+              fi
+            fi
+            if [[ "$withdrawn_state" != deleted && "$withdrawn_state" != "a draft or a pre-release" ]]; then
+              echo "::error::this withdrawal takes $IMAGE:latest back from $current_version, whose release $withdrawn is $withdrawn_state: delete the withdrawn release $withdrawn first, so nodes still waiting to install it drop it and its Release run can't move the latest tag to it again, then run this again"
+              exit 1
+            fi
           fi
           marker=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)
           if [[ "$marker" =~ ^[0-9a-f]{40}$ ]]; then
@@ -565,11 +596,21 @@ jobs:
               echo "- A withdrawal: withdraw is set, so the new image may be older than the one before, and its node too."
             fi
             echo "- $VERSION is still the published release $release."
+            if [[ -n "$withdrawn" ]]; then
+              echo "- The withdrawn release $withdrawn, of $current_version, is $withdrawn_state: nodes still waiting to install it drop it, and its Release run can't move the latest tag to it again."
+            fi
             if [[ "$marker" =~ ^[0-9a-f]{40}$ && ! "$target_marker" =~ ^[0-9a-f]{40}$ ]]; then
               echo "- **allow_unmarked is set: the latest tag goes from an image with darwin-nodes as its node manager to one with none, whose node manager is Autonomi's.**"
             fi
             if [[ -n "$lasting" ]]; then
-              echo "- To move it back (the image before is recorded for good by $lasting): \`gh workflow run latest.yml --ref main -f commit=$base -f digest=$current -f withdraw=true\`"
+              back=""
+              if [[ ! "$marker" =~ ^[0-9a-f]{40}$ && "$target_marker" =~ ^[0-9a-f]{40}$ ]]; then
+                back=" -f allow_unmarked=true"
+              fi
+              echo "- To move it back (the image before is recorded for good by $lasting): \`gh workflow run latest.yml --ref main -f commit=$base -f digest=$current -f withdraw=true$back\`"
+              if [[ -n "$back" ]]; then
+                echo "- The command sets allow_unmarked: the image before has no image marker, so its node manager is Autonomi's, and $DIGEST has one."
+              fi
             elif [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
               echo "- $current has no record that doesn't expire: no attestation from the push of $base to main, and no line in docker/release-images. A withdrawal to it is refused once its Build run's storage-node-digest artifact has expired, 30 days after that run."
             fi

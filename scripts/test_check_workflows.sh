@@ -563,12 +563,26 @@ expect "a Test run by hand with the listings cross-test" "${TEST_RUN}"
 
 DIGEST_CHECKED="latest.yml's checks job must check that the digest is the image the commit's Build run from its push to main pushed, by its attestation or its record, or, for a withdrawal alone, by docker/release-images"
 fresh
-edit "${LATEST}" $'select(.buildTrigger == "push") | .runInvocationURI] | first // empty\' || true)\n          kept=' \
-    $'.runInvocationURI] | first // empty\' || true)\n          kept='
+edit "${LATEST}" 'select(.buildTrigger == "push" and (.runInvocationURI | startswith($from)))' \
+    'select(.runInvocationURI | startswith($from))'
 expect "an image attested by a run by hand" "${DIGEST_CHECKED}"
 
 fresh
-edit "${LATEST}" '--source-ref refs/heads/main --source-digest "$COMMIT" --format json \' '--format json \'
+edit "${LATEST}" 'select(.buildTrigger == "push" and (.runInvocationURI | startswith($from)))' \
+    'select(.buildTrigger == "push")'
+expect "an image attested by any Build run of the commit's push, outside a withdrawal" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" 'if [[ "$WITHDRAW" != true ]]; then' 'if false; then'
+expect "the attestation tied to the Build run in no run" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" 'from_run="https://github.com/$GH_REPO/actions/runs/$RUN/"' \
+    'from_run="https://github.com/$GH_REPO/actions/runs/"'
+expect "the attestation not tied to the Build run whose smoke test was checked" "${DIGEST_CHECKED}"
+
+fresh
+edit "${LATEST}" '--source-ref refs/heads/main --source-digest "$COMMIT" --format json || true; } \' '--format json || true; } \'
 expect "an image attested from another ref or commit" "${DIGEST_CHECKED}"
 
 fresh
@@ -839,6 +853,60 @@ fresh
 edit "${LATEST}" 'release="v${VERSION#ant-node }"' 'release="v${current_version#ant-node }"'
 expect "latest's own release checked again in place of the image's" "${STILL_PUBLISHED}"
 
+# A withdrawal to an older node only once the withdrawn release is deleted,
+# a draft or a pre-release; any other answer from GitHub refuses it.
+WITHDRAWN="latest.yml's latest job must refuse a withdrawal to an older node until the withdrawn release, :latest's node's, is deleted, a draft or a pre-release"
+fresh
+edit "${LATEST}" 'if [[ "$withdrawn_state" != deleted && "$withdrawn_state" != "a draft or a pre-release" ]]; then' 'if false; then'
+expect "a withdrawal while the withdrawn release is still published" "${WITHDRAWN}"
+
+fresh
+edit "${LATEST}" 'if [[ "$order" == "older than" ]]; then' 'if false; then'
+expect "the withdrawn release never looked up" "${WITHDRAWN}"
+
+fresh
+edit "${LATEST}" "if grep -qF 'HTTP 404' \"\$RUNNER_TEMP/withdrawn.err\"; then" 'if true; then'
+expect "any error from GitHub taken as the withdrawn release gone" "${WITHDRAWN}"
+
+fresh
+edit "${LATEST}" "--jq 'if .draft or .prerelease then \"a draft or a pre-release\" else \"published\" end'" \
+    "--jq 'if .draft then \"a draft or a pre-release\" else \"published\" end'"
+expect "a withdrawn release made a pre-release taken as still published" "${WITHDRAWN}"
+
+fresh
+edit "${LATEST}" 'withdrawn="v${current_version#ant-node }"' 'withdrawn="v${VERSION#ant-node }"'
+expect "the image's own release looked up in place of the withdrawn one" "${WITHDRAWN}"
+
+fresh
+edit "${LATEST}" 'echo "- The withdrawn release $withdrawn, of $current_version, is $withdrawn_state:' 'echo "- Withdrawn:'
+expect "the withdrawn release's state left out of the summary" "${WITHDRAWN}"
+
+# The command that moves :latest back sets allow_unmarked when the image
+# before has no marker and the new one has one: in latest.yml's summary and
+# in release.yml's.
+BACK="latest.yml's latest job must set allow_unmarked in the command that moves :latest back when the image before has no image marker and the new one has one"
+fresh
+edit "${LATEST}" 'if [[ ! "$marker" =~ ^[0-9a-f]{40}$ && "$target_marker" =~ ^[0-9a-f]{40}$ ]]; then' 'if false; then'
+expect "latest.yml's move-back command never setting allow_unmarked" "${BACK}"
+
+fresh
+edit "${LATEST}" 'withdraw=true$back' 'withdraw=true'
+expect "latest.yml's move-back command leaving allow_unmarked out" "${BACK}"
+
+RELEASE_BACK="release.yml's latest job must set allow_unmarked in the command that withdraws the release when :latest's image has no image marker and the release's has one"
+fresh
+edit "${RELEASE}" 'if [[ ! "$current_marker" =~ ^[0-9a-f]{40}$ && "$release_marker" =~ ^[0-9a-f]{40}$ ]]; then' 'if false; then'
+expect "release.yml's withdrawal command never setting allow_unmarked" "${RELEASE_BACK}"
+
+fresh
+edit "${RELEASE}" 'withdraw=true$back' 'withdraw=true'
+expect "release.yml's withdrawal command leaving allow_unmarked out" "${RELEASE_BACK}"
+
+fresh
+edit "${RELEASE}" 'release_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DIGEST" /opt/ant/image-version 2>/dev/null || true)' \
+    'release_marker=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)'
+expect "the release image's marker read from latest's image" "${RELEASE_BACK}"
+
 # From an image with darwin-nodes as its node manager (an image marker) to
 # one with Autonomi's (none) only with allow_unmarked.
 UNMARKED="latest.yml's latest job must refuse, unless allow_unmarked is set, a move from an image with an image marker to one with none"
@@ -967,8 +1035,8 @@ edit "${LATEST}" $'            echo "::error::run this workflow from main (--ref
 expect "a refusal of latest.yml that doesn't stop its step" "${STOPS}"
 
 fresh
-edit "${LATEST}" $'only a withdrawal (withdraw) may move it back"\n            exit 1\n          fi\n          marker=' \
-    $'only a withdrawal (withdraw) may move it back"\n            true\n          fi\n          marker='
+edit "${LATEST}" $'only a withdrawal (withdraw) may move it back"\n            exit 1\n          fi\n          withdrawn=' \
+    $'only a withdrawal (withdraw) may move it back"\n            true\n          fi\n          withdrawn='
 expect "a refusal of latest.yml carrying on with true" "${STOPS}"
 
 EARLY="latest.yml must have no line that ends a step early or lets a failure pass"

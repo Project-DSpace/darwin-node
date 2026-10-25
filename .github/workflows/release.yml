@@ -394,15 +394,26 @@ jobs:
             fi
             # The commit that image was built from, for a withdrawal: its
             # image marker, or, for an image with none, which only a release
-            # put on :latest, the commit of that release's tag.
-            built_from=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)
+            # put on :latest, the commit of that release's tag. Moving back
+            # from this release's image, with a marker, to one with none
+            # needs allow_unmarked, so the command sets it then.
+            current_marker=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)
+            built_from=$current_marker
             if [[ ! "$built_from" =~ ^[0-9a-f]{40}$ ]]; then
               built_from=$(gh api "repos/$GH_REPO/commits/refs/tags/v${current_version#ant-node }" --jq .sha 2>/dev/null || true)
+            fi
+            release_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DIGEST" /opt/ant/image-version 2>/dev/null || true)
+            back=""
+            if [[ ! "$current_marker" =~ ^[0-9a-f]{40}$ && "$release_marker" =~ ^[0-9a-f]{40}$ ]]; then
+              back=" -f allow_unmarked=true"
             fi
             {
               echo "- $IMAGE:latest is $current, whose node, $current_version, is older than $VERSION."
               if [[ "$built_from" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "- To withdraw this release, delete it, then move :latest back: \`gh workflow run latest.yml --ref main -f commit=$built_from -f digest=$current -f withdraw=true\`"
+                echo "- To withdraw this release, delete it, then move :latest back: \`gh workflow run latest.yml --ref main -f commit=$built_from -f digest=$current -f withdraw=true$back\`"
+                if [[ -n "$back" ]]; then
+                  echo "- The command sets allow_unmarked: $current has no image marker, so its node manager is Autonomi's, and this release's image has one."
+                fi
               fi
             } >> "$GITHUB_STEP_SUMMARY"
           fi
