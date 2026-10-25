@@ -249,19 +249,38 @@ never ran.
   `src/upgrade/apply/ds_ordering.rs`). `tests/fork_pins.rs` pins the
   repository and the SHA-256 of the release key, and the Build workflow, as
   release.yml does for a tag, checks that the key compiled into the node is
-  that key. The storage-node image's `:latest` moves
-  only when a release is published (from ds.10): release.yml then points it
-  at the image the Build workflow made from the release's commit. A push to
-  main publishes the image as `:<commit>` only. From ds.13 a release
-  publishes nothing until the tagged commit's newest Test run (from its push
-  to main, or one run by hand) and its Build run from the push to main have
-  succeeded: release.yml's `checks` job waits for both, and the release's
-  approval is asked for only after that. `scripts/check-workflows.sh`, which
-  the Build and Test workflows run, fails unless `.github/workflows` holds
-  only build.yml, release.yml and test.yml, every action is pinned to a
-  commit, release.yml keeps its tag trigger, empty default permissions,
-  key check, release environment, that order of jobs and the only write of
-  `:latest`, test.yml's test job runs every test: the library and
+  that key. The storage-node image's `:latest` moves when a release is
+  published (from ds.10): release.yml then points it at the image the Build
+  workflow made from the release's commit. A push to main publishes the
+  image as `:<commit>` only. Otherwise only the Latest workflow
+  (`.github/workflows/latest.yml`) moves `:latest`, run by hand from main
+  and approved in the release environment, as a release is: for an image
+  release, a new image with the node `:latest` already has (a new node
+  manager, say), and to withdraw a release, taking `:latest` back to the
+  image an earlier release put there. It is given a commit on main, the
+  digest of the image the Build workflow made from it, and `withdraw` for a
+  withdrawal. Its `checks` job, which can write nothing, checks that the run
+  is from main, that the commit is on main, that the commit's Build run
+  from its push to main succeeded, smoke test included, and that the digest
+  is the one that run recorded (its `storage-node-digest` artifact, while
+  that is kept, 30 days) and the one `:<commit>` has in the registry. Its
+  `latest` job then refuses an image whose node is older than the one
+  `:latest` has, unless the run is a withdrawal, writes the digest `:latest`
+  had and the new one to the run's summary, so a later run can move it
+  back, then moves `:latest` and checks it. Operators get an image release
+  only by pulling the image: the nodes' own upgrades replace only their
+  binary. From ds.13 a release publishes nothing until the tagged commit's
+  newest Test run (from its push to main, or one run by hand) and its Build
+  run from the push to main have succeeded: release.yml's `checks` job
+  waits for both, and the release's approval is asked for only after that.
+  `scripts/check-workflows.sh`, which the Build and Test workflows run,
+  fails unless `.github/workflows` holds only build.yml, latest.yml,
+  release.yml and test.yml, every action is pinned to a commit, release.yml
+  keeps its tag trigger, empty default permissions, key check, release
+  environment and that order of jobs, latest.yml keeps its trigger by hand,
+  empty default permissions, checks, approval and order of jobs, only the
+  `latest` jobs of the two write `:latest`, no other job runs in an
+  environment, test.yml's test job runs every test: the library and
   binaries, both vendored crates' own tests and every target in `tests/`,
   and build.yml builds the image's node manager with `--locked` from the
   pinned darwin-client commit, once it has checked that the commit is on
