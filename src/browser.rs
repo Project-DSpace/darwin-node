@@ -195,7 +195,7 @@ impl BrowserDevnetManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{browser_payment_network, payment_chain_id_retrying};
+    use super::{browser_payment_network, payment_chain_id, payment_chain_id_retrying};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -255,5 +255,52 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// A chain ID that isn't one (zero-padded, over 64 bits, under another
+    /// request id) or a provider error is refused, and the error names
+    /// neither the provider's words nor the RPC's URL, whose user, password,
+    /// path and query can hold the operator's keys. Was the devnet test
+    /// `invalid_chain_identity_fails_without_exposing_provider_response`
+    /// (tests/webrtc_direct_devnet.rs), which started a devnet for each case
+    /// to reach this read.
+    #[tokio::test]
+    async fn an_invalid_chain_identity_is_refused_without_the_providers_words() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x01"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x10000000000000000"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":"0x1"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"message":"dummy-private-url"}}"#,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url: reqwest::Url = format!(
+                "http://dummy-user:dummy-password@{}/v2/dummy-path-key?api_key=dummy-query-key",
+                listener.local_addr().unwrap()
+            )
+            .parse()
+            .unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buffer = vec![0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+
+{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            let error = payment_chain_id(&url)
+                .await
+                .expect_err(body)
+                .to_string();
+            assert!(!error.contains("dummy"), "{body}: {error}");
+            assert!(!error.contains(url.as_str()), "{body}: {error}");
+        }
     }
 }

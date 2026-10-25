@@ -528,33 +528,6 @@ async fn encrypted_hello_and_manifest_never_disclose_verification_rpc() -> Resul
     Ok(())
 }
 
-#[tokio::test]
-async fn invalid_chain_identity_fails_without_exposing_provider_response(
-) -> Result<(), Box<dyn Error>> {
-    let temp = tempfile::tempdir()?;
-    for body in [
-        json!({"jsonrpc":"2.0", "id":1, "result":"0x01"}),
-        json!({"jsonrpc":"2.0", "id":1, "result":"0x10000000000000000"}),
-        json!({"jsonrpc":"2.0", "id":2, "result":"0x1"}),
-        json!({"jsonrpc":"2.0", "id":1, "error":{"message":"dummy-private-url"}}),
-    ] {
-        let rpc = MockChainRpc::new(body.to_string()).await?;
-        let mut config = DevnetConfig::minimal();
-        config.data_dir = temp.path().join("invalid-rpc");
-        config.evm_network = Some(rpc.network());
-        let mut devnet = Devnet::new(config).await?;
-        let error = devnet
-            .browser_payment_network()
-            .await
-            .err()
-            .ok_or_else(|| io::Error::other("accepted invalid chain identity"))?;
-        assert!(!error.to_string().contains("dummy"));
-        assert!(!error.to_string().contains(&rpc.url));
-        devnet.shutdown().await?;
-    }
-    Ok(())
-}
-
 /// A devnet node keeps listings as a node does, which
 /// `scripts/test_e2e_listings.sh` relies on: its chunk handler refuses an
 /// envelope whose payment it can't find from a proof, and its protocol loop
