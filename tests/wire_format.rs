@@ -1,5 +1,7 @@
 //! The bytes of every message one node sends another, as v0.23.0+ds.15 writes
-//! and reads them, and the variants of each that it knows.
+//! and reads them, and the variants of each that it knows; and of the messages
+//! appended since, which go only to peers known to read them: the one-way
+//! "full" notice a full node sends.
 //!
 //! A release that changes messages between nodes keeps the rule in the
 //! README's "Messages between nodes": a new message type is appended to
@@ -32,7 +34,7 @@
 use ant_node::replication::commitment::StorageCommitment;
 use ant_node::replication::protocol::{
     AuditChallenge, AuditResponse, FetchRequest, FetchResponse, FreshReplicationOffer,
-    FreshReplicationResponse, GetCommitmentByPin, GetCommitmentByPinResponse,
+    FreshReplicationResponse, FullNotice, GetCommitmentByPin, GetCommitmentByPinResponse,
     KeyVerificationResult, NeighborSyncRequest, NeighborSyncResponse, PaidNotify,
     PointerFetchRequest, PointerFetchResponse, PointerFreshOffer, PointerHints,
     PointerStateRequest, PointerStateResponse, PointerStateSummary, RejectKind, ReplicationMessage,
@@ -174,6 +176,8 @@ fn name(body: &ReplicationMessageBody) -> String {
         ),
         B::PointerStateRequest(_) => "PointerStateRequest".into(),
         B::PointerStateResponse(_) => "PointerStateResponse".into(),
+        B::FullNotice(FullNotice { full: true }) => "FullNotice, full".into(),
+        B::FullNotice(FullNotice { full: false }) => "FullNotice, no longer full".into(),
     }
 }
 
@@ -365,6 +369,8 @@ fn samples() -> Vec<ReplicationMessageBody> {
         B::PointerStateResponse(PointerStateResponse {
             states: vec![Some(pointer_summary(0x2F)), None],
         }),
+        B::FullNotice(FullNotice { full: true }),
+        B::FullNotice(FullNotice { full: false }),
     ]
 }
 
@@ -530,6 +536,11 @@ const PINNED: &[(&str, &str)] = &[
         "PointerStateResponse",
         "b4241602012f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f3030303030303030303030303030303030303030303030303030303030303030ac0201313131313131313131313131313131313131313131313131313131313131313100",
     ),
+    // Appended since ds.15, whose message enum ends at index 22, and sent only
+    // to peers known to read them; ds.15 drops the notice (`a_node_before_the_full_notice_reads_every_earlier_body_and_drops_the_notice`
+    // in src/replication/protocol.rs).
+    ("FullNotice, full", "b4241701"),
+    ("FullNotice, no longer full", "b4241700"),
 ];
 
 fn encode(body: ReplicationMessageBody) -> Vec<u8> {
@@ -626,7 +637,8 @@ fn the_variants_are_the_pinned_ones() {
     let challenge = varint(9);
     // (what, the bytes up to the variant index, how many variants it has)
     let cases: Vec<(&str, Vec<u8>, u8)> = vec![
-        ("ReplicationMessageBody", frame(&[]), 23),
+        // 23 variants up to ds.15, then the "full" notice.
+        ("ReplicationMessageBody", frame(&[]), 24),
         ("FreshReplicationResponse", frame(&[&[1]]), 2),
         ("FetchResponse", frame(&[&[8]]), 3),
         ("AuditResponse", frame(&[&[10]]), 3),

@@ -19,6 +19,7 @@ use crate::replication::protocol::{
     NeighborSyncRequest, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
 };
 use crate::replication::types::NeighborSyncState;
+use crate::replication::{erasure, full};
 use crate::storage::ChunkStore;
 
 /// Hint-build duration that is worth surfacing at info level.
@@ -89,13 +90,21 @@ pub(crate) async fn build_replica_hints_for_peer_with_close_groups(
         }
     };
 
-    let dht = p2p_node.dht_manager();
+    // A record being erased is named in no hint (two-phase erasure), and the
+    // close group widens by one for each peer marked full inside it.
+    let gate = erasure::gate_for(p2p_node.peer_id());
+    let marked = full::view_for(p2p_node.peer_id())
+        .marks
+        .marked_set(Instant::now());
     let mut hints = Vec::new();
     for key in all_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(&key, close_group_size)
-            .await;
-        let close_peers = closest.iter().map(|n| n.peer_id).collect::<HashSet<_>>();
+        if gate.is_being_erased(&key) {
+            continue;
+        }
+        let close_peers = full::widened_close_group_with(p2p_node, &key, close_group_size, &marked)
+            .await
+            .into_iter()
+            .collect::<HashSet<_>>();
         if close_peers.contains(peer) {
             hints.push(SentReplicaHint { key, close_peers });
         }
@@ -135,11 +144,20 @@ pub(crate) async fn build_sync_hints_for_peers(
     let stored_key_count = all_keys.len();
 
     let dht = p2p_node.dht_manager();
+    // A record being erased is named in no hint (two-phase erasure), and the
+    // close group widens by one for each peer marked full inside it.
+    let gate = erasure::gate_for(p2p_node.peer_id());
+    let marked = full::view_for(p2p_node.peer_id())
+        .marks
+        .marked_set(Instant::now());
     for key in all_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(&key, close_group_size)
-            .await;
-        let close_peers = closest.iter().map(|n| n.peer_id).collect::<HashSet<_>>();
+        if gate.is_being_erased(&key) {
+            continue;
+        }
+        let close_peers = full::widened_close_group_with(p2p_node, &key, close_group_size, &marked)
+            .await
+            .into_iter()
+            .collect::<HashSet<_>>();
         for peer in close_peers.intersection(&target_peers) {
             if let Some(peer_hints) = hints_by_peer.get_mut(peer) {
                 peer_hints.sent_replica_hints.push(SentReplicaHint {
@@ -387,12 +405,18 @@ pub(crate) async fn sync_with_peer_with_hints(
     // see `NeighborSyncRequest::commitment` and `ingest_peer_commitment`.
     commitment: Option<crate::replication::commitment::StorageCommitment>,
 ) -> Option<NeighborSyncOutcome> {
-    let replica_hints = hints
+    // Built earlier in the round: a record selected for erasure since is left
+    // out now, as it is sent (two-phase erasure).
+    let gate = erasure::gate_for(p2p_node.peer_id());
+    let sent_replica_hints = hints
         .sent_replica_hints
+        .into_iter()
+        .filter(|hint| !gate.is_being_erased(&hint.key))
+        .collect::<Vec<_>>();
+    let replica_hints = sent_replica_hints
         .iter()
         .map(|hint| hint.key)
         .collect::<Vec<_>>();
-    let sent_replica_hints = hints.sent_replica_hints;
 
     let request = NeighborSyncRequest {
         replica_hints,

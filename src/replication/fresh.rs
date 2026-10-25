@@ -5,6 +5,7 @@
 //! 2. Record the key in `PaidForList(self)` and send `PaidNotify` to every
 //!    peer in `PaidCloseGroup(K)` — immediately, never behind back-pressure.
 //! 3. Send fresh offers to `CLOSE_GROUP_SIZE` nearest peers (excluding self),
+//!    one more for each peer marked full among them (at most 20 in all),
 //!    bounded by the pending-offer permits so a write burst cannot pile up
 //!    chunk-sized buffers.
 
@@ -122,17 +123,20 @@ pub(crate) async fn send_fresh_offers(
     let self_id = *ctx.p2p_node.peer_id();
 
     // Use the self-inclusive query to get the true close group, then filter
-    // self out.
-    let closest = ctx
-        .p2p_node
-        .dht_manager()
-        .find_closest_nodes_local_with_self(key, ctx.config.close_group_size)
-        .await;
-    let target_peers: Vec<PeerId> = closest
-        .iter()
-        .filter(|n| n.peer_id != self_id)
-        .map(|n| n.peer_id)
-        .collect();
+    // self out. One more for each peer marked full inside it: the
+    // nearest beyond stand in for it, at most 20 in all.
+    let target_peers: Vec<PeerId> = crate::replication::full::widened_close_group(
+        &ctx.p2p_node,
+        key,
+        ctx.config.close_group_size,
+    )
+    .await
+    .into_iter()
+    .filter(|peer| *peer != self_id)
+    .collect();
+    // The paid quotes' issuers, for the possession check: a full peer paid for
+    // the record is charged for not holding it.
+    let paid_quote_issuers = crate::replication::full::paid_quote_issuers(&proof_of_payment);
 
     let offer = FreshReplicationOffer {
         key: *key,
@@ -215,6 +219,7 @@ pub(crate) async fn send_fresh_offers(
         let _ = ctx.possession_check_tx.send(PossessionCheckEvent {
             key: *key,
             peers: target_peers,
+            paid_quote_issuers,
         });
     }
 }

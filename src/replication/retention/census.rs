@@ -36,7 +36,8 @@
 //!
 //! The same reading of the source pins other calls to reviewed sites, each in
 //! a test of its own: the disk-pressure state's builders, the routing loop's
-//! event reader, the lanes that penalise an unheld close-group chunk, upstream's
+//! event reader, the lanes that penalise an unheld close-group chunk and the
+//! one exemption a full peer gets from it, upstream's
 //! merkle payment code (compiled, never reached), and the payment vault reads
 //! and RPC addresses behind the payment check's fallback. A last test reads
 //! the vendored protocol's wire messages and payment proof types, and the
@@ -1739,11 +1740,12 @@ fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
 /// every lane that finds it out, as in upstream v0.23.0: the responsible-chunk
 /// audit, the possession check after a fresh write, the prune audit, a
 /// sole-source replica hint its sender then denies, and a fetch a verified
-/// source can't serve. Nothing can withhold it: the release switch, its
-/// environment override and the helper the lanes went through while nodes
-/// moved off the LMDB chunk store are gone, and stay gone. Each lane charges
-/// the peer's trust itself, and the functions holding the lanes keep the
-/// reviewed number of trust charges.
+/// source can't serve. Nothing can withhold it but one bounded waiver for
+/// a full peer (the next test): the release switch, its environment override
+/// and the helper the lanes went through while nodes moved off the LMDB chunk
+/// store are gone, and stay gone. Each lane charges the peer's trust itself,
+/// and the functions holding the lanes keep the reviewed number of trust
+/// charges.
 #[test]
 fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
     const SWITCH: &[(Option<&str>, &str)] = &[
@@ -1841,6 +1843,114 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
          Each of these functions charges the peer itself with report_trust_event. If a \
          charge moved, follow it and list where it went; if one is gone, find out why \
          before changing the count.\n"
+    );
+}
+
+/// Full, not faulty: the one exemption from the unheld-chunk penalty.
+///
+/// A full peer (its own "full" notice fresh) that answered it lacks a key it
+/// was never seen proving, in a check not pinned to its commitment and, after a
+/// write, with its own quote not among the paid ones, is not charged. Every
+/// lane asks one function, `FullView::waives_unheld_penalty`
+/// (`src/replication/full.rs`), at one reviewed site, and names its own lane
+/// there. No other call can withhold the penalty: there is no switch and no
+/// environment override (the switch's names are pinned away in the test
+/// above, and in `tests/fork_pins.rs`).
+///
+/// The possession check after a write that goes unanswered asks nothing: a
+/// full node keeps answering, so only an answer that the key is absent is ever
+/// waived.
+#[test]
+fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
+    const WAIVER: &[(Option<&str>, &str)] = &[(None, "waives_unheld_penalty")];
+    const SITES: &[Reviewed] = &[
+        // A fetch a verified source answered NotFound.
+        (
+            "src/replication/mod.rs",
+            "execute_single_fetch",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A responsible-chunk audit failed only by absent keys, each asked.
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A sole-source replica hint its sender then denied.
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // The possession check after a write, answered with the absent digest.
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A prune audit answered with the absent digest.
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "waives_unheld_penalty",
+            1,
+        ),
+    ];
+    const LANES: &[(Option<&str>, &str)] = &[(Some("Lane"), "*")];
+    const NAMED: &[Reviewed] = &[
+        (
+            "src/replication/mod.rs",
+            "execute_single_fetch",
+            "Lane::Fetch",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "Lane::ResponsibleAudit",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "Lane::ReplicaHint",
+            1,
+        ),
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "Lane::PossessionFailed",
+            1,
+        ),
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "Lane::PruneAudit",
+            1,
+        ),
+    ];
+    let sites = unreviewed(Counting::Calls(WAIVER), SITES);
+    assert!(
+        sites.is_empty(),
+        "\nThe unheld-chunk penalty is waived somewhere other than the reviewed sites.\n\n\
+         {sites}\n\
+         A full peer's penalty is waived in one bounded case, through \
+         FullView::waives_unheld_penalty, asked once on each lane that charges it. A new \
+         site widens the exemption: review it against that case before listing it.\n"
+    );
+
+    let named = unreviewed(Counting::Mentions(LANES), NAMED);
+    assert!(
+        named.is_empty(),
+        "\nA lane asks the waiver under another lane's name, or a lane is named elsewhere.\n\n\
+         {named}\n\
+         Each lane names itself in the case it asks about, so the log says which lane \
+         waived, and the behaviour tests of each lane (src/replication/full.rs, \
+         tests/fork_pins.rs) cover what that lane asks.\n"
     );
 }
 

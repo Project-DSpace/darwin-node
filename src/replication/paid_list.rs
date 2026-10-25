@@ -16,9 +16,10 @@
 //! ## Out-of-range timestamps
 //!
 //! Per-key `PaidOutOfRangeFirstSeen` and `RecordOutOfRangeFirstSeen`
-//! timestamps live in memory only. On restart the hysteresis clock
-//! restarts from zero, which is safe: the prune timer simply starts
-//! fresh.
+//! timestamps live in memory here. The record timestamps are also kept in a
+//! table of their own, `{root}/out_of_range.mdb`, written at the end of each
+//! prune pass and put back at start (see [`super::erasure`]); the paid ones
+//! restart from zero, which is safe: the prune timer simply starts fresh.
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
@@ -347,6 +348,17 @@ impl PaidList {
     /// Returns `None` if the record is currently in range (no timestamp set).
     pub fn record_out_of_range_since(&self, key: &XorName) -> Option<Instant> {
         self.record_out_of_range.read().get(key).copied()
+    }
+
+    /// Every `RecordOutOfRangeFirstSeen` timestamp, for saving across a
+    /// restart (see [`super::erasure`]).
+    #[must_use]
+    pub fn record_out_of_range_entries(&self) -> Vec<(XorName, Instant)> {
+        self.record_out_of_range
+            .read()
+            .iter()
+            .map(|(key, since)| (*key, *since))
+            .collect()
     }
 
     /// Put back a `RecordOutOfRangeFirstSeen` timestamp a removal cleared.

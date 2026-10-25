@@ -765,10 +765,7 @@ fn disk_state(under_pressure: bool) -> DiskRetention {
 fn disk_state_with_floor(under_pressure: bool, floor: Option<XorName>) -> DiskRetention {
     let retention = DiskRetention::new(std::env::temp_dir());
     let available = if under_pressure { 5 } else { 50 };
-    retention.set_space_for_test(Some(DiskSpace {
-        available,
-        total: 100,
-    }));
+    retention.set_space_for_test(Some(DiskSpace::bytes(available, 100)));
     retention.set_floor_for_test(floor);
     retention
 }
@@ -961,10 +958,7 @@ async fn pointer_erasure_goes_farthest_first_and_stops_once_fifteen_percent_is_f
         } else {
             15
         };
-        Some(DiskSpace {
-            available,
-            total: 100,
-        })
+        Some(DiskSpace::bytes(available, 100))
     });
 
     let result = replication(pruner_node)

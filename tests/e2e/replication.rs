@@ -22,7 +22,7 @@ use ant_node::replication::protocol::{
     ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
 };
 use ant_node::replication::pruning;
-use ant_node::replication::retention::{erase_floor, DiskRetention, DiskSpace};
+use ant_node::replication::retention::{erase_floor, DiskRetention, DiskSpace, Floors};
 use ant_node::replication::scheduling::ReplicationQueues;
 use ant_node::replication::types::{NeighborSyncState, RepairProofs};
 use ant_node::storage::{ChunkStore, XorName};
@@ -1436,10 +1436,7 @@ async fn test_audit_absent_key_returns_sentinel() {
 fn test_retention(storage: &ChunkStore, under_pressure: bool) -> DiskRetention {
     let retention = DiskRetention::for_store(storage);
     let available = if under_pressure { 5 } else { 50 };
-    retention.set_space_for_test(Some(DiskSpace {
-        available,
-        total: 100,
-    }));
+    retention.set_space_for_test(Some(DiskSpace::bytes(available, 100)));
     retention.set_floor_for_test(Some([0u8; 32]));
     retention
 }
@@ -1505,6 +1502,7 @@ impl Pruner {
             commitment_state: None,
             audit_challenge_coordinator: &self.audit_challenge_coordinator,
             disk_retention,
+            erasure_epoch: None,
         })
         .await
     }
@@ -1576,6 +1574,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(blocked.records_pruned, 0);
@@ -1605,6 +1604,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(blocked_again.records_pruned, 0);
@@ -1628,6 +1628,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &roomy,
+        erasure_epoch: None,
     })
     .await;
     assert!(!kept.disk_pressure);
@@ -1662,6 +1663,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
             commitment_state: None,
             audit_challenge_coordinator: &audit_challenge_coordinator,
             disk_retention: &within_floor,
+            erasure_epoch: None,
         })
         .await;
         assert!(floored.disk_pressure);
@@ -1688,6 +1690,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &just_beyond,
+        erasure_epoch: None,
     })
     .await;
     assert!(confirmed.disk_pressure);
@@ -1727,6 +1730,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(incomplete.records_pruned, 0);
@@ -1759,6 +1763,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(complete.records_pruned, 1);
@@ -1873,10 +1878,7 @@ async fn chunk_erasure_goes_farthest_first_and_stops_once_fifteen_percent_is_fre
         } else {
             15
         };
-        Some(DiskSpace {
-            available,
-            total: 100,
-        })
+        Some(DiskSpace::bytes(available, 100))
     });
 
     let result = pruner.pass(&config, &disk).await;
@@ -1938,19 +1940,31 @@ async fn the_erase_floor_is_read_from_the_routing_table() {
     let peer = *p2p.peer_id();
 
     let disk = DiskRetention::new(std::env::temp_dir());
-    let floor = disk
-        .floor_from_routing_table(p2p, &peer, close_group_size)
+    let floors = disk
+        .floors_from_routing_table(p2p, &peer, close_group_size)
         .await;
-    assert!(floor.is_some());
+    assert!(floors.penalty.is_some());
     assert_eq!(
-        floor,
+        floors.penalty,
         erase_floor(&id, &known, close_group_size),
         "ten times the distance to the node's second-nearest peer"
     );
     assert_eq!(
-        disk.floor_from_routing_table(p2p, &peer, known.len() + 1)
+        floors.erase, None,
+        "nothing is erased without disk pressure"
+    );
+
+    // 9% free: the falling floor's first step, ten times the distance.
+    disk.set_space_for_test(Some(DiskSpace::bytes(9, 100)));
+    assert!(disk.refresh());
+    let floors = disk
+        .floors_from_routing_table(p2p, &peer, close_group_size)
+        .await;
+    assert_eq!(floors.erase, floors.penalty);
+    assert_eq!(
+        disk.floors_from_routing_table(p2p, &peer, known.len() + 1)
             .await,
-        None,
+        Floors::default(),
         "no floor with fewer peers known than the group"
     );
 
@@ -2037,6 +2051,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         commitment_state: Some(&committed),
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2070,6 +2085,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2174,6 +2190,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
             commitment_state: None,
             audit_challenge_coordinator: &audit_challenge_coordinator,
             disk_retention: &pressured,
+            erasure_epoch: None,
         })
         .await;
         assert_eq!(
@@ -2218,6 +2235,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2290,6 +2308,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(marked.records_marked_out_of_range, 1);
@@ -2313,6 +2332,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(pending.records_marked_out_of_range, 0);
@@ -2339,6 +2359,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(matured.records_candidates, 1);
@@ -2418,6 +2439,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &roomy,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2454,6 +2476,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &roomy,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -3949,6 +3972,69 @@ async fn test_late_joiner_replicates_responsible_chunks() {
             );
         }
     }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Full, not faulty: a node standing in for a peer marked full keeps the
+/// record it would otherwise give up, and is in range for it, not an erase
+/// candidate; once the mark lapses, the record is out of range again.
+///
+/// Five nodes and a close group of two, so the storage-retention width is
+/// four: the pruner is the fifth nearest to the record, just outside it. With
+/// the nearest peer marked full in the pruner's own view, the width is five.
+#[tokio::test]
+#[serial]
+async fn a_stand_in_for_a_full_peer_keeps_the_record_until_the_mark_lapses() {
+    use ant_node::replication::full::{self, FULL_NOTICE_FRESHNESS};
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let pruner_idx = 3;
+    let close_group_size = 2;
+    let config = prune_test_config(close_group_size);
+    let pruner = Pruner::new(&harness, pruner_idx);
+    let (content, address, targets) =
+        find_remote_prune_candidate(&harness, pruner_idx, close_group_size, "stand-in").await;
+    pruner
+        .storage
+        .put(&address, &content)
+        .await
+        .expect("put the record on the pruner");
+    let roomy = test_retention(&pruner.storage, false);
+
+    // The nearest peer is marked full: the pruner stands in for it.
+    let nearest = targets[0];
+    let view = full::view_for(&pruner.peer);
+    view.marks.mark_for_test(nearest, std::time::Instant::now());
+    let kept = pruner.pass(&config, &roomy).await;
+    assert_eq!(kept.records_candidates, 0, "a stand-in is in range");
+    assert!(kept.records_near_full_peers >= 1);
+    assert!(
+        pruner
+            .paid_list
+            .record_out_of_range_since(&address)
+            .is_none(),
+        "no out-of-range clock starts for a record the node stands in for"
+    );
+
+    // The mark lapses: the record is out of range again, its clock started.
+    let lapsed = std::time::Instant::now()
+        .checked_sub(FULL_NOTICE_FRESHNESS + Duration::from_secs(1))
+        .expect("an instant that long ago");
+    view.marks.mark_for_test(nearest, lapsed);
+    let out = pruner.pass(&config, &roomy).await;
+    assert_eq!(out.records_near_full_peers, 0, "a lapsed mark is no mark");
+    assert!(
+        pruner
+            .paid_list
+            .record_out_of_range_since(&address)
+            .is_some(),
+        "the record is out of range once the mark has lapsed"
+    );
+    assert_eq!(out.records_pruned, 0, "and kept while the disk has room");
+    assert!(pruner.holds(&address));
 
     harness.teardown().await.expect("teardown");
 }

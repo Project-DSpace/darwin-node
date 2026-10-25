@@ -1,0 +1,896 @@
+//! Full, not faulty: how a full node tells its peers, and how they
+//! treat it.
+//!
+//! A node is full when it is at the full line and its last prune passes, at
+//! the falling floor's last step, erased nothing and left nothing selected for
+//! erasure untried (see [`super::retention`], [`after_passes`]). A full
+//! node keeps serving and proving what it holds, prices no new data, refuses
+//! every new record, and tells its peers with a one-way "full" notice
+//! ([`FullNotice`]), renewed while it stays full. Its audit and possession
+//! replies keep their format: real digests for the keys it holds, the absent
+//! digest for the keys it lacks.
+//!
+//! Its peers:
+//!
+//! - **Mark it full** only from its own notice. The mark is held locally and
+//!   lapses once the notice is older than [`FULL_NOTICE_FRESHNESS`], unless a
+//!   new one renews it ([`FullMarks`]).
+//! - **Widen their windows around it** ([`widened_len`]). With f peers marked
+//!   full among a key's nearest, hint and fresh-offer targets are the 7 + f
+//!   nearest, and the storage admission and retention width is 9 + f, both
+//!   capped at [`MAX_WIDENED_WIDTH`] (20), the size of the paid-list group
+//!   and of the client's set of nearest nodes (built from the existing
+//!   widths). The nodes standing in for the full node are in
+//!   range, not erase candidates, and the full node stays responsible for
+//!   what it holds.
+//! - **Erase near it** only with the proofs of the 7 nearest nodes not marked
+//!   full (6 of them): a full node that lacks the key is neither a proof nor
+//!   a veto, a full node that holds it still proves it.
+//! - **Waive the unheld-key penalty** for it in one bounded case, through one
+//!   function, [`FullView::waives_unheld_penalty`]: the peer's notice is
+//!   fresh, its answer was that it lacks the key, the check isn't pinned to
+//!   its commitment, this node has never seen it prove it holds that key, and,
+//!   on the possession check after a write, its own quote isn't among the paid
+//!   quotes of the proof. Everything else is charged as before. The bound on
+//!   how long a node may answer "full" without a penalty is how long one
+//!   notice stays fresh: a node that keeps renewing it, prices nothing and
+//!   passes audits of what it holds is never penalised for being full.
+//!
+//! The notice goes only to peers known to read it: a peer whose user agent
+//! names [`FULL_NOTICE_FROM_RELEASE`] or a later release, or one that has
+//! sent a notice itself. Older nodes drop it, keep charging a full node as
+//! before, and don't widen their windows until they update.
+
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+use saorsa_core::identity::PeerId;
+
+use crate::ant_protocol::XorName;
+use crate::replication::config::{NEIGHBOR_SYNC_INTERVAL_MAX, PAID_LIST_CLOSE_GROUP_SIZE};
+
+pub use crate::replication::protocol::FullNotice;
+
+/// How long one "full" notice stays fresh: two of the longest neighbour-sync
+/// intervals.
+///
+/// This is the bound on how long a node may answer "full" without the
+/// unheld-key penalty: a peer's mark lapses this long after its last notice,
+/// and the penalty applies again from then.
+pub const FULL_NOTICE_FRESHNESS: Duration =
+    Duration::from_secs(2 * NEIGHBOR_SYNC_INTERVAL_MAX.as_secs());
+
+/// How many notices a full node sends inside one freshness window: it renews
+/// at this fraction of [`FULL_NOTICE_FRESHNESS`], so a mark survives three
+/// lost notices in a row.
+pub const FULL_NOTICE_RENEWALS_PER_WINDOW: u32 = 4;
+
+/// The first release whose nodes read the "full" notice: its `+ds.<n>` build
+/// number.
+///
+/// A full node sends the notice to a peer whose user agent names this release
+/// or a later one, and to a peer that has sent one itself.
+pub const FULL_NOTICE_FROM_RELEASE: u64 = 17;
+
+/// The most a widened window grows to: the paid-list group, and the client's
+/// set of nearest nodes.
+pub const MAX_WIDENED_WIDTH: usize = PAID_LIST_CLOSE_GROUP_SIZE;
+
+/// The most peers whose "full" mark a node holds at once. A node is told only
+/// by its neighbours, far fewer than this; past it the stalest mark goes.
+const MAX_FULL_MARKS: usize = 1024;
+
+/// The most peers a node remembers as readers of the notice from their own
+/// notices.
+const MAX_KNOWN_READERS: usize = 4096;
+
+/// How long one "full" notice stays fresh in this process: the
+/// `test-utils` seam's value when a test set one, otherwise
+/// [`FULL_NOTICE_FRESHNESS`].
+#[must_use]
+pub fn full_notice_freshness() -> Duration {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(freshness) = crate::test_seams::full_freshness() {
+        return freshness;
+    }
+    FULL_NOTICE_FRESHNESS
+}
+
+/// How often a full node renews its notice.
+#[must_use]
+pub fn full_notice_renewal() -> Duration {
+    full_notice_freshness() / FULL_NOTICE_RENEWALS_PER_WINDOW
+}
+
+/// The first release whose nodes read the notice in this process: the
+/// `test-utils` seam's value when a test set one, otherwise
+/// [`FULL_NOTICE_FROM_RELEASE`].
+#[must_use]
+pub fn full_notice_from_release() -> u64 {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(release) = crate::test_seams::full_notice_from_release() {
+        return release;
+    }
+    FULL_NOTICE_FROM_RELEASE
+}
+
+/// Whether `user_agent` is a node's of a release that reads the notice:
+/// `node/<version>+ds.<n>[...]` with `n` at least `from_release`. An agent of
+/// no release this fork numbers counts as old.
+#[must_use]
+pub fn agent_reads_full_notice(user_agent: &str, from_release: u64) -> bool {
+    user_agent
+        .strip_prefix("node/")
+        .and_then(|version| semver::Version::parse(version).ok())
+        .and_then(|version| {
+            version
+                .build
+                .as_str()
+                .strip_prefix("ds.")
+                .and_then(|release| release.split('.').next())
+                .and_then(|release| release.parse::<u64>().ok())
+        })
+        .is_some_and(|release| release >= from_release)
+}
+
+/// How many of `nearest`, sorted nearest first, a window of `base` holds
+/// once widened past the peers marked full.
+///
+/// The nearest prefix that holds `base` entries not marked full, at most
+/// [`MAX_WIDENED_WIDTH`]. With f marked full inside it, that is `base + f`.
+#[must_use]
+pub fn widened_len<T>(nearest: &[T], base: usize, is_full: impl Fn(&T) -> bool) -> usize {
+    let mut not_full = 0usize;
+    for (index, entry) in nearest.iter().enumerate() {
+        if index >= MAX_WIDENED_WIDTH || not_full >= base {
+            return index;
+        }
+        if !is_full(entry) {
+            not_full += 1;
+        }
+    }
+    nearest.len().min(MAX_WIDENED_WIDTH)
+}
+
+/// The peers marked full from their own notices, and the peers known to read
+/// the notice because they sent one.
+#[derive(Debug, Default)]
+pub struct FullMarks {
+    /// When each peer marked full last sent its notice.
+    marks: Mutex<HashMap<PeerId, Instant>>,
+    /// Peers that sent a notice, full or not, so read the notice.
+    readers: Mutex<HashMap<PeerId, Instant>>,
+}
+
+impl FullMarks {
+    /// Note `peer`'s own notice, received at `now`: it is full, or it has
+    /// left "full". Only the peer's own notice reaches this.
+    pub fn note_notice(&self, peer: PeerId, full: bool, now: Instant) {
+        {
+            let mut readers = self.readers.lock();
+            insert_bounded(&mut readers, peer, now, MAX_KNOWN_READERS);
+        }
+        let mut marks = self.marks.lock();
+        if full {
+            insert_bounded(&mut marks, peer, now, MAX_FULL_MARKS);
+        } else {
+            marks.remove(&peer);
+        }
+    }
+
+    /// Whether `peer` is marked full at `now`: its last notice said full and
+    /// is younger than [`full_notice_freshness`]. A lapsed mark counts as no
+    /// mark.
+    #[must_use]
+    pub fn is_marked(&self, peer: &PeerId, now: Instant) -> bool {
+        let freshness = full_notice_freshness();
+        self.marks
+            .lock()
+            .get(peer)
+            .is_some_and(|noticed| now.saturating_duration_since(*noticed) < freshness)
+    }
+
+    /// The peers marked full at `now`, lapsed marks dropped.
+    #[must_use]
+    pub fn marked(&self, now: Instant) -> Vec<PeerId> {
+        let freshness = full_notice_freshness();
+        let mut marks = self.marks.lock();
+        marks.retain(|_, noticed| now.saturating_duration_since(*noticed) < freshness);
+        marks.keys().copied().collect()
+    }
+
+    /// [`Self::marked`], as a set.
+    #[must_use]
+    pub fn marked_set(&self, now: Instant) -> std::collections::HashSet<PeerId> {
+        self.marked(now).into_iter().collect()
+    }
+
+    /// Whether `peer` has sent a notice, and so reads one.
+    #[must_use]
+    pub fn sent_a_notice(&self, peer: &PeerId) -> bool {
+        self.readers.lock().contains_key(peer)
+    }
+
+    /// Forget `peer`: it left the routing table.
+    pub fn forget(&self, peer: &PeerId) {
+        self.marks.lock().remove(peer);
+        self.readers.lock().remove(peer);
+    }
+
+    /// Mark `peer` full as if its notice had arrived at `at`. Tests only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn mark_for_test(&self, peer: PeerId, at: Instant) {
+        self.marks.lock().insert(peer, at);
+    }
+}
+
+/// Insert into a map bounded at `cap`, dropping the stalest entry first.
+fn insert_bounded(map: &mut HashMap<PeerId, Instant>, peer: PeerId, now: Instant, cap: usize) {
+    if map.len() >= cap && !map.contains_key(&peer) {
+        if let Some(stalest) = map
+            .iter()
+            .min_by_key(|(_, noticed)| **noticed)
+            .map(|(peer, _)| *peer)
+        {
+            map.remove(&stalest);
+        }
+    }
+    map.insert(peer, now);
+}
+
+/// Bits in the record of keys peers were seen proving: 2 MiB.
+const SEEN_BITS: usize = 1 << 24;
+/// Hashes per entry.
+const SEEN_HASHES: u64 = 3;
+/// 64-bit words of [`SEEN_BITS`].
+const SEEN_WORDS: usize = SEEN_BITS / 64;
+
+/// The keys this node has seen each peer prove it holds: a digest matched
+/// against this node's own copy, or a fetch served with the right bytes.
+///
+/// A Bloom filter of fixed size, so it never forgets a proof it recorded: it
+/// can only answer "seen" for a pair it never saw, and that answer charges
+/// the penalty, as for any node. As it fills, the waiver applies less often,
+/// never more. Process-local: a restart starts it empty.
+pub struct SeenHolders {
+    hasher: RandomState,
+    bits: OnceLock<Box<[AtomicU64]>>,
+    recorded: AtomicU64,
+}
+
+impl Default for SeenHolders {
+    fn default() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            bits: OnceLock::new(),
+            recorded: AtomicU64::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for SeenHolders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeenHolders")
+            .field("recorded", &self.recorded.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl SeenHolders {
+    fn positions(&self, peer: &PeerId, key: &XorName) -> impl Iterator<Item = usize> {
+        let hash = self.hasher.hash_one((peer.as_bytes(), key));
+        let first = hash & 0xFFFF_FFFF;
+        let step = (hash >> 32) | 1;
+        (0..SEEN_HASHES).map(move |i| {
+            let position = first.wrapping_add(i.wrapping_mul(step)) % (SEEN_BITS as u64);
+            usize::try_from(position).unwrap_or(0)
+        })
+    }
+
+    fn words(&self) -> &[AtomicU64] {
+        self.bits
+            .get_or_init(|| (0..SEEN_WORDS).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    /// Record that `peer` proved it holds `key`.
+    pub fn record(&self, peer: &PeerId, key: &XorName) {
+        let words = self.words();
+        for position in self.positions(peer, key) {
+            if let Some(word) = words.get(position / 64) {
+                word.fetch_or(1 << (position % 64), Ordering::Relaxed);
+            }
+        }
+        self.recorded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether `peer` may have proved it holds `key` before: `false` only
+    /// when it never has, to this node's knowledge.
+    #[must_use]
+    pub fn may_have_seen(&self, peer: &PeerId, key: &XorName) -> bool {
+        let Some(words) = self.bits.get() else {
+            return false;
+        };
+        self.positions(peer, key).all(|position| {
+            words
+                .get(position / 64)
+                .is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (position % 64)) != 0)
+        })
+    }
+}
+
+/// The lanes that charge a peer for not holding a key it should, as the lane
+/// census lists them (`src/replication/retention/census.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// A fetch a verified source couldn't serve.
+    Fetch,
+    /// A responsible-chunk audit the peer failed.
+    ResponsibleAudit,
+    /// A sole-source replica hint its sender then denied.
+    ReplicaHint,
+    /// The possession check after a write, unanswered.
+    PossessionNoAnswer,
+    /// The possession check after a write, answered wrongly.
+    PossessionFailed,
+    /// A prune audit the peer failed.
+    PruneAudit,
+}
+
+impl Lane {
+    /// Every lane, in the census's order.
+    pub const ALL: [Self; 6] = [
+        Self::Fetch,
+        Self::ResponsibleAudit,
+        Self::ReplicaHint,
+        Self::PossessionNoAnswer,
+        Self::PossessionFailed,
+        Self::PruneAudit,
+    ];
+
+    /// The lane's name in logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::ResponsibleAudit => "responsible_audit",
+            Self::ReplicaHint => "replica_hint",
+            Self::PossessionNoAnswer => "possession_no_answer",
+            Self::PossessionFailed => "possession_failed",
+            Self::PruneAudit => "prune_audit",
+        }
+    }
+}
+
+/// What the peer answered about the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnheldAnswer {
+    /// That it doesn't hold the key: the absent digest, "not found", or a
+    /// denial in a verification answer.
+    Absent,
+    /// Anything else: no answer, a wrong digest, an error, a malformed or
+    /// refused reply.
+    Other,
+}
+
+/// Whether the peer's own quote is among the paid quotes of the proof the
+/// checker holds, on the possession check after a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnQuote {
+    /// Not a check after a write: there is no proof to look in.
+    NoProof,
+    /// The proof's paid quotes are known, and the peer's isn't among them.
+    NotPaid,
+    /// The peer's quote is among the paid quotes, or the proof couldn't be
+    /// read: the peer is charged.
+    PaidOrUnknown,
+}
+
+/// One case of a peer not holding a key it should, on one lane.
+#[derive(Debug, Clone, Copy)]
+pub struct UnheldCase<'a> {
+    /// The lane that found it.
+    pub lane: Lane,
+    /// The peer.
+    pub peer: &'a PeerId,
+    /// The key.
+    pub key: &'a XorName,
+    /// What the peer answered.
+    pub answer: UnheldAnswer,
+    /// Whether the check is pinned to the peer's commitment.
+    pub commitment_pinned: bool,
+    /// Whether the peer was paid for the key, on a check after a write.
+    pub own_quote: OwnQuote,
+}
+
+/// What a node knows of its peers' "full" state: the marks, and the keys it
+/// has seen each peer prove it holds.
+#[derive(Debug, Default)]
+pub struct FullView {
+    /// The peers marked full.
+    pub marks: FullMarks,
+    /// The keys peers were seen proving.
+    pub seen: SeenHolders,
+    /// Keys whose verification found fewer than 4 holders present, since the
+    /// last prune pass took the count.
+    few_holders: AtomicU64,
+}
+
+impl FullView {
+    /// Note `count` keys whose verification found fewer than 4 holders.
+    pub fn note_few_holders(&self, count: u64) {
+        self.few_holders.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// The keys found with fewer than 4 holders since the last call.
+    pub fn take_few_holders(&self) -> u64 {
+        self.few_holders.swap(0, Ordering::Relaxed)
+    }
+
+    /// Whether the unheld-key penalty is waived for `case` at `now`.
+    ///
+    /// The one place every lane asks. Waived only when all of these hold: the
+    /// peer's "full" notice is fresh; it answered that it lacks the key; the
+    /// check isn't pinned to its commitment; this node has never seen it
+    /// prove it holds that key; and, on the possession check after a write,
+    /// its own quote isn't among the paid quotes of the proof. A node paid for
+    /// a record it then can't take is charged, and so is everything else.
+    #[must_use]
+    pub fn waives_unheld_penalty(&self, case: &UnheldCase<'_>, now: Instant) -> bool {
+        let waived = case.answer == UnheldAnswer::Absent
+            && !case.commitment_pinned
+            && case.own_quote != OwnQuote::PaidOrUnknown
+            && self.marks.is_marked(case.peer, now)
+            && !self.seen.may_have_seen(case.peer, case.key);
+        if waived {
+            crate::logging::debug!(
+                lane = case.lane.as_str(),
+                peer = %case.peer,
+                key = %hex::encode(case.key),
+                "Not charging a full peer for a key it doesn't hold: its full notice is fresh, \
+                 it was never seen holding the key, and it was not paid for it"
+            );
+        }
+        waived
+    }
+}
+
+static VIEWS: std::sync::LazyLock<Mutex<HashMap<[u8; 32], std::sync::Weak<FullView>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register `view` as what the node `self_id` knows of its peers' "full"
+/// state, for the code that reaches it by the node's id (the lanes, the
+/// prune passes, and the paths that widen windows).
+pub fn register_view(self_id: &PeerId, view: &std::sync::Arc<FullView>) {
+    let mut views = VIEWS.lock();
+    views.retain(|_, view| view.strong_count() > 0);
+    views.insert(*self_id.as_bytes(), std::sync::Arc::downgrade(view));
+}
+
+/// What the node `self_id` knows of its peers' "full" state: an empty view,
+/// with no marks, for a node with no replication engine running, so it
+/// widens nothing and waives nothing.
+#[must_use]
+pub fn view_for(self_id: &PeerId) -> std::sync::Arc<FullView> {
+    VIEWS
+        .lock()
+        .get(self_id.as_bytes())
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap_or_default()
+}
+
+/// The paid quotes of a proof, as the issuers' peer ids.
+///
+/// Every quote at the median price, the one the client pays for (more than
+/// one when prices tie). `None` when the proof can't be read as a single-node
+/// proof.
+#[must_use]
+pub fn paid_quote_issuers(proof_of_payment: &[u8]) -> Option<Vec<PeerId>> {
+    let (proof, _) = crate::payment::deserialize_proof(proof_of_payment).ok()?;
+    let mut prices: Vec<_> = proof
+        .peer_quotes
+        .iter()
+        .map(|(_, quote)| quote.price)
+        .collect();
+    if prices.is_empty() {
+        return None;
+    }
+    prices.sort_unstable();
+    let median = *prices.get(prices.len() / 2)?;
+    Some(
+        proof
+            .peer_quotes
+            .iter()
+            .filter(|(_, quote)| quote.price == median)
+            .map(|(peer, _)| PeerId::from_bytes(*peer.as_bytes()))
+            .collect(),
+    )
+}
+
+/// The [`OwnQuote`] of `peer`, for a check after a write whose proof's paid
+/// quotes are `paid` (`None`: unreadable).
+#[must_use]
+pub fn own_quote(peer: &PeerId, paid: Option<&[PeerId]>) -> OwnQuote {
+    match paid {
+        Some(paid) if !paid.contains(peer) => OwnQuote::NotPaid,
+        _ => OwnQuote::PaidOrUnknown,
+    }
+}
+
+/// The targets of replica hints and fresh offers for `key`: its close group,
+/// widened past the peers marked full.
+///
+/// From `p2p_node`'s local routing table, the node itself included, nearest
+/// first, widened by one for each peer in `marked` (marked full) inside it, at
+/// most [`MAX_WIDENED_WIDTH`]. With no peer marked, the close group.
+pub async fn widened_close_group_with<S: BuildHasher + Sync>(
+    p2p_node: &saorsa_core::P2PNode,
+    key: &XorName,
+    close_group_size: usize,
+    marked: &std::collections::HashSet<PeerId, S>,
+) -> Vec<PeerId> {
+    let dht = p2p_node.dht_manager();
+    if marked.is_empty() {
+        return dht
+            .find_closest_nodes_local_with_self(key, close_group_size)
+            .await
+            .into_iter()
+            .map(|node| node.peer_id)
+            .collect();
+    }
+    let mut nearest: Vec<PeerId> = dht
+        .find_closest_nodes_local_with_self(key, MAX_WIDENED_WIDTH)
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .collect();
+    let width = widened_len(&nearest, close_group_size, |peer| marked.contains(peer));
+    nearest.truncate(width);
+    nearest
+}
+
+/// [`widened_close_group_with`] the peers `p2p_node` marks full now.
+pub async fn widened_close_group(
+    p2p_node: &saorsa_core::P2PNode,
+    key: &XorName,
+    close_group_size: usize,
+) -> Vec<PeerId> {
+    let marked = view_for(p2p_node.peer_id())
+        .marks
+        .marked_set(Instant::now());
+    widened_close_group_with(p2p_node, key, close_group_size, &marked).await
+}
+
+/// How many of its nearest peers a full node tells: two k-buckets, so the
+/// nodes that check what it holds hear it, prune auditors a little farther
+/// out among them.
+pub const FULL_NOTICE_PEERS: usize = 2 * crate::replication::config::K_BUCKET_SIZE;
+
+/// After a node's prune passes of one epoch, enter or leave "full".
+///
+/// A node enters "full" at the line when the passes ran at the falling
+/// floor's last step, erased nothing (`erased`) and left no record selected
+/// for erasure waiting for its first try (`waiting`, see
+/// [`super::erasure::ErasureGate::waiting_at`]): nothing it may erase now is
+/// left. Records still in their out-of-range wait aren't eligible, and one
+/// whose possession check failed is tried again later, so neither keeps a
+/// node from being full. It leaves only with
+/// [`LEAVE_FULL_MARGIN`](crate::replication::retention::LEAVE_FULL_MARGIN) of
+/// room above the line. Returns the new state when it changed; the caller
+/// tells the node's peers.
+pub fn after_passes(
+    storage: &crate::storage::ChunkStore,
+    retention: &crate::replication::retention::DiskRetention,
+    erased: usize,
+    waiting: usize,
+) -> Option<bool> {
+    if storage.is_full() {
+        return leave_if_room(storage, retention);
+    }
+    let trigger = retention.at_the_line()?;
+    if retention.step() != Some(crate::replication::retention::LAST_FLOOR_STEP)
+        || erased > 0
+        || waiting > 0
+    {
+        return None;
+    }
+    let state = storage.enter_full(trigger)?;
+    let since = state
+        .since
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let free = retention.last_space().map_or(0, |space| space.available);
+    crate::logging::info!(
+        full = 1,
+        since,
+        trigger = state.trigger.as_str(),
+        free_bytes = free,
+        line_bytes = retention.line(),
+        "Node full: since {since}, at the full line by {} with nothing it may erase now. Full, \
+         not faulty: it prices and takes no new data, keeps serving and proving what it holds, \
+         and tells its peers. Add disk, or lower NODE_COUNT",
+        state.trigger.as_str()
+    );
+    Some(true)
+}
+
+/// Leave "full" if the node has the room to: [`LEAVE_FULL_MARGIN`] above the
+/// line, measured again now. Returns `Some(false)` when it left.
+///
+/// [`LEAVE_FULL_MARGIN`]: crate::replication::retention::LEAVE_FULL_MARGIN
+pub fn leave_if_room(
+    storage: &crate::storage::ChunkStore,
+    retention: &crate::replication::retention::DiskRetention,
+) -> Option<bool> {
+    if !storage.is_full() {
+        return None;
+    }
+    retention.refresh();
+    let space = retention.last_space()?;
+    if !crate::replication::retention::may_leave_full(space, retention.line()) {
+        return None;
+    }
+    let state = storage.leave_full()?;
+    let full_for = state.since.elapsed().map_or(0, |d| d.as_secs());
+    crate::logging::info!(
+        full = 0,
+        full_for_secs = full_for,
+        free_bytes = space.available,
+        line_bytes = retention.line(),
+        "Node full: no longer, after {full_for}s; {} bytes free, room above the full line \
+         again, so it prices and takes new data",
+        space.available
+    );
+    Some(false)
+}
+
+/// Tell this node's nearest peers that read it whether it is full.
+///
+/// Its [`FULL_NOTICE_PEERS`] nearest, each only if its user agent names a
+/// release that reads the notice, or it sent one itself. One-way. Returns how
+/// many were told.
+pub async fn send_full_notice(p2p_node: &saorsa_core::P2PNode, full: bool) -> usize {
+    use crate::replication::config::REPLICATION_PROTOCOL_ID;
+    use crate::replication::protocol::{ReplicationMessage, ReplicationMessageBody};
+
+    let self_id = *p2p_node.peer_id();
+    let view = view_for(&self_id);
+    let from_release = full_notice_from_release();
+    let msg = ReplicationMessage {
+        request_id: rand::random(),
+        body: ReplicationMessageBody::FullNotice(FullNotice { full }),
+    };
+    let Ok(bytes) = msg.encode() else {
+        return 0;
+    };
+    let peers = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local(self_id.as_bytes(), FULL_NOTICE_PEERS)
+        .await;
+    let mut told = 0usize;
+    for node in peers {
+        let peer = node.peer_id;
+        let reads = view.marks.sent_a_notice(&peer)
+            || p2p_node
+                .transport()
+                .peer_user_agent(&peer)
+                .await
+                .is_some_and(|agent| agent_reads_full_notice(&agent, from_release));
+        if !reads {
+            continue;
+        }
+        if p2p_node
+            .send_message(&peer, REPLICATION_PROTOCOL_ID, bytes.clone(), &[])
+            .await
+            .is_ok()
+        {
+            told += 1;
+        }
+    }
+    crate::logging::debug!(
+        "Told {told} peers that this node is {}full",
+        if full { "" } else { "no longer " }
+    );
+    told
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn peer(n: u8) -> PeerId {
+        PeerId::from_bytes([n; 32])
+    }
+
+    #[test]
+    fn the_freshness_is_two_of_the_longest_sync_intervals() {
+        assert_eq!(FULL_NOTICE_FRESHNESS, Duration::from_mins(40));
+        assert_eq!(full_notice_renewal(), Duration::from_mins(10));
+        assert_eq!(MAX_WIDENED_WIDTH, 20);
+    }
+
+    #[test]
+    fn nodes_of_the_release_with_the_notice_and_later_read_it() {
+        for agent in [
+            "node/0.23.0+ds.17",
+            "node/0.23.0+ds.17.image.abc123",
+            "node/0.24.0+ds.18",
+            "node/1.0.0+ds.100",
+        ] {
+            assert!(agent_reads_full_notice(agent, 17), "{agent}");
+        }
+        for agent in [
+            "node/0.23.0+ds.15",
+            "node/0.23.0+ds.16.image.abc123",
+            "node/0.23.0",
+            "client/0.23.0+ds.17",
+            "node/0.23.0+ds.",
+            "node/garbage",
+            "",
+        ] {
+            assert!(!agent_reads_full_notice(agent, 17), "{agent}");
+        }
+        assert_eq!(FULL_NOTICE_FROM_RELEASE, 17);
+    }
+
+    #[test]
+    fn a_window_widens_by_one_for_each_full_peer_inside_it() {
+        let full = |n: &u8| *n % 2 == 1;
+        let nearest: Vec<u8> = (0..30).collect();
+        // Odd entries full: 7 not full needs 13 entries (0..=12, six odd).
+        assert_eq!(widened_len(&nearest, 7, full), 13);
+        // Nobody full: the base.
+        assert_eq!(widened_len(&nearest, 7, |_| false), 7);
+        assert_eq!(widened_len(&nearest, 9, |_| false), 9);
+        // f full among the nearest: base + f.
+        for f in 0..=4u8 {
+            let marked = |n: &u8| *n < f;
+            assert_eq!(widened_len(&nearest, 7, marked), 7 + usize::from(f));
+            assert_eq!(widened_len(&nearest, 9, marked), 9 + usize::from(f));
+        }
+        // Capped at 20.
+        assert_eq!(widened_len(&nearest, 9, |n| *n < 15), 20);
+        assert_eq!(widened_len(&nearest, 7, |_| true), 20);
+        // Short lists end where they end.
+        assert_eq!(widened_len(&nearest[..5], 7, |_| false), 5);
+    }
+
+    #[test]
+    fn a_mark_comes_from_the_peers_notice_and_lapses_unless_renewed() {
+        let marks = FullMarks::default();
+        let now = Instant::now();
+        let a = peer(1);
+        assert!(!marks.is_marked(&a, now));
+        assert!(!marks.sent_a_notice(&a));
+
+        marks.note_notice(a, true, now);
+        assert!(marks.is_marked(&a, now));
+        assert!(marks.sent_a_notice(&a));
+        let freshness = full_notice_freshness();
+        assert!(marks.is_marked(&a, now + freshness.saturating_sub(Duration::from_secs(1))));
+        assert!(
+            !marks.is_marked(&a, now + freshness),
+            "a lapsed mark counts as no mark"
+        );
+        assert_eq!(marks.marked(now + freshness), Vec::<PeerId>::new());
+
+        // Renewed.
+        marks.note_notice(a, true, now + freshness / 2);
+        assert!(marks.is_marked(&a, now + freshness));
+
+        // Left "full": cleared at once, still a reader.
+        marks.note_notice(a, false, now + freshness);
+        assert!(!marks.is_marked(&a, now + freshness));
+        assert!(marks.sent_a_notice(&a));
+    }
+
+    #[test]
+    fn the_marks_are_bounded() {
+        let marks = FullMarks::default();
+        let start = Instant::now();
+        for i in 0..=MAX_FULL_MARKS {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            marks.note_notice(
+                PeerId::from_bytes(bytes),
+                true,
+                start + Duration::from_millis(i as u64),
+            );
+        }
+        assert_eq!(marks.marks.lock().len(), MAX_FULL_MARKS);
+        assert!(
+            !marks.is_marked(&PeerId::from_bytes([0u8; 32]), start),
+            "the stalest mark went first"
+        );
+    }
+
+    #[test]
+    fn a_proof_once_seen_is_never_forgotten() {
+        let seen = SeenHolders::default();
+        let key = [7u8; 32];
+        assert!(!seen.may_have_seen(&peer(1), &key));
+        seen.record(&peer(1), &key);
+        assert!(seen.may_have_seen(&peer(1), &key));
+        assert!(!seen.may_have_seen(&peer(2), &key), "per peer");
+        assert!(!seen.may_have_seen(&peer(1), &[8u8; 32]), "per key");
+        for n in 0..10_000u32 {
+            let mut other = [0u8; 32];
+            other[..4].copy_from_slice(&n.to_be_bytes());
+            seen.record(&peer(3), &other);
+        }
+        assert!(seen.may_have_seen(&peer(1), &key));
+    }
+
+    fn case<'a>(peer: &'a PeerId, key: &'a XorName, lane: Lane) -> UnheldCase<'a> {
+        UnheldCase {
+            lane,
+            peer,
+            key,
+            answer: UnheldAnswer::Absent,
+            commitment_pinned: false,
+            own_quote: OwnQuote::NoProof,
+        }
+    }
+
+    #[test]
+    fn the_waiver_holds_only_when_every_condition_does() {
+        let view = FullView::default();
+        let now = Instant::now();
+        let a = peer(1);
+        let key = [9u8; 32];
+        for lane in Lane::ALL {
+            let base = case(&a, &key, lane);
+            assert!(
+                !view.waives_unheld_penalty(&base, now),
+                "no notice: charged"
+            );
+        }
+        view.marks.note_notice(a, true, now);
+        for lane in Lane::ALL {
+            let base = case(&a, &key, lane);
+            assert!(view.waives_unheld_penalty(&base, now), "{lane:?}");
+            let stale = now + full_notice_freshness();
+            assert!(!view.waives_unheld_penalty(&base, stale), "stale notice");
+            let pinned = UnheldCase {
+                commitment_pinned: true,
+                ..base
+            };
+            assert!(!view.waives_unheld_penalty(&pinned, now), "pinned");
+            let other = UnheldCase {
+                answer: UnheldAnswer::Other,
+                ..base
+            };
+            assert!(!view.waives_unheld_penalty(&other, now), "not absent");
+            let paid = UnheldCase {
+                own_quote: OwnQuote::PaidOrUnknown,
+                ..base
+            };
+            assert!(!view.waives_unheld_penalty(&paid, now), "paid");
+            let unpaid = UnheldCase {
+                own_quote: OwnQuote::NotPaid,
+                ..base
+            };
+            assert!(view.waives_unheld_penalty(&unpaid, now), "not paid");
+        }
+        view.seen.record(&a, &key);
+        assert!(
+            !view.waives_unheld_penalty(&case(&a, &key, Lane::Fetch), now),
+            "seen holding it"
+        );
+        assert!(view.waives_unheld_penalty(&case(&a, &[10u8; 32], Lane::Fetch), now));
+    }
+
+    #[test]
+    fn only_a_paid_quote_or_an_unreadable_proof_charges() {
+        let paid = [peer(1), peer(2)];
+        assert_eq!(own_quote(&peer(1), Some(&paid)), OwnQuote::PaidOrUnknown);
+        assert_eq!(own_quote(&peer(3), Some(&paid)), OwnQuote::NotPaid);
+        assert_eq!(own_quote(&peer(3), None), OwnQuote::PaidOrUnknown);
+        assert_eq!(paid_quote_issuers(b"not a proof"), None);
+    }
+}

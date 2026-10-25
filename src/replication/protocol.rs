@@ -243,6 +243,15 @@ pub enum ReplicationMessageBody {
     PointerStateRequest(PointerStateRequest),
     /// Response to [`Self::PointerStateRequest`].
     PointerStateResponse(PointerStateResponse),
+
+    // === Full, not faulty ===
+    // APPENDED for the same reason. A peer built before it cannot decode it
+    // and drops it. It is one-way, and sent only to a peer known to read it
+    // (see `full::agent_reads_full_notice`), so silence, a decode failure or
+    // a timeout never counts against anyone.
+    /// The sender is full, or has left "full": its own word, renewed while it
+    /// stays full.
+    FullNotice(FullNotice),
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +270,7 @@ pub enum ReplicationMessageBody {
 // modules that do not carry any shared engine handle.
 
 /// Number of [`ReplicationMessageBody`] variants (the counter-table width).
-pub(crate) const N_REPLICATION_VARIANTS: usize = 23;
+pub(crate) const N_REPLICATION_VARIANTS: usize = 24;
 
 static REPL_TX_BYTES: [AtomicU64; N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
@@ -302,6 +311,7 @@ impl ReplicationMessageBody {
             Self::PointerFetchResponse(_) => 20,
             Self::PointerStateRequest(_) => 21,
             Self::PointerStateResponse(_) => 22,
+            Self::FullNotice(_) => 23,
         }
     }
 
@@ -368,7 +378,7 @@ impl BodyFamily {
 pub(crate) fn family_of_variant(index: usize) -> Option<BodyFamily> {
     match index {
         11..=14 => Some(BodyFamily::SubtreeAudit),
-        0..=10 | 15..=22 => Some(BodyFamily::Core),
+        0..=10 | 15..=23 => Some(BodyFamily::Core),
         _ => None,
     }
 }
@@ -659,6 +669,13 @@ pub(crate) fn log_traffic_summary() {
         pointer_state_request_rx_bytes = rb(21), pointer_state_request_rx_count = rc(21),
         pointer_state_response_tx_bytes = tb(22), pointer_state_response_tx_count = tc(22),
         pointer_state_response_rx_bytes = rb(22), pointer_state_response_rx_count = rc(22),
+        "replication traffic summary (cumulative)"
+    );
+    crate::logging::info!(
+        target: "ant_node::replication::traffic",
+        group = 5,
+        full_notice_tx_bytes = tb(23), full_notice_tx_count = tc(23),
+        full_notice_rx_bytes = rb(23), full_notice_rx_count = rc(23),
         "replication traffic summary (cumulative)"
     );
 }
@@ -1150,6 +1167,22 @@ pub struct PointerStateRequest {
 pub struct PointerStateResponse {
     /// One entry per requested address, in order: the state held, or `None`.
     pub states: Vec<Option<PointerStateSummary>>,
+}
+
+// ---------------------------------------------------------------------------
+// Full, not faulty
+// ---------------------------------------------------------------------------
+
+/// A node's own word that it is full, or has left "full".
+///
+/// One-way: nothing answers it. A full node sends it on entering "full" and
+/// renews it while it stays full, so its peers' marks stay fresh; it sends it
+/// once more, `full: false`, on leaving. A peer is marked full only from its
+/// own notice, and the mark lapses once the notice is no longer fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullNotice {
+    /// Whether the sender is full.
+    pub full: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1787,6 +1820,7 @@ mod tests {
             }),
             ReplicationMessageBody::PointerStateRequest(PointerStateRequest { addresses: vec![] }),
             ReplicationMessageBody::PointerStateResponse(PointerStateResponse { states: vec![] }),
+            ReplicationMessageBody::FullNotice(FullNotice { full: true }),
         ]
     }
 
@@ -1984,9 +2018,10 @@ mod tests {
     fn an_undeclared_variant_index_classifies_as_nothing() {
         let declared = all_bodies().len();
         assert_eq!(
-            declared, 23,
+            declared, N_REPLICATION_VARIANTS,
             "update this test's bounds when a variant is added or removed"
         );
+        assert_eq!(declared, 24);
         for index in [declared, declared + 1, 99, usize::MAX] {
             assert_eq!(
                 family_of_variant(index),
@@ -2966,5 +3001,90 @@ mod tests {
         let display = err.to_string();
         assert!(display.contains("20000000"));
         assert!(display.contains(&MAX_REPLICATION_MESSAGE_SIZE.to_string()));
+    }
+
+    // === Full, not faulty ===
+
+    /// `ReplicationMessageBody` as a node of the release before the "full"
+    /// notice declares it, 23 variants, in a message as such a node decodes
+    /// one. Unit variants stand in for their contents, which postcard reads
+    /// only after the index, and leaves unread here.
+    mod before_full_notice {
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        pub(super) enum Body {
+            FreshReplicationOffer,
+            FreshReplicationResponse,
+            PaidNotify,
+            NeighborSyncRequest,
+            NeighborSyncResponse,
+            VerificationRequest,
+            VerificationResponse,
+            FetchRequest,
+            FetchResponse,
+            AuditChallenge,
+            AuditResponse,
+            SubtreeAuditChallenge,
+            SubtreeAuditResponse,
+            SubtreeSliceChallenge,
+            SubtreeSliceResponse,
+            GetCommitmentByPin,
+            GetCommitmentByPinResponse,
+            PointerFreshOffer,
+            PointerHints,
+            PointerFetchRequest,
+            PointerFetchResponse,
+            PointerStateRequest,
+            PointerStateResponse,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        pub(super) struct Message {
+            pub request_id: u64,
+            pub body: Body,
+        }
+    }
+
+    /// The notice is appended: every earlier body keeps the index a node of
+    /// the release before it reads, and that node fails to decode the notice,
+    /// so it drops it without acting on it.
+    #[test]
+    fn a_node_before_the_full_notice_reads_every_earlier_body_and_drops_the_notice() {
+        for body in all_bodies() {
+            let index = body.variant_index();
+            let encoded = ReplicationMessage {
+                request_id: 7,
+                body,
+            }
+            .encode()
+            .expect("encode");
+            let old = postcard::from_bytes::<before_full_notice::Message>(&encoded);
+            if index < 23 {
+                assert!(old.is_ok(), "index {index} must still decode: {old:?}");
+            } else {
+                assert!(old.is_err(), "the notice must not decode as anything old");
+            }
+        }
+    }
+
+    /// The notice's bytes: the request id, the body's index 23, the flag.
+    #[test]
+    fn a_full_notice_keeps_its_bytes() {
+        for (full, flag) in [(true, 1u8), (false, 0u8)] {
+            let msg = ReplicationMessage {
+                request_id: 7,
+                body: ReplicationMessageBody::FullNotice(FullNotice { full }),
+            };
+            let encoded = msg.encode().expect("encode");
+            assert_eq!(encoded, vec![7, 23, flag]);
+            let decoded = ReplicationMessage::decode(&encoded).expect("decode");
+            assert!(matches!(
+                decoded.body,
+                ReplicationMessageBody::FullNotice(FullNotice { full: f }) if f == full
+            ));
+        }
     }
 }

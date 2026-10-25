@@ -2,7 +2,11 @@
 //! quietly put back: the repository nodes upgrade from and the key its
 //! releases are signed with, the bootstrap peers that ship (none), the
 //! allowance of new browser sessions per source, and the penalty for not
-//! holding a close-group chunk, which nothing can withhold. And how the
+//! holding a close-group chunk, which nothing withholds but one bounded case:
+//! a full peer (its own "full" notice fresh) answering that it lacks a key it
+//! was never seen proving, in a check not pinned to its commitment and, after
+//! a write, not paid for it ("full, not faulty", `unheld_chunk_penalty`
+//! below). And how the
 //! payment check reads the chain (`payment_reads` below), which a release
 //! that rewrites the read path must keep: the node's own RPC is read first,
 //! then, if that is one of Robinhood Chain's public RPCs, the others; a failed
@@ -201,12 +205,14 @@ fn rust_files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
 }
 
 /// A peer that doesn't hold a close-group chunk it should is penalised, as in
-/// upstream v0.23.0, and nothing in the node or the image can withhold it: no
-/// switch and no environment override. The census
-/// (src/replication/retention/census.rs) pins the lanes that charge it, and a
-/// build whose trust weights fall to zero doesn't compile (src/replication/mod.rs).
+/// upstream v0.23.0, and nothing in the node or the image can withhold it but
+/// the one bounded case of "full, not faulty" (`unheld_chunk_penalty` below):
+/// no switch and no environment override. The census
+/// (src/replication/retention/census.rs) pins the lanes that charge it and the
+/// one waiver each lane asks, and a build whose trust weights fall to zero
+/// doesn't compile (src/replication/mod.rs).
 #[test]
-fn nothing_withholds_the_unheld_chunk_penalty() {
+fn nothing_but_a_fresh_full_notice_withholds_the_unheld_chunk_penalty() {
     // The census names the switch's parts to pin them away, in test-only code.
     let census = repo_path("src/replication/retention/census.rs");
     let mut sources = Vec::new();
@@ -224,9 +230,121 @@ fn nothing_withholds_the_unheld_chunk_penalty() {
             assert!(
                 !text.contains(name),
                 "{} names {name}: the penalty for an unheld close-group chunk is applied \
-                 on every lane, and nothing may withhold it",
+                 on every lane, and nothing may withhold it but the waiver for a full peer",
                 path.display()
             );
+        }
+    }
+}
+
+/// "Full, not faulty": the one case in which the unheld-chunk penalty is
+/// waived, on each lane that charges it, through the one function every lane
+/// asks (`FullView::waives_unheld_penalty`). The bound on how long a node may
+/// answer "full" without the penalty is how long one "full" notice stays
+/// fresh: a node that keeps renewing it is never charged for being full, and
+/// one that stops is charged again once its last notice is that old.
+mod unheld_chunk_penalty {
+    use ant_node::replication::full::{
+        FullView, Lane, OwnQuote, UnheldAnswer, UnheldCase, FULL_NOTICE_FRESHNESS,
+    };
+    use saorsa_core::identity::PeerId;
+    use std::time::{Duration, Instant};
+
+    /// How long one "full" notice stays fresh: 40 minutes, two of the
+    /// longest neighbour-sync intervals.
+    const FRESHNESS: Duration = Duration::from_mins(40);
+
+    fn case<'a>(lane: Lane, peer: &'a PeerId, key: &'a [u8; 32]) -> UnheldCase<'a> {
+        UnheldCase {
+            lane,
+            peer,
+            key,
+            answer: UnheldAnswer::Absent,
+            commitment_pinned: false,
+            own_quote: if matches!(lane, Lane::PossessionFailed | Lane::PossessionNoAnswer) {
+                OwnQuote::NotPaid
+            } else {
+                OwnQuote::NoProof
+            },
+        }
+    }
+
+    #[test]
+    fn a_full_notice_stays_fresh_for_forty_minutes() {
+        assert_eq!(FULL_NOTICE_FRESHNESS, FRESHNESS);
+    }
+
+    /// On every lane: no notice, a stale notice, a check pinned to the peer's
+    /// commitment, a key the peer was seen holding, the peer's own paid quote,
+    /// and an answer other than "absent" (no answer among them) are all
+    /// charged; a fresh notice for any other key is not.
+    #[test]
+    fn only_a_fresh_notice_for_a_key_never_seen_held_and_not_paid_for_is_waived() {
+        let view = FullView::default();
+        let peer = PeerId::from_bytes([1; 32]);
+        let other = PeerId::from_bytes([2; 32]);
+        let key = [7u8; 32];
+        let held = [8u8; 32];
+        let now = Instant::now();
+        for lane in Lane::ALL {
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &peer, &key), now),
+                "{lane:?}: no notice, charged"
+            );
+        }
+        view.marks.note_notice(peer, true, now);
+        view.seen.record(&peer, &held);
+        for lane in Lane::ALL {
+            let fresh = case(lane, &peer, &key);
+            assert!(view.waives_unheld_penalty(&fresh, now), "{lane:?}: waived");
+            assert!(
+                view.waives_unheld_penalty(
+                    &fresh,
+                    now + FRESHNESS.saturating_sub(Duration::from_secs(1))
+                ),
+                "{lane:?}: still fresh"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&fresh, now + FRESHNESS),
+                "{lane:?}: a stale notice is charged"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &other, &key), now),
+                "{lane:?}: another peer's notice is no notice"
+            );
+            let pinned = UnheldCase {
+                commitment_pinned: true,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&pinned, now),
+                "{lane:?}: a commitment-pinned check is charged"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &peer, &held), now),
+                "{lane:?}: a key the peer was seen holding is charged"
+            );
+            let paid = UnheldCase {
+                own_quote: OwnQuote::PaidOrUnknown,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&paid, now),
+                "{lane:?}: a peer paid for the record is charged"
+            );
+            let unanswered = UnheldCase {
+                answer: UnheldAnswer::Other,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&unanswered, now),
+                "{lane:?}: no answer, or any answer but absent, is charged"
+            );
+        }
+        // A peer that says it has left "full" is charged at once.
+        view.marks.note_notice(peer, false, now);
+        for lane in Lane::ALL {
+            assert!(!view.waives_unheld_penalty(&case(lane, &peer, &key), now));
         }
     }
 }
