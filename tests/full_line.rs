@@ -47,10 +47,12 @@ const LOG_BYTES_PER_SECOND: u64 = 4 * MIB;
 /// How long the nodes stay at the line.
 const AT_THE_LINE: Duration = Duration::from_secs(45);
 
-/// The upgrade's own writes, at a release's sizes: an archive and the binary
-/// twice (extracted, and the backup of the running one).
+/// The upgrade's own writes, at a release's sizes: the archive twice (the
+/// download, and its copy in the shared cache) and the binary twice
+/// (extracted, and the backup of the running one).
 const ARCHIVE: u64 = 20 * MIB;
 const BINARY: u64 = 60 * MIB;
+const UPGRADE_WRITES: u64 = 2 * ARCHIVE + 2 * BINARY;
 
 /// A partition of [`PARTITION`] bytes holding everything under `root`, and
 /// `others` bytes that other writers hold.
@@ -386,8 +388,9 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
     let test_binary = std::fs::metadata(AutoApplyUpgrader::current_binary_path().unwrap())
         .unwrap()
         .len();
-    partition
-        .fill_to(OLD_MANAGER_LINE + UPGRADE_SPACE_MARGIN + ARCHIVE + 2 * test_binary + 64 * MIB);
+    partition.fill_to(
+        OLD_MANAGER_LINE + UPGRADE_SPACE_MARGIN + 2 * ARCHIVE + 2 * test_binary + 64 * MIB,
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     let upgrade = UpgradeInfo {
         version: semver::Version::parse("0.23.0+ds.99").unwrap(),
@@ -413,6 +416,7 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
     std::fs::create_dir_all(&upgrade_dir).unwrap();
     for (name, len) in [
         ("archive", ARCHIVE),
+        ("archive-cached", ARCHIVE),
         ("ant-node", BINARY),
         ("ant-node.backup", BINARY),
     ] {
@@ -463,12 +467,12 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
             tokio::spawn(async move {
                 let upgrader =
                     AutoApplyUpgrader::new().with_binary_cache(BinaryCache::new(cache_dir));
-                match upgrader.room_to_apply(ARCHIVE + 2 * BINARY, &root).await {
+                match upgrader.room_to_apply(UPGRADE_WRITES, &root).await {
                     Ok(turn) => {
                         let writes = root.join(format!("upgrade-{n}"));
                         std::fs::write(
                             &writes,
-                            vec![0u8; usize::try_from(ARCHIVE + 2 * BINARY).unwrap()],
+                            vec![0u8; usize::try_from(UPGRADE_WRITES).unwrap()],
                         )
                         .unwrap();
                         // The partition sees the writes before the turn passes.
@@ -502,7 +506,7 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
     partition.fill_to(600 * MIB);
     tokio::time::sleep(Duration::from_millis(100)).await;
     match AutoApplyUpgrader::new()
-        .room_to_apply(ARCHIVE + 2 * BINARY, &root)
+        .room_to_apply(UPGRADE_WRITES, &root)
         .await
     {
         Err(UpgradeResult::NotEnoughSpace { available, .. }) => {

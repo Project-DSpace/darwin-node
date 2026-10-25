@@ -28,8 +28,8 @@ pub(super) const MAX_ARCHIVE_SIZE_BYTES: usize = 200 * 1024 * 1024;
 /// are made.
 ///
 /// It is for the node's other writes meanwhile. With a release's sizes
-/// (an upgrade needing about 140 MiB), a node at the full line (1 GiB free)
-/// still upgrades: 500 + 256 + 140 MiB is under 1 GiB.
+/// (an upgrade needing about 160 MiB), a node at the full line (1 GiB free)
+/// still upgrades: 500 + 256 + 160 MiB is under 1 GiB.
 pub const UPGRADE_SPACE_MARGIN: u64 = 256 * MIB;
 
 /// Whether `available` free bytes leave room for an upgrade needing `needed`:
@@ -42,12 +42,15 @@ fn room_for(needed: u64, available: u64) -> bool {
             .saturating_add(needed)
 }
 
-/// The free space an upgrade's own writes take: the archive, and the binary
+/// The free space an upgrade's own writes take: the archive twice (the
+/// download in its private folder, and its copy in the shared cache, or on
+/// a cache hit the private copy made to verify it again), and the binary
 /// twice, extracted and as the backup of the running one. An archive whose
 /// size the release doesn't give counts as the largest one downloaded.
 fn space_needed(archive_size: Option<u64>, binary_len: u64) -> u64 {
     archive_size
         .unwrap_or(MAX_ARCHIVE_SIZE_BYTES as u64)
+        .saturating_mul(2)
         .saturating_add(binary_len.saturating_mul(2))
 }
 
@@ -1017,27 +1020,28 @@ mod space_tests {
     use super::{room_for, space_needed, MAX_ARCHIVE_SIZE_BYTES};
     use crate::storage::{DEFAULT_DISK_RESERVE, MIB};
 
-    /// A release's sizes: a 20 MiB archive and a 60 MiB binary.
-    const RELEASE: u64 = 140 * MIB;
+    /// A release's sizes: a 20 MiB archive and a 60 MiB binary, each
+    /// written twice.
+    const RELEASE: u64 = 160 * MIB;
 
     #[test]
     fn an_upgrade_leaves_the_disk_clear_of_the_old_managers_line() {
         // A node at the full line upgrades.
         assert!(room_for(RELEASE, DEFAULT_DISK_RESERVE));
         // Short of 500 + 256 MiB above its own writes, it doesn't.
-        assert!(room_for(RELEASE, 896 * MIB));
-        assert!(!room_for(RELEASE, 896 * MIB - 1));
+        assert!(room_for(RELEASE, 916 * MIB));
+        assert!(!room_for(RELEASE, 916 * MIB - 1));
         assert!(!room_for(RELEASE, 600 * MIB));
         assert!(!room_for(u64::MAX, u64::MAX - 1));
     }
 
     #[test]
-    fn an_upgrade_needs_the_archive_and_twice_the_binary() {
-        assert_eq!(space_needed(Some(20 * MIB), 60 * MIB), 140 * MIB);
+    fn an_upgrade_needs_twice_the_archive_and_twice_the_binary() {
+        assert_eq!(space_needed(Some(20 * MIB), 60 * MIB), 160 * MIB);
         // An archive of unknown size counts as the largest one downloaded.
         assert_eq!(
             space_needed(None, 60 * MIB),
-            MAX_ARCHIVE_SIZE_BYTES as u64 + 120 * MIB
+            2 * MAX_ARCHIVE_SIZE_BYTES as u64 + 120 * MIB
         );
         assert_eq!(space_needed(Some(u64::MAX), u64::MAX), u64::MAX);
     }
