@@ -31,6 +31,9 @@ fn main() {
 
     // Rerun when HEAD moves: HEAD itself (a branch switch or detached HEAD),
     // the current branch's ref (a new commit) and packed-refs (`git gc`).
+    // The ref's folder too: after `git gc` or `git pack-refs` the ref lives
+    // only in packed-refs, and the next commit writes a new loose ref file
+    // there without touching HEAD or packed-refs.
     // Only paths that exist are named. Cargo treats a missing
     // rerun-if-changed path as changed, so naming one (packed-refs in a
     // shallow clone, every `.git/...` in a linked worktree, where `.git` is a
@@ -40,7 +43,10 @@ fn main() {
     watched.extend(git_path("HEAD"));
     if let Some(branch) = git(&["rev-parse", "--symbolic-full-name", "HEAD"]) {
         if branch.starts_with("refs/") {
-            watched.extend(git_path(&branch));
+            if let Some(ref_path) = git_path(&branch) {
+                watched.extend(ref_path.parent().map(Path::to_path_buf));
+                watched.push(ref_path);
+            }
         }
     }
     watched.extend(git_path("packed-refs"));
