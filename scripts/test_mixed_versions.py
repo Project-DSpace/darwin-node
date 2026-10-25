@@ -882,9 +882,12 @@ def analyze(run):
     for node in run["nodes"]:
         if node["full"]:
             text = (folder / node["log"]).read_bytes().decode("utf-8", "replace")
-            # A refusal for lack of space: the seam's 0 free bytes are under
-            # any reserve, where the host's own disk has room.
-            full_evidence[node["name"]] = "Insufficient disk space" in text
+            # A refusal for lack of space (the seam's 0 free bytes are under
+            # any reserve, where the host's own disk has room), or the node's
+            # own line on entering "full": a full node no PUT reached logs
+            # only the latter.
+            full_evidence[node["name"]] = ("Insufficient disk space" in text
+                                           or "Node full: since" in text)
     full_run = full_run_checks(run, records, checks) if run.get("full_phases") else None
     return {
         "full_run": full_run,
@@ -1138,8 +1141,8 @@ def verdicts(results, args):
                                 f"{len(record['storers'])} nodes that stored it")
         for node, ok in result["full_evidence"].items():
             if not ok:
-                failures.append(f"{name}: {node} never refused for lack of space: the "
-                                "free-space seam didn't reach it")
+                failures.append(f"{name}: {node} never refused for lack of space nor "
+                                "entered full: the free-space seam didn't reach it")
         for node, counters in sorted(result["traffic"].items()):
             if not counters:
                 failures.append(f"{name}: {node} logged no traffic summary in the window "
