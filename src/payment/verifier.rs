@@ -748,6 +748,14 @@ pub struct PaymentVerifier {
     /// as `bytes16` in the `completedPayments` slot.
     #[cfg(any(test, feature = "test-utils"))]
     test_completed_payments_override: RwLock<HashMap<QuoteHash, TestSettlementOverride>>,
+    /// Test-only override for the RPCs payments are read through.
+    ///
+    /// Production builds the list from the node's RPC
+    /// ([`Self::payment_rpc_urls`]); tests that need a second provider on
+    /// 127.0.0.1 name both here, and [`Self::payment_rpc_urls`] returns them
+    /// in place of that list, so every read that takes its RPCs from it does.
+    #[cfg(any(test, feature = "test-utils"))]
+    test_payment_rpc_urls_override: RwLock<Option<Vec<reqwest::Url>>>,
     // NOTE: the test-only own-peer-id override was removed with the ADR-retired
     // quote-freshness/staleness gate (ADR-0004 binds price to the committed
     // count instead), so it no longer has any reader.
@@ -931,6 +939,8 @@ impl PaymentVerifier {
             test_paid_quote_k_closest_override: RwLock::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             test_completed_payments_override: RwLock::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_payment_rpc_urls_override: RwLock::new(None),
             commitment_cache: RwLock::new(None),
             pin_fetch_negative_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(crate::replication::config::PIN_FETCH_NEGATIVE_CACHE_CAPACITY)
@@ -1082,6 +1092,24 @@ impl PaymentVerifier {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_paid_quote_known_peers_for_tests(&self, peer_ids: Vec<[u8; 32]>) {
         self.set_paid_quote_k_closest_for_tests(peer_ids);
+    }
+
+    /// Test-only setter for the RPCs payments are read through, in order, in
+    /// place of the list built from the node's RPC. Every payment read takes
+    /// its RPCs from that list, so a test with providers on 127.0.0.1 can see
+    /// how a read moves from one to the next.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_payment_rpc_urls_for_tests(&self, urls: Vec<reqwest::Url>) {
+        *self.test_payment_rpc_urls_override.write() = Some(urls);
+    }
+
+    /// Test-only view of the RPCs payments are read through, in order: the
+    /// node's own, then, if it is one of Robinhood Chain's public RPCs, the
+    /// others (or the list a test set).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn payment_rpc_urls_for_tests(&self) -> Vec<reqwest::Url> {
+        self.payment_rpc_urls()
     }
 
     /// Test-only setter for an on-chain completed payment amount. The recorded
@@ -2111,6 +2139,10 @@ impl PaymentVerifier {
     /// The RPCs a payment is read through: the node's own, then, if it is one
     /// of Robinhood Chain's public RPCs, the others.
     fn payment_rpc_urls(&self) -> Vec<reqwest::Url> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(urls) = self.test_payment_rpc_urls_override.read().as_ref() {
+            return urls.clone();
+        }
         let own = self.config.evm.network.rpc_url();
         let mut urls: Vec<reqwest::Url> = crate::listings::listings_rpc_urls(own.as_str())
             .iter()

@@ -4,10 +4,12 @@
 //! allowance of new browser sessions per source, and the penalty for not
 //! holding a close-group chunk, which nothing can withhold. And how the
 //! payment check reads the chain (`payment_reads` below), which a release
-//! that rewrites the read path must keep: a failed read is made again in a
-//! second round, an empty record is read once more, a payment to another
-//! payee is refused, an overpayment taken, and a merkle proof refused before
-//! anything is read.
+//! that rewrites the read path must keep: the node's own RPC is read first,
+//! then, if that is one of Robinhood Chain's public RPCs, the others; a failed
+//! read moves on to the next RPC at once and is made again in a second round,
+//! while an answer, even an empty record, ends the read; an empty record is
+//! read once more; a payment to another payee is refused, an overpayment
+//! taken, and a merkle proof refused before anything is read.
 //!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes. The payment reads need the
@@ -232,7 +234,9 @@ fn nothing_withholds_the_unheld_chunk_penalty() {
 /// stands in for the vault here, as it does in the verifier's unit tests. A
 /// release that reads payments another way (pooled, batched, cached) keeps
 /// these behaviours or fails here. The provider answers one call or a JSON-RPC
-/// batch of them.
+/// batch of them. Where a node reads through two RPCs, both are providers on
+/// 127.0.0.1, named through the `test-utils` setter for the list of RPCs
+/// every payment read takes its RPCs from (`set_payment_rpc_urls_for_tests`).
 ///
 /// The paid quote's issuer must be among the node's closest peers, which a
 /// node checks against its routing table; the tests name it as close through
@@ -758,6 +762,289 @@ mod payment_reads {
                 "{context:?}: {:?}",
                 provider.calls()
             );
+        }
+    }
+
+    /// The RPCs a node reads payments through, as the verifier lists them:
+    /// its own first, then, if that is one of Robinhood Chain's public RPCs,
+    /// the chain's others; any other RPC (an operator's own, a local chain)
+    /// alone.
+    #[test]
+    fn payments_are_read_through_the_nodes_rpc_then_the_chains_other_public_ones() {
+        const MAINNET: &str = "https://rpc.mainnet.chain.robinhood.com";
+        const PUBLICNODE: &str = "https://robinhood-rpc.publicnode.com";
+        const ORDOFI: &str = "https://rpc.ordofi.network";
+        let urls = |rpc: &str| -> Vec<String> {
+            PaymentVerifier::new(PaymentVerifierConfig {
+                evm: EvmVerifierConfig {
+                    network: evmlib::Network::new_custom(rpc, TOKEN, VAULT),
+                },
+                cache_capacity: 100,
+                close_group_size: CLOSE_GROUP_SIZE,
+                local_rewards_address: RewardsAddress::new([0xD1; 20]),
+                price_floor: PriceFloorConfig::default(),
+            })
+            .payment_rpc_urls_for_tests()
+            .iter()
+            .map(|url| url.as_str().trim_end_matches('/').to_string())
+            .collect()
+        };
+        assert_eq!(urls(MAINNET), [MAINNET, PUBLICNODE, ORDOFI]);
+        assert_eq!(
+            urls(&format!("{PUBLICNODE}/")),
+            [PUBLICNODE, ORDOFI, MAINNET]
+        );
+        assert_eq!(urls(ORDOFI), [ORDOFI, PUBLICNODE, MAINNET]);
+        assert_eq!(urls("http://127.0.0.1:8545"), ["http://127.0.0.1:8545"]);
+    }
+
+    /// What one payment check on a node with two RPCs came to: its outcome,
+    /// and the calls its own RPC and the next one got.
+    struct CheckedTwo {
+        context: VerificationContext,
+        outcome: Result<PaymentStatus, String>,
+        own: Vec<Call>,
+        next: Vec<Call>,
+        took: Duration,
+    }
+
+    impl CheckedTwo {
+        /// Every call, in the order made: which RPC it went to (0, the
+        /// node's own; 1, the next), and when.
+        fn calls(&self) -> Vec<(usize, Instant)> {
+            let mut calls: Vec<(usize, Instant)> = self
+                .own
+                .iter()
+                .map(|call| (0, call.at))
+                .chain(self.next.iter().map(|call| (1, call.at)))
+                .collect();
+            calls.sort_by_key(|&(_, at)| at);
+            calls
+        }
+    }
+
+    /// Checks a fresh bundle's payment in `context` on a node that reads
+    /// payments through two providers, its own (`own`) and then the next
+    /// (`next`), each answering its `n`th call with `answer(n, bundle)`. The
+    /// two are set as the node's RPC list (`set_payment_rpc_urls_for_tests`),
+    /// which every payment read takes its RPCs from.
+    async fn check_two<F, G>(
+        seed: u8,
+        context: VerificationContext,
+        own_answer: F,
+        next_answer: G,
+    ) -> CheckedTwo
+    where
+        F: Fn(usize, &Bundle) -> Answer + Send + Sync + 'static,
+        G: Fn(usize, &Bundle) -> Answer + Send + Sync + 'static,
+    {
+        let bundle = Arc::new(bundle(seed));
+        let (for_own, for_next) = (Arc::clone(&bundle), Arc::clone(&bundle));
+        let own = provider(move |n, _| own_answer(n, &for_own)).await;
+        let next = provider(move |n, _| next_answer(n, &for_next)).await;
+        let verifier = verifier(&own, &bundle);
+        verifier.set_payment_rpc_urls_for_tests(vec![
+            own.url.parse().unwrap(),
+            next.url.parse().unwrap(),
+        ]);
+        let started = Instant::now();
+        let outcome = verifier
+            .verify_payment(&bundle.xorname, Some(&bundle.proof), context)
+            .await
+            .map_err(|e| e.to_string());
+        let took = started.elapsed();
+        for provider in [&own, &next] {
+            let other_methods = provider.other_methods.lock().unwrap().clone();
+            assert!(
+                other_methods.is_empty(),
+                "{context:?}: a provider was asked for more than completedPayments: {other_methods:?}"
+            );
+        }
+        CheckedTwo {
+            context,
+            outcome,
+            own: own.calls(),
+            next: next.calls(),
+            took,
+        }
+    }
+
+    /// The same check in every context at once, each with its own bundle,
+    /// providers and node.
+    async fn check_two_everywhere<F, G>(seed: u8, own: F, next: G) -> Vec<CheckedTwo>
+    where
+        F: Fn(usize, &Bundle) -> Answer + Clone + Send + Sync + 'static,
+        G: Fn(usize, &Bundle) -> Answer + Clone + Send + Sync + 'static,
+    {
+        futures::future::join_all(
+            CONTEXTS
+                .iter()
+                .zip(seed..)
+                .map(|(context, seed)| check_two(seed, *context, own.clone(), next.clone())),
+        )
+        .await
+    }
+
+    /// The node's own RPC fails, busy or by dropping the call, and the next
+    /// one is asked at once, in the same round: the payment verifies after one
+    /// call on each, with no pause between them.
+    #[tokio::test]
+    async fn a_failed_read_moves_on_to_the_next_rpc_at_once() {
+        for failure in [Answer::Busy, Answer::Dropped] {
+            let checked =
+                check_two_everywhere(0x80, move |_, _| failure, |_, bundle| paid(bundle)).await;
+            for c in checked {
+                let case = format!("{:?}, the node's RPC {failure:?}", c.context);
+                assert_eq!(c.outcome, Ok(PaymentStatus::PaymentVerified), "{case}");
+                assert_eq!(
+                    (c.own.len(), c.next.len()),
+                    (1, 1),
+                    "{case}: one call on each RPC: {:?}",
+                    c.calls()
+                );
+                assert!(
+                    c.own[0].at <= c.next[0].at
+                        && c.next[0].at.duration_since(c.own[0].at) < READ_BACKOFF,
+                    "{case}: the next RPC is asked at once, not after a round's pause: {:?}",
+                    c.calls()
+                );
+            }
+        }
+    }
+
+    /// What the node's own RPC answers: its name, the answer, and whether the
+    /// payment then verifies.
+    type AnsweredCase = (&'static str, fn(&Bundle) -> Answer, bool);
+
+    /// An answer from the node's own RPC settles the read, whatever it says:
+    /// the payment, a payment to another payee, or a wei too little. The next
+    /// RPC, which would answer that the payment is there, is never asked.
+    #[tokio::test]
+    async fn an_answer_settles_the_read_and_the_next_rpc_is_not_asked() {
+        let answers: [AnsweredCase; 3] = [
+            ("the payment", paid, true),
+            (
+                "a payment to another payee",
+                |bundle| Answer::Record([0xEE; 16], bundle.required * 10),
+                false,
+            ),
+            (
+                "a wei too little",
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.required - 1),
+                false,
+            ),
+        ];
+        for (answer_name, answer, verified) in answers {
+            let checked = check_two_everywhere(
+                0x90,
+                move |_, bundle| answer(bundle),
+                |_, bundle| paid(bundle),
+            )
+            .await;
+            for c in checked {
+                let case = format!("{:?}, the node's RPC answers {answer_name}", c.context);
+                if verified {
+                    assert_eq!(c.outcome, Ok(PaymentStatus::PaymentVerified), "{case}");
+                } else {
+                    assert!(c.outcome.is_err(), "{case}: {:?}", c.outcome);
+                }
+                assert_eq!(c.own.len(), 1, "{case}: {:?}", c.calls());
+                assert!(
+                    c.next.is_empty(),
+                    "{case}: the next RPC was asked: {:?}",
+                    c.calls()
+                );
+            }
+        }
+    }
+
+    /// An empty record from the node's own RPC, which is a block or two
+    /// behind, ends the read it answers: the next RPC isn't asked at once.
+    /// The record is read once more after the pause (`EMPTY_RECHECK`), a read
+    /// of its own, which may go to either RPC, and that answer decides: the
+    /// payment, or an empty record again, refused. Two calls in all.
+    #[tokio::test]
+    async fn an_empty_record_ends_its_read_and_is_read_again_after_the_pause() {
+        for (later_name, later_paid) in [("holds the payment", true), ("is empty again", false)] {
+            let own = move |n: usize, bundle: &Bundle| {
+                if n > 1 && later_paid {
+                    paid(bundle)
+                } else {
+                    Answer::Record([0u8; 16], 0)
+                }
+            };
+            let next = move |_: usize, bundle: &Bundle| {
+                if later_paid {
+                    paid(bundle)
+                } else {
+                    Answer::Record([0u8; 16], 0)
+                }
+            };
+            let checked = check_two_everywhere(0xA0, own, next).await;
+            for c in checked {
+                let case = format!("{:?}, the record read again {later_name}", c.context);
+                if later_paid {
+                    assert_eq!(c.outcome, Ok(PaymentStatus::PaymentVerified), "{case}");
+                } else {
+                    assert!(c.outcome.is_err(), "{case}: {:?}", c.outcome);
+                    assert!(
+                        c.took < EMPTY_RECHECK * 2,
+                        "{case}: one pause in all, took {:?}",
+                        c.took
+                    );
+                }
+                let calls = c.calls();
+                assert_eq!(
+                    calls.len(),
+                    2,
+                    "{case}: read, then read once more: {calls:?}"
+                );
+                assert_eq!(
+                    calls[0].0, 0,
+                    "{case}: the first read asks the node's own RPC: {calls:?}"
+                );
+                assert!(
+                    calls[1].1.duration_since(calls[0].1) >= EMPTY_RECHECK,
+                    "{case}: nothing is asked until the pause is over: {calls:?}"
+                );
+            }
+        }
+    }
+
+    /// A read that fails on every RPC asks each once a round, the node's own
+    /// first and the next at once after it, in two rounds half a second apart,
+    /// and then refuses the store.
+    #[tokio::test]
+    async fn a_read_failing_on_every_rpc_asks_each_once_a_round_then_refuses() {
+        let checked = check_two_everywhere(0xB0, |_, _| Answer::Busy, |_, _| Answer::Busy).await;
+        for c in checked {
+            let context = c.context;
+            assert!(c.outcome.is_err(), "{context:?}: {:?}", c.outcome);
+            assert_eq!(
+                (c.own.len(), c.next.len()),
+                (READ_ROUNDS, READ_ROUNDS),
+                "{context:?}: each RPC once in each of {READ_ROUNDS} rounds: {:?}",
+                c.calls()
+            );
+            let calls = c.calls();
+            assert_eq!(
+                calls[0].0, 0,
+                "{context:?}: the node's own RPC first: {calls:?}"
+            );
+            for (at, pair) in calls.windows(2).enumerate() {
+                let gap = pair[1].1.duration_since(pair[0].1);
+                if at % 2 == 0 {
+                    assert!(
+                        pair[0].0 != pair[1].0 && gap < READ_BACKOFF,
+                        "{context:?}: within a round, the other RPC at once: {calls:?}"
+                    );
+                } else {
+                    assert!(
+                        gap >= READ_BACKOFF,
+                        "{context:?}: the next round waits {READ_BACKOFF:?}: {calls:?}"
+                    );
+                }
+            }
         }
     }
 }
