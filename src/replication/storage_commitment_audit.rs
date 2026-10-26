@@ -1082,6 +1082,7 @@ pub(crate) fn verify_slice_response(
 /// longer held cannot have committed a correct `nonced_root`, so it fails —
 /// regardless of what the auditor holds. On a full pass, credits the peer as a
 /// proven holder.
+#[allow(clippy::too_many_lines)] // the two rounds, in the order they run
 async fn verify_subtree_response(
     ctx: &AuditCtx<'_>,
     commitment: &StorageCommitment,
@@ -1207,6 +1208,13 @@ async fn verify_subtree_response(
             failed(challenged_peer, challenge_id, reason)
         }
         AuditVerdict::Pass { checked } => {
+            // The keys whose bytes round 2 verified: the peer proved it holds
+            // them, so it is charged if it later says it lacks them while full.
+            record_byte_verified(
+                &crate::replication::full::view_for(ctx.p2p_node.peer_id()).seen,
+                challenged_peer,
+                &openings_with_leaves,
+            );
             // Closeness (ADR-0002, soft/observe-only) — see observe_closeness.
             observe_closeness(ctx.p2p_node, ctx.config, challenged_peer, proof).await;
             // Credit the peer as a proven holder of its committed keys.
@@ -1226,6 +1234,23 @@ async fn verify_subtree_response(
                 challenged_peer: *challenged_peer,
                 keys_checked: checked,
             }
+        }
+    }
+}
+
+/// Record in `seen` that `peer` proved it holds each key of `openings`, the
+/// leaves whose bytes (or, for a pointer, whole signed record) a passed round
+/// 2 verified. Only those: the other keys of the commitment are claimed, not
+/// proven.
+fn record_byte_verified(
+    seen: &crate::replication::full::SeenHolders,
+    peer: &PeerId,
+    openings: &[(crate::replication::subtree::SubtreeLeaf, u32)],
+) {
+    let mut recorded = HashSet::new();
+    for (leaf, _) in openings {
+        if recorded.insert(leaf.key) {
+            seen.record(peer, &leaf.key);
         }
     }
 }
@@ -2554,6 +2579,38 @@ mod tests {
     }
 
     // ---- round 1: structure --------------------------------------------------
+
+    /// A passed round 2 records the keys whose bytes it verified as seen held
+    /// by the peer, and none of the commitment's other keys.
+    #[test]
+    fn a_passed_round_two_records_only_the_byte_verified_keys() {
+        let nonce = [9u8; 32];
+        let (built, proof, peer) = honest(400, &nonce);
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        let openings = openings_for(&s);
+        let items = served_honest_items(&openings, &nonce, &peer);
+        assert!(matches!(
+            verify_slice_response(&openings, &nonce, &peer, &items),
+            AuditVerdict::Pass { .. }
+        ));
+        let seen = crate::replication::full::SeenHolders::default();
+        let peer_id = PeerId::from_bytes(peer);
+        record_byte_verified(&seen, &peer_id, &openings);
+        let sampled: HashSet<XorName> = openings.iter().map(|(leaf, _)| leaf.key).collect();
+        assert!(!sampled.is_empty());
+        for key in &sampled {
+            assert!(seen.may_have_seen(&peer_id, key));
+        }
+        let unsampled = proof
+            .leaves
+            .iter()
+            .map(|leaf| leaf.key)
+            .filter(|key| !sampled.contains(key))
+            .take(50)
+            .filter(|key| seen.may_have_seen(&peer_id, key))
+            .count();
+        assert_eq!(unsampled, 0, "claimed keys are not proven ones");
+    }
 
     #[test]
     fn honest_structure_then_bytes_passes() {

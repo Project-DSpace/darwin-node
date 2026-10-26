@@ -5,6 +5,7 @@
 //! 2. Record the key in `PaidForList(self)` and send `PaidNotify` to every
 //!    peer in `PaidCloseGroup(K)` — immediately, never behind back-pressure.
 //! 3. Send fresh offers to `CLOSE_GROUP_SIZE` nearest peers (excluding self),
+//!    one more for each peer marked full among them (at most 20 in all),
 //!    bounded by the pending-offer permits so a write burst cannot pile up
 //!    chunk-sized buffers.
 
@@ -122,17 +123,29 @@ pub(crate) async fn send_fresh_offers(
     let self_id = *ctx.p2p_node.peer_id();
 
     // Use the self-inclusive query to get the true close group, then filter
-    // self out.
-    let closest = ctx
-        .p2p_node
-        .dht_manager()
-        .find_closest_nodes_local_with_self(key, ctx.config.close_group_size)
-        .await;
-    let target_peers: Vec<PeerId> = closest
-        .iter()
-        .filter(|n| n.peer_id != self_id)
-        .map(|n| n.peer_id)
+    // self out. One more for each peer marked full inside it: the
+    // nearest beyond stand in for it, at most 20 in all.
+    let widened = crate::replication::full::widened_close_group(
+        &ctx.p2p_node,
+        key,
+        ctx.config.close_group_size,
+    )
+    .await;
+    // The stand-ins: past the unwidened storage admission width (9 nearest,
+    // the node itself counted). They take the offer, older nodes included,
+    // since a chunk receiver admits a fresh offer anywhere among the key's 20
+    // nearest (`paid_list_close_group_size`). They are left unchecked because
+    // no peer past the 9 nearest was possession-checked before ds.17: nothing
+    // is waived for them, and one that takes the record is, by intent, not
+    // recorded as seen holding it.
+    let checked_peers = possession_checked(&widened, &self_id, ctx.config.close_group_size);
+    let target_peers: Vec<PeerId> = widened
+        .into_iter()
+        .filter(|peer| *peer != self_id)
         .collect();
+    // The paid quotes' issuers, for the possession check: a full peer paid for
+    // the record is charged for not holding it.
+    let paid_quote_issuers = crate::replication::full::paid_quote_issuers(&proof_of_payment);
 
     let offer = FreshReplicationOffer {
         key: *key,
@@ -209,14 +222,36 @@ pub(crate) async fn send_fresh_offers(
     );
 
     // Schedule the delayed possession check (ADR-0003) for the responsible
-    // close-group peers. A closed receiver (engine shutting down) is ignored.
-    if !target_peers.is_empty() {
+    // close-group peers, the stand-ins left out. A closed receiver (engine
+    // shutting down) is ignored.
+    if !checked_peers.is_empty() {
         ctx.dispatched.fetch_add(1, Ordering::Relaxed);
         let _ = ctx.possession_check_tx.send(PossessionCheckEvent {
             key: *key,
-            peers: target_peers,
+            peers: checked_peers,
+            paid_quote_issuers,
         });
     }
+}
+
+/// The peers of `widened`, a key's close group widened past the peers marked
+/// full (nearest first, this node included), that the possession check
+/// probes: those inside the unwidened storage admission width, this node
+/// left out. The stand-ins beyond it, which a receiver that doesn't widen
+/// refuses, are offered the record but not checked.
+fn possession_checked(
+    widened: &[PeerId],
+    self_id: &PeerId,
+    close_group_size: usize,
+) -> Vec<PeerId> {
+    widened
+        .iter()
+        .take(crate::replication::config::storage_admission_width(
+            close_group_size,
+        ))
+        .filter(|peer| *peer != self_id)
+        .copied()
+        .collect()
 }
 
 /// Send `PaidNotify(K)` to every peer in `PaidCloseGroup(K)` (fire-and-forget).
@@ -274,6 +309,25 @@ async fn send_paid_notify(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Ranks 1 to 9 of the widened group are inside every receiver's
+    /// admission width and are possession-checked; ranks 10 and beyond are
+    /// stand-ins, offered the record but not checked. The node itself is
+    /// never checked.
+    #[test]
+    fn only_the_nine_nearest_are_possession_checked_and_stand_ins_are_not() {
+        let peers: Vec<PeerId> = (1..=12u8).map(|n| PeerId::from_bytes([n; 32])).collect();
+        let outside = PeerId::from_bytes([0xEE; 32]);
+        assert_eq!(possession_checked(&peers, &outside, 7), peers[..9].to_vec());
+        assert_eq!(
+            possession_checked(&peers[..7], &outside, 7),
+            peers[..7].to_vec()
+        );
+        // This node at rank 3: the other eight of the nine nearest.
+        let mut expected = peers[..9].to_vec();
+        expected.remove(2);
+        assert_eq!(possession_checked(&peers, &peers[2], 7), expected);
+    }
 
     /// The permit is released with the last handle to the encoded offer, not
     /// the first: a slice the transport still holds keeps the offer counted.

@@ -168,10 +168,32 @@ never ran.
   stays and is named in a warning (upstream's ADR-0022). A census test
   checks that each lane charges the peer and that the switch which withheld
   the penalty is gone, `tests/fork_pins.rs` that nothing in the node or the
-  image can withhold it, and a build whose trust weights are zero doesn't
-  compile. A test of a built node (`src/node.rs`) checks that it announces
-  `node/<version>` alone in its user agent. The listing store sizes its own
-  LMDB map from the disk as before (`src/listings/map_size.rs`).
+  image can withhold it but one bounded case (below), and a build whose
+  trust weights are zero doesn't compile. A test of a built node
+  (`src/node.rs`) checks that it announces `node/<version>` alone in its
+  user agent. The listing store sizes its own LMDB map from the disk as
+  before (`src/listings/map_size.rs`).
+- **Full, not faulty** (from ds.17, [ADR-0024](docs/adr/ADR-0024-full-not-faulty-and-the-falling-floor.md),
+  amending ADR-0003 and ADR-0022). Under disk pressure the erase floor
+  falls with free space, from 10 times the distance to the node's
+  7th-nearest peer at 10% free to the edge of its own range below 2.5%,
+  each step also firing at the full line plus 4 MiB on small disks; free
+  inodes count as free space; records are erased in two phases, named in
+  no hint a whole sync cycle before; and their out-of-range clocks survive
+  restarts (`{root}/out_of_range.mdb`). A node at the full line with
+  nothing left it may erase is full: it prices and takes no new data (a
+  chunk it holds is still answered as already stored, a pointer it holds
+  still updated), keeps serving and proving what it holds, and tells its
+  peers with a one-way notice, renewed every 10 minutes. They widen their
+  windows around it (7 + f and 9 + f for f full peers, at most 20), erase
+  near it only with 6 proofs from the 7 nearest not full, and waive the
+  unheld-chunk penalty for it only when its notice is under 40 minutes old,
+  it answered that it lacks the key, the check isn't pinned to its
+  commitment, it was never seen proving the key (a record kept across
+  restarts in `{root}/seen_holders.bin`), and, after a write, it
+  wasn't paid for it. Every lane asks one function at one reviewed site
+  (the census), and `tests/fork_pins.rs` pins the waiver's conditions on
+  each lane.
 - **Nodes keep listings** (from ds.2) of the files stored with an
   envelope: a node records the payment of each envelope chunk it stores,
   found from the proof that comes with a PUT or a fresh replication offer,
@@ -1746,9 +1768,21 @@ erase records (free space fell below 10% and is not yet back to 15%),
 `beyond_floor=` counts the records far enough from it to be erased, and the
 `pruned=` before `; paid` counts the records erased in that pass; the one
 after `paid` counts payment bookkeeping entries, which are dropped whatever
-the disk. `Disk pressure:` and `Disk pressure over:` mark when erasing may
-start and when it stops, and `Free space on the record store's partition
-could not be measured` that it stopped because the disk could not be read.
+the disk. After `pruned=` come `floor_step=` (0 without pressure, then 1 for
+10 times the distance to the node's 7th-nearest peer, 2 for 5 times, 3 for 2
+times, 4 for the edge of its own range), `being_erased=` (records selected
+for erasure, named in no hint, and erased a whole sync cycle later),
+`near_full_peers=` (held records with a peer marked full among their nearest
+nodes), `few_holders=` (keys whose verification since the last pass found
+fewer than 4 holders), `seen_fill=` and `seen_false=` (how full the node's
+record of keys peers were seen proving is, and its estimated share of false
+"seen" answers, which charge a full peer) and `full=` (1 while the node is
+full: at the full line with nothing left it may erase). `Disk pressure:` and `Disk pressure over:`
+mark when erasing may start and when it stops, `Disk pressure: the erase
+floor moves to step` each step down, and `Free space on the record store's
+partition could not be measured` that it stopped because the disk could not
+be read. `Node full: since <unix seconds>` and `Node full: no longer` mark a
+node entering and leaving "full" ([ADR-0024](docs/adr/ADR-0024-full-not-faulty-and-the-falling-floor.md)).
 
 ---
 

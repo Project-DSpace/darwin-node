@@ -255,6 +255,14 @@ pub enum ReplicationMessageBody {
     /// Response to [`Self::NeighborSyncPageRequest`]: the responder's page,
     /// or busy.
     NeighborSyncPageResponse(NeighborSyncPageResponse),
+    // === Full, not faulty ===
+    // APPENDED for the same reason. A peer built before it cannot decode it
+    // and drops it. It is one-way, and sent only to a peer known to read it
+    // (see `full::agent_reads_full_notice`), so silence, a decode failure or
+    // a timeout never counts against anyone.
+    /// The sender is full, or has left "full": its own word, renewed while it
+    /// stays full.
+    FullNotice(FullNotice),
 }
 
 // ---------------------------------------------------------------------------
@@ -272,8 +280,27 @@ pub enum ReplicationMessageBody {
 // encode/decode call sites are free functions scattered across the replication
 // modules that do not carry any shared engine handle.
 
+/// The last body index a ds.15 node reads: `PointerStateResponse`. Every
+/// index past it is unreadable on a ds.15 node.
+pub const DS15_LAST_INDEX: usize = 22;
+
+/// The last body index before the "full" notice: node-1b-sync's
+/// `NeighborSyncPageResponse`, after its `NeighborSyncPageRequest` at 23.
+///
+/// The merge order is fixed (build plan, ADR-0024): node-1b-sync keeps 23
+/// and 24, and the notice takes the next index after it, 25, since this
+/// branch merged second. The merge moved this one constant from ds.15's last
+/// (22) to 24; the notice's index, the variant count, the family table, the
+/// traffic summary, the notice's byte test and the check of its pins in
+/// `tests/wire_format.rs` follow from it.
+pub const BEFORE_FULL_NOTICE_LAST_INDEX: usize = 24;
+
+/// The "full" notice's body index: the first after
+/// [`BEFORE_FULL_NOTICE_LAST_INDEX`].
+pub const FULL_NOTICE_INDEX: usize = BEFORE_FULL_NOTICE_LAST_INDEX + 1;
+
 /// Number of [`ReplicationMessageBody`] variants (the counter-table width).
-pub(crate) const N_REPLICATION_VARIANTS: usize = 25;
+pub(crate) const N_REPLICATION_VARIANTS: usize = FULL_NOTICE_INDEX + 1;
 
 static REPL_TX_BYTES: [AtomicU64; N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
@@ -316,6 +343,7 @@ impl ReplicationMessageBody {
             Self::PointerStateResponse(_) => 22,
             Self::NeighborSyncPageRequest(_) => 23,
             Self::NeighborSyncPageResponse(_) => 24,
+            Self::FullNotice(_) => FULL_NOTICE_INDEX,
         }
     }
 
@@ -382,7 +410,7 @@ impl BodyFamily {
 pub(crate) fn family_of_variant(index: usize) -> Option<BodyFamily> {
     match index {
         11..=14 => Some(BodyFamily::SubtreeAudit),
-        0..=10 | 15..=24 => Some(BodyFamily::Core),
+        0..=10 | 15..N_REPLICATION_VARIANTS => Some(BodyFamily::Core),
         _ => None,
     }
 }
@@ -686,6 +714,10 @@ pub(crate) fn log_traffic_summary() {
         neighbor_sync_page_response_tx_count = tc(24),
         neighbor_sync_page_response_rx_bytes = rb(24),
         neighbor_sync_page_response_rx_count = rc(24),
+        full_notice_tx_bytes = tb(FULL_NOTICE_INDEX),
+        full_notice_tx_count = tc(FULL_NOTICE_INDEX),
+        full_notice_rx_bytes = rb(FULL_NOTICE_INDEX),
+        full_notice_rx_count = rc(FULL_NOTICE_INDEX),
         "replication traffic summary (cumulative)"
     );
 }
@@ -1246,6 +1278,22 @@ pub struct PointerStateRequest {
 pub struct PointerStateResponse {
     /// One entry per requested address, in order: the state held, or `None`.
     pub states: Vec<Option<PointerStateSummary>>,
+}
+
+// ---------------------------------------------------------------------------
+// Full, not faulty
+// ---------------------------------------------------------------------------
+
+/// A node's own word that it is full, or has left "full".
+///
+/// One-way: nothing answers it. A full node sends it on entering "full" and
+/// renews it while it stays full, so its peers' marks stay fresh; it sends it
+/// once more, `full: false`, on leaving. A peer is marked full only from its
+/// own notice, and the mark lapses once the notice is no longer fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullNotice {
+    /// Whether the sender is full.
+    pub full: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1896,6 +1944,7 @@ mod tests {
                 cycle: 1,
                 page: 0,
             }),
+            ReplicationMessageBody::FullNotice(FullNotice { full: true }),
         ]
     }
 
@@ -2096,7 +2145,8 @@ mod tests {
             declared, N_REPLICATION_VARIANTS,
             "update this test's bounds when a variant is added or removed"
         );
-        assert_eq!(declared, 25);
+        assert_eq!(declared, FULL_NOTICE_INDEX + 1);
+        assert_eq!(declared, 26);
         for index in [declared, declared + 1, 99, usize::MAX] {
             assert_eq!(
                 family_of_variant(index),
@@ -3371,5 +3421,131 @@ mod tests {
         let display = err.to_string();
         assert!(display.contains("20000000"));
         assert!(display.contains(&MAX_REPLICATION_MESSAGE_SIZE.to_string()));
+    }
+
+    // === Full, not faulty ===
+
+    /// `ReplicationMessageBody` as a ds.15 node declares it, indexes 0 to
+    /// [`DS15_LAST_INDEX`], in a message as such a node decodes one. Unit variants stand in for their contents, which postcard reads
+    /// only after the index, and leaves unread here.
+    mod before_full_notice {
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        pub(super) enum Body {
+            FreshReplicationOffer,
+            FreshReplicationResponse,
+            PaidNotify,
+            NeighborSyncRequest,
+            NeighborSyncResponse,
+            VerificationRequest,
+            VerificationResponse,
+            FetchRequest,
+            FetchResponse,
+            AuditChallenge,
+            AuditResponse,
+            SubtreeAuditChallenge,
+            SubtreeAuditResponse,
+            SubtreeSliceChallenge,
+            SubtreeSliceResponse,
+            GetCommitmentByPin,
+            GetCommitmentByPinResponse,
+            PointerFreshOffer,
+            PointerHints,
+            PointerFetchRequest,
+            PointerFetchResponse,
+            PointerStateRequest,
+            PointerStateResponse,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        pub(super) struct Message {
+            pub request_id: u64,
+            pub body: Body,
+        }
+    }
+
+    /// The notice is appended: every earlier body keeps the index a node of
+    /// the release before it reads, and that node fails to decode the notice,
+    /// so it drops it without acting on it.
+    #[test]
+    fn a_node_before_the_full_notice_reads_every_earlier_body_and_drops_the_notice() {
+        for body in all_bodies() {
+            let index = body.variant_index();
+            let encoded = ReplicationMessage {
+                request_id: 7,
+                body,
+            }
+            .encode()
+            .expect("encode");
+            let old = postcard::from_bytes::<before_full_notice::Message>(&encoded);
+            if index <= DS15_LAST_INDEX {
+                assert!(old.is_ok(), "index {index} must still decode: {old:?}");
+            } else {
+                assert!(
+                    old.is_err(),
+                    "index {index} must not decode as anything old"
+                );
+            }
+        }
+    }
+
+    /// Every body has an index of its own, the indexes run 0 to
+    /// `N_REPLICATION_VARIANTS - 1` with no gap, and every index past ds.15's
+    /// last (22) fails to decode on a ds.15 node: a message appended for the
+    /// next release can't be read there as an older one, and is sent only to
+    /// peers known to read it. A branch that appends a message of its own
+    /// takes the next free index after every branch merged before it, and
+    /// re-pins its bytes in `tests/wire_format.rs`.
+    #[test]
+    fn every_body_index_is_distinct_and_unreadable_before_its_release() {
+        let indexes: Vec<usize> = all_bodies()
+            .into_iter()
+            .map(|body| body.variant_index())
+            .collect();
+        let distinct: std::collections::BTreeSet<usize> = indexes.iter().copied().collect();
+        assert_eq!(distinct.len(), indexes.len(), "two bodies share an index");
+        assert_eq!(
+            distinct.into_iter().collect::<Vec<_>>(),
+            (0..N_REPLICATION_VARIANTS).collect::<Vec<_>>()
+        );
+        for body in all_bodies() {
+            let index = body.variant_index();
+            if index <= DS15_LAST_INDEX {
+                continue;
+            }
+            let encoded = ReplicationMessage {
+                request_id: 7,
+                body,
+            }
+            .encode()
+            .expect("encode");
+            assert!(
+                postcard::from_bytes::<before_full_notice::Message>(&encoded).is_err(),
+                "index {index} must not decode on a ds.15 node"
+            );
+        }
+    }
+
+    /// The notice's bytes: the request id, the body's index
+    /// ([`FULL_NOTICE_INDEX`]), the flag.
+    #[test]
+    fn a_full_notice_keeps_its_bytes() {
+        for (full, flag) in [(true, 1u8), (false, 0u8)] {
+            let msg = ReplicationMessage {
+                request_id: 7,
+                body: ReplicationMessageBody::FullNotice(FullNotice { full }),
+            };
+            let encoded = msg.encode().expect("encode");
+            let index = u8::try_from(FULL_NOTICE_INDEX).expect("one byte");
+            assert_eq!(encoded, vec![7, index, flag]);
+            let decoded = ReplicationMessage::decode(&encoded).expect("decode");
+            assert!(matches!(
+                decoded.body,
+                ReplicationMessageBody::FullNotice(FullNotice { full: f }) if f == full
+            ));
+        }
     }
 }

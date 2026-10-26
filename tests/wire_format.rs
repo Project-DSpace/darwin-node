@@ -1,7 +1,8 @@
 //! The bytes of every message one node sends another, as v0.23.0+ds.15 writes
 //! and reads them, and the variants of each that it knows; and of the messages
 //! appended since, which go only to peers known to read them: paged neighbour
-//! sync's page request and its answer.
+//! sync's page request and its answer, and the one-way "full" notice a full
+//! node sends.
 //!
 //! A release that changes messages between nodes keeps the rule in the
 //! README's "Messages between nodes": a new message type is appended to
@@ -34,7 +35,7 @@
 use ant_node::replication::commitment::StorageCommitment;
 use ant_node::replication::protocol::{
     AuditChallenge, AuditResponse, FetchRequest, FetchResponse, FreshReplicationOffer,
-    FreshReplicationResponse, GetCommitmentByPin, GetCommitmentByPinResponse,
+    FreshReplicationResponse, FullNotice, GetCommitmentByPin, GetCommitmentByPinResponse,
     KeyVerificationResult, NeighborSyncPageRequest, NeighborSyncPageResponse, NeighborSyncRequest,
     NeighborSyncResponse, PaidNotify, PointerFetchRequest, PointerFetchResponse, PointerFreshOffer,
     PointerHints, PointerStateRequest, PointerStateResponse, PointerStateSummary, RejectKind,
@@ -194,6 +195,8 @@ fn name(body: &ReplicationMessageBody) -> String {
         B::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy { .. }) => {
             "NeighborSyncPageResponse::Busy".into()
         }
+        B::FullNotice(FullNotice { full: true }) => "FullNotice, full".into(),
+        B::FullNotice(FullNotice { full: false }) => "FullNotice, no longer full".into(),
     }
 }
 
@@ -425,6 +428,8 @@ fn samples() -> Vec<ReplicationMessageBody> {
             cycle: 0x0102_0304_0506_0708,
             page: 1,
         }),
+        B::FullNotice(FullNotice { full: true }),
+        B::FullNotice(FullNotice { full: false }),
     ]
 }
 
@@ -610,7 +615,38 @@ const PINNED: &[(&str, &str)] = &[
         "NeighborSyncPageResponse::Busy",
         "b4241801888e98a8c0e080810101",
     ),
+    // Appended since ds.15, whose message enum ends at index 22, and sent only
+    // to peers known to read them; ds.15 drops the notice (`a_node_before_the_full_notice_reads_every_earlier_body_and_drops_the_notice`
+    // in src/replication/protocol.rs).
+    // Its index byte is FULL_NOTICE_INDEX (checked below): 25, after
+    // node-1b-sync's page messages (23, 24), which were merged before it.
+    ("FullNotice, full", "b4241901"),
+    ("FullNotice, no longer full", "b4241900"),
 ];
+
+/// The notice's pinned bytes carry the index the protocol gives it, so the
+/// merge that moves it past node-1b-sync's messages re-pins them here.
+#[test]
+fn the_full_notice_pins_carry_its_index() {
+    use ant_node::replication::protocol::FULL_NOTICE_INDEX;
+    // After node-1b-sync's page messages, 23 and 24 (build plan, ADR-0024).
+    assert_eq!(FULL_NOTICE_INDEX, 25);
+    for (name, flag) in [
+        ("FullNotice, full", "01"),
+        ("FullNotice, no longer full", "00"),
+    ] {
+        let pinned = PINNED
+            .iter()
+            .find(|(pinned, _)| *pinned == name)
+            .map(|(_, bytes)| *bytes)
+            .unwrap();
+        assert_eq!(
+            pinned,
+            format!("b424{FULL_NOTICE_INDEX:02x}{flag}"),
+            "{name}"
+        );
+    }
+}
 
 fn encode(body: ReplicationMessageBody) -> Vec<u8> {
     ReplicationMessage {
@@ -706,7 +742,8 @@ fn the_variants_are_the_pinned_ones() {
     let challenge = varint(9);
     // (what, the bytes up to the variant index, how many variants it has)
     let cases: Vec<(&str, Vec<u8>, u8)> = vec![
-        ("ReplicationMessageBody", frame(&[]), 25),
+        // 23 variants up to ds.15, then paged sync's two, then the "full" notice.
+        ("ReplicationMessageBody", frame(&[]), 26),
         ("FreshReplicationResponse", frame(&[&[1]]), 2),
         ("FetchResponse", frame(&[&[8]]), 3),
         ("AuditResponse", frame(&[&[10]]), 3),

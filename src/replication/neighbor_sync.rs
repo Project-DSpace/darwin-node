@@ -49,6 +49,7 @@ use crate::replication::protocol::{
 };
 use crate::replication::sync_pages::{self, HeldAnswer, ReceivedHints, SyncPeers};
 use crate::replication::types::NeighborSyncState;
+use crate::replication::{erasure, full};
 use crate::storage::ChunkStore;
 
 /// Hint-build duration that is worth surfacing at info level.
@@ -75,11 +76,20 @@ const MAX_EXCHANGE_KEYS: usize = MAX_NEIGHBOR_SYNC_PAGES as usize * MAX_PAGE_KEY
 /// A key's close group of width `w` is its `w` nearest by XOR distance among
 /// these: the same answer `find_closest_nodes_local_with_self` gives for a
 /// routing table that hasn't changed, without a lookup for every key.
+///
+/// A snapshot taken for hints ([`Self::take_for_hints`]) also holds the
+/// peers marked full at that moment (Stage B, "full, not faulty"): a replica
+/// hint's close group is then widened by one for each of them inside it, as
+/// [`full::widened_close_group_with`] widens a lookup's, at most
+/// [`full::MAX_WIDENED_WIDTH`]. Any other snapshot marks none, and its close
+/// groups are the plain ones.
 #[derive(Debug, Clone)]
 pub(crate) struct RoutingSnapshot {
     self_id: PeerId,
     /// The routing table's peers, sorted, without this node.
     peers: Vec<PeerId>,
+    /// Peers marked full when the snapshot was taken for hints.
+    full: HashSet<PeerId>,
 }
 
 impl RoutingSnapshot {
@@ -95,12 +105,51 @@ impl RoutingSnapshot {
         Self::new(*p2p_node.peer_id(), peers)
     }
 
+    /// The routing table now, with the peers this node marks full now, for
+    /// the replica hints' widened close groups.
+    pub(crate) async fn take_for_hints(p2p_node: &P2PNode) -> Self {
+        let marked = full::view_for(p2p_node.peer_id())
+            .marks
+            .marked_set(Instant::now());
+        Self::take(p2p_node).await.with_full(marked)
+    }
+
     /// A snapshot of `peers`, as the routing table of `self_id`.
     pub(crate) fn new(self_id: PeerId, mut peers: Vec<PeerId>) -> Self {
         peers.retain(|peer| *peer != self_id);
         peers.sort_unstable();
         peers.dedup();
-        Self { self_id, peers }
+        Self {
+            self_id,
+            peers,
+            full: HashSet::new(),
+        }
+    }
+
+    /// The snapshot with `marked` as the peers marked full.
+    pub(crate) fn with_full(mut self, marked: HashSet<PeerId>) -> Self {
+        self.full = marked;
+        self
+    }
+
+    /// The width of `key`'s close group of `base`, widened by one for each
+    /// peer marked full inside it, at most [`full::MAX_WIDENED_WIDTH`]
+    /// ([`full::widened_len`]). With no peer marked, `base`.
+    pub(crate) fn widened_width(&self, key: &XorName, base: usize) -> usize {
+        if self.full.is_empty() || base == 0 {
+            return base;
+        }
+        let mut by_distance: Vec<([u8; 32], PeerId)> = self
+            .candidates()
+            .map(|candidate| (xor(candidate.as_bytes(), key), *candidate))
+            .collect();
+        let nearest = full::MAX_WIDENED_WIDTH.min(by_distance.len());
+        if nearest < by_distance.len() {
+            by_distance.select_nth_unstable_by(nearest, |a, b| a.0.cmp(&b.0));
+            by_distance.truncate(nearest);
+        }
+        by_distance.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        full::widened_len(&by_distance, base, |(_, peer)| self.full.contains(peer))
     }
 
     /// This node.
@@ -241,12 +290,11 @@ impl HintPage<'_> {
 /// such keys out of a set's page count, and again as each page or single
 /// message goes out ([`HintPage::to_send`]).
 ///
-/// The erasure gate that answers this is node-1b-disk's
-/// (`erasure::gate_for(self_id).is_being_erased`), which joins here when the
-/// branches merge. This branch selects nothing for erasure, so here no key is
-/// being erased.
-pub(crate) fn erasing(_self_id: &PeerId) -> impl Fn(&XorName) -> bool + Send + Sync + 'static {
-    |_key: &XorName| false
+/// The erasure gate answers it (`erasure::gate_for(self_id).is_being_erased`):
+/// a key the falling floor's pass has selected and not yet erased or let go.
+pub(crate) fn erasing(self_id: &PeerId) -> impl Fn(&XorName) -> bool + Send + Sync + 'static {
+    let gate = erasure::gate_for(self_id);
+    move |key: &XorName| gate.is_being_erased(key)
 }
 
 impl PeerSyncHints {
@@ -428,7 +476,10 @@ impl HintGroups {
     pub(crate) fn close_groups(&self) -> Vec<(XorName, HashSet<PeerId>)> {
         self.keys
             .iter()
-            .map(|key| (*key, self.snapshot.close_group(key, self.close_group_size)))
+            .map(|key| {
+                let width = self.snapshot.widened_width(key, self.close_group_size);
+                (*key, self.snapshot.close_group(key, width))
+            })
             .collect()
     }
 }
@@ -503,7 +554,7 @@ pub(crate) async fn build_sync_hints_for_peers(
     paid_list_close_group_size: usize,
 ) -> HashMap<PeerId, PeerSyncHints> {
     let started = Instant::now();
-    let snapshot = Arc::new(RoutingSnapshot::take(p2p_node).await);
+    let snapshot = Arc::new(RoutingSnapshot::take_for_hints(p2p_node).await);
     let empty = |snapshot: &Arc<RoutingSnapshot>| {
         peers
             .iter()
@@ -625,8 +676,10 @@ fn hints_from_snapshot(
         .collect();
     if close_group_size > 0 {
         for key in keys {
+            // Widened past the peers marked full inside it (Stage B).
+            let width = snapshot.widened_width(key, close_group_size);
             for peer in &candidates {
-                if snapshot.ranks_within(peer, key, close_group_size) {
+                if snapshot.ranks_within(peer, key, width) {
                     if let Some((replica, _)) = lists.get_mut(peer) {
                         replica.push(*key);
                     }

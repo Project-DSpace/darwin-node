@@ -55,6 +55,35 @@ pub async fn is_responsible(
     closest.iter().any(|n| n.peer_id == *self_id)
 }
 
+/// Check if this node is within `base_width` nearest to `key`, the width
+/// widened by one for each peer marked full inside it (see
+/// [`crate::replication::full`]), at most 20.
+///
+/// The storage admission and retention width: a node standing in for a full
+/// one takes and keeps the key. With no peer marked full this is
+/// [`is_responsible`] at `base_width`.
+pub async fn is_responsible_widened(
+    self_id: &PeerId,
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    base_width: usize,
+) -> bool {
+    let view = crate::replication::full::view_for(self_id);
+    let now = std::time::Instant::now();
+    let marked = view.marks.marked(now);
+    if marked.is_empty() {
+        return is_responsible(self_id, key, p2p_node, base_width).await;
+    }
+    let nearest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local_with_self(key, crate::replication::full::MAX_WIDENED_WIDTH)
+        .await;
+    let width = crate::replication::full::widened_len(&nearest, base_width, |node| {
+        marked.contains(&node.peer_id)
+    });
+    nearest.iter().take(width).any(|n| n.peer_id == *self_id)
+}
+
 /// Check if this node is in the `PaidCloseGroup` for key `K`.
 ///
 /// `PaidCloseGroup` = `paid_list_close_group_size` nearest peers to `K` in

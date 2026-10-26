@@ -36,7 +36,8 @@
 //!
 //! The same reading of the source pins other calls to reviewed sites, each in
 //! a test of its own: the disk-pressure state's builders, the routing loop's
-//! event reader, the lanes that penalise an unheld close-group chunk, upstream's
+//! event reader, the lanes that penalise an unheld close-group chunk and the
+//! one exemption a full peer gets from it, upstream's
 //! merkle payment code (compiled, never reached), and the payment vault reads
 //! and RPC addresses behind the payment check's fallback. A last test reads
 //! the vendored protocol's wire messages and payment proof types, and the
@@ -348,9 +349,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "PointerReplication::erase_if_proven",
         "delete",
         1,
-        "Erases a pointer only under disk pressure, beyond the erase floor, farthest \
-         first, after all but one of its current close group prove they hold it and the \
-         re-check just before deleting passes.",
+        "Erases a pointer only under disk pressure, beyond the falling floor (down to the \
+         edge of the node's range, never inside the widened retention width), farthest \
+         first, in two phases (selected and named in no hint for a whole sync cycle, then \
+         tried; released and hinted again if the check fails), after 6 of the 7 nearest \
+         peers not marked full prove they hold it (a full holder's proof counting, and 6 \
+         still needed when the cap of 20 cuts the group short), never while this node \
+         answered present for it to a state or fetch request within the fetch window, \
+         and only when the re-check just before deleting passes.",
     ),
     site(
         "src/replication/possession.rs",
@@ -376,9 +382,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "erase_if_still_eligible",
         "erase_stored_record",
         1,
-        "Erases a chunk only under disk pressure, beyond the erase floor, farthest first, \
-         after all but one of its current close group prove possession and the re-check \
-         just before deleting passes.",
+        "Erases a chunk only under disk pressure, beyond the falling floor (down to the \
+         edge of the node's range, never inside the widened retention width), farthest \
+         first, in two phases (selected and named in no hint for a whole sync cycle, then \
+         tried; released and hinted again if the check fails), after 6 of the 7 nearest \
+         peers not marked full prove possession (a full holder's proof counting, and 6 \
+         still needed when the cap of 20 cuts the group short), never while this node \
+         answered present for it within the fetch window, and only when the re-check just \
+         before deleting passes.",
     ),
     site(
         "src/replication/pruning.rs",
@@ -1616,8 +1627,9 @@ fn every_call_that_can_remove_stored_data_is_reviewed() {
         "\nThe calls in src/ that can remove stored data no longer match the reviewed list.\n\n\
          {report}\n\
          A node keeps every record and pointer it holds while its disk has room. The prune \
-         passes erase one only under disk pressure, beyond the erase floor, farthest first, \
-         and only after the nodes now nearest to it prove they hold it \
+         passes erase one only under disk pressure, beyond the falling floor (never inside \
+         the node's widened retention width), farthest first, in two phases, and only after \
+         6 of the 7 nodes now nearest to it and not marked full prove they hold it \
          (src/replication/retention.rs). Every other call that can remove stored data is \
          listed, with the reason it is there, in ERASE_SITES in \
          src/replication/retention/census.rs.\n\n\
@@ -1739,11 +1751,14 @@ fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
 /// every lane that finds it out, as in upstream v0.23.0: the responsible-chunk
 /// audit, the possession check after a fresh write, the prune audit, a
 /// sole-source replica hint its sender then denies, and a fetch a verified
-/// source can't serve. Nothing can withhold it: the release switch, its
-/// environment override and the helper the lanes went through while nodes
-/// moved off the LMDB chunk store are gone, and stay gone. Each lane charges
-/// the peer's trust itself, and the functions holding the lanes keep the
-/// reviewed number of trust charges.
+/// source can't serve; and a peer that doesn't hold a pointer it was offered,
+/// on the pointer possession check after a write (charged through
+/// `PointerReplication::penalise`). Nothing can withhold it but one bounded waiver for
+/// a full peer (the next test): the release switch, its environment override
+/// and the helper the lanes went through while nodes moved off the LMDB chunk
+/// store are gone, and stay gone. Each lane charges the peer's trust itself,
+/// and the functions holding the lanes keep the reviewed number of trust
+/// charges.
 #[test]
 fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
     const SWITCH: &[(Option<&str>, &str)] = &[
@@ -1812,12 +1827,25 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
             1,
         ),
     ];
-    let found = census_counting(
+    // The pointer possession check after a write charges through the pointer
+    // service's own `penalise`, which calls report_trust_event once.
+    const POINTER_CHARGE: &[(Option<&str>, &str)] = &[(None, "penalise")];
+    const POINTER_LANES: &[Reviewed] = &[(
+        "src/replication/pointer.rs",
+        "PointerReplication::check_possession",
+        "penalise",
+        1,
+    )];
+    let mut found = census_counting(
         Path::new(env!("CARGO_MANIFEST_DIR")),
         Counting::Calls(CHARGE),
     );
+    found.extend(census_counting(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Counting::Calls(POINTER_CHARGE),
+    ));
     let mut lanes = String::new();
-    for (file, site, call, count) in LANES {
+    for (file, site, call, count) in LANES.iter().chain(POINTER_LANES) {
         let key = (
             (*file).to_string(),
             (*site).to_string(),
@@ -1838,9 +1866,178 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
         lanes.is_empty(),
         "\nThe lanes that penalise a peer for an unheld close-group chunk no longer charge \
          its trust as reviewed.\n\n{lanes}\n\
-         Each of these functions charges the peer itself with report_trust_event. If a \
-         charge moved, follow it and list where it went; if one is gone, find out why \
+         Each of these functions charges the peer itself with report_trust_event, or for \
+         the pointer lane with PointerReplication::penalise. If a charge moved, follow it and list where it went; if one is gone, find out why \
          before changing the count.\n"
+    );
+}
+
+/// Full, not faulty: the one exemption from the unheld-chunk penalty.
+///
+/// A full peer (its own "full" notice fresh) that answered it lacks a key it
+/// was never seen proving, in a check not pinned to its commitment and, after a
+/// write, with its own quote not among the paid ones, is not charged. Every
+/// lane asks one function, `FullView::waives_unheld_penalty`
+/// (`src/replication/full.rs`), at one reviewed site, and names its own lane
+/// there. No other call can withhold the penalty: there is no switch and no
+/// environment override (the switch's names are pinned away in the test
+/// above, and in `tests/fork_pins.rs`).
+///
+/// The possession check after a write that goes unanswered asks nothing: a
+/// full node keeps answering, so only an answer that the key is absent is ever
+/// waived.
+#[test]
+fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
+    const WAIVER: &[(Option<&str>, &str)] = &[(None, "waives_unheld_penalty")];
+    const SITES: &[Reviewed] = &[
+        // A fetch a verified source answered NotFound.
+        (
+            "src/replication/mod.rs",
+            "execute_single_fetch",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A responsible-chunk audit failed only by absent keys, each asked.
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A sole-source replica hint its sender then denied.
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // The possession check after a write, answered with the absent digest.
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A prune audit answered with the absent digest.
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // The pointer possession check after a write, answered with no state
+        // of the pointer at all.
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "waives_unheld_penalty",
+            1,
+        ),
+    ];
+    const LANES: &[(Option<&str>, &str)] = &[(Some("Lane"), "*")];
+    const NAMED: &[Reviewed] = &[
+        (
+            "src/replication/mod.rs",
+            "execute_single_fetch",
+            "Lane::Fetch",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "Lane::ResponsibleAudit",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "Lane::ReplicaHint",
+            1,
+        ),
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "Lane::PossessionFailed",
+            1,
+        ),
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "Lane::PruneAudit",
+            1,
+        ),
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "Lane::PointerPossession",
+            1,
+        ),
+    ];
+    let sites = unreviewed(Counting::Calls(WAIVER), SITES);
+    assert!(
+        sites.is_empty(),
+        "\nThe unheld-chunk penalty is waived somewhere other than the reviewed sites.\n\n\
+         {sites}\n\
+         A full peer's penalty is waived in one bounded case, through \
+         FullView::waives_unheld_penalty, asked once on each lane that charges it. A new \
+         site widens the exemption: review it against that case before listing it.\n"
+    );
+
+    let named = unreviewed(Counting::Mentions(LANES), NAMED);
+    assert!(
+        named.is_empty(),
+        "\nA lane asks the waiver under another lane's name, or a lane is named elsewhere.\n\n\
+         {named}\n\
+         Each lane names itself in the case it asks about, so the log says which lane \
+         waived, and the behaviour tests of each lane (src/replication/full.rs, \
+         tests/fork_pins.rs) cover what that lane asks.\n"
+    );
+}
+
+/// Each lane of the waiver reads the peer's answer through its own small mapping,
+/// whose unit tests pin what counts as "absent" on that lane.
+#[test]
+fn each_lane_reads_its_answer_through_its_tested_mapping() {
+    const ANSWERS: &[(Option<&str>, &str)] = &[
+        (None, "hint_answer"),
+        (None, "audit_answer"),
+        (None, "prune_answer"),
+        (None, "possession_answer"),
+    ];
+    const ANSWERED: &[Reviewed] = &[
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "hint_answer",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "audit_answer",
+            1,
+        ),
+        (
+            "src/replication/pruning.rs",
+            "peer_proves_records",
+            "prune_answer",
+            1,
+        ),
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "possession_answer",
+            1,
+        ),
+    ];
+    let answered = unreviewed(Counting::Calls(ANSWERS), ANSWERED);
+    assert!(
+        answered.is_empty(),
+        "\nA lane reads the peer's answer other than through its tested mapping.\n\n\
+         {answered}\n\
+         hint_answer, audit_answer, prune_answer and possession_answer say what counts as \
+         \"absent\" on their lanes, and their unit tests pin it (a digest mismatch, a \
+         rejected hint or a failed prune answer is charged). Read the answer through them.\n"
     );
 }
 

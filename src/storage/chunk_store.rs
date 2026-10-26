@@ -38,7 +38,7 @@
 use crate::ant_protocol::{XorName, MAX_CHUNK_SIZE, XORNAME_LEN};
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, trace, warn};
-use crate::storage::StorageStats;
+use crate::storage::{Inodes, StorageStats};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -366,6 +366,37 @@ struct CapacitySnapshot {
     /// How many measurements have been taken: tells a reader of
     /// [`SpaceReading`] which one it has.
     measurements: u64,
+    /// Free inodes at `measured_at`, where the filesystem counts them.
+    inodes: Option<Inodes>,
+}
+
+/// Why a node is full: what put it at the full line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullTrigger {
+    /// Free bytes: no more than the line and one chunk.
+    Bytes,
+    /// Free inodes: below the falling floor's last step's share.
+    Inodes,
+}
+
+impl FullTrigger {
+    /// The word logs and status use for it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Inodes => "inodes",
+        }
+    }
+}
+
+/// A node's "full" state: since when, and what put it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullState {
+    /// When the node became full, by the wall clock.
+    pub since: std::time::SystemTime,
+    /// What put it at the line.
+    pub trigger: FullTrigger,
 }
 
 /// Size-aware free-space predicate with a short-lived cache.
@@ -382,6 +413,10 @@ struct CapacityGuard {
     reserve: u64,
     /// The cached measurement.
     snapshot: parking_lot::Mutex<CapacitySnapshot>,
+    /// Whether the node is full, and since when. While it is, no new
+    /// record is admitted, whatever free space a measurement finds, until the
+    /// erasure task says the node has left "full".
+    full: parking_lot::Mutex<Option<FullState>>,
 }
 
 impl CapacitySnapshot {
@@ -405,8 +440,24 @@ impl CapacityGuard {
                 written_since: 0,
                 in_flight: 0,
                 measurements: 0,
+                inodes: None,
             }),
+            full: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The node's "full" state, if it is full.
+    fn full_state(&self) -> Option<FullState> {
+        *self.full.lock()
+    }
+
+    /// The refusal for a new record while the node is full.
+    fn full_refusal(state: FullState) -> Error {
+        Error::Storage(format!(
+            "Insufficient disk space: this node is full (at the full line by {}), and takes \
+             no new data until it has room above the line again",
+            state.trigger.as_str()
+        ))
     }
 
     /// The free space and the line, measuring again first if the last
@@ -433,14 +484,15 @@ impl CapacityGuard {
             .saturating_add(ALLOC_UNIT)
     }
 
-    /// Free bytes right now, or `None` if the question could not be answered.
+    /// Free bytes and inodes right now, or `None` if the question could not be
+    /// answered.
     ///
     /// Deliberately separate from [`Self::measure`], which folds a failure into an error
     /// the caller cannot tell from "below the reserve".
-    fn measure_available(&self) -> Option<u64> {
+    fn measure_available(&self) -> Option<(u64, Option<Inodes>)> {
         let mut snapshot = self.snapshot.lock();
         match self.measure(&mut snapshot) {
-            Ok(()) => Some(snapshot.free_estimate()),
+            Ok(()) => Some((snapshot.free_estimate(), snapshot.inodes)),
             Err(_) => None,
         }
     }
@@ -450,6 +502,7 @@ impl CapacityGuard {
         let available = super::available_space(&self.dir)
             .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
         snapshot.available = available;
+        snapshot.inodes = super::free_inodes(&self.dir);
         // Reservations survive: their bytes are not on the platter yet, so the fresh
         // measurement does not include them.
         snapshot.written_since = 0;
@@ -463,12 +516,17 @@ impl CapacityGuard {
     /// Only *passing* results are cached, so a low-space condition is rechecked on every
     /// call and freed space is noticed promptly.
     fn admit(&self, snapshot: &mut CapacitySnapshot, needed: u64) -> Result<()> {
+        if let Some(state) = self.full_state() {
+            return Err(Self::full_refusal(state));
+        }
         let want = self.reserve.saturating_add(Self::charge(needed));
 
         let cache_fresh = snapshot
             .measured_at
             .is_some_and(|t| t.elapsed().as_secs() < DISK_CHECK_INTERVAL_SECS);
-        if cache_fresh && snapshot.free_estimate() >= want {
+        let inodes_short =
+            |snapshot: &CapacitySnapshot| snapshot.inodes.is_some_and(Inodes::at_the_line);
+        if cache_fresh && snapshot.free_estimate() >= want && !inodes_short(snapshot) {
             return Ok(());
         }
 
@@ -483,7 +541,91 @@ impl CapacityGuard {
                 bytes_to_gib(self.reserve),
             )));
         }
+        if let Some(inodes) = snapshot.inodes.filter(|inodes| inodes.at_the_line()) {
+            // Out of inodes counts as being at the line: the write would take one
+            // the filesystem may not have, after the node had been paid for it.
+            return Err(Error::Storage(format!(
+                "Insufficient disk space: {} of {} inodes free, below {}.{}% of the partition's. \
+                 Free inodes or move the node to a filesystem with more to continue storing chunks.",
+                inodes.free,
+                inodes.total,
+                crate::storage::INODES_AT_THE_LINE_PER_MILLE / 10,
+                crate::storage::INODES_AT_THE_LINE_PER_MILLE % 10,
+            )));
+        }
         Ok(())
+    }
+
+    /// Admit a write of `needed` bytes that replaces a record of the same size
+    /// already on disk, and charge it: it needs room only for its temporary
+    /// file, not room above the line, and is admitted while the node is full.
+    ///
+    /// For an update of a pointer the node holds, which takes no new space
+    /// once its temporary file has replaced the old one.
+    fn reserve_replacement(self: &Arc<Self>, needed: u64) -> Result<Reservation> {
+        {
+            let mut snapshot = self.snapshot.lock();
+            self.admit_replacement(&mut snapshot, needed)?;
+            snapshot.in_flight = snapshot.in_flight.saturating_add(Self::charge(needed));
+        }
+        Ok(Reservation {
+            capacity: Arc::clone(self),
+            bytes: needed,
+            settled: false,
+        })
+    }
+
+    /// Test a replacing write of `needed` bytes: room for its temporary file
+    /// only, whether or not the node is full. Charges nothing.
+    fn admit_replacement(&self, snapshot: &mut CapacitySnapshot, needed: u64) -> Result<()> {
+        let want = Self::charge(needed);
+        if snapshot.free_estimate() < want {
+            self.measure(snapshot)?;
+            if snapshot.free_estimate() < want {
+                return Err(Error::Storage(format!(
+                    "Insufficient disk space: {} bytes available, {want} needed for the \
+                     temporary file of a replacing write",
+                    snapshot.free_estimate()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Admit and charge the repair of a chunk removed as corrupt, whose removal
+    /// freed `freed` bytes.
+    ///
+    /// Above the line and not full, it is admitted as any new record is. Full
+    /// or at the line, it replaces the space its removal freed and is admitted
+    /// on room for its temporary file alone, but only up to that space: a
+    /// repair whose charge is larger than the removed file's is refused as a
+    /// new record would be.
+    fn reserve_repair(self: &Arc<Self>, needed: u64, freed: u64) -> Result<Reservation> {
+        {
+            let mut snapshot = self.snapshot.lock();
+            if let Err(refusal) = self.admit(&mut snapshot, needed) {
+                if Self::charge(needed) > Self::charge(freed) {
+                    return Err(refusal);
+                }
+                self.admit_replacement(&mut snapshot, needed)?;
+            }
+            snapshot.in_flight = snapshot.in_flight.saturating_add(Self::charge(needed));
+        }
+        Ok(Reservation {
+            capacity: Arc::clone(self),
+            bytes: needed,
+            settled: false,
+        })
+    }
+
+    /// [`Self::reserve_repair`]'s answer for a repair the size of the space
+    /// its removal freed. Charges nothing.
+    fn check_repair(&self, freed: u64) -> Result<()> {
+        let mut snapshot = self.snapshot.lock();
+        if self.admit(&mut snapshot, freed).is_ok() {
+            return Ok(());
+        }
+        self.admit_replacement(&mut snapshot, freed)
     }
 
     /// Drop the cached measurement so the next question hits the filesystem.
@@ -754,6 +896,11 @@ impl std::fmt::Debug for RemovedSlot {
 /// that reads it reports it again.
 const MAX_CORRUPT_REPORTS: usize = 1024;
 
+/// The most chunks removed as corrupt whose repair a store takes while full,
+/// each up to the space its own removal freed:
+/// as many as [`MAX_CORRUPT_REPORTS`] queues for the recheck that removes them.
+const MAX_QUARANTINED_REPAIRS: usize = MAX_CORRUPT_REPORTS;
+
 /// Chunks found not to hash to their address, waiting for
 /// [`ChunkStore::run_corrupt_rechecks`].
 #[derive(Debug, Default)]
@@ -847,6 +994,14 @@ pub struct ChunkStore {
     /// often they are read, and only a repair or a removal settles it. A raw read that
     /// does not hash anything must not take a chunk out of this set.
     known_wrong: Arc<parking_lot::RwLock<HashSet<XorName>>>,
+    /// Chunks this store held and removed because their bytes were wrong,
+    /// oldest first, at most [`MAX_QUARANTINED_REPAIRS`], each with the bytes
+    /// its removal freed: a repair of one replaces that space, so it is taken
+    /// while the node is full or at the line, needing room only for its
+    /// temporary file, and only up to the freed bytes. Cleared when the key is
+    /// stored again; past the cap the oldest goes, and its repair then waits
+    /// for room as any new record does.
+    quarantined: Arc<parking_lot::Mutex<VecDeque<(XorName, u64)>>>,
     /// Addresses this store is part-way through writing.
     ///
     /// Every mutation registers here before it spawns its blocking work and clears the
@@ -1024,6 +1179,7 @@ impl ChunkStore {
             shards_present: Arc::new(parking_lot::Mutex::new(shards_present)),
             suspect: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             known_wrong: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            quarantined: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
             writing: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             write_finished: Arc::new(tokio::sync::Notify::new()),
             capacity,
@@ -1143,8 +1299,14 @@ impl ChunkStore {
 
         let len = content.len() as u64;
         // Reserved after the duplicate test so re-storing an existing chunk stays a
-        // harmless no-op on a full disk.
-        let reservation = self.capacity.reserve(len)?;
+        // harmless no-op on a full disk. The repair of a chunk this store held and
+        // removed as corrupt replaces the space that removal freed: while the node is
+        // full or at the line it needs room only for its temporary file, and only up
+        // to the bytes the removal freed.
+        let reservation = match self.quarantined_freed(address) {
+            Some(freed) => self.capacity.reserve_repair(len, freed)?,
+            None => self.capacity.reserve(len)?,
+        };
 
         let shard = self.chunks_dir.join(shard_name(address));
         let final_path = shard.join(hex::encode(address));
@@ -1174,6 +1336,7 @@ impl ChunkStore {
         let lease = Arc::clone(&self.lock);
         let known_wrong = Arc::clone(&self.known_wrong);
         let suspect = Arc::clone(&self.suspect);
+        let quarantined = Arc::clone(&self.quarantined);
 
         let outcome = self
             .blocking_tracker
@@ -1250,6 +1413,10 @@ impl ChunkStore {
                     // happened to settle it.
                     known_wrong.write().remove(&key);
                     suspect.write().remove(&key);
+                    // Repaired: the space its removal freed is taken again.
+                    quarantined
+                        .lock()
+                        .retain(|(quarantined, _)| *quarantined != key);
                     // Settled here, inside the work, so a dropped awaiter cannot strand it.
                     reservation.commit();
                 }
@@ -2059,6 +2226,52 @@ impl ChunkStore {
         self.capacity.check(0)
     }
 
+    /// [`Self::check_capacity`] for a write of `key`. The repair of a chunk
+    /// this store held and removed as corrupt replaces the space its removal
+    /// freed: while the node is full or at the line it needs room only for its
+    /// temporary file, up to the bytes the removal freed (see [`Self::put`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::check_capacity`], for any other key; for a repair, when the
+    /// disk has no room for its temporary file.
+    pub fn check_capacity_for_key(&self, key: &XorName) -> Result<()> {
+        self.quarantined_freed(key).map_or_else(
+            || self.check_capacity(),
+            |freed| self.capacity.check_repair(freed),
+        )
+    }
+
+    /// Whether a write of `key` would repair a chunk this store held and
+    /// removed because its bytes were wrong: taken while the node is full, up
+    /// to the space the removal freed.
+    #[must_use]
+    pub fn is_quarantined_repair(&self, key: &XorName) -> bool {
+        self.quarantined_freed(key).is_some()
+    }
+
+    /// The bytes freed by removing `key` as corrupt, if its repair is pending.
+    fn quarantined_freed(&self, key: &XorName) -> Option<u64> {
+        self.quarantined
+            .lock()
+            .iter()
+            .find(|(quarantined, _)| quarantined == key)
+            .map(|(_, freed)| *freed)
+    }
+
+    /// Note that `key`'s file was removed as corrupt, freeing `freed` bytes.
+    fn note_quarantined(&self, key: &XorName, freed: u64) {
+        let mut quarantined = self.quarantined.lock();
+        if let Some(entry) = quarantined.iter_mut().find(|(k, _)| k == key) {
+            entry.1 = freed;
+            return;
+        }
+        if quarantined.len() >= MAX_QUARANTINED_REPAIRS {
+            quarantined.pop_front();
+        }
+        quarantined.push_back((*key, freed));
+    }
+
     /// Three-way answer to "can this store take a write right now".
     ///
     /// Kept distinct from [`Self::check_capacity`] because a failed free-space query and a
@@ -2068,13 +2281,69 @@ impl ChunkStore {
     /// well succeed on the next pass.
     #[must_use]
     pub fn capacity_verdict(&self) -> crate::storage::CapacityVerdict {
+        if self.capacity.full_state().is_some() {
+            return crate::storage::CapacityVerdict::Full;
+        }
         match self.capacity.measure_available() {
-            Some(available) if available < self.capacity.reserve => {
+            Some((available, inodes))
+                if available < self.capacity.reserve || inodes.is_some_and(Inodes::at_the_line) =>
+            {
                 crate::storage::CapacityVerdict::Full
             }
             Some(_) => crate::storage::CapacityVerdict::Writable,
             None => crate::storage::CapacityVerdict::Unknown,
         }
+    }
+
+    /// The full line: the free bytes this store keeps unused.
+    #[must_use]
+    pub fn full_line(&self) -> u64 {
+        self.capacity.reserve
+    }
+
+    /// Whether the node is full, and since when. While it is, the store
+    /// admits no new record ([`Self::check_capacity`], [`Self::put`] and the
+    /// pointer store's charges refuse), and the node prices no new data.
+    #[must_use]
+    pub fn full_state(&self) -> Option<FullState> {
+        self.capacity.full_state()
+    }
+
+    /// Whether the node is full (see [`Self::full_state`]).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.capacity.full_state().is_some()
+    }
+
+    /// Enter "full", put there by `trigger`. Returns the state when the node
+    /// was not full before; the caller logs the change.
+    pub(crate) fn enter_full(&self, trigger: FullTrigger) -> Option<FullState> {
+        let state = FullState {
+            since: std::time::SystemTime::now(),
+            trigger,
+        };
+        let mut full = self.capacity.full.lock();
+        let entered = full.is_none();
+        if entered {
+            *full = Some(state);
+        }
+        drop(full);
+        entered.then_some(state)
+    }
+
+    /// Leave "full". Returns the state the node was in, if it was full.
+    pub(crate) fn leave_full(&self) -> Option<FullState> {
+        self.capacity.full.lock().take()
+    }
+
+    /// Mark the node full or not, for a test that needs a full node without
+    /// filling a disk. Tests only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_full_for_test(&self, trigger: Option<FullTrigger>) {
+        *self.capacity.full.lock() = trigger.map(|trigger| FullState {
+            since: std::time::SystemTime::now(),
+            trigger,
+        });
     }
 
     /// The free space on this store's partition and its full line, as
@@ -2105,6 +2374,19 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if the disk cannot take `bytes` more.
     pub(crate) fn reserve(&self, bytes: u64) -> Result<Reservation> {
         self.capacity.reserve(bytes)
+    }
+
+    /// Charge `bytes` for a write that replaces a record of the same size this
+    /// node holds, such as an update of a held pointer: it takes no new space
+    /// once its temporary file replaces the old record, so it needs room only
+    /// for that file, not room above the line, and is taken while the node is
+    /// full.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the disk cannot take the temporary file.
+    pub(crate) fn reserve_replacement(&self, bytes: u64) -> Result<Reservation> {
+        self.capacity.reserve_replacement(bytes)
     }
 
     /// Credit `bytes` deleted from the pointer store back to the disk budget.
@@ -2346,6 +2628,10 @@ impl ChunkStore {
         // inside a directory a second process had already been handed.
         let lease = Arc::clone(&self.lock);
         let removed = Arc::clone(&self.removed_observer);
+        // Set when this removes the file, to the bytes it held: a file already
+        // gone freed nothing.
+        let freed = Arc::new(parking_lot::Mutex::new(None::<u64>));
+        let freed_here = Arc::clone(&freed);
         let outcome =
             self.blocking_tracker
                 .spawn_blocking(move || -> std::io::Result<bool> {
@@ -2370,6 +2656,7 @@ impl ChunkStore {
                         return Ok(false);
                     }
                     std::fs::remove_file(&path)?;
+                    *freed_here.lock() = Some(buf.len() as u64);
                     // The same flush the ordinary delete does, for the same reason: an
                     // unlink that has not reached the directory can be undone by a power
                     // loss, and here the entry that comes back is one this node has proven
@@ -2389,6 +2676,10 @@ impl ChunkStore {
             Ok(Ok(true)) => {
                 self.clear_known_wrong(address);
                 self.clear_suspect(address);
+                let freed = *freed.lock();
+                if let Some(freed) = freed {
+                    self.note_quarantined(address, freed);
+                }
                 warn!(
                     "Removed corrupt chunk file {}; replication will repair it",
                     hex::encode(address)
@@ -4108,6 +4399,110 @@ mod tests {
             "a corrupt chunk must stop being advertised"
         );
         assert_eq!(store.stats().verification_failures, 1);
+    }
+
+    /// A full node keeps serving and proving what it holds: the repair of a
+    /// chunk it removed as corrupt is taken while full, since it replaces the
+    /// space the removal freed, once; any other new chunk is refused.
+    #[tokio::test]
+    async fn a_full_store_takes_the_repair_of_a_chunk_it_removed_as_corrupt() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("repair while full");
+        store.put(&addr, &content).await.expect("put");
+        std::fs::write(store.chunk_path(&addr), b"tampered").expect("tamper");
+        store
+            .get_or_quarantine(&addr)
+            .await
+            .expect_err("verification must fail");
+        assert!(store.is_quarantined_repair(&addr));
+
+        store.set_full_for_test(Some(FullTrigger::Bytes));
+        let (other, other_content) = addressed("a new record");
+        assert!(
+            store.put(&other, &other_content).await.is_err(),
+            "new: refused"
+        );
+        assert!(store.check_capacity_for_key(&other).is_err());
+        assert!(store.check_capacity_for_key(&addr).is_ok());
+
+        assert!(
+            store.put(&addr, &content).await.expect("repair"),
+            "repaired"
+        );
+        assert_eq!(
+            store.get(&addr).await.expect("get").as_deref(),
+            Some(&content[..])
+        );
+        assert!(!store.is_quarantined_repair(&addr), "taken once");
+        assert!(store.check_capacity_for_key(&addr).is_err());
+
+        // A file already gone freed nothing: no repair slot.
+        let (gone, gone_content) = addressed("gone");
+        store.set_full_for_test(None);
+        store.put(&gone, &gone_content).await.expect("put");
+        std::fs::remove_file(store.chunk_path(&gone)).expect("remove");
+        store.quarantine_corrupt(&gone).await;
+        assert!(!store.is_quarantined_repair(&gone));
+    }
+
+    /// At the line, the repair of a chunk removed as corrupt is taken only up to
+    /// the space its removal freed: a repair larger than the removed file, or of
+    /// a key never removed, is refused as any new record is.
+    #[tokio::test]
+    async fn at_the_line_a_repair_is_taken_only_up_to_the_space_its_removal_freed() {
+        let dir = TempDir::new().expect("temp dir");
+        let content_of = |seed: &str| {
+            let mut content = format!("repair at the line {seed}").into_bytes();
+            content.resize(usize::try_from(3 * ALLOC_UNIT).expect("small"), b'x');
+            (crate::client::compute_address(&content), content)
+        };
+        let (within, within_content) = content_of("within");
+        let (beyond, beyond_content) = content_of("beyond");
+        let (never, never_content) = content_of("never");
+        {
+            let store = reopen(&dir).await;
+            store.put(&within, &within_content).await.expect("put");
+            store.put(&beyond, &beyond_content).await.expect("put");
+        }
+        // Reopened short of a reserve no disk can meet: at the line for good.
+        let store = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: true,
+            disk_reserve: u64::MAX / 2,
+        })
+        .await
+        .expect("reopen at the line");
+
+        // Rot that keeps the length frees the whole chunk; a truncated file frees less.
+        let mut rotted = within_content.clone();
+        rotted[0] ^= 0xff;
+        std::fs::write(store.chunk_path(&within), &rotted).expect("tamper");
+        std::fs::write(store.chunk_path(&beyond), b"short").expect("truncate");
+        for key in [&within, &beyond] {
+            store
+                .get_or_quarantine(key)
+                .await
+                .expect_err("verification must fail");
+            assert!(store.is_quarantined_repair(key));
+        }
+
+        assert!(store.check_capacity_for_key(&never).is_err());
+        assert!(
+            store.put(&never, &never_content).await.is_err(),
+            "a key never removed is a new record"
+        );
+        assert!(
+            store.put(&beyond, &beyond_content).await.is_err(),
+            "larger than the space its removal freed"
+        );
+        assert!(store.is_quarantined_repair(&beyond), "still waiting");
+        assert!(store.check_capacity_for_key(&within).is_ok());
+        assert!(
+            store.put(&within, &within_content).await.expect("repair"),
+            "within the space its removal freed"
+        );
+        assert!(!store.is_quarantined_repair(&within), "taken once");
+        assert!(store.check_capacity_for_key(&within).is_err());
     }
 
     /// A plain verifying read takes a chunk whose bytes don't match its name out of

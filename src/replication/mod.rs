@@ -22,7 +22,9 @@ pub mod bootstrap;
 pub mod commitment;
 pub mod commitment_state;
 pub mod config;
+pub mod erasure;
 pub mod fresh;
+pub mod full;
 pub mod neighbor_sync;
 pub mod paid_list;
 pub mod pointer;
@@ -1513,8 +1515,10 @@ const VERIFICATION_CYCLE_SLOW_LOG_MS: u128 = 500;
 const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 
 // A peer that doesn't hold a close-group chunk it should is penalised at these
-// weights on every lane that finds it out, and nothing withholds it (the census's
-// lane pin, tests/fork_pins.rs). A weight of zero would withhold it without a
+// weights on every lane that finds it out, and nothing withholds it but one
+// bounded waiver for a full peer, asked through `full::FullView::
+// waives_unheld_penalty` at one reviewed site a lane (the census's lane and
+// waiver pins, tests/fork_pins.rs). A weight of zero would withhold it without a
 // word, so a build with one doesn't compile.
 const _: () = assert!(
     REPLICATION_TRUST_WEIGHT > 0.0 && config::AUDIT_FAILURE_TRUST_WEIGHT > 0.0,
@@ -1709,6 +1713,20 @@ pub struct ReplicationEngine {
     /// Disk-pressure state shared by the chunk and pointer prune passes: the
     /// only state in which they erase records.
     disk_retention: Arc<retention::DiskRetention>,
+    /// What this node knows of its peers' "full" state: the marks, and
+    /// the keys it has seen each peer prove it holds. Registered by the
+    /// node's id, so the lanes and passes reach it.
+    full_view: Arc<full::FullView>,
+    /// The records being erased, and the keys lately answered "present" for:
+    /// erasure in two phases. Registered by the node's id.
+    erasure_gate: Arc<erasure::ErasureGate>,
+    /// Wakes the erasure task when a neighbour-sync cycle completes.
+    erasure_trigger: Arc<Notify>,
+    /// The out-of-range clocks' own table, when it could be opened.
+    out_of_range_clocks: Option<Arc<erasure::OutOfRangeClocks>>,
+    /// The node's root, where the record of keys peers were seen proving is
+    /// saved after each prune pass (`full::SEEN_FILE`).
+    root_dir: PathBuf,
     /// Payment verifier for `PoP` validation.
     payment_verifier: Arc<PaymentVerifier>,
     /// Replication pipeline queues.
@@ -1933,7 +1951,7 @@ impl ReplicationEngine {
     ///
     /// Returns an error if the `PaidList` LMDB environment cannot be opened
     /// or if the configuration fails validation.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn new(
         config: ReplicationConfig,
         p2p_node: Arc<P2PNode>,
@@ -1957,6 +1975,23 @@ impl ReplicationEngine {
         let disk_retention = Arc::new(retention::DiskRetention::for_store(&storage));
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
+        // Full, not faulty, and two-phase erasure: per node, reached by the node's id.
+        let seen_root = root_dir.to_path_buf();
+        let seen = tokio::task::spawn_blocking(move || full::SeenHolders::load(&seen_root))
+            .await
+            .unwrap_or_default();
+        let full_view = Arc::new(full::FullView::with_seen(seen));
+        full::register_view(p2p_node.peer_id(), &full_view);
+        let erasure_gate = Arc::new(erasure::ErasureGate::default());
+        erasure::register_gate(p2p_node.peer_id(), &erasure_gate);
+        let out_of_range_clocks = open_out_of_range_clocks(
+            root_dir,
+            &storage,
+            &paid_list,
+            config.prune_hysteresis_duration,
+        )
+        .await;
+
         // ADR-0004: monetized-pin channel (verifier -> first-audit drainer).
         // Bounded (Amendment 2): every stage of the first-audit pipeline is
         // now capacity-limited — ingress queue here, pending set (LRU), and
@@ -1970,6 +2005,11 @@ impl ReplicationEngine {
             storage,
             paid_list,
             disk_retention,
+            full_view,
+            erasure_gate,
+            erasure_trigger: Arc::new(Notify::new()),
+            out_of_range_clocks,
+            root_dir: root_dir.to_path_buf(),
             payment_verifier,
             queues: Arc::new(RwLock::new(ReplicationQueues::new())),
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
@@ -2067,6 +2107,21 @@ impl ReplicationEngine {
     #[must_use]
     pub fn paid_list(&self) -> &Arc<PaidList> {
         &self.paid_list
+    }
+
+    /// What this node knows of its peers' "full" state: the marks, and the
+    /// keys it has seen each peer prove it holds. The engine holds it, and
+    /// the node's code reaches it by the node's id ([`full::view_for`]).
+    #[must_use]
+    pub fn full_view(&self) -> &Arc<full::FullView> {
+        &self.full_view
+    }
+
+    /// The records and pointers being erased, and the keys lately answered
+    /// "present" for (see [`erasure`]).
+    #[must_use]
+    pub fn erasure_gate(&self) -> &Arc<erasure::ErasureGate> {
+        &self.erasure_gate
     }
 
     /// Get a reference to the responder's commitment state. Used by audit
@@ -2335,9 +2390,22 @@ impl ReplicationEngine {
     /// deterministically without waiting for the scheduled check.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn run_possession_check_now(&self, key: XorName, peers: Vec<PeerId>) {
+        self.run_possession_check_now_paid(key, peers, None).await;
+    }
+
+    /// Test-only: [`Self::run_possession_check_now`] for a write whose proof's
+    /// paid quotes were issued by `paid_quote_issuers` (`None`: unreadable).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn run_possession_check_now_paid(
+        &self,
+        key: XorName,
+        peers: Vec<PeerId>,
+        paid_quote_issuers: Option<Vec<PeerId>>,
+    ) {
         possession::run_possession_check(
             key,
             peers,
+            paid_quote_issuers.as_deref(),
             &self.p2p_node,
             &self.storage,
             &self.config,
@@ -2561,6 +2629,10 @@ impl ReplicationEngine {
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_replication();
         self.start_possession_check_scheduler();
+        // The prune passes in a task of their own, erasing in two
+        // phases, and the "full" notice renewed while the node stays full.
+        self.start_erasure_task();
+        self.start_full_notice_loop();
         if let Some(pointers) = &self.pointers {
             self.task_handles.push(pointers.start_verification_loop());
             if let Some(writes) = self.pointer_fresh_rx.take() {
@@ -2975,6 +3047,7 @@ impl ReplicationEngine {
                                     possession::run_possession_check(
                                         event.key,
                                         event.peers,
+                                        event.paid_quote_issuers.as_deref(),
                                         &p2p,
                                         &storage,
                                         &config,
@@ -3598,6 +3671,9 @@ impl ReplicationEngine {
                                 }
                                 handler_context.sync_peers.forget(&peer_id);
                                 handler_context.served_hint_sets.forget(&peer_id);
+                                // Its "full" mark and its place among the
+                                // notice's readers go with it.
+                                full::view_for(p2p.peer_id()).marks.forget(&peer_id);
                                 update_bootstrap_after_peer_removed(
                                     &peer_id,
                                     &handler_context.bootstrap_state,
@@ -3641,7 +3717,7 @@ impl ReplicationEngine {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
         let paid_list = Arc::clone(&self.paid_list);
-        let disk_retention = Arc::clone(&self.disk_retention);
+        let erasure_trigger = Arc::clone(&self.erasure_trigger);
         let queues = Arc::clone(&self.queues);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
@@ -3656,7 +3732,6 @@ impl ReplicationEngine {
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
-        let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let detached_task_tracker = self.detached_task_tracker.clone();
         let sync_peers = Arc::clone(&self.sync_peers);
         // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
@@ -3714,11 +3789,10 @@ impl ReplicationEngine {
                         &last_commitment_by_peer,
                         &ever_capable_peers,
                         &sig_verify_attempts,
-                        &audit_challenge_coordinator,
                         &gossip_audit,
                         pointers.as_ref(),
-                        &disk_retention,
                         &sync_peers,
+                        &erasure_trigger,
                     ) => {}
                 }
             }
@@ -3948,6 +4022,171 @@ impl ReplicationEngine {
                 }
             }
             debug!("Commitment rotation loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// The prune passes (Section 11), in a task of their own: woken each
+    /// time a neighbour-sync cycle completes, never run inside the sync loop.
+    ///
+    /// Each pass erases in two phases (see [`erasure`]): an eligible record is
+    /// selected in one cycle, named in no hint from then on, and erased in a
+    /// later cycle. Prune candidacy is unconditional once the out-of-range wait
+    /// has passed; records are erased only under disk pressure, and bootstrap
+    /// defers the remote prune-confirmation audits until it has drained. Both
+    /// passes share one disk-pressure state. After them the node enters or
+    /// leaves "full" ([`full::after_passes`]) and tells its peers, and the
+    /// out-of-range clocks are saved, so they survive a restart.
+    fn start_erasure_task(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let storage = Arc::clone(&self.storage);
+        let paid_list = Arc::clone(&self.paid_list);
+        let config = Arc::clone(&self.config);
+        let sync_state = Arc::clone(&self.sync_state);
+        let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
+        let repair_proofs = Arc::clone(&self.repair_proofs);
+        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let commitment_state = Arc::clone(&self.commitment_state);
+        let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
+        let disk_retention = Arc::clone(&self.disk_retention);
+        let erasure_trigger = Arc::clone(&self.erasure_trigger);
+        let erasure_gate = Arc::clone(&self.erasure_gate);
+        let clocks = self.out_of_range_clocks.clone();
+        let full_view = Arc::clone(&self.full_view);
+        let root_dir = self.root_dir.clone();
+        let pointers = self.pointers.clone();
+        let shutdown = self.shutdown.clone();
+        if let (Some(clocks), Some(pointers)) = (&clocks, &pointers) {
+            restore_pointer_clocks(clocks, pointers, config.prune_hysteresis_duration);
+        }
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = erasure_trigger.notified() => {}
+                }
+                let self_id = *p2p.peer_id();
+                let epoch = *sync_cycle_epoch.read().await;
+                let allow_remote_prune_audits =
+                    !*is_bootstrapping.read().await && bootstrap_state.read().await.is_drained();
+                let passes = async {
+                    let records = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+                        self_id: &self_id,
+                        storage: &storage,
+                        paid_list: &paid_list,
+                        p2p_node: &p2p,
+                        config: &config,
+                        sync_state: &sync_state,
+                        repair_proofs: &repair_proofs,
+                        allow_remote_prune_audits,
+                        commitment_state: Some(&commitment_state),
+                        audit_challenge_coordinator: &audit_challenge_coordinator,
+                        disk_retention: &disk_retention,
+                        erasure_epoch: Some(epoch),
+                    })
+                    .await;
+                    let pointers_erased = match &pointers {
+                        Some(pointers) => {
+                            pointers
+                                .prune_pass_in_epoch(
+                                    allow_remote_prune_audits,
+                                    Some(&commitment_state),
+                                    &disk_retention,
+                                    Some(epoch),
+                                )
+                                .await
+                                .pruned
+                        }
+                        None => 0,
+                    };
+                    records.records_pruned.saturating_add(pointers_erased)
+                };
+                let erased = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    erased = passes => erased,
+                };
+                let not_yet_erased = erasure_gate.not_yet_erased();
+                // The notice dials peers in turn: a shutdown stops it, and
+                // the clocks are still saved before the task leaves. The
+                // state changes and is sent under the announcer's lock, so a
+                // renewal can't send an older state after it.
+                let mut stopping = false;
+                let notice = full_view.announcer.announce(
+                    |announcer| {
+                        let changed =
+                            full::after_passes(&storage, &disk_retention, erased, not_yet_erased);
+                        announcer.note_pass_done();
+                        changed.map(|_| {
+                            announcer.state_sent();
+                            storage.is_full()
+                        })
+                    },
+                    |full| full::send_full_notice(&p2p, full),
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => stopping = true,
+                    _ = notice => {}
+                }
+                if let Some(clocks) = &clocks {
+                    save_out_of_range_clocks(clocks, &paid_list, pointers.as_ref()).await;
+                }
+                full_view.seen.save(&root_dir).await;
+                if stopping {
+                    break;
+                }
+            }
+            debug!("Erasure task shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Full, not faulty: while the node is full, renew its "full" notice
+    /// every [`full::full_notice_renewal`], so its peers' marks stay fresh, and
+    /// look again between prune passes for the room to leave "full", telling
+    /// its peers once when it does.
+    ///
+    /// The "full" state isn't kept across a restart: at start the node logs
+    /// where it stands ([`full::at_start`]), and a node that starts at the
+    /// line tells its peers once, at the first renewal, if no prune pass has
+    /// run by then, so their marks from before the restart don't lapse while
+    /// it waits for that pass. If the pass then doesn't put it in "full", the
+    /// next renewal takes that back ([`full::FullAnnouncer`]).
+    fn start_full_notice_loop(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let storage = Arc::clone(&self.storage);
+        let disk_retention = Arc::clone(&self.disk_retention);
+        let full_view = Arc::clone(&self.full_view);
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let mut at_the_line_at_start = full::at_start(&disk_retention);
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(full::full_notice_renewal()) => {}
+                }
+                // Read and sent under the announcer's lock, after any state
+                // change the erasure task sent.
+                let notice = full_view.announcer.announce(
+                    |announcer| {
+                        if storage.is_full() {
+                            at_the_line_at_start = false;
+                            announcer.renewal_when_full();
+                            Some(full::leave_if_room(&storage, &disk_retention) != Some(false))
+                        } else {
+                            let at_start = std::mem::take(&mut at_the_line_at_start)
+                                && disk_retention.at_the_line().is_some();
+                            announcer.renewal_when_not_full(at_start)
+                        }
+                    },
+                    |full| full::send_full_notice(&p2p, full),
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = notice => {}
+                }
+            }
+            debug!("Full notice loop shut down");
         });
         self.task_handles.push(handle);
     }
@@ -5027,6 +5266,7 @@ const fn replication_message_class(body: &ReplicationMessageBody) -> &'static st
         ReplicationMessageBody::PointerStateResponse(_) => "pointer_state_response",
         ReplicationMessageBody::NeighborSyncPageRequest(_) => "neighbor_sync_page_request",
         ReplicationMessageBody::NeighborSyncPageResponse(_) => "neighbor_sync_page_response",
+        ReplicationMessageBody::FullNotice(_) => "full_notice",
     }
 }
 
@@ -6202,6 +6442,19 @@ async fn handle_replication_message(
                 rr_message_id,
             )
             .await
+        }
+        // Full, not faulty: a peer's own word that it is full, or no longer. One-way.
+        ReplicationMessageBody::FullNotice(notice) => {
+            full::view_for(ctx.p2p_node.peer_id()).marks.note_notice(
+                *source,
+                notice.full,
+                Instant::now(),
+            );
+            debug!(
+                "{source} says it is {}full",
+                if notice.full { "" } else { "no longer " }
+            );
+            Ok(())
         }
         // Response messages are handled by their respective request initiators.
         ReplicationMessageBody::FreshReplicationResponse(_)
@@ -8152,6 +8405,16 @@ pub fn verification_requests_for_key_from_for_test(requester: &PeerId, key: &Xor
     })
 }
 
+/// Two-phase erasure: a key this node says it holds is kept from erasure for
+/// the fetch window, so the asker that fetches it next finds it.
+fn note_answered_present(p2p_node: &P2PNode, results: &[protocol::KeyVerificationResult]) {
+    let gate = erasure::gate_for(p2p_node.peer_id());
+    let now = Instant::now();
+    for result in results.iter().filter(|result| result.present) {
+        gate.note_answered_present(&result.key, now);
+    }
+}
+
 async fn handle_verification_request(
     source: &PeerId,
     request: &protocol::VerificationRequest,
@@ -8266,6 +8529,7 @@ async fn handle_verification_request(
         });
     }
 
+    note_answered_present(p2p_node, &results);
     send_verification_results(source, p2p_node, request_id, results, rr_message_id).await;
 
     Ok(())
@@ -8771,6 +9035,220 @@ async fn record_sent_replica_hints(
 }
 
 // ---------------------------------------------------------------------------
+// What a peer answered, as the "full" waiver reads it
+// ---------------------------------------------------------------------------
+
+/// A replica hint's verification outcome, as the "full" waiver reads its
+/// sender's answer: a hint the close group rejected is not a denial, so it is
+/// never waived; any other outcome that leaves the sender punishable means
+/// it denied holding the key.
+fn hint_answer(outcome: &KeyVerificationOutcome) -> full::UnheldAnswer {
+    if matches!(outcome, KeyVerificationOutcome::QuorumFailed) {
+        full::UnheldAnswer::Other
+    } else {
+        full::UnheldAnswer::Absent
+    }
+}
+
+/// A failed responsible-chunk audit, as the "full" waiver reads it: absent
+/// only when every one of the `failed_keys` confirmed failures was the
+/// absent-key answer. A digest mismatch, or any other reason, makes the whole
+/// audit "other", so it is charged.
+fn audit_answer(
+    reason: &AuditFailureReason,
+    summary: &crate::replication::types::AuditFailureSummary,
+    failed_keys: usize,
+) -> full::UnheldAnswer {
+    if *reason == AuditFailureReason::KeyAbsent
+        && summary.digest_mismatch_keys == 0
+        && summary.absent_keys == failed_keys
+        && failed_keys > 0
+    {
+        full::UnheldAnswer::Absent
+    } else {
+        full::UnheldAnswer::Other
+    }
+}
+
+#[cfg(test)]
+mod full_lane_answers {
+    use super::*;
+
+    fn fresh_full_peer() -> (full::FullView, PeerId) {
+        let view = full::FullView::default();
+        let peer = PeerId::from_bytes([4; 32]);
+        view.marks.note_notice(peer, true, Instant::now());
+        (view, peer)
+    }
+
+    fn waived(lane: full::Lane, answer: full::UnheldAnswer) -> bool {
+        let (view, peer) = fresh_full_peer();
+        view.waives_unheld_penalty(
+            &full::UnheldCase {
+                lane,
+                peer: &peer,
+                key: &[9; 32],
+                answer,
+                commitment_pinned: false,
+                own_quote: full::OwnQuote::NoProof,
+            },
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn a_hint_the_quorum_rejected_is_charged_even_from_a_full_peer() {
+        let rejected = hint_answer(&KeyVerificationOutcome::QuorumFailed);
+        assert_eq!(rejected, full::UnheldAnswer::Other);
+        assert!(!waived(full::Lane::ReplicaHint, rejected));
+        let denied = hint_answer(&KeyVerificationOutcome::QuorumInconclusive);
+        assert_eq!(denied, full::UnheldAnswer::Absent);
+        assert!(waived(full::Lane::ReplicaHint, denied));
+    }
+
+    #[test]
+    fn an_audit_with_a_digest_mismatch_is_charged_even_from_a_full_peer() {
+        let summary = |absent, mismatch| crate::replication::types::AuditFailureSummary {
+            challenged_keys: 4,
+            failed_keys: absent + mismatch,
+            absent_keys: absent,
+            digest_mismatch_keys: mismatch,
+        };
+        // One absent key and one digest mismatch: charged.
+        let mixed = audit_answer(&AuditFailureReason::KeyAbsent, &summary(1, 1), 2);
+        assert_eq!(mixed, full::UnheldAnswer::Other);
+        assert!(!waived(full::Lane::ResponsibleAudit, mixed));
+        let mismatch = audit_answer(&AuditFailureReason::DigestMismatch, &summary(1, 1), 2);
+        assert_eq!(mismatch, full::UnheldAnswer::Other);
+        // Every failed key absent: waived.
+        let absent = audit_answer(&AuditFailureReason::KeyAbsent, &summary(2, 0), 2);
+        assert_eq!(absent, full::UnheldAnswer::Absent);
+        assert!(waived(full::Lane::ResponsibleAudit, absent));
+        // No failed key at all is never read as absent.
+        let none = audit_answer(&AuditFailureReason::KeyAbsent, &summary(0, 0), 0);
+        assert_eq!(none, full::UnheldAnswer::Other);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-range clocks across restarts
+// ---------------------------------------------------------------------------
+
+/// Open the out-of-range clocks' table under `root_dir` and put back the
+/// records' clocks saved before the restart. `None` when the table can't be
+/// opened: the clocks then start now, as before.
+async fn open_out_of_range_clocks(
+    root_dir: &Path,
+    storage: &ChunkStore,
+    paid_list: &PaidList,
+    hysteresis: Duration,
+) -> Option<Arc<erasure::OutOfRangeClocks>> {
+    match erasure::OutOfRangeClocks::open(root_dir).await {
+        Ok(clocks) => {
+            restore_record_clocks(&clocks, storage, paid_list, hysteresis).await;
+            Some(Arc::new(clocks))
+        }
+        Err(e) => {
+            warn!("Out-of-range clocks start now on every restart: {e}");
+            None
+        }
+    }
+}
+
+/// Put back the out-of-range clocks of the records still held, as saved
+/// before the restart (see [`erasure`]): each keeps the time the node saw it
+/// out of range before the save, and the time since the save doesn't count.
+/// A record no longer held is left out; one back in range is cleared by the
+/// first prune pass, as any is.
+async fn restore_record_clocks(
+    clocks: &erasure::OutOfRangeClocks,
+    storage: &ChunkStore,
+    paid_list: &PaidList,
+    hysteresis: Duration,
+) {
+    let saved = clocks.load(erasure::ClockKind::Records);
+    if saved.is_empty() {
+        return;
+    }
+    let held: HashSet<XorName> = match storage.all_keys().await {
+        Ok(keys) => keys.into_iter().collect(),
+        Err(e) => {
+            warn!("Out-of-range clocks start now: the stored keys could not be read: {e}");
+            return;
+        }
+    };
+    let now = Instant::now();
+    let mut restored = 0usize;
+    for (key, secs) in saved.starts {
+        if held.contains(&key) {
+            paid_list.restore_record_out_of_range(
+                &key,
+                erasure::restored_instant(secs, saved.saved_at, now, hysteresis),
+            );
+            restored += 1;
+        }
+    }
+    info!("Out-of-range clocks of {restored} records put back as saved before the restart");
+}
+
+/// Put back the out-of-range clocks of the pointers still held (see
+/// [`restore_record_clocks`]).
+fn restore_pointer_clocks(
+    clocks: &erasure::OutOfRangeClocks,
+    pointers: &pointer::PointerReplication,
+    hysteresis: Duration,
+) {
+    let saved = clocks.load(erasure::ClockKind::Pointers);
+    if saved.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let saved_at = saved.saved_at;
+    pointers.restore_out_of_range(saved.starts.into_iter().map(|(address, secs)| {
+        (
+            address,
+            erasure::restored_instant(secs, saved_at, now, hysteresis),
+        )
+    }));
+}
+
+/// Save the out-of-range clocks of the records and pointers held, in wall-clock
+/// seconds, with the time of the write, in place of those saved before. A
+/// write that fails leaves the earlier list and its write time, and is tried
+/// again after the next pass.
+async fn save_out_of_range_clocks(
+    clocks: &erasure::OutOfRangeClocks,
+    paid_list: &PaidList,
+    pointers: Option<&Arc<pointer::PointerReplication>>,
+) {
+    let now = Instant::now();
+    let wall_now = SystemTime::now();
+    let in_wall_secs = |entries: Vec<(XorName, Instant)>| -> Vec<(XorName, u64)> {
+        entries
+            .into_iter()
+            .map(|(key, since)| (key, erasure::wall_secs(since, now, wall_now)))
+            .collect()
+    };
+    let saved_at = erasure::wall_secs(now, now, wall_now);
+    let records = in_wall_secs(paid_list.record_out_of_range_entries());
+    if let Err(e) = clocks
+        .save(erasure::ClockKind::Records, saved_at, records)
+        .await
+    {
+        warn!("Could not save the records' out-of-range clocks: {e}");
+    }
+    if let Some(pointers) = pointers {
+        let saved = in_wall_secs(pointers.out_of_range_clocks());
+        if let Err(e) = clocks
+            .save(erasure::ClockKind::Pointers, saved_at, saved)
+            .await
+        {
+            warn!("Could not save the pointers' out-of-range clocks: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Neighbor sync round
 // ---------------------------------------------------------------------------
 
@@ -8792,11 +9270,10 @@ async fn run_neighbor_sync_round(
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
-    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     gossip_audit: &GossipAuditTrigger,
     pointers: Option<&Arc<pointer::PointerReplication>>,
-    disk_retention: &retention::DiskRetention,
     sync_peers: &Arc<SyncPeers>,
+    erasure_trigger: &Notify,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -8820,35 +9297,10 @@ async fn run_neighbor_sync_round(
             *epoch = epoch.saturating_add(1);
         }
 
-        // Post-cycle pruning (Section 11) — runs without holding sync_state.
-        // Prune candidacy is unconditional once the hysteresis elapses;
-        // records are erased only under disk pressure, and bootstrap state
-        // defers the remote prune-confirmation audits until bootstrap has
-        // drained. Both passes share one disk-pressure state.
-        let allow_remote_prune_audits = !bootstrapping && bootstrap_state.read().await.is_drained();
-        pruning::run_prune_pass_with_context(pruning::PrunePassContext {
-            self_id: &self_id,
-            storage,
-            paid_list,
-            p2p_node,
-            config,
-            sync_state,
-            repair_proofs,
-            allow_remote_prune_audits,
-            commitment_state: Some(commitment_state),
-            audit_challenge_coordinator,
-            disk_retention,
-        })
-        .await;
-        if let Some(pointers) = pointers {
-            pointers
-                .prune_pass(
-                    allow_remote_prune_audits,
-                    Some(commitment_state),
-                    disk_retention,
-                )
-                .await;
-        }
+        // Post-cycle pruning (Section 11) runs in the erasure task, never in
+        // this loop: it is woken for the epoch just completed, and erases in
+        // two phases (see `erasure`).
+        erasure_trigger.notify_one();
 
         // Take fresh close-neighbor snapshot (DHT query, no lock held).
         let neighbors =
@@ -9648,9 +10100,17 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // have retired. What is left is a probe whose only purpose is finding a
         // holder to download from, and this node cannot write what it would
         // download.
+        // The repair of a chunk this node removed as corrupt is not held: it
+        // replaces the space the removal freed, so the store takes it while
+        // full.
         if write_blocked && !local_paid_presence_probe_keys.is_empty() {
+            let (repairs, blocked): (Vec<XorName>, Vec<XorName>) =
+                std::mem::take(&mut local_paid_presence_probe_keys)
+                    .into_iter()
+                    .partition(|key| storage.is_quarantined_repair(key));
+            local_paid_presence_probe_keys = repairs;
             let mut q = queues.write().await;
-            for key in std::mem::take(&mut local_paid_presence_probe_keys) {
+            for key in blocked {
                 if q.defer_pending(&key, config::CAPACITY_BLOCKED_RETRY) {
                     capacity_deferred_probe += 1;
                 }
@@ -9824,6 +10284,24 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             }
         } // read lock released
 
+        // Reports: the keys whose verification found fewer holders present
+        // than a majority of the close group, counted for the next prune-pass
+        // line.
+        let few_holders = evaluated
+            .iter()
+            .filter(|(key, _)| {
+                evidence.get(key).is_some_and(|ev| {
+                    ev.presence
+                        .values()
+                        .filter(|presence| **presence == PresenceEvidence::Present)
+                        .count()
+                        < crate::ant_protocol::CLOSE_GROUP_MAJORITY
+                })
+            })
+            .count();
+        let full_view = full::view_for(&self_id);
+        full_view.note_few_holders(u64::try_from(few_holders).unwrap_or(u64::MAX));
+
         // Step 4: Insert verified keys into PaidForList (no lock held).
         let mut paid_insert_keys: Vec<XorName> = Vec::new();
         for (key, outcome) in &evaluated {
@@ -9875,7 +10353,20 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 if let Some(source) =
                     punishable_singleton_replica_hint_source(&replica_hint_sources, &outcome, ev)
                 {
-                    *bad_singleton_hints.entry(source).or_insert(0) += 1;
+                    // Full, not faulty: a full source that only denied holding a key it
+                    // hinted, in the one case the waiver allows, is not
+                    // charged. A hint the close group rejected is.
+                    let case = full::UnheldCase {
+                        lane: full::Lane::ReplicaHint,
+                        peer: &source,
+                        key: &key,
+                        answer: hint_answer(&outcome),
+                        commitment_pinned: false,
+                        own_quote: full::OwnQuote::NoProof,
+                    };
+                    if !full_view.waives_unheld_penalty(&case, Instant::now()) {
+                        *bad_singleton_hints.entry(source).or_insert(0) += 1;
+                    }
                 }
             }
             match outcome {
@@ -9884,7 +10375,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     let mut fetch_sources = sources;
                     add_replica_hint_sources(&mut fetch_sources, &replica_hint_sources);
                     let fetch_eligible = fetch_allowed_keys.contains(&key);
-                    if fetch_eligible && write_blocked {
+                    if fetch_eligible && write_blocked && !storage.is_quarantined_repair(&key) {
                         // Capacity gate, second of two, and deliberately after
                         // Step 4: the key is now recorded in `PaidForList` and
                         // its verification stands. Only the download is held,
@@ -10292,7 +10783,9 @@ async fn is_storage_admitted(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
 ) -> bool {
-    admission::is_responsible(
+    // Widened past peers marked full: a node standing in for a full one
+    // takes the key.
+    admission::is_responsible_widened(
         self_id,
         key,
         p2p_node,
@@ -10365,7 +10858,7 @@ async fn execute_single_fetch(
     // failure is then classified as the source's — no trust event, but the
     // worker walks to every remaining holder, and each re-uploads the same
     // chunk into the same full disk.
-    if let Err(e) = storage.check_capacity() {
+    if let Err(e) = storage.check_capacity_for_key(&key) {
         debug!(
             "Skipping fetch for {}: local storage cannot accept a write: {e}",
             hex::encode(key)
@@ -10486,6 +10979,10 @@ async fn execute_single_fetch(
                         };
                     }
 
+                    // The source served the right bytes: it was seen holding
+                    // the key.
+                    full::view_for(&self_id).seen.record(&source, &key);
+
                     // Responsibility can lapse during the network round-trip.
                     // The bandwidth is already spent; declining the write is
                     // what still avoids the disk write and the later
@@ -10538,23 +11035,37 @@ async fn execute_single_fetch(
                     // This peer was selected as a fetch source because it recently
                     // answered `Present` during verification, so either answer means it
                     // could not serve a chunk it had just claimed.
-                    if let protocol::FetchResponse::Error { reason, .. } = response {
+                    let answer = if let protocol::FetchResponse::Error { reason, .. } = response {
                         warn!(
                             "Fetch: peer {source} returned error for {}: {reason}",
                             hex::encode(key)
                         );
+                        full::UnheldAnswer::Other
                     } else {
                         warn!(
                             "Fetch: verified source {source} returned NotFound for {}",
                             hex::encode(key)
                         );
+                        full::UnheldAnswer::Absent
+                    };
+                    // Full, not faulty: a full source that only lacks the key, in the one
+                    // case the waiver allows, is not charged.
+                    let case = full::UnheldCase {
+                        lane: full::Lane::Fetch,
+                        peer: &source,
+                        key: &key,
+                        answer,
+                        commitment_pinned: false,
+                        own_quote: full::OwnQuote::NoProof,
+                    };
+                    if !full::view_for(&self_id).waives_unheld_penalty(&case, Instant::now()) {
+                        p2p_node
+                            .report_trust_event(
+                                &source,
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
                     }
-                    p2p_node
-                        .report_trust_event(
-                            &source,
-                            TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                        )
-                        .await;
                     FetchOutcome {
                         key,
                         result: FetchResult::SourceFailed,
@@ -10834,12 +11345,34 @@ async fn handle_audit_result(
                 } else {
                     debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
                 }
-                p2p_node
-                    .report_trust_event(
-                        challenged_peer,
-                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                    )
-                    .await;
+                // Full, not faulty: an audit a full peer failed only by lacking keys, each in
+                // the one case the waiver allows, is not charged. Any key failed
+                // otherwise charges the audit.
+                let answer = audit_answer(reason, summary, confirmed_failed_keys.len());
+                let view = full::view_for(p2p_node.peer_id());
+                let now = Instant::now();
+                let waived = answer == full::UnheldAnswer::Absent
+                    && confirmed_failed_keys.iter().all(|key| {
+                        view.waives_unheld_penalty(
+                            &full::UnheldCase {
+                                lane: full::Lane::ResponsibleAudit,
+                                peer: challenged_peer,
+                                key,
+                                answer,
+                                commitment_pinned: false,
+                                own_quote: full::OwnQuote::NoProof,
+                            },
+                            now,
+                        )
+                    });
+                if !waived {
+                    p2p_node
+                        .report_trust_event(
+                            challenged_peer,
+                            TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
+                        )
+                        .await;
+                }
             }
         }
         AuditTickResult::BootstrapClaim { peer } => {
