@@ -2183,25 +2183,27 @@ const PROOF_SENDERS: &[Reviewed] = &[
         2,
     ),
     // When a hold ends: the notice with the slim proof the PUT handler
-    // built, to the close-group peers not heard from and marked full.
+    // built, to every peer of the close group, as announced or as it is now,
+    // not heard from. Sent before any offer is queued: an offer, and the
+    // dispatcher that drops one, send no notice.
     (
         "src/replication/fresh.rs",
         "HoldContext::end_hold",
         "send_notice",
         1,
     ),
-    // After each offer: the notice with the offer's own slim proof.
+    // When the node stops: the same notices for the holds still open.
     (
         "src/replication/fresh.rs",
-        "send_fresh_offers",
+        "HoldContext::flush_on_shutdown",
         "send_notice",
         1,
     ),
-    // An offer dropped before dispatch: the same notice, with the event's
-    // slim proof.
+    // The engine's entry point: the notice with the slim proof it built, to
+    // the close group, before its offers.
     (
-        "src/replication/fresh.rs",
-        "notify_unoffered",
+        "src/replication/mod.rs",
+        "ReplicationEngine::replicate_fresh",
         "send_notice",
         1,
     ),

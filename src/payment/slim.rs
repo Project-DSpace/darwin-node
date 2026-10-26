@@ -21,13 +21,14 @@ use std::fmt;
 use evmlib::ProofOfPayment;
 use serde::Serialize;
 
-use crate::ant_protocol::PROOF_TAG_SINGLE_NODE;
+use crate::ant_protocol::{XorName, PROOF_TAG_SINGLE_NODE};
 use crate::payment::proof::{
     deserialize_single_node_proof, detect_proof_type, PaymentProof, ProofType,
 };
 use crate::payment::verifier::{
     PaymentVerifier, MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
+use crate::payment::verify_quote_content;
 
 /// The proof kinds the builder slims, by their tag byte. A proof kind the
 /// verifier accepts must appear here, or be forwarded whole as a reviewed
@@ -54,6 +55,9 @@ pub enum SlimDeclined {
     OffCurve,
     /// No median price, or a zero one.
     NoMedian,
+    /// No median-priced quote names the record's content address: a proof
+    /// for another record, which every receiver refuses.
+    OtherContent,
     /// The slim proof could not be written.
     Encode,
 }
@@ -68,6 +72,9 @@ impl fmt::Display for SlimDeclined {
             Self::Structure => f.write_str("the quotes fail the structure check"),
             Self::OffCurve => f.write_str("a quote's price is off the pricing curve"),
             Self::NoMedian => f.write_str("the quotes have no median price"),
+            Self::OtherContent => {
+                f.write_str("no median-priced quote names the record's content address")
+            }
             Self::Encode => f.write_str("the slim proof could not be written"),
         }
     }
@@ -102,29 +109,38 @@ pub fn parse_forwardable(bytes: &[u8]) -> Result<PaymentProof, SlimDeclined> {
 /// sidecars, byte fields as msgpack byte strings.
 ///
 /// Before choosing, the builder runs the verifier's own local checks of the
-/// quotes: the structure check and the price re-check of every quote. On a
-/// fresh accept the verifier has run them already; after a PUT accepted from
-/// the payment cache they are what stands in for the skipped read, since the
-/// unpaid quotes are what receivers no longer see.
+/// quotes: the structure check, the price re-check of every quote, and the
+/// content check of the median-priced ones: at least one must name `content`,
+/// the address the payment is for (a chunk's address, a pointer's
+/// `state_id`), by the same comparison the verifier's content check makes. On
+/// a fresh accept the verifier has run them already; after a PUT accepted
+/// from the payment cache they are what stands in for the skipped read, since
+/// the unpaid quotes are what receivers no longer see, and a proof for
+/// another record is what every receiver would refuse.
 ///
 /// # Errors
 ///
 /// The check the quotes fail, or [`SlimDeclined::Encode`].
-pub fn slim_proof(proof: &PaymentProof) -> Result<Vec<u8>, SlimDeclined> {
+pub fn slim_proof(proof: &PaymentProof, content: &XorName) -> Result<Vec<u8>, SlimDeclined> {
     let payment = &proof.proof_of_payment;
     PaymentVerifier::validate_quote_structure(payment).map_err(|_| SlimDeclined::Structure)?;
     PaymentVerifier::validate_quote_arithmetic(payment).map_err(|_| SlimDeclined::OffCurve)?;
     let median =
         PaymentVerifier::single_node_median_price(payment).map_err(|_| SlimDeclined::NoMedian)?;
+    let kept: Vec<_> = payment
+        .peer_quotes
+        .iter()
+        .filter(|(_, quote)| quote.price == median)
+        .cloned()
+        .collect();
+    if !kept
+        .iter()
+        .any(|(_, quote)| verify_quote_content(quote, content))
+    {
+        return Err(SlimDeclined::OtherContent);
+    }
     let slim = PaymentProof {
-        proof_of_payment: ProofOfPayment {
-            peer_quotes: payment
-                .peer_quotes
-                .iter()
-                .filter(|(_, quote)| quote.price == median)
-                .cloned()
-                .collect(),
-        },
+        proof_of_payment: ProofOfPayment { peer_quotes: kept },
         tx_hashes: proof.tx_hashes.clone(),
         commitment_sidecars: Vec::new(),
     };
@@ -132,13 +148,14 @@ pub fn slim_proof(proof: &PaymentProof) -> Result<Vec<u8>, SlimDeclined> {
 }
 
 /// [`parse_forwardable`], then [`slim_proof`]: what a node puts into a notice,
-/// an offer or a pointer offer in place of the proof it was handed.
+/// an offer or a pointer offer in place of the proof it was handed, for the
+/// record whose payment names `content`.
 ///
 /// # Errors
 ///
 /// The first check the bytes fail.
-pub fn forwardable_slim_proof(bytes: &[u8]) -> Result<Vec<u8>, SlimDeclined> {
-    let slim = parse_forwardable(bytes).and_then(|proof| slim_proof(&proof));
+pub fn forwardable_slim_proof(bytes: &[u8], content: &XorName) -> Result<Vec<u8>, SlimDeclined> {
+    let slim = parse_forwardable(bytes).and_then(|proof| slim_proof(&proof, content));
     if slim.is_err() {
         crate::replication::fresh_metrics::bump(
             crate::replication::fresh_metrics::FreshCounter::SlimProofsDeclined,
@@ -185,12 +202,15 @@ mod tests {
     use rand::Rng;
     use std::time::SystemTime;
 
+    /// The address every test quote names.
+    const CONTENT: XorName = [7u8; 32];
+
     /// An on-curve quote at `records` stored records, with a filled key and
     /// signature so the byte fields have weight. The builder never checks
     /// signatures; the verifier does, on the bytes' values.
     fn quote_at(records: usize, seed: u8) -> (EncodedPeerId, PaymentQuote) {
         let quote = PaymentQuote {
-            content: xor_name::XorName([7u8; 32]),
+            content: xor_name::XorName(CONTENT),
             timestamp: SystemTime::now(),
             price: calculate_price(records),
             rewards_address: RewardsAddress::new([seed; 20]),
@@ -224,7 +244,7 @@ mod tests {
     #[test]
     fn a_slim_proof_decodes_with_both_decoders_and_keeps_the_quotes_values() {
         let full = full_proof(&[10, 20, 30, 40, 50, 60, 70]);
-        let slim = slim_proof(&full).unwrap();
+        let slim = slim_proof(&full, &CONTENT).unwrap();
         assert_eq!(slim[0], PROOF_TAG_SINGLE_NODE);
 
         let decoded = deserialize_single_node_proof(&slim).unwrap();
@@ -251,7 +271,7 @@ mod tests {
     fn a_slim_proof_is_a_fraction_of_the_whole_one() {
         let full = full_proof(&[10, 20, 30, 40, 50, 60, 70]);
         let whole = serialize_single_node_proof(&full).unwrap();
-        let slim = slim_proof(&full).unwrap();
+        let slim = slim_proof(&full, &CONTENT).unwrap();
         // Byte strings, one quote, no sidecars: well under a sixth.
         assert!(
             slim.len() * 6 < whole.len(),
@@ -270,7 +290,8 @@ mod tests {
             let n = rng.gen_range(1..=7);
             let records: Vec<usize> = (0..n).map(|_| rng.gen_range(0..4) * 1000).collect();
             let full = full_proof(&records);
-            let slim = deserialize_single_node_proof(&slim_proof(&full).unwrap()).unwrap();
+            let slim =
+                deserialize_single_node_proof(&slim_proof(&full, &CONTENT).unwrap()).unwrap();
             let median = median_price(&records);
             let expected: Vec<_> = full
                 .proof_of_payment
@@ -298,7 +319,7 @@ mod tests {
         let mut records = vec![500, 500, 500, 10, 20, 900, 900];
         records.shuffle(&mut rand::thread_rng());
         let full = full_proof(&records);
-        let slim = deserialize_single_node_proof(&slim_proof(&full).unwrap()).unwrap();
+        let slim = deserialize_single_node_proof(&slim_proof(&full, &CONTENT).unwrap()).unwrap();
         let order: Vec<_> = full
             .proof_of_payment
             .peer_quotes
@@ -318,35 +339,38 @@ mod tests {
     #[test]
     fn a_proof_that_is_not_a_good_single_node_proof_is_never_slimmed() {
         let whole = serialize_single_node_proof(&full_proof(&[1, 2, 3, 4, 5, 6, 7])).unwrap();
-        assert!(forwardable_slim_proof(&whole).is_ok());
+        assert!(forwardable_slim_proof(&whole, &CONTENT).is_ok());
 
-        assert_eq!(forwardable_slim_proof(&[]), Err(SlimDeclined::TooSmall(0)));
         assert_eq!(
-            forwardable_slim_proof(&[PROOF_TAG_SINGLE_NODE; 16]),
+            forwardable_slim_proof(&[], &CONTENT),
+            Err(SlimDeclined::TooSmall(0))
+        );
+        assert_eq!(
+            forwardable_slim_proof(&[PROOF_TAG_SINGLE_NODE; 16], &CONTENT),
             Err(SlimDeclined::TooSmall(16))
         );
         let huge = vec![PROOF_TAG_SINGLE_NODE; MAX_PAYMENT_PROOF_SIZE_BYTES + 1];
         assert!(matches!(
-            forwardable_slim_proof(&huge),
+            forwardable_slim_proof(&huge, &CONTENT),
             Err(SlimDeclined::TooLarge(_))
         ));
 
         let mut merkle = whole.clone();
         merkle[0] = crate::ant_protocol::PROOF_TAG_MERKLE;
         assert_eq!(
-            forwardable_slim_proof(&merkle),
+            forwardable_slim_proof(&merkle, &CONTENT),
             Err(SlimDeclined::NotSingleNode)
         );
         let mut unknown = whole;
         unknown[0] = 0x7F;
         assert_eq!(
-            forwardable_slim_proof(&unknown),
+            forwardable_slim_proof(&unknown, &CONTENT),
             Err(SlimDeclined::NotSingleNode)
         );
 
         let garbage = [PROOF_TAG_SINGLE_NODE; 64];
         assert_eq!(
-            forwardable_slim_proof(&garbage),
+            forwardable_slim_proof(&garbage, &CONTENT),
             Err(SlimDeclined::Unparseable)
         );
 
@@ -355,16 +379,46 @@ mod tests {
         let off_curve = serialize_single_node_proof(&off_curve).unwrap();
         if crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
             assert_eq!(
-                forwardable_slim_proof(&off_curve),
+                forwardable_slim_proof(&off_curve, &CONTENT),
                 Err(SlimDeclined::OffCurve)
             );
         }
 
         let mut empty = full_proof(&[1]);
         empty.proof_of_payment.peer_quotes.clear();
-        assert_eq!(slim_proof(&empty), Err(SlimDeclined::Structure));
+        assert_eq!(slim_proof(&empty, &CONTENT), Err(SlimDeclined::Structure));
         let eight = full_proof(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(slim_proof(&eight), Err(SlimDeclined::Structure));
+        assert_eq!(slim_proof(&eight, &CONTENT), Err(SlimDeclined::Structure));
+    }
+
+    /// A well-formed proof for another record is not forwarded: every receiver
+    /// would refuse it, and the offered peers would then fail a possession
+    /// check they could never pass. One median-priced quote naming the
+    /// record is enough, as it is for the verifier.
+    #[test]
+    fn a_well_formed_proof_for_another_record_is_never_slimmed() {
+        let full = full_proof(&[10, 20, 30, 40, 50, 60, 70]);
+        let whole = serialize_single_node_proof(&full).unwrap();
+        let other = [8u8; 32];
+        assert_eq!(slim_proof(&full, &other), Err(SlimDeclined::OtherContent));
+        assert_eq!(
+            forwardable_slim_proof(&whole, &other),
+            Err(SlimDeclined::OtherContent)
+        );
+
+        // A tie at the median where only one quote names the record.
+        let mut tie = full_proof(&[500, 500, 500, 10, 20, 900, 900]);
+        for (_, quote) in tie.proof_of_payment.peer_quotes.iter_mut().take(2) {
+            quote.content = xor_name::XorName(other);
+        }
+        assert!(slim_proof(&tie, &CONTENT).is_ok());
+
+        // Only quotes off the median name the record: they are not the
+        // ones a receiver checks.
+        for (_, quote) in tie.proof_of_payment.peer_quotes.iter_mut().take(3) {
+            quote.content = xor_name::XorName(other);
+        }
+        assert_eq!(slim_proof(&tie, &CONTENT), Err(SlimDeclined::OtherContent));
     }
 
     /// A proof is refused for its form when it doesn't decode or its quotes
@@ -400,14 +454,17 @@ mod tests {
                 None | Some(ProofType::Merkle) => {
                     assert!(!SLIMMED_PROOF_TAGS.contains(&tag), "tag {tag:#04x}");
                     assert_eq!(
-                        forwardable_slim_proof(&bytes),
+                        forwardable_slim_proof(&bytes, &CONTENT),
                         Err(SlimDeclined::NotSingleNode),
                         "tag {tag:#04x}"
                     );
                 }
                 Some(ProofType::SingleNode) => {
                     assert!(SLIMMED_PROOF_TAGS.contains(&tag), "tag {tag:#04x}");
-                    assert!(forwardable_slim_proof(&bytes).is_ok(), "tag {tag:#04x}");
+                    assert!(
+                        forwardable_slim_proof(&bytes, &CONTENT).is_ok(),
+                        "tag {tag:#04x}"
+                    );
                 }
                 Some(other) => {
                     panic!("proof kind {other:?} (tag {tag:#04x}) has no case in the slim builder")

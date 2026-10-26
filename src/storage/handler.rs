@@ -521,15 +521,20 @@ impl AntProtocol {
     /// proof sends holding notices only: no notice and no offer carrying a
     /// proof, since receivers penalise an offer whose proof is empty or short.
     /// The slim proof keeps no sidecars (ADR-0004: replicated receipts keep
-    /// only the pin and count), as the stripped proof did before.
-    fn forwarded_proof(addr_hex: &str, proof: Option<&[u8]>) -> Vec<u8> {
+    /// only the pin and count), as the stripped proof did before. A proof
+    /// none of whose median-priced quotes names `address` is a proof for
+    /// another chunk, refused by every receiver, and is not forwarded either.
+    fn forwarded_proof(address: &XorName, proof: Option<&[u8]>) -> Vec<u8> {
         let Some(proof) = proof else {
             return Vec::new();
         };
-        match crate::payment::slim::forwardable_slim_proof(proof) {
+        match crate::payment::slim::forwardable_slim_proof(proof, address) {
             Ok(slim) => slim,
             Err(declined) => {
-                debug!("Not forwarding the proof for {addr_hex}: {declined}; holding notices only");
+                debug!(
+                    "Not forwarding the proof for {}: {declined}; holding notices only",
+                    hex::encode(address)
+                );
                 Vec::new()
             }
         }
@@ -910,7 +915,7 @@ impl AntProtocol {
                 //    and a PUT with no proof, or one that fails them, is
                 //    announced with holding notices only.
                 if let Some(ref tx) = self.fresh_write_tx {
-                    let proof = Self::forwarded_proof(&addr_hex, request.payment_proof.as_deref());
+                    let proof = Self::forwarded_proof(&address, request.payment_proof.as_deref());
                     // Storage has already accepted the chunk on this path, so
                     // the event carries only the key; the offer dispatcher
                     // reads the chunk back when it is ready to send it.
@@ -2421,16 +2426,19 @@ mod tests {
             commitment_sidecars: vec![vec![1u8; 16]],
         };
         let bytes = serialize_single_node_proof(&with_sidecars).expect("serialize");
-        let forwarded = AntProtocol::forwarded_proof("k", Some(&bytes));
+        let forwarded = AntProtocol::forwarded_proof(&[3u8; 32], Some(&bytes));
         let parsed = deserialize_single_node_proof(&forwarded).expect("deserialize slim");
         assert!(parsed.commitment_sidecars.is_empty());
         assert_eq!(parsed.proof_of_payment.peer_quotes.len(), 1);
 
-        assert!(AntProtocol::forwarded_proof("k", None).is_empty());
-        assert!(AntProtocol::forwarded_proof("k", Some(&[0x01; 16])).is_empty());
+        let key = [3u8; 32];
+        assert!(AntProtocol::forwarded_proof(&key, None).is_empty());
+        assert!(AntProtocol::forwarded_proof(&key, Some(&[0x01; 16])).is_empty());
+        // Well formed, but for another chunk.
+        assert!(AntProtocol::forwarded_proof(&[4u8; 32], Some(&bytes)).is_empty());
         let mut merkle = bytes;
         merkle[0] = crate::ant_protocol::PROOF_TAG_MERKLE;
-        assert!(AntProtocol::forwarded_proof("k", Some(&merkle)).is_empty());
-        assert!(AntProtocol::forwarded_proof("k", Some(&[0x01; 64])).is_empty());
+        assert!(AntProtocol::forwarded_proof(&key, Some(&merkle)).is_empty());
+        assert!(AntProtocol::forwarded_proof(&key, Some(&[0x01; 64])).is_empty());
     }
 }

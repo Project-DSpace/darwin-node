@@ -197,9 +197,15 @@ impl PointerService {
     /// the slim builder's local checks (possible only when the payment was
     /// answered from the payment cache, unread) is not forwarded, and
     /// receivers penalise an offer without one, so no offer goes out; the
-    /// close group's sync covers it.
-    fn forwarded_proof(address: &[u8; 32], proof: Option<&[u8]>) -> Option<Vec<u8>> {
-        crate::payment::slim::forwardable_slim_proof(proof?)
+    /// close group's sync covers it. A pointer's payment names its
+    /// `state_id`, so a proof none of whose median-priced quotes names
+    /// `state_id` is one for another record, and is not forwarded either.
+    fn forwarded_proof(
+        address: &[u8; 32],
+        state_id: &[u8; 32],
+        proof: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        crate::payment::slim::forwardable_slim_proof(proof?, state_id)
             .map_err(|declined| {
                 debug!(
                     "Not offering pointer {} on: {declined}",
@@ -304,7 +310,8 @@ impl PointerService {
                 // of the proof, so every member holds it whichever of them
                 // the client reached.
                 let writes = self.fresh_writes.read().clone();
-                let proof = Self::forwarded_proof(&address, request.payment_proof.as_deref());
+                let proof =
+                    Self::forwarded_proof(&address, &state_id, request.payment_proof.as_deref());
                 if let (Some(writes), Some(proof)) = (writes, proof) {
                     if writes
                         .send(PointerFreshWrite {

@@ -2544,17 +2544,17 @@ impl ReplicationEngine {
     /// the PUT path. A proof the slim builder declines is not forwarded: the
     /// close group gets holding notices only, and no offers.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
-        let proof_of_payment = match crate::payment::slim::forwardable_slim_proof(proof_of_payment)
-        {
-            Ok(slim) => slim,
-            Err(declined) => {
-                debug!(
-                    "Not forwarding the proof for {}: {declined}; holding notices only",
-                    hex::encode(key)
-                );
-                Vec::new()
-            }
-        };
+        let proof_of_payment =
+            match crate::payment::slim::forwardable_slim_proof(proof_of_payment, key) {
+                Ok(slim) => slim,
+                Err(declined) => {
+                    debug!(
+                        "Not forwarding the proof for {}: {declined}; holding notices only",
+                        hex::encode(key)
+                    );
+                    Vec::new()
+                }
+            };
         let announced = fresh::announce_paid_write(
             key,
             &proof_of_payment,
@@ -2566,6 +2566,18 @@ impl ReplicationEngine {
         if proof_of_payment.is_empty() {
             fresh_metrics::bump(fresh_metrics::FreshCounter::HoldsWithoutProof);
             return;
+        }
+        // The close group got holding notices; with nothing held, each gets
+        // the slim proof now, before the offers wait for a permit. A storer
+        // whose own paid-list write failed sent it to them already.
+        if announced.recorded {
+            fresh::send_notice(
+                key,
+                proof_of_payment.clone(),
+                announced.close_group.iter(),
+                &self.p2p_node,
+                fresh_metrics::FreshCounter::ProofNoticesSent,
+            );
         }
         // Never closed, so this cannot fail; the arm keeps the call panic-free.
         let Ok(pending_offer) = Arc::clone(&self.pending_offer_semaphore)
@@ -2580,7 +2592,6 @@ impl ReplicationEngine {
             data.to_vec(),
             proof_of_payment,
             announced.close_group,
-            announced.recorded,
             pending_offer,
         )
         .await;
@@ -2646,6 +2657,12 @@ impl ReplicationEngine {
                     }
                 }
             }
+            // The open holds' close-group peers not heard from have had only
+            // a holding notice, which records nothing: send them the slim
+            // proof before the node stops, so a restart doesn't leave them
+            // without this storer's paid-list evidence. Bounded by the
+            // engine's task drain.
+            holds.flush_on_shutdown().await;
             debug!("Fresh-offer hold keeper shut down");
         });
         self.task_handles.push(handle);
@@ -2752,24 +2769,26 @@ impl ReplicationEngine {
                 // charges the sender for an offer that does not hash to its
                 // key. A chunk that fails verification is quarantined by this
                 // read, so its retry finds it gone and skips it.
-                let data = match storage.get_or_quarantine(&event.key).await {
-                    Ok(Some(data)) => data,
-                    Ok(None) => {
+                //
+                // A dropped offer sends nothing: its targets got the notice
+                // with the slim proof when the hold ended (`fresh::fresh_read`).
+                let read = storage.get_or_quarantine(&event.key).await;
+                let read = fresh::fresh_read(read, event.read_attempts, MAX_FRESH_READ_ATTEMPTS);
+                let data = match read {
+                    fresh::FreshRead::Offer(data) => data,
+                    fresh::FreshRead::Gone => {
                         debug!("Chunk {key_hex} no longer stored, skipping fresh replication");
-                        fresh::notify_unoffered(&ctx.p2p_node, &event);
                         continue;
                     }
-                    Err(e) => {
+                    fresh::FreshRead::GiveUp { attempts, error: e } => {
+                        warn!(
+                            "Giving up fresh replication of {key_hex} after {attempts} failed reads: {e}"
+                        );
+                        continue;
+                    }
+                    fresh::FreshRead::Retry { attempts, error: e } => {
                         // The permit is released as this iteration ends, well
                         // before any retry is due.
-                        let attempts = event.read_attempts + 1;
-                        if attempts >= MAX_FRESH_READ_ATTEMPTS {
-                            warn!(
-                                "Giving up fresh replication of {key_hex} after {attempts} failed reads: {e}"
-                            );
-                            fresh::notify_unoffered(&ctx.p2p_node, &event);
-                            continue;
-                        }
                         // One warning per write: a store-wide fault fails the
                         // whole backlog, once per retry.
                         if attempts == 1 {
@@ -2810,7 +2829,6 @@ impl ReplicationEngine {
                     data,
                     event.payment_proof,
                     event.targets,
-                    event.notify_after,
                     pending_offer,
                 )
                 .await;
@@ -6955,7 +6973,8 @@ async fn dispatch_paid_notify(
 /// notify goes on to admission: only one with a proof does.
 ///
 /// The sender holds the key: every release sends a notice only after storing
-/// it. The note comes before admission and before the "already known" drop,
+/// it, and this one sends none from an offer it drops because its copy is
+/// gone or unreadable (`fresh::fresh_read`). The note comes before admission and before the "already known" drop,
 /// and is only ever read to skip an offer. A holding notice (an empty proof)
 /// carries nothing to record, so it never takes an admission slot or a worker.
 fn note_paid_notify(

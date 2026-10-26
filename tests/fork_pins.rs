@@ -1457,10 +1457,11 @@ mod payment_encodings {
         }
     }
 
-    /// A single-node proof, as a client sends it with a PUT and nodes pass it
-    /// on: here two of the close group's quotes, enough to pin how the list
-    /// is laid out, with the payment's transaction and the commitment the
-    /// first quote is bound to (an opaque sidecar).
+    /// A single-node proof, as a client sends it with a PUT: here two of the
+    /// close group's quotes, enough to pin how the list is laid out, with the
+    /// payment's transaction and the commitment the first quote is bound to
+    /// (an opaque sidecar). Nodes pass on its slim form instead, pinned in
+    /// `a_slim_proof_keeps_its_bytes`.
     fn proof() -> PaymentProof {
         PaymentProof {
             proof_of_payment: ProofOfPayment {
@@ -1516,6 +1517,106 @@ mod payment_encodings {
         assert_eq!(decoded.tx_hashes, sample.tx_hashes);
         assert_eq!(decoded.commitment_sidecars, sample.commitment_sidecars);
         assert_eq!(serialize_single_node_proof(&decoded).unwrap(), pinned);
+    }
+
+    /// The address the slim pin's quotes name.
+    const SLIM_CONTENT: [u8; 32] = [0xAB; 32];
+
+    /// A quote the slim builder keeps or drops: on the pricing curve at its
+    /// key count, naming `SLIM_CONTENT`, with the rest of its fields from
+    /// `byte` as in `quote`.
+    fn on_curve_quote(byte: u8, committed: bool) -> PaymentQuote {
+        let count: usize = if committed { 70_000 } else { 0 };
+        PaymentQuote {
+            content: xor_name::XorName(SLIM_CONTENT),
+            price: ant_node::payment::calculate_price(count),
+            committed_key_count: u32::try_from(count).unwrap(),
+            ..quote(byte, committed)
+        }
+    }
+
+    /// A client's proof the slim builder reads: three quotes, two of them
+    /// at the median price (bound to a commitment) and a cheaper baseline
+    /// one, the payment's transaction, and a sidecar per quote.
+    fn slim_source() -> PaymentProof {
+        PaymentProof {
+            proof_of_payment: ProofOfPayment {
+                peer_quotes: vec![
+                    (EncodedPeerId::new([0x61; 32]), on_curve_quote(0x30, true)),
+                    (EncodedPeerId::new([0x62; 32]), on_curve_quote(0x40, false)),
+                    (EncodedPeerId::new([0x63; 32]), on_curve_quote(0x50, true)),
+                ],
+            },
+            tx_hashes: vec![TxHash::from([0x7B; 32])],
+            commitment_sidecars: vec![vec![0xC3], vec![0xC4], vec![0xC5]],
+        }
+    }
+
+    /// `slim_source()`'s slim form, as nodes pass it on in notices, offers
+    /// and pointer offers: the single-node tag (01), then the proof in
+    /// `MessagePack` with every byte field a byte string (c4), only the two
+    /// median-priced quotes in the client's order, the transaction hash, and
+    /// an empty sidecar list (90).
+    const PINNED_SLIM_PROOF: &str = "0193919292c420616161616161616161616161616161616161616161616161616161616161616198dc0020ccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccab92ce6acfc000ce075bccbcc4200000000000000000000000000000000000000000000000084ec55f0bf49d0000c4143131313131313131313131313131313131313131c403323232c40433333333ce00011170dc0020343434343434343434343434343434343434343434343434343434343434343492c420636363636363636363636363636363636363636363636363636363636363636398dc0020ccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccab92ce6acfc000ce075bccbcc4200000000000000000000000000000000000000000000000084ec55f0bf49d0000c4145151515151515151515151515151515151515151c403525252c40453535353ce00011170dc0020545454545454545454545454545454545454545454545454545454545454545491c4207b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b90";
+
+    /// The rmp-serde release ds.15 builds with, whose decoder reads the
+    /// pinned slim proof. A lock bump changes how a byte string decodes into
+    /// a `Vec<u8>` only with a new release, which then comes with a check
+    /// that the pinned bytes still decode as below.
+    const DS15_RMP_SERDE: &str = "1.3.1";
+
+    #[test]
+    fn a_slim_proof_keeps_its_bytes() {
+        let source = slim_source();
+        let slim = ant_node::payment::slim::slim_proof(&source, &SLIM_CONTENT)
+            .unwrap_or_else(|e| panic!("the slim builder declined the sample: {e}"));
+        let bytes = hex::encode(&slim);
+        assert!(
+            bytes == PINNED_SLIM_PROOF,
+            "
+A slim payment proof no longer matches its pinned bytes in tests/fork_pins.rs.              Nodes up to ds.15 decode these bytes in every fresh offer, paid notice and              pointer offer. Its bytes now:
+
+{bytes}
+"
+        );
+
+        // The pinned bytes, read with the decoder every release has: the two
+        // median-priced quotes with their signed bytes and hashes, the
+        // transaction, and no sidecars.
+        let pinned = hex::decode(PINNED_SLIM_PROOF).unwrap();
+        let decoded = deserialize_single_node_proof(&pinned)
+            .unwrap_or_else(|e| panic!("the pinned slim proof doesn't decode: {e}"));
+        let kept = &decoded.proof_of_payment.peer_quotes;
+        let expected = [
+            &source.proof_of_payment.peer_quotes[0],
+            &source.proof_of_payment.peer_quotes[2],
+        ];
+        assert_eq!(kept.len(), expected.len());
+        for ((id, quote), (want_id, want)) in kept.iter().zip(expected) {
+            assert_eq!(id, want_id);
+            assert_eq!(quote.hash(), want.hash());
+            assert_eq!(quote.bytes_for_sig(), want.bytes_for_sig());
+            assert_eq!(quote, want);
+        }
+        assert_eq!(decoded.tx_hashes, source.tx_hashes);
+        assert!(decoded.commitment_sidecars.is_empty());
+
+        // The decoder these bytes were checked with is ds.15's.
+        let lock = super::repo_text("Cargo.lock");
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"rmp-serde\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \""))
+                    .map(|v| v.trim_end_matches('"').to_string())
+            })
+            .expect("rmp-serde in Cargo.lock");
+        assert_eq!(
+            version, DS15_RMP_SERDE,
+            "rmp-serde moved from the release ds.15 builds; check the pinned slim proof still              decodes as ds.15 decodes it, then move DS15_RMP_SERDE"
+        );
     }
 
     #[test]

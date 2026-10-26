@@ -10,13 +10,15 @@
 //! 3. Hold the offers up to `FRESH_OFFER_HOLD`, so the other storers'
 //!    holding notices arrive first; the hold ends sooner once every
 //!    close-group peer has been heard from or is marked full.
-//! 4. When the hold ends, each close-group peer not heard from gets a notice
-//!    with the slim proof and, unless it is marked full, an offer (the notice
-//!    then follows the offer), bounded by
-//!    the pending-offer permits so a write burst cannot pile up chunk-sized
+//! 4. When the hold ends, every peer of the close group, as announced or as
+//!    it is now, that was not heard from gets the notice with the slim proof
+//!    at once, never behind back-pressure; a peer still in the close group
+//!    and not marked full is then offered the record, bounded by the
+//!    pending-offer permits so a write burst cannot pile up chunk-sized
 //!    buffers. Every close-group peer is still checked for possession: a peer
 //!    skipped from when the hold ends, a peer offered from when its offer is
-//!    dispatched.
+//!    dispatched. When the node stops, the open holds' notices are sent
+//!    before it does.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,7 +105,9 @@ impl HeldNotices {
 }
 
 /// A write whose hold has ended and whose chunk offer is waiting for a
-/// pending-offer permit. Carries no chunk bytes.
+/// pending-offer permit. Carries no chunk bytes, and no notice: its targets
+/// got the notice with the slim proof when the hold ended, so neither the
+/// queue nor the permits ever delay a peer's paid-list evidence.
 pub(crate) struct FreshOfferEvent {
     pub(crate) key: XorName,
     pub(crate) payment_proof: Vec<u8>,
@@ -112,10 +116,6 @@ pub(crate) struct FreshOfferEvent {
     /// The close-group peers to offer the record to: those not heard from and
     /// not marked full when the hold ended.
     pub(crate) targets: Vec<PeerId>,
-    /// Whether each target also gets the notice with the slim proof once its
-    /// offer is sent: true unless this node's own paid-list write failed, in
-    /// which case the whole paid group already got it.
-    pub(crate) notify_after: bool,
 }
 
 /// Handles shared by everything that sends fresh offers, so the offer
@@ -233,10 +233,9 @@ pub(crate) async fn announce_held(
 /// hold left to offer, and schedule their delayed possession check
 /// (ADR-0003).
 ///
-/// With `notify_after`, each peer also gets the notice with the slim proof,
-/// once its offer has been sent. The receiver has then usually recorded the
-/// key from the offer and drops the notice before admission, so a peer the
-/// client's PUT missed isn't sent a notice and an offer for one key at once.
+/// Sends no notice: the caller sent the targets the notice with the slim
+/// proof before handing their offer here, so the permits and the send
+/// semaphore never delay a peer's paid-list evidence.
 ///
 /// `pending_offer` is the caller's permit from the pending-offer semaphore;
 /// it is held with the encoded offer until the last handle to it is dropped.
@@ -248,10 +247,8 @@ pub(crate) async fn send_fresh_offers(
     data: Vec<u8>,
     proof_of_payment: Vec<u8>,
     target_peers: Vec<PeerId>,
-    notify_after: bool,
     pending_offer: OwnedSemaphorePermit,
 ) {
-    let notice_proof = notify_after.then(|| proof_of_payment.clone());
     let offer = FreshReplicationOffer {
         key: *key,
         data,
@@ -282,8 +279,6 @@ pub(crate) async fn send_fresh_offers(
         let offer = encoded.clone();
         let peer_id = *peer;
         let sem = Arc::clone(&ctx.send_semaphore);
-        let notice_proof = notice_proof.clone();
-        let key = *key;
         tokio::spawn(async move {
             // Acquire a permit before sending — this caps the number of
             // concurrent outbound replication transfers across the engine.
@@ -321,16 +316,6 @@ pub(crate) async fn send_fresh_offers(
                     }
                 }
             }
-            // The notice with the slim proof, after the offer, sent or not.
-            if let Some(proof) = notice_proof {
-                send_notice(
-                    &key,
-                    proof,
-                    std::iter::once(&peer_id),
-                    &p2p,
-                    FreshCounter::ProofNoticesSent,
-                );
-            }
         });
     }
 
@@ -355,18 +340,43 @@ pub(crate) async fn send_fresh_offers(
     }
 }
 
-/// An offer dropped before it was sent, because its record is gone or can't
-/// be read: its peers still get the notice with the slim proof they would
-/// have had after the offer. No possession check is scheduled for them.
-pub(crate) fn notify_unoffered(p2p_node: &Arc<P2PNode>, event: &FreshOfferEvent) {
-    if event.notify_after {
-        send_notice(
-            &event.key,
-            event.payment_proof.clone(),
-            event.targets.iter(),
-            p2p_node,
-            FreshCounter::ProofNoticesSent,
-        );
+/// What the offer dispatcher does with a write after reading its record
+/// back from storage.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FreshRead<T, E> {
+    /// The record was read: offer it.
+    Offer(T),
+    /// The record is gone: drop the offer.
+    Gone,
+    /// The read failed and the write has had its attempts: drop the offer.
+    GiveUp { attempts: u32, error: E },
+    /// The read failed: try again later, with this many attempts made.
+    Retry { attempts: u32, error: E },
+}
+
+/// Sort a dispatcher read-back, made after `prior_attempts` failed ones,
+/// into what happens next. A dropped offer sends nothing, no notice either:
+/// its targets got the notice with the slim proof when the hold ended, while
+/// this node held the record, and a notice sent now would come from a node
+/// that has just found it holds no readable copy, which receivers would
+/// count as heard from and skip offering. No possession check is scheduled
+/// for a dropped offer's targets.
+pub(crate) fn fresh_read<T, E>(
+    read: Result<Option<T>, E>,
+    prior_attempts: u32,
+    max_attempts: u32,
+) -> FreshRead<T, E> {
+    match read {
+        Ok(Some(data)) => FreshRead::Offer(data),
+        Ok(None) => FreshRead::Gone,
+        Err(error) => {
+            let attempts = prior_attempts + 1;
+            if attempts >= max_attempts {
+                FreshRead::GiveUp { attempts, error }
+            } else {
+                FreshRead::Retry { attempts, error }
+            }
+        }
     }
 }
 
@@ -422,7 +432,8 @@ fn notice_recipients(
 ///
 /// Per Invariant 16, as amended for holding notices: the sender MUST attempt
 /// a notice to every member, with the slim proof, except that a close-group
-/// peer gets a holding notice once this node has recorded the key itself. A
+/// peer gets a holding notice once this node has recorded the key itself,
+/// and the slim proof when the hold ends unless it was heard from. A
 /// notice carries no record, so it is neither gated by the send semaphore nor
 /// by the pending-offer permit.
 async fn send_paid_notices(
@@ -463,16 +474,17 @@ async fn send_paid_notices(
 
 /// Encode one `PaidNotify(K)` and send it to each peer, fire-and-forget. An
 /// empty proof makes it a holding notice. `counter` counts the recipients.
-fn send_notice<'a>(
+/// Returns the send tasks, which only the shutdown flush waits on.
+pub(crate) fn send_notice<'a>(
     key: &XorName,
     proof_of_payment: Vec<u8>,
     peers: impl Iterator<Item = &'a PeerId>,
     p2p_node: &Arc<P2PNode>,
     counter: FreshCounter,
-) {
+) -> Vec<tokio::task::JoinHandle<()>> {
     let mut peers = peers.peekable();
     if peers.peek().is_none() {
-        return;
+        return Vec::new();
     }
     let notify = PaidNotify {
         key: *key,
@@ -486,25 +498,27 @@ fn send_notice<'a>(
 
     let Ok(encoded) = msg.encode() else {
         warn!("Failed to encode PaidNotify for {}", hex::encode(key));
-        return;
+        return Vec::new();
     };
     // One buffer for every recipient; the sends only take handles.
     let encoded = Bytes::from(encoded);
-    for peer in peers {
-        let p2p = Arc::clone(p2p_node);
-        let data = encoded.clone();
-        let peer_id = *peer;
-        protocol::record_sent(&data);
-        fresh_metrics::bump(counter);
-        tokio::spawn(async move {
-            if let Err(e) = p2p
-                .send_message(&peer_id, REPLICATION_PROTOCOL_ID, data, &[])
-                .await
-            {
-                debug!("Failed to send PaidNotify to {peer_id}: {e}");
-            }
-        });
-    }
+    peers
+        .map(|peer| {
+            let p2p = Arc::clone(p2p_node);
+            let data = encoded.clone();
+            let peer_id = *peer;
+            protocol::record_sent(&data);
+            fresh_metrics::bump(counter);
+            tokio::spawn(async move {
+                if let Err(e) = p2p
+                    .send_message(&peer_id, REPLICATION_PROTOCOL_ID, data, &[])
+                    .await
+                {
+                    debug!("Failed to send PaidNotify to {peer_id}: {e}");
+                }
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -671,8 +685,8 @@ struct Serving {
     /// Marked full and not heard from: each gets the notice with the slim
     /// proof when the hold ends.
     notified: Vec<PeerId>,
-    /// Not heard from and not marked full: each is offered the record, gets
-    /// the notice with the slim proof once its offer is sent, and is checked
+    /// Not heard from and not marked full: each gets the notice with the slim
+    /// proof when the hold ends, is then offered the record, and is checked
     /// from the dispatch path.
     offered: Vec<PeerId>,
 }
@@ -699,6 +713,48 @@ fn serve(reasons: Vec<(PeerId, Option<Served>)>) -> Serving {
         }
     }
     serving
+}
+
+/// The peers of the close group a hold was announced to that are no longer
+/// in the close group it ends with, in the announced order.
+fn left_close_group(announced: &[PeerId], now: &[PeerId]) -> Vec<PeerId> {
+    let now: HashSet<&PeerId> = now.iter().collect();
+    announced
+        .iter()
+        .filter(|peer| !now.contains(peer))
+        .copied()
+        .collect()
+}
+
+/// Who gets the notice with the slim proof when a hold ends, at once: every
+/// peer of the close group now that was not heard from (marked full, or about
+/// to be offered), and every peer that has left the announced close group
+/// since and was not heard from either, `left` giving their skip reasons. A
+/// peer that left is still in the paid group, and the holding notice it was
+/// sent at announce recorded nothing, so this is its paid-list evidence from
+/// this storer.
+///
+/// Nothing when this node's own paid-list write failed at announce: the
+/// whole paid group got the slim proof then.
+fn proof_notice_recipients(
+    serving: &Serving,
+    left: &[(PeerId, Option<Served>)],
+    recorded: bool,
+) -> Vec<PeerId> {
+    if !recorded {
+        return Vec::new();
+    }
+    serving
+        .notified
+        .iter()
+        .chain(serving.offered.iter())
+        .copied()
+        .chain(
+            left.iter()
+                .filter(|(_, reason)| *reason != Some(Served::HeardFrom))
+                .map(|(peer, _)| *peer),
+        )
+        .collect()
 }
 
 /// Everything holding and ending a hold needs.
@@ -749,6 +805,45 @@ impl HoldContext {
         }
     }
 
+    /// When the node stops: end every open hold without offers or checks,
+    /// sending the notices with the slim proof each would have sent at its
+    /// end, and wait for those sends. The engine's task drain bounds the
+    /// wait. The offers already queued sent their notices when their holds
+    /// ended.
+    pub(crate) async fn flush_on_shutdown(&self) {
+        let open = self.holds.take_due(Instant::now(), Duration::ZERO);
+        let mut sends = Vec::new();
+        for hold in open {
+            let (_, _, proof_notices) = self.split(&hold).await;
+            sends.extend(send_notice(
+                &hold.key,
+                hold.proof,
+                proof_notices.iter(),
+                &self.p2p_node,
+                FreshCounter::ProofNoticesSent,
+            ));
+        }
+        for send in sends {
+            let _ = send.await;
+        }
+    }
+
+    /// How a hold's peers are served when it ends: the close group now, its
+    /// split by skip reasons, and who gets the notice with the slim proof.
+    async fn split(&self, hold: &Hold) -> (Vec<PeerId>, Serving, Vec<PeerId>) {
+        let close_group = close_group_peers(&hold.key, &self.p2p_node, &self.config).await;
+        let now = Instant::now();
+        let serving = serve(skip_reasons(&self.heard_from, &hold.key, &close_group, now));
+        let left = skip_reasons(
+            &self.heard_from,
+            &hold.key,
+            &left_close_group(&hold.close_group, &close_group),
+            now,
+        );
+        let proof_notices = proof_notice_recipients(&serving, &left, hold.recorded);
+        (close_group, serving, proof_notices)
+    }
+
     /// End every hold that has ended by now: at its time, or early once every
     /// close-group peer is heard from or marked full.
     pub(crate) async fn end_ended_holds(&self) {
@@ -765,10 +860,11 @@ impl HoldContext {
         }
     }
 
-    /// End one hold: each close-group peer in this node's view now that was
-    /// not heard from gets a notice with the slim proof and, unless marked
-    /// full, an offer, with the notice sent after it; every skipped peer's
-    /// possession check is scheduled now.
+    /// End one hold: each peer [`proof_notice_recipients`] names gets the
+    /// notice with the slim proof now, and each close-group peer in this
+    /// node's view now that was not heard from and is not marked full is then
+    /// offered the record; every skipped peer's possession check is scheduled
+    /// now.
     async fn end_hold(&self, hold: Hold, end: HoldEnd) {
         fresh_metrics::bump(match end {
             HoldEnd::Early => FreshCounter::HoldsEndedEarly,
@@ -786,13 +882,7 @@ impl HoldContext {
                 );
             }
         }
-        let close_group = close_group_peers(&key, &self.p2p_node, &self.config).await;
-        let serving = serve(skip_reasons(
-            &self.heard_from,
-            &key,
-            &close_group,
-            Instant::now(),
-        ));
+        let (close_group, serving, proof_notices) = self.split(&hold).await;
         let unserved = serving.unserved(close_group.len());
         if unserved > 0 {
             fresh_metrics::add(FreshCounter::PeersLeftUnserved, unserved as u64);
@@ -806,17 +896,15 @@ impl HoldContext {
         }
         // A storer whose own write failed sent the whole paid group the slim
         // proof when it announced the write. The others sent their close group
-        // holding notices, so the peers not heard from get the proof: a peer
-        // marked full now, a peer offered once its offer is sent.
-        if hold.recorded {
-            send_notice(
-                &key,
-                hold.proof.clone(),
-                serving.notified.iter(),
-                &self.p2p_node,
-                FreshCounter::ProofNoticesSent,
-            );
-        }
+        // holding notices, so the peers not heard from get the proof now,
+        // before any offer waits for a permit.
+        send_notice(
+            &key,
+            hold.proof.clone(),
+            proof_notices.iter(),
+            &self.p2p_node,
+            FreshCounter::ProofNoticesSent,
+        );
         // A closed receiver (engine shutting down) is ignored.
         if !serving.skipped.is_empty() {
             let _ = self.possession_check_tx.send(PossessionCheckEvent {
@@ -835,7 +923,6 @@ impl HoldContext {
                 payment_proof: hold.proof,
                 read_attempts: 0,
                 targets: serving.offered,
-                notify_after: hold.recorded,
             })
             .is_err()
         {
@@ -1017,8 +1104,8 @@ mod tests {
     }
 
     /// Every close-group peer is served when a hold ends: skipped (heard from
-    /// or marked full) or offered. A peer marked full is notified when the
-    /// hold ends, a peer offered after its offer.
+    /// or marked full) or offered. Every peer not heard from is notified when
+    /// the hold ends (see the next test).
     #[test]
     fn no_close_group_peer_is_left_unserved_when_a_hold_ends() {
         let p = peers(1..8);
@@ -1042,6 +1129,84 @@ mod tests {
         );
         assert_eq!(serving.offered, vec![p[2], p[4], p[5]]);
         assert_eq!(serving.notified, vec![p[1]]);
+    }
+
+    /// When a hold ends, every close-group peer not heard from gets the
+    /// notice with the slim proof at once, the peers to be offered included:
+    /// their notice is decided here, before their offer is queued, so an
+    /// offer waiting behind a full pending-offer semaphore (or never sent)
+    /// never delays or loses it. A storer whose paid-list write failed sent
+    /// the whole paid group the proof at announce, and sends none here.
+    #[test]
+    fn every_peer_not_heard_from_gets_the_proof_when_the_hold_ends() {
+        let p = peers(1..8);
+        let serving = serve(vec![
+            (p[0], Some(Served::HeardFrom)),
+            (p[1], Some(Served::MarkedFull)),
+            (p[2], None),
+            (p[3], None),
+        ]);
+        let notices = proof_notice_recipients(&serving, &[], true);
+        assert_eq!(notices, vec![p[1], p[2], p[3]]);
+        for target in &serving.offered {
+            assert!(notices.contains(target), "offered {target:?} has no notice");
+        }
+        assert!(proof_notice_recipients(&serving, &[], false).is_empty());
+    }
+
+    /// A peer that left the close group during the hold, but was in it at
+    /// announce, got only a holding notice, which records nothing. Unless it
+    /// was heard from, it gets the slim proof when the hold ends, though it
+    /// is no longer offered; a peer that joined is served as any other.
+    #[test]
+    fn a_peer_that_left_the_close_group_during_the_hold_still_gets_the_proof() {
+        let announced = peers(1..8);
+        let now = peers(3..10);
+        let left = left_close_group(&announced, &now);
+        assert_eq!(left, peers(1..3));
+
+        let serving = serve(now.iter().map(|peer| (*peer, None)).collect());
+        assert_eq!(serving.unserved(now.len()), 0);
+        let left_reasons = vec![(left[0], Some(Served::HeardFrom)), (left[1], None)];
+        let notices = proof_notice_recipients(&serving, &left_reasons, true);
+        assert!(!notices.contains(&left[0]), "a peer heard from is skipped");
+        assert!(notices.contains(&left[1]), "a peer that left is notified");
+        assert!(!serving.offered.contains(&left[1]), "and not offered");
+        for peer in &now {
+            assert!(notices.contains(peer));
+        }
+        assert_eq!(notices.len(), now.len() + 1);
+
+        assert!(left_close_group(&announced, &announced).is_empty());
+    }
+
+    /// The offer dispatcher's arms: a record read back is offered, one gone
+    /// is dropped at once, and a failed read is retried until its attempts
+    /// run out, then dropped. A dropped offer sends nothing, no notice
+    /// either (the dispatcher has no call that sends one, which the census
+    /// of proof senders pins).
+    #[test]
+    fn the_dispatcher_offers_a_record_read_back_and_drops_one_gone_or_unreadable() {
+        let max = 3;
+        assert_eq!(
+            fresh_read::<_, ()>(Ok(Some(vec![1u8])), 0, max),
+            FreshRead::Offer(vec![1u8])
+        );
+        assert_eq!(fresh_read::<Vec<u8>, ()>(Ok(None), 0, max), FreshRead::Gone);
+        assert_eq!(
+            fresh_read::<Vec<u8>, _>(Err("io"), 0, max),
+            FreshRead::Retry {
+                attempts: 1,
+                error: "io"
+            }
+        );
+        assert_eq!(
+            fresh_read::<Vec<u8>, _>(Err("io"), max - 1, max),
+            FreshRead::GiveUp {
+                attempts: max,
+                error: "io"
+            }
+        );
     }
 
     /// An offer is skipped only for a peer the heard-from table names for the

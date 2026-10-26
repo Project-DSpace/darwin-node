@@ -146,6 +146,35 @@ async fn wait_for(harness: &TestHarness, index: usize, record: &Pointer) -> bool
     false
 }
 
+/// A single-node proof the storer's slim builder forwards for `record`: one
+/// quote on the pricing curve, at the baseline count, naming the record's
+/// state. Its signature is a stand-in and it pays nothing on chain: every
+/// node accepts it from the payment cache, which `mark_paid` fills. A proof
+/// the builder declines would send no pointer offer.
+fn forwardable_proof(record: &Pointer) -> Vec<u8> {
+    use ant_node::payment::{calculate_price, serialize_single_node_proof, PaymentProof};
+    use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
+
+    let quote = PaymentQuote {
+        content: xor_name::XorName(record.state_id()),
+        timestamp: std::time::SystemTime::now(),
+        price: calculate_price(0),
+        rewards_address: RewardsAddress::new([0x5A; 20]),
+        committed_key_count: 0,
+        commitment_pin: None,
+        pub_key: vec![0x5B; 64],
+        signature: vec![0x5C; 64],
+    };
+    serialize_single_node_proof(&PaymentProof {
+        proof_of_payment: ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new([0x5D; 32]), quote)],
+        },
+        tx_hashes: vec![],
+        commitment_sidecars: vec![],
+    })
+    .expect("serialize the proof")
+}
+
 /// Send a paid pointer PUT to one node through its request handler, as a
 /// client's PUT arrives, and return its answer.
 async fn put(node: &TestNode, record: &Pointer) -> PointerPutResponse {
@@ -153,7 +182,7 @@ async fn put(node: &TestNode, record: &Pointer) -> PointerPutResponse {
         request_id: 1,
         body: ChunkMessageBody::PointerPutRequest(PointerPutRequest::with_payment(
             Bytes::from(record.to_bytes()),
-            DUMMY_PROOF.to_vec(),
+            forwardable_proof(record),
         )),
     };
     let reply = node

@@ -52,6 +52,11 @@ mod live_testnet;
 #[cfg(test)]
 mod listings;
 
+// Slim proofs checked by receivers against a real chain: chunk and pointer
+// writes PUT to one storer, an "already stored" answer, a declined proof.
+#[cfg(test)]
+mod slim_proofs;
+
 #[cfg(test)]
 mod payment_flow;
 
