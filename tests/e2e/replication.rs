@@ -23,7 +23,6 @@ use ant_node::replication::protocol::{
 };
 use ant_node::replication::pruning;
 use ant_node::replication::retention::{erase_floor, DiskRetention, DiskSpace};
-use ant_node::replication::scheduling::ReplicationQueues;
 use ant_node::replication::types::{NeighborSyncState, RepairProofs};
 use ant_node::storage::{ChunkStore, XorName};
 use ant_node::ReplicationConfig;
@@ -211,36 +210,6 @@ async fn store_record_on_peers(
     for peer in peers {
         store_record_on_peer(harness, peer, address, content).await;
     }
-}
-
-/// Fresh write happy path (Section 18 #1).
-///
-/// Store a chunk on a node that has a `ReplicationEngine`, manually call
-/// `replicate_fresh`, then check that at least one other node in the
-/// close group received it via their storage.
-#[tokio::test]
-#[serial]
-async fn test_fresh_replication_propagates_to_close_group() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let source_idx = FRESH_PIPELINE_SOURCE_INDEX;
-    let content = b"hello replication world";
-    // Paid on every node, so receivers accept the offer without Anvil.
-    let address = store_paid_chunk(&harness, source_idx, content).await;
-    harness
-        .test_node(source_idx)
-        .and_then(|node| node.replication_engine.as_ref())
-        .expect("source replication engine")
-        .replicate_fresh(&address, content, &well_formed_payment_proof(&address))
-        .await;
-
-    assert!(
-        wait_until_replicated(&harness, source_idx, &address, PROPAGATION_TIMEOUT).await,
-        "Chunk should have replicated to at least one other node"
-    );
-
-    harness.teardown().await.expect("teardown");
 }
 
 /// The whole PUT path: a chunk PUT through the handler emits the fresh-write
@@ -1322,250 +1291,346 @@ async fn self_closeness_gate_accepts_responsible_rejects_far_node() {
     harness.teardown().await.expect("teardown");
 }
 
-/// `PaidForList` persistence (Section 18 #43).
+/// What a node answers on the replication protocol, case after case on one
+/// 5-node network. Node B (4) asks node A (3) unless a case says otherwise.
+/// Each case was a test of its own on its own network; their names are kept
+/// in the case comments. Cases that change state use keys and contents of
+/// their own, so no case depends on another.
 ///
-/// Insert a key into the `PaidList`, verify it persists by reopening the
-/// list from the same data directory.
+/// - `test_fetch_request_returns_record`, `test_fetch_not_found`: a fetch
+///   returns the record A holds, and `NotFound` for a key it doesn't;
+/// - `test_audit_challenge_multi_key` (Section 18 #11): an audit of two held
+///   keys and one absent returns their digests and the absent sentinel, in
+///   order;
+/// - `test_verification_with_paid_list_check`,
+///   `test_verification_request_returns_presence`: a verification reports a
+///   held, paid key as present and paid, and a key A doesn't hold as absent
+///   and unpaid (quorum repair counts these answers);
+/// - `test_fresh_offer_with_empty_pop_rejected` (Section 18 #2), and
+///   `test_fresh_offer_with_mismatched_content_address_rejected`: fresh
+///   offers with no proof of payment, or under an address that isn't their
+///   content's, are refused and nothing is stored;
+/// - `test_neighbor_sync_request_returns_hints` (Section 18 #5/#37),
+///   `scenario_14_sync_hints_cover_all_local_keys`,
+///   `scenario_17_bidirectional_sync_when_sender_in_rt`: neighbour sync
+///   answers, not bootstrapping, with hints covering every key A holds;
+/// - `scenario_12_bootstrap_quorum_aggregation`,
+///   `scenario_21_paid_list_majority_from_multiple_peers`: node 4 gets a
+///   quorum of presence and paid confirmations from nodes 0 to 3;
+/// - `scenario_11_repeated_failures_decrease_trust`, last since it lowers
+///   A's trust in B: application failures reported lower the trust score.
 #[tokio::test]
 #[serial]
-async fn test_paid_list_persistence() {
-    let mut harness = TestHarness::setup_minimal().await.expect("setup");
-
-    let key = [0xAA; 32];
-    let data_dir = {
-        let node = harness.test_node(3).expect("node");
-        let dir = node.data_dir.clone();
-
-        // Insert into paid list
-        if let Some(ref engine) = node.replication_engine {
-            engine.paid_list().insert(&key).await.expect("insert");
-            assert!(engine.paid_list().contains(&key).expect("contains"));
-        }
-        dir
-    };
-
-    // Shut down the replication engine so the chunk store is released
-    {
-        let node = harness.network_mut().node_mut(3).expect("node");
-        if let Some(ref mut engine) = node.replication_engine {
-            engine.shutdown().await;
-        }
-        node.replication_engine = None;
-        node.replication_shutdown = None;
-    }
-
-    // Reopen the paid list from the same directory to verify persistence
-    let paid_list2 = ant_node::replication::paid_list::PaidList::new(&data_dir)
-        .await
-        .expect("reopen");
-    assert!(paid_list2.contains(&key).expect("contains after reopen"));
-
-    harness.teardown().await.expect("teardown");
-}
-
-/// Verification request/response (Section 18 #6, #27).
-///
-/// Send a verification request to a node and check that it returns proper
-/// per-key presence results for both stored and missing keys.
-#[tokio::test]
-#[serial]
-async fn test_verification_request_returns_presence() {
+async fn replication_protocol_answers() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
     let node_a = harness.test_node(3).expect("node_a");
     let node_b = harness.test_node(4).expect("node_b");
     let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol_a");
-    let storage_a = protocol_a.storage();
-
-    // Store a chunk on node A
-    let content = b"verification test data";
-    let address = compute_address(content);
-    storage_a.put(&address, content).await.expect("put");
-
-    // Also create a key that doesn't exist
-    let missing_key = [0xBB; 32];
-
-    // Build verification request from B to A
-    let request = VerificationRequest {
-        keys: vec![address, missing_key],
-        paid_list_check_indices: vec![],
-    };
-    let msg = ReplicationMessage {
-        request_id: 42,
-        body: ReplicationMessageBody::VerificationRequest(request),
-    };
-
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
     let peer_a = *p2p_a.peer_id();
+    let peer_b = *p2p_b.peer_id();
+    let storage_a = node_a.ant_protocol.as_ref().expect("protocol_a").storage();
+    let paid_list_a = node_a
+        .replication_engine
+        .as_ref()
+        .expect("engine_a")
+        .paid_list();
+    let ask_a = |request_id: u64, body: ReplicationMessageBody| {
+        send_replication_request(
+            p2p_b,
+            &peer_a,
+            ReplicationMessage { request_id, body },
+            Duration::from_secs(10),
+        )
+    };
 
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
-        assert_eq!(resp.results.len(), 2);
-        assert!(resp.results[0].present, "First key should be present");
-        assert!(!resp.results[1].present, "Second key should be absent");
-    } else {
-        panic!("Expected VerificationResponse");
-    }
-
-    harness.teardown().await.expect("teardown");
-}
-
-/// Fetch request/response happy path.
-///
-/// Store a chunk on node A, send a `FetchRequest` from node B, and verify
-/// the response contains the correct data.
-#[tokio::test]
-#[serial]
-async fn test_fetch_request_returns_record() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol_a");
-
-    // Store chunk on A
+    // test_fetch_request_returns_record
     let content = b"fetch me please";
     let address = compute_address(content);
-    protocol_a
-        .storage()
-        .put(&address, content)
-        .await
-        .expect("put");
-
-    // Send fetch request from B to A
-    let request = FetchRequest { key: address };
-    let msg = ReplicationMessage {
-        request_id: 99,
-        body: ReplicationMessageBody::FetchRequest(request),
-    };
-
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let peer_a = *p2p_a.peer_id();
-
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    if let ReplicationMessageBody::FetchResponse(FetchResponse::Success { key, data }) =
-        resp_msg.body
+    storage_a.put(&address, content).await.expect("put");
+    match ask_a(
+        99,
+        ReplicationMessageBody::FetchRequest(FetchRequest { key: address }),
+    )
+    .await
+    .body
     {
-        assert_eq!(key, address);
-        assert_eq!(data, content);
-    } else {
-        panic!("Expected FetchResponse::Success");
+        ReplicationMessageBody::FetchResponse(FetchResponse::Success { key, data }) => {
+            assert_eq!(key, address, "fetch: the key asked for");
+            assert_eq!(data, content, "fetch: the record's bytes");
+        }
+        other => panic!("fetch: expected Success, got {other:?}"),
     }
 
-    harness.teardown().await.expect("teardown");
-}
+    // test_fetch_not_found
+    let answer = ask_a(
+        77,
+        ReplicationMessageBody::FetchRequest(FetchRequest { key: [0xEE; 32] }),
+    )
+    .await;
+    assert!(
+        matches!(
+            answer.body,
+            ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { .. })
+        ),
+        "fetch of a key A doesn't hold: expected NotFound, got {:?}",
+        answer.body
+    );
 
-/// Audit challenge/response (Section 18 #54).
-///
-/// Store a chunk on a node, send an audit challenge, and verify the
-/// returned digest matches our local computation.
-#[tokio::test]
-#[serial]
-async fn test_audit_challenge_returns_correct_digest() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
+    // test_audit_challenge_multi_key: four chunks held, so the dynamic audit
+    // key limit (2 * sqrt(4) = 4, more with the other cases' chunks) takes a
+    // 3-key challenge. Only c1 and c2 are challenged.
+    let c1 = b"audit multi key 1";
+    let c2 = b"audit multi key 2";
+    let a1 = compute_address(c1);
+    let a2 = compute_address(c2);
+    let paddings: [&[u8]; 2] = [
+        b"audit multi key 3 (padding)",
+        b"audit multi key 4 (padding)",
+    ];
+    for padding in paddings {
+        storage_a
+            .put(&compute_address(padding), padding)
+            .await
+            .expect("put padding");
+    }
+    storage_a.put(&a1, c1).await.expect("put 1");
+    storage_a.put(&a2, c2).await.expect("put 2");
+    let nonce = [0x55; 32];
+    let challenge = AuditChallenge {
+        challenge_id: 3000,
+        nonce,
+        challenged_peer_id: *peer_a.as_bytes(),
+        keys: vec![a1, [0xCC; 32], a2],
+    };
+    match ask_a(3000, ReplicationMessageBody::AuditChallenge(challenge))
+        .await
+        .body
+    {
+        ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
+            challenge_id,
+            digests,
+        }) => {
+            assert_eq!(challenge_id, 3000);
+            assert_eq!(
+                digests,
+                vec![
+                    compute_audit_digest(&nonce, peer_a.as_bytes(), &a1, c1),
+                    ABSENT_KEY_DIGEST,
+                    compute_audit_digest(&nonce, peer_a.as_bytes(), &a2, c2),
+                ],
+                "audit: each held key's digest, and the sentinel for the absent one"
+            );
+        }
+        other => panic!("audit: expected Digests, got {other:?}"),
+    }
 
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol_a");
-
-    // Store chunk on A
-    let content = b"audit test data";
+    // test_verification_with_paid_list_check and
+    // test_verification_request_returns_presence
+    let content = b"paid test data";
     let address = compute_address(content);
-    protocol_a
-        .storage()
-        .put(&address, content)
+    storage_a.put(&address, content).await.expect("put");
+    paid_list_a
+        .insert(&address)
         .await
-        .expect("put");
-
-    let peer_a = *p2p_a.peer_id();
-    let nonce = [0x42u8; 32];
-
-    // Send audit challenge from B to A
-    // The on-wire `AuditChallenge` is handled by the responsible-chunk audit
-    // responder (`audit::handle_audit_challenge`), which answers with per-key
-    // `Digests`. The prune-confirmation audit reuses the same message. (The
-    // storage-commitment audit uses the separate
-    // `SubtreeAuditChallenge`/`SubtreeAuditResponse` path.)
-    let challenge = AuditChallenge {
-        challenge_id: 1234,
-        nonce,
-        challenged_peer_id: *peer_a.as_bytes(),
-        keys: vec![address],
+        .expect("paid_list insert");
+    let request = VerificationRequest {
+        keys: vec![address, [0xBB; 32]],
+        paid_list_check_indices: vec![0, 1],
     };
-    let msg = ReplicationMessage {
-        request_id: 1234,
-        body: ReplicationMessageBody::AuditChallenge(challenge),
-    };
-
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    if let ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
-        challenge_id,
-        digests,
-    }) = resp_msg.body
+    match ask_a(55, ReplicationMessageBody::VerificationRequest(request))
+        .await
+        .body
     {
-        assert_eq!(challenge_id, 1234);
-        assert_eq!(digests.len(), 1);
-
-        // Verify digest matches our local computation
-        let expected = compute_audit_digest(&nonce, peer_a.as_bytes(), &address, content);
-        assert_eq!(digests[0], expected);
-    } else {
-        panic!("Expected AuditResponse::Digests");
+        ReplicationMessageBody::VerificationResponse(resp) => {
+            assert_eq!(resp.results.len(), 2);
+            assert!(resp.results[0].present, "verification: key present");
+            assert_eq!(resp.results[0].paid, Some(true), "verification: key paid");
+            assert!(
+                !resp.results[1].present,
+                "verification: a key A doesn't hold is absent"
+            );
+            assert_eq!(
+                resp.results[1].paid,
+                Some(false),
+                "verification: a key nobody paid for is unpaid"
+            );
+        }
+        other => panic!("verification: expected VerificationResponse, got {other:?}"),
     }
 
-    harness.teardown().await.expect("teardown");
-}
-
-/// Audit absent key returns sentinel (Section 18 #54 variant).
-///
-/// Challenge a node with a key it does NOT hold and verify the digest
-/// is the [`ABSENT_KEY_DIGEST`] sentinel.
-#[tokio::test]
-#[serial]
-async fn test_audit_absent_key_returns_sentinel() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-    let peer_a = *p2p_a.peer_id();
-
-    // Challenge with a key that A does NOT hold
-    let missing_key = [0xDD; 32];
-    let nonce = [0x11u8; 32];
-
-    let challenge = AuditChallenge {
-        challenge_id: 5678,
-        nonce,
-        challenged_peer_id: *peer_a.as_bytes(),
-        keys: vec![missing_key],
+    // test_fresh_offer_with_empty_pop_rejected
+    let content = b"invalid pop test";
+    let address = compute_address(content);
+    let offer = FreshReplicationOffer {
+        key: address,
+        data: content.to_vec(),
+        proof_of_payment: vec![],
     };
-    let msg = ReplicationMessage {
-        request_id: 5678,
-        body: ReplicationMessageBody::AuditChallenge(challenge),
-    };
-
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    if let ReplicationMessageBody::AuditResponse(AuditResponse::Digests { digests, .. }) =
-        resp_msg.body
+    match ask_a(1000, ReplicationMessageBody::FreshReplicationOffer(offer))
+        .await
+        .body
     {
-        assert_eq!(digests.len(), 1);
-        assert_eq!(
-            digests[0], ABSENT_KEY_DIGEST,
-            "Absent key should return sentinel digest"
-        );
-    } else {
-        panic!("Expected AuditResponse::Digests");
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+            reason,
+            ..
+        }) => assert!(
+            reason.contains("proof of payment") || reason.contains("Missing"),
+            "empty proof of payment: should say it is missing, got: {reason}"
+        ),
+        other => panic!("empty proof of payment: expected Rejected, got {other:?}"),
     }
+    assert!(
+        !storage_a.exists(&address).unwrap_or(false),
+        "empty proof of payment: nothing stored"
+    );
+
+    // test_fresh_offer_with_mismatched_content_address_rejected: refused
+    // before the payment is checked.
+    let content = b"mismatched fresh offer content";
+    let actual_address = compute_address(content);
+    let mut wrong_address = actual_address;
+    wrong_address[0] ^= 0xFF;
+    let offer = FreshReplicationOffer {
+        key: wrong_address,
+        data: content.to_vec(),
+        proof_of_payment: dummy_payment_proof(),
+    };
+    match ask_a(1001, ReplicationMessageBody::FreshReplicationOffer(offer))
+        .await
+        .body
+    {
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+            reason,
+            ..
+        }) => assert!(
+            reason.contains("Content address mismatch"),
+            "mismatched address: should say so, got: {reason}"
+        ),
+        other => panic!("mismatched address: expected Rejected, got {other:?}"),
+    }
+    assert!(
+        !storage_a.exists(&wrong_address).unwrap_or(false)
+            && !storage_a.exists(&actual_address).unwrap_or(false),
+        "mismatched address: stored under neither address"
+    );
+
+    // test_neighbor_sync_request_returns_hints, scenario_14 and scenario_17:
+    // in a 5-node network after warmup every node is in every key's close
+    // group, so A hints every key it holds to B; B's own hint (a made-up key)
+    // doesn't stop that.
+    let mut backlog = Vec::new();
+    for i in 0..10u8 {
+        let content = format!("backlog test chunk {i}");
+        let address = compute_address(content.as_bytes());
+        storage_a
+            .put(&address, content.as_bytes())
+            .await
+            .expect("put");
+        backlog.push(address);
+    }
+    let all_keys = storage_a.all_keys().await.expect("all_keys");
+    assert!(
+        backlog.iter().all(|key| all_keys.contains(key)),
+        "all_keys covers every stored chunk"
+    );
+    let request = NeighborSyncRequest {
+        replica_hints: vec![[0x17; 32]],
+        paid_hints: vec![],
+        bootstrapping: false,
+        commitment: None,
+    };
+    match ask_a(1700, ReplicationMessageBody::NeighborSyncRequest(request))
+        .await
+        .body
+    {
+        ReplicationMessageBody::NeighborSyncResponse(resp) => {
+            assert!(!resp.bootstrapping, "neighbour sync: A isn't bootstrapping");
+            for key in &all_keys {
+                assert!(
+                    resp.replica_hints.contains(key),
+                    "neighbour sync: hints include held key {}; got {} hints",
+                    hex::encode(key),
+                    resp.replica_hints.len()
+                );
+            }
+        }
+        other => panic!("neighbour sync: expected NeighborSyncResponse, got {other:?}"),
+    }
+
+    // scenario_12 (stored and paid on nodes 0 to 3) and scenario_21 (paid
+    // only): node 4 asks each holder. The quorum is min(4, 4 / 2 + 1) = 3.
+    let held = b"bootstrap quorum test";
+    let held_address = compute_address(held);
+    let paid_only = [0x21; 32];
+    let holders = 0..4;
+    for idx in holders.clone() {
+        let node = harness.test_node(idx).expect("node");
+        node.ant_protocol
+            .as_ref()
+            .expect("protocol")
+            .storage()
+            .put(&held_address, held)
+            .await
+            .expect("put");
+        let paid_list = node
+            .replication_engine
+            .as_ref()
+            .expect("engine")
+            .paid_list();
+        paid_list.insert(&held_address).await.expect("paid insert");
+        paid_list.insert(&paid_only).await.expect("paid insert");
+    }
+    let (mut present, mut paid, mut paid_only_confirmed) = (0, 0, 0);
+    for idx in holders {
+        let peer = *harness
+            .test_node(idx)
+            .and_then(|node| node.p2p_node.as_ref())
+            .expect("p2p")
+            .peer_id();
+        let request = VerificationRequest {
+            keys: vec![held_address, paid_only],
+            paid_list_check_indices: vec![0, 1],
+        };
+        let msg = ReplicationMessage {
+            request_id: 1200 + idx as u64,
+            body: ReplicationMessageBody::VerificationRequest(request),
+        };
+        if let ReplicationMessageBody::VerificationResponse(resp) =
+            send_replication_request(p2p_b, &peer, msg, Duration::from_secs(10))
+                .await
+                .body
+        {
+            present += usize::from(resp.results.first().is_some_and(|r| r.present));
+            paid += usize::from(resp.results.first().and_then(|r| r.paid) == Some(true));
+            paid_only_confirmed +=
+                usize::from(resp.results.get(1).and_then(|r| r.paid) == Some(true));
+        }
+    }
+    let quorum = 3;
+    assert!(
+        present >= quorum && paid >= quorum,
+        "bootstrap quorum: {present} present and {paid} paid, need {quorum}"
+    );
+    assert!(
+        paid_only_confirmed >= quorum,
+        "paid-list majority: {paid_only_confirmed} confirmations, need {quorum}"
+    );
+
+    // scenario_11_repeated_failures_decrease_trust
+    let initial_trust = p2p_a.peer_trust(&peer_b);
+    for _ in 0..5 {
+        p2p_a
+            .report_trust_event(&peer_b, TrustEvent::ApplicationFailure(3.0))
+            .await;
+    }
+    let final_trust = p2p_a.peer_trust(&peer_b);
+    assert!(
+        final_trust < initial_trust,
+        "trust falls after repeated failures: {initial_trust} -> {final_trust}"
+    );
 
     harness.teardown().await.expect("teardown");
 }
@@ -2611,376 +2676,6 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
     harness.teardown().await.expect("teardown");
 }
 
-/// Fetch not-found returns `NotFound`.
-///
-/// Request a key that does not exist on the target node and verify
-/// the response is `FetchResponse::NotFound`.
-#[tokio::test]
-#[serial]
-async fn test_fetch_not_found() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-    let peer_a = *p2p_a.peer_id();
-
-    let missing_key = [0xEE; 32];
-    let request = FetchRequest { key: missing_key };
-    let msg = ReplicationMessage {
-        request_id: 77,
-        body: ReplicationMessageBody::FetchRequest(request),
-    };
-
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    assert!(
-        matches!(
-            resp_msg.body,
-            ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { .. })
-        ),
-        "Expected FetchResponse::NotFound"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
-/// Verification with paid-list check.
-///
-/// Store a chunk AND add it to the paid list on node A, then send a
-/// verification request with `paid_list_check_indices` and confirm the
-/// response reports both presence and paid status.
-#[tokio::test]
-#[serial]
-async fn test_verification_with_paid_list_check() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-
-    // Store a chunk AND add to paid list on node A
-    let content = b"paid test data";
-    let address = compute_address(content);
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol_a");
-    protocol_a
-        .storage()
-        .put(&address, content)
-        .await
-        .expect("put");
-
-    if let Some(ref engine) = node_a.replication_engine {
-        engine
-            .paid_list()
-            .insert(&address)
-            .await
-            .expect("paid_list insert");
-    }
-
-    // Send verification with paid-list check for index 0
-    let request = VerificationRequest {
-        keys: vec![address],
-        paid_list_check_indices: vec![0],
-    };
-    let msg = ReplicationMessage {
-        request_id: 55,
-        body: ReplicationMessageBody::VerificationRequest(request),
-    };
-
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let peer_a = *p2p_a.peer_id();
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
-        assert_eq!(resp.results.len(), 1);
-        assert!(resp.results[0].present, "Key should be present");
-        assert_eq!(
-            resp.results[0].paid,
-            Some(true),
-            "Key should be in PaidForList"
-        );
-    } else {
-        panic!("Expected VerificationResponse");
-    }
-
-    harness.teardown().await.expect("teardown");
-}
-
-/// Fresh write with empty `PoP` rejected (Section 18 #2).
-///
-/// Send a `FreshReplicationOffer` with an empty `proof_of_payment` and
-/// verify the receiver rejects it without storing the chunk.
-#[tokio::test]
-#[serial]
-async fn test_fresh_offer_with_empty_pop_rejected() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
-
-    let content = b"invalid pop test";
-    let address = ant_node::client::compute_address(content);
-
-    // Send fresh offer with EMPTY PoP
-    let offer = FreshReplicationOffer {
-        key: address,
-        data: content.to_vec(),
-        proof_of_payment: vec![], // Empty!
-    };
-    let msg = ReplicationMessage {
-        request_id: 1000,
-        body: ReplicationMessageBody::FreshReplicationOffer(offer),
-    };
-
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    match resp_msg.body {
-        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-            reason,
-            ..
-        }) => {
-            assert!(
-                reason.contains("proof of payment") || reason.contains("Missing"),
-                "Should mention missing PoP, got: {reason}"
-            );
-        }
-        other => panic!("Expected Rejected, got: {other:?}"),
-    }
-
-    // Verify chunk was NOT stored
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol");
-    assert!(
-        !protocol_a.storage().exists(&address).unwrap_or(false),
-        "Chunk should not be stored with empty PoP"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
-/// Fresh write with a key that does not match the supplied bytes is rejected
-/// before payment verification.
-#[tokio::test]
-#[serial]
-async fn test_fresh_offer_with_mismatched_content_address_rejected() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
-
-    let content = b"mismatched fresh offer content";
-    let actual_address = compute_address(content);
-    let mut wrong_address = actual_address;
-    wrong_address[0] ^= 0xFF;
-
-    let offer = FreshReplicationOffer {
-        key: wrong_address,
-        data: content.to_vec(),
-        proof_of_payment: dummy_payment_proof(),
-    };
-    let msg = ReplicationMessage {
-        request_id: 1001,
-        body: ReplicationMessageBody::FreshReplicationOffer(offer),
-    };
-
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    match resp_msg.body {
-        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-            reason,
-            ..
-        }) => {
-            assert!(
-                reason.contains("Content address mismatch"),
-                "Should mention content address mismatch, got: {reason}"
-            );
-        }
-        other => panic!("Expected Rejected, got: {other:?}"),
-    }
-
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol");
-    assert!(
-        !protocol_a.storage().exists(&wrong_address).unwrap_or(false),
-        "Chunk should not be stored under the wrong address"
-    );
-    assert!(
-        !protocol_a
-            .storage()
-            .exists(&actual_address)
-            .unwrap_or(false),
-        "Chunk should not be stored under the actual address after rejected offer"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
-/// Neighbor sync request returns a sync response (Section 18 #5/#37).
-///
-/// Send a `NeighborSyncRequest` from one node to another and verify we
-/// receive a well-formed `NeighborSyncResponse`.
-#[tokio::test]
-#[serial]
-async fn test_neighbor_sync_request_returns_hints() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
-
-    // Store something on A so it has hints to share
-    let content = b"sync test data";
-    let address = ant_node::client::compute_address(content);
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol");
-    protocol_a
-        .storage()
-        .put(&address, content)
-        .await
-        .expect("put");
-
-    // Send sync request
-    let request = NeighborSyncRequest {
-        replica_hints: vec![],
-        paid_hints: vec![],
-        bootstrapping: false,
-        commitment: None,
-    };
-    let msg = ReplicationMessage {
-        request_id: 2000,
-        body: ReplicationMessageBody::NeighborSyncRequest(request),
-    };
-
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    match resp_msg.body {
-        ReplicationMessageBody::NeighborSyncResponse(resp) => {
-            // Node A should return a sync response (may or may not contain hints
-            // depending on whether B is in A's close group for any keys)
-            assert!(!resp.bootstrapping, "Node A shouldn't claim bootstrapping");
-            // The response is valid -- that's the main assertion
-        }
-        other => panic!("Expected NeighborSyncResponse, got: {other:?}"),
-    }
-
-    harness.teardown().await.expect("teardown");
-}
-
-/// Audit challenge with multiple keys, some present and some absent
-/// (Section 18 #11).
-///
-/// Challenge a node with three keys (two stored, one missing) and verify
-/// per-key digest correctness.
-#[tokio::test]
-#[serial]
-async fn test_audit_challenge_multi_key() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol_a");
-
-    // Store four chunks on A so the dynamic audit key limit (2 * sqrt(4) = 4)
-    // accommodates our 3-key challenge.  Only c1 and c2 are challenged; c3
-    // and c4 just raise the stored-chunk count.
-    let c1 = b"audit multi key 1";
-    let c2 = b"audit multi key 2";
-    let c3 = b"audit multi key 3 (padding)";
-    let c4 = b"audit multi key 4 (padding)";
-    let a1 = ant_node::client::compute_address(c1);
-    let a2 = ant_node::client::compute_address(c2);
-    let a3 = ant_node::client::compute_address(c3);
-    let a4 = ant_node::client::compute_address(c4);
-    protocol_a.storage().put(&a1, c1).await.expect("put 1");
-    protocol_a.storage().put(&a2, c2).await.expect("put 2");
-    protocol_a.storage().put(&a3, c3).await.expect("put 3");
-    protocol_a.storage().put(&a4, c4).await.expect("put 4");
-
-    let absent_key = [0xCC; 32];
-    let peer_a = *p2p_a.peer_id();
-    let nonce = [0x55; 32];
-
-    let challenge = AuditChallenge {
-        challenge_id: 3000,
-        nonce,
-        challenged_peer_id: *peer_a.as_bytes(),
-        keys: vec![a1, absent_key, a2],
-    };
-    let msg = ReplicationMessage {
-        request_id: 3000,
-        body: ReplicationMessageBody::AuditChallenge(challenge),
-    };
-
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    if let ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
-        challenge_id,
-        digests,
-    }) = resp_msg.body
-    {
-        assert_eq!(challenge_id, 3000);
-        assert_eq!(digests.len(), 3);
-
-        // Key 1 -- correct digest
-        let expected_1 = compute_audit_digest(&nonce, peer_a.as_bytes(), &a1, c1);
-        assert_eq!(digests[0], expected_1, "First key digest should match");
-
-        // Key 2 -- absent sentinel
-        assert_eq!(
-            digests[1], ABSENT_KEY_DIGEST,
-            "Absent key should be sentinel"
-        );
-
-        // Key 3 -- correct digest
-        let expected_2 = compute_audit_digest(&nonce, peer_a.as_bytes(), &a2, c2);
-        assert_eq!(digests[2], expected_2, "Third key digest should match");
-    } else {
-        panic!("Expected AuditResponse::Digests");
-    }
-
-    harness.teardown().await.expect("teardown");
-}
-
-/// Fetch returns `NotFound` for a zeroed-out key (variant of the basic
-/// not-found test).
-///
-/// Request a key that is all zeros -- not a valid content address -- and
-/// verify the response is `FetchResponse::NotFound`.
-#[tokio::test]
-#[serial]
-async fn test_fetch_returns_error_for_corrupt_key() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-    let peer_a = *p2p_a.peer_id();
-
-    let fake_key = [0x00; 32];
-    let request = FetchRequest { key: fake_key };
-    let msg = ReplicationMessage {
-        request_id: 4000,
-        body: ReplicationMessageBody::FetchRequest(request),
-    };
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    assert!(
-        matches!(
-            resp_msg.body,
-            ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { .. })
-        ),
-        "Expected NotFound for non-existent key"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
 // =========================================================================
 // Section 18, Scenario #1/#24: Fresh replication stores + PaidNotify
 // =========================================================================
@@ -3051,272 +2746,6 @@ async fn scenario_1_and_24_fresh_replication_stores_and_propagates_paid_list() {
         paid_listed_elsewhere,
         "Key should be in PaidForList on at least one other node"
     );
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #9: Fetch retry with alternate source
-// =========================================================================
-
-/// When a fetch fails, the queue rotates to the next untried source
-/// (Section 18 #9).
-///
-/// Tested via direct `ReplicationQueues` manipulation since we cannot
-/// deterministically trigger network failures in e2e.
-#[tokio::test]
-#[serial]
-async fn scenario_9_fetch_retry_uses_alternate_source() {
-    let mut queues = ReplicationQueues::new();
-    let key = [0x09; 32];
-    let distance = [0x01; 32];
-    let source_a = PeerId::from_bytes([0xA0; 32]);
-    let source_b = PeerId::from_bytes([0xB0; 32]);
-
-    // Enqueue with two sources
-    queues.enqueue_fetch(key, distance, vec![source_a, source_b]);
-    let candidate = queues.dequeue_fetch().expect("dequeue");
-
-    // Start in-flight with first source
-    queues.start_dequeued_fetch(candidate, source_a);
-
-    // First source fails -> retry should give source_b
-    let next = queues.retry_fetch(&key);
-    assert_eq!(next, Some(source_b), "Should retry with alternate source");
-
-    // Second source fails -> no more sources
-    let exhausted = queues.retry_fetch(&key);
-    assert!(exhausted.is_none(), "No more sources available");
-}
-
-// =========================================================================
-// Section 18, Scenario #10: Fetch retry exhaustion
-// =========================================================================
-
-/// When all sources fail, the fetch is exhausted and can be completed
-/// (Section 18 #10).
-#[tokio::test]
-#[serial]
-async fn scenario_10_fetch_retry_exhaustion() {
-    let mut queues = ReplicationQueues::new();
-    let key = [0x10; 32];
-    let distance = [0x01; 32];
-    let source = PeerId::from_bytes([0xC0; 32]);
-
-    // Single source
-    queues.enqueue_fetch(key, distance, vec![source]);
-    let candidate = queues.dequeue_fetch().expect("dequeue");
-    queues.start_dequeued_fetch(candidate, source);
-
-    // Source fails -> no alternates -> exhausted
-    let next = queues.retry_fetch(&key);
-    assert!(next.is_none(), "Single source exhausted");
-
-    // Complete the fetch (abandon)
-    let entry = queues.complete_fetch(&key);
-    assert!(entry.is_some(), "Should have in-flight entry to complete");
-    assert_eq!(queues.in_flight_count(), 0);
-}
-
-// =========================================================================
-// Section 18, Scenario #11: Repeated failures -> trust penalty
-// =========================================================================
-
-/// Multiple application failures from a peer decrease its trust score
-/// (Section 18 #11).
-#[tokio::test]
-#[serial]
-async fn scenario_11_repeated_failures_decrease_trust() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let peer_b = *p2p_b.peer_id();
-
-    // Get initial trust score for node B (should be neutral ~0.5)
-    let initial_trust = p2p_a.peer_trust(&peer_b);
-
-    // Report multiple application failures
-    let failure_count = 5;
-    let failure_weight = 3.0;
-    for _ in 0..failure_count {
-        p2p_a
-            .report_trust_event(&peer_b, TrustEvent::ApplicationFailure(failure_weight))
-            .await;
-    }
-
-    let final_trust = p2p_a.peer_trust(&peer_b);
-    assert!(
-        final_trust < initial_trust,
-        "Trust should decrease after repeated failures: {initial_trust} -> {final_trust}"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #12: Bootstrap quorum aggregation
-// =========================================================================
-
-/// A bootstrapping node queries multiple peers and discovers that a key
-/// meets the multi-peer presence threshold (Section 18 #12).
-///
-/// Store a chunk on nodes 0-3 (4 holders), then have node 4 send
-/// verification requests to all holders. The querying node should receive
-/// enough presence confirmations to meet the quorum threshold.
-#[tokio::test]
-#[serial]
-async fn scenario_12_bootstrap_quorum_aggregation() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let content = b"bootstrap quorum test";
-    let address = compute_address(content);
-
-    // Store chunk + paid-list entry on nodes 0-3 (4 holders)
-    let holder_count = 4;
-    for idx in 0..holder_count {
-        let node = harness.test_node(idx).expect("node");
-        let protocol = node.ant_protocol.as_ref().expect("protocol");
-        protocol
-            .storage()
-            .put(&address, content)
-            .await
-            .expect("put");
-        if let Some(ref engine) = node.replication_engine {
-            engine
-                .paid_list()
-                .insert(&address)
-                .await
-                .expect("paid insert");
-        }
-    }
-
-    // Node 4 acts as the bootstrapping node: query each holder for presence
-    let querier = harness.test_node(4).expect("querier");
-    let p2p_q = querier.p2p_node.as_ref().expect("p2p");
-
-    let mut presence_confirmations = 0u32;
-    let mut paid_confirmations = 0u32;
-    for idx in 0..holder_count {
-        let target = harness.test_node(idx).expect("target");
-        let peer = *target.p2p_node.as_ref().expect("p2p").peer_id();
-
-        let request = VerificationRequest {
-            keys: vec![address],
-            paid_list_check_indices: vec![0],
-        };
-        let msg = ReplicationMessage {
-            request_id: 1200 + idx as u64,
-            body: ReplicationMessageBody::VerificationRequest(request),
-        };
-
-        let resp_msg = send_replication_request(p2p_q, &peer, msg, Duration::from_secs(10)).await;
-        if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
-            if let Some(result) = resp.results.first() {
-                if result.present {
-                    presence_confirmations += 1;
-                }
-                if result.paid == Some(true) {
-                    paid_confirmations += 1;
-                }
-            }
-        }
-    }
-
-    // Quorum threshold is floor(CLOSE_GROUP_SIZE/2)+1 = 4, but dynamic
-    // QuorumNeeded uses min(4, floor(|targets|/2)+1). With 4 targets:
-    // min(4, 3) = 3. Require at least 3 confirmations.
-    let min_quorum = 3;
-    assert!(
-        presence_confirmations >= min_quorum,
-        "Bootstrap node should receive enough presence confirmations for quorum: \
-         got {presence_confirmations}, need {min_quorum}"
-    );
-    assert!(
-        paid_confirmations >= min_quorum,
-        "Bootstrap node should receive enough paid-list confirmations: \
-         got {paid_confirmations}, need {min_quorum}"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #14: Coverage under backlog
-// =========================================================================
-
-/// Under load, neighbor-sync hint construction covers the full local
-/// inventory: when node A stores multiple chunks and node B sends a
-/// `NeighborSyncRequest`, A's response hints include all locally stored
-/// keys that B should hold (Section 18 #14).
-#[tokio::test]
-#[serial]
-async fn scenario_14_sync_hints_cover_all_local_keys() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
-
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol_a");
-    let storage_a = protocol_a.storage();
-
-    // Store multiple chunks on node A (simulating backlog)
-    let chunk_count = 10u8;
-    let mut addresses = Vec::new();
-    for i in 0..chunk_count {
-        let content = format!("backlog test chunk {i}");
-        let address = compute_address(content.as_bytes());
-        storage_a
-            .put(&address, content.as_bytes())
-            .await
-            .expect("put");
-        addresses.push(address);
-    }
-
-    // Verify the local inventory is complete
-    let all_keys = storage_a.all_keys().await.expect("all_keys");
-    assert_eq!(
-        all_keys.len(),
-        addresses.len(),
-        "all_keys should cover every stored chunk"
-    );
-
-    // Send a NeighborSyncRequest from B to A and inspect the response hints.
-    let request = NeighborSyncRequest {
-        replica_hints: vec![],
-        paid_hints: vec![],
-        bootstrapping: false,
-        commitment: None,
-    };
-    let msg = ReplicationMessage {
-        request_id: 1400,
-        body: ReplicationMessageBody::NeighborSyncRequest(request),
-    };
-
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    let hints = match resp_msg.body {
-        ReplicationMessageBody::NeighborSyncResponse(resp) => resp.replica_hints,
-        other => panic!("Expected NeighborSyncResponse, got: {other:?}"),
-    };
-
-    // Node A builds replica hints for B based on B's close-group membership.
-    // In a 5-node network every node is close to every key, so the hints
-    // should include ALL locally stored keys.
-    for addr in &addresses {
-        assert!(
-            hints.contains(addr),
-            "Sync response hints should include stored key {addr:?}; \
-             got {} hints total",
-            hints.len()
-        );
-    }
 
     harness.teardown().await.expect("teardown");
 }
@@ -3398,264 +2827,6 @@ async fn scenario_15_partition_and_heal() {
     } else {
         panic!("Expected VerificationResponse");
     }
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #17: Admission asymmetry
-// =========================================================================
-
-/// When sender IS in receiver's `LocalRT`, sync is bidirectional: the
-/// receiver sends outbound hints AND accepts inbound hints. This test
-/// verifies the outbound direction: after warmup (all nodes in each
-/// other's RT), node A stores data, node B sends sync, and A's response
-/// includes replica hints for its stored keys (Section 18 #17).
-///
-/// The inbound admission guard (dropping hints from non-RT senders) is
-/// tested in the unit-level `admission.rs` tests.
-#[tokio::test]
-#[serial]
-async fn scenario_17_bidirectional_sync_when_sender_in_rt() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let node_a = harness.test_node(3).expect("node_a");
-    let node_b = harness.test_node(4).expect("node_b");
-    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
-
-    // Store data on node A so it has something to hint about
-    let content = b"admission asymmetry test";
-    let address = compute_address(content);
-    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol");
-    protocol_a
-        .storage()
-        .put(&address, content)
-        .await
-        .expect("put");
-
-    // B sends sync request with a hint for a fabricated key
-    let inbound_hint = [0x17; 32];
-    let request = NeighborSyncRequest {
-        replica_hints: vec![inbound_hint],
-        paid_hints: vec![],
-        bootstrapping: false,
-        commitment: None,
-    };
-    let msg = ReplicationMessage {
-        request_id: 1700,
-        body: ReplicationMessageBody::NeighborSyncRequest(request),
-    };
-
-    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    match resp_msg.body {
-        ReplicationMessageBody::NeighborSyncResponse(resp) => {
-            assert!(!resp.bootstrapping, "Node A should not claim bootstrapping");
-
-            // A should send outbound hints back to B — in a 5-node network
-            // after warmup, B is in A's close group for all keys, so A's
-            // stored key should appear in the replica hints.
-            assert!(
-                resp.replica_hints.contains(&address),
-                "When sender is in receiver's RT, receiver should send outbound \
-                 replica hints. Expected address {address:?} in hints, got {} hints.",
-                resp.replica_hints.len()
-            );
-        }
-        other => panic!("Expected NeighborSyncResponse, got: {other:?}"),
-    }
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #21: Paid-list majority confirmation
-// =========================================================================
-
-/// Paid-list status is confirmed by querying multiple peers via verification
-/// requests (Section 18 #21).
-///
-/// Insert a key into the paid lists of 4 out of 5 nodes, then query each
-/// from the remaining node and verify a majority confirms paid status.
-#[tokio::test]
-#[serial]
-async fn scenario_21_paid_list_majority_from_multiple_peers() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let key = [0x21; 32];
-
-    // Add key to paid lists on nodes 0,1,2,3 (4 of 5 nodes)
-    let populated_count = 4;
-    for idx in 0..populated_count {
-        if let Some(node) = harness.test_node(idx) {
-            if let Some(ref engine) = node.replication_engine {
-                engine.paid_list().insert(&key).await.expect("paid insert");
-            }
-        }
-    }
-
-    // Node 4 queries nodes 0..3 for paid-list status via verification
-    let querier = harness.test_node(4).expect("querier");
-    let p2p_q = querier.p2p_node.as_ref().expect("p2p");
-
-    let mut paid_confirmations = 0u32;
-    for idx in 0..populated_count {
-        let target = harness.test_node(idx).expect("target");
-        let target_p2p = target.p2p_node.as_ref().expect("target_p2p");
-        let peer = *target_p2p.peer_id();
-
-        let request = VerificationRequest {
-            keys: vec![key],
-            paid_list_check_indices: vec![0],
-        };
-        let msg = ReplicationMessage {
-            request_id: 2100 + idx as u64,
-            body: ReplicationMessageBody::VerificationRequest(request),
-        };
-
-        let resp_msg = send_replication_request(p2p_q, &peer, msg, Duration::from_secs(10)).await;
-        if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
-            if resp.results.first().and_then(|r| r.paid) == Some(true) {
-                paid_confirmations += 1;
-            }
-        }
-    }
-
-    // Should have at least 3 confirmations (we added to 4 nodes)
-    let min_confirmations = 3;
-    assert!(
-        paid_confirmations >= min_confirmations,
-        "Should get paid confirmations from multiple peers, got {paid_confirmations}"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #24: Fresh replication paid-list propagation
-// =========================================================================
-
-/// After fresh replication, `PaidNotify` propagates to remote nodes' paid
-/// lists (Section 18 #24).
-#[tokio::test]
-#[serial]
-async fn scenario_24_fresh_replication_propagates_paid_notify() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let source_idx = 3;
-    let source = harness.test_node(source_idx).expect("source");
-    let protocol = source.ant_protocol.as_ref().expect("protocol");
-
-    let content = b"paid notify propagation test";
-    let address = compute_address(content);
-    protocol
-        .storage()
-        .put(&address, content)
-        .await
-        .expect("put");
-
-    // Pre-populate payment cache on ALL nodes so receivers accept the offer
-    // and PaidNotify (bypasses EVM verification, unavailable without Anvil).
-    harness.prepopulate_payment_cache_everywhere(&address);
-
-    // Trigger fresh replication (includes PaidNotify to PaidCloseGroup), with
-    // a proof the slim builder forwards.
-    let pop = well_formed_payment_proof(&address);
-    if let Some(ref engine) = source.replication_engine {
-        engine.replicate_fresh(&address, content, &pop).await;
-    }
-
-    // Poll until PaidNotify propagates (or timeout).
-    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
-    let mut paid_count;
-    loop {
-        paid_count = 0u32;
-        for i in 0..harness.node_count() {
-            if i == source_idx {
-                continue;
-            }
-            if let Some(node) = harness.test_node(i) {
-                if let Some(ref engine) = node.replication_engine {
-                    if engine.paid_list().contains(&address).unwrap_or(false) {
-                        paid_count += 1;
-                    }
-                }
-            }
-        }
-        if paid_count >= 1 || tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
-    }
-
-    // At least one other node should have received the PaidNotify
-    // (PaidCloseGroup is up to 20, but in a 5-node network all peers are close)
-    assert!(
-        paid_count >= 1,
-        "PaidNotify should propagate to at least 1 other node, got {paid_count}"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #25: Convergence repair
-// =========================================================================
-
-/// Paid-list convergence: a majority of queried peers confirm paid status
-/// for a key added to a subset of nodes (Section 18 #25).
-#[tokio::test]
-#[serial]
-async fn scenario_25_paid_list_convergence_via_verification() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let key = [0x25; 32];
-
-    // Add to paid list on nodes 0,1,2 (majority of 5)
-    let populated_count = 3;
-    for idx in 0..populated_count {
-        if let Some(node) = harness.test_node(idx) {
-            if let Some(ref engine) = node.replication_engine {
-                engine.paid_list().insert(&key).await.expect("insert");
-            }
-        }
-    }
-
-    // Node 4 queries nodes 0,1,2 for paid-list status
-    let querier = harness.test_node(4).expect("querier");
-    let p2p_q = querier.p2p_node.as_ref().expect("p2p");
-
-    let mut confirmations = 0u32;
-    for idx in 0..populated_count {
-        let target = harness.test_node(idx).expect("target");
-        let peer = *target.p2p_node.as_ref().expect("p2p").peer_id();
-
-        let request = VerificationRequest {
-            keys: vec![key],
-            paid_list_check_indices: vec![0],
-        };
-        let msg = ReplicationMessage {
-            request_id: 2500 + idx as u64,
-            body: ReplicationMessageBody::VerificationRequest(request),
-        };
-
-        let resp_msg = send_replication_request(p2p_q, &peer, msg, Duration::from_secs(10)).await;
-        if let ReplicationMessageBody::VerificationResponse(v) = resp_msg.body {
-            if v.results.first().and_then(|r| r.paid) == Some(true) {
-                confirmations += 1;
-            }
-        }
-    }
-
-    let min_confirmations = 2;
-    assert!(
-        confirmations >= min_confirmations,
-        "Majority of queried peers should confirm paid status, got {confirmations}"
-    );
 
     harness.teardown().await.expect("teardown");
 }
@@ -3841,87 +3012,6 @@ async fn scenario_26_paid_list_majority_repairs_missing_replica_below_storage_qu
         .expect("read repaired record")
         .expect("repaired record should be present");
     assert_eq!(fetched, content, "target should store the fetched bytes");
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #43: Paid-list persistence across restart
-// =========================================================================
-
-/// `PaidForList` survives restart: keys inserted before shutdown are found
-/// when the list is reopened from the same data directory (Section 18 #43).
-#[tokio::test]
-#[serial]
-async fn scenario_43_paid_list_persists_across_restart() {
-    let mut harness = TestHarness::setup_minimal().await.expect("setup");
-
-    let data_dir = {
-        let node = harness.test_node(3).expect("node");
-        let dir = node.data_dir.clone();
-        let key = [0x44; 32];
-
-        // Insert into paid list
-        if let Some(ref engine) = node.replication_engine {
-            engine.paid_list().insert(&key).await.expect("insert");
-        }
-        dir
-    };
-
-    // Shut down the replication engine so the chunk store is released
-    {
-        let node = harness.network_mut().node_mut(3).expect("node");
-        if let Some(ref mut engine) = node.replication_engine {
-            engine.shutdown().await;
-        }
-        node.replication_engine = None;
-        node.replication_shutdown = None;
-    }
-
-    // Simulate restart: reopen PaidList from same directory
-    let key = [0x44; 32];
-    let paid_list2 = ant_node::replication::paid_list::PaidList::new(&data_dir)
-        .await
-        .expect("reopen");
-
-    assert!(
-        paid_list2.contains(&key).expect("contains"),
-        "PaidForList should survive restart (cold-start recovery)"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
-// =========================================================================
-// Section 18, Scenario #45: Unrecoverable when paid-list lost
-// =========================================================================
-
-/// If `PaidForList` is lost AND no quorum exists, the key is unrecoverable.
-/// A fresh `PaidList` in a different directory does NOT contain previously-paid
-/// keys (Section 18 #45).
-#[tokio::test]
-#[serial]
-async fn scenario_45_unrecoverable_when_paid_list_lost() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-
-    let key = [0x45; 32];
-
-    // Insert into node 3's paid list
-    let node = harness.test_node(3).expect("node");
-    if let Some(ref engine) = node.replication_engine {
-        engine.paid_list().insert(&key).await.expect("insert");
-    }
-
-    // Create a fresh PaidList in a different directory (simulating data loss)
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let fresh_paid_list = ant_node::replication::paid_list::PaidList::new(temp_dir.path())
-        .await
-        .expect("fresh paid list");
-
-    assert!(
-        !fresh_paid_list.contains(&key).expect("contains"),
-        "Key should NOT be found in a fresh (lost) PaidForList"
-    );
 
     harness.teardown().await.expect("teardown");
 }

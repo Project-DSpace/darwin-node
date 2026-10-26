@@ -1,0 +1,11 @@
+# The exact Rust release the node is built with, in every workflow (rustup
+# takes it over the stable toolchain the workflows install) and by hand.
+# It is one of the paths latest.yml counts as the node's code, so a
+# compiler change shows in an image release's node_code like any other
+# change since the node's release. 1.99.1 built v0.23.0+ds.15 (its Release
+# run). Change it only to an exact X.Y.Z: scripts/check-workflows.sh
+# refuses a channel such as stable.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

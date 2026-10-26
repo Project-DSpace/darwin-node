@@ -78,6 +78,27 @@ if [[ "${RPC_URL:-}" == *robinhood-rpc.publicnode.com* ]]; then
     echo "RPC_URL is PublicNode, the old default, which refuses some of the chain reads nodes make:" \
         "delete RPC_URL to use the image's RPCs."
 fi
+# One of the image's RPC_URLS before 2026-10-26, which older compose files
+# still set. A node on exactly https://rpc.ordofi.network (trailing slashes
+# aside) still falls back to its built-in public RPCs, but reads through it
+# first; one on any other form of it reads through it alone. No node falls
+# back to it.
+ordofi_exact=false ordofi_other=false
+for url in "${rpc_urls[@]}"; do
+    if [[ "${url%"${url##*[!/]}"}" == https://rpc.ordofi.network ]]; then
+        ordofi_exact=true
+    elif [[ "$url" == *rpc.ordofi.network* ]]; then
+        ordofi_other=true
+    fi
+done
+if $ordofi_exact; then
+    echo "https://rpc.ordofi.network is no longer one of the image's RPCs: a node on it reads payments through it first," \
+        "then falls back to the image's built-in public RPCs. Delete RPC_URL and RPC_URLS to use the image's RPCs."
+fi
+if $ordofi_other; then
+    echo "An RPC names rpc.ordofi.network other than as https://rpc.ordofi.network: a node on it reads payments through" \
+        "it alone, with no fallback. Delete RPC_URL and RPC_URLS to use the image's RPCs."
+fi
 read -ra bootstrap <<<"$BOOTSTRAP_PEERS"
 # ANT_RELAY_SERVING reaches every node as it is: false turns relay serving
 # off, true or unset leaves the node's default (on). Empty or only spaces

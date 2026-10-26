@@ -8,6 +8,8 @@
 # 0.21.0 < 0.21.0+ds.1 < 0.21.0+ds.2 < 0.21.1 < 0.21.1+ds.1. Bump Cargo.toml
 # (and Cargo.lock's ant-node entry) with every node code change, then tag it:
 # a running node only takes a release whose version is higher than its own.
+# A release's notes are a fixed text, then release-notes/<tag>.md (for
+# example release-notes/v0.21.0+ds.2.md) when the tagged commit has one.
 #
 # The tag has to come from a person: GitHub won't let GITHUB_TOKEN create a tag
 # on a commit that changes .github/workflows, so this only publishes an
@@ -24,8 +26,24 @@
 #
 # Once the release is published, the latest job points the storage-node
 # image's :latest, which home operators run, at the image the Build workflow
-# made from the tagged commit when it was pushed to main. Nothing else moves
-# :latest, so it only ever follows an approved, signed release.
+# made from the tagged commit when it was pushed to main, forward only: it
+# refuses unless :latest's node is older than the release's, or :latest
+# already has that image (a re-run after the move, which leaves it as it
+# is). Only latest.yml, run by hand from main and approved in the latest
+# environment, also moves :latest: to a new image with the node release
+# :latest has, a published release's (an image release), or back to an
+# image :latest held before (a withdrawal, once the withdrawn release is
+# deleted on GitHub). A re-run of this workflow's latest job can't undo
+# either.
+#
+# Runs of this workflow and latest.yml share one concurrency group, which
+# keeps one run going and at most one waiting: a run queued while one is
+# waiting cancels the waiting one, so of three tags pushed close together
+# the second one's run is cancelled. A cancelled Release run publishes
+# nothing, so after pushing a tag check that its run is going
+# (`gh run list --workflow release.yml`), and re-run a cancelled run with
+# `gh run rerun <id>`. See latest.yml's header before dispatching it while
+# a release runs.
 
 name: Release
 
@@ -144,9 +162,15 @@ jobs:
       # Autonomi's archives, it also carries the project's licence files, the
       # third-party notices and the Rust standard library's notices from the
       # toolchain that built the binary; whatever installs a release extracts
-      # only ant-node, so the extra files do not affect upgrades.
+      # only ant-node, so the extra files do not affect upgrades. The tagged
+      # commit's release-notes/<tag>.md, if it has one, goes to the publish
+      # job as release-notes.md, which is empty otherwise.
       - name: Package
         run: |
+          touch release-notes.md
+          if [[ -f "release-notes/$GITHUB_REF_NAME.md" ]]; then
+            cp "release-notes/$GITHUB_REF_NAME.md" release-notes.md
+          fi
           mkdir dist
           cp target/release/ant-node config/bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt dist/
           cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" dist/RUST-STD-COPYRIGHT.html
@@ -160,6 +184,7 @@ jobs:
           path: |
             ant-node-cli-linux-x64.tar.gz
             release-signing-key.pub
+            release-notes.md
           if-no-files-found: error
           retention-days: 1
 
@@ -260,7 +285,8 @@ jobs:
           sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt
 
       # Nodes fail to read the whole release list if any release has no title
-      # or no notes, so both are always set.
+      # or no notes, so both are always set. The release's own notes, from
+      # release-notes/<tag>.md in the tagged commit, follow the fixed text.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -275,6 +301,10 @@ jobs:
             "" \
             "The archive also contains LICENSE-MIT and LICENSE-APACHE, plus THIRD-PARTY-NOTICES.txt and RUST-STD-COPYRIGHT.html with the licences and copyright notices of the third-party code in the binary and of the tools used to build it." \
             > notes.md
+          if [[ -s release-notes.md ]]; then
+            echo >> notes.md
+            cat release-notes.md >> notes.md
+          fi
           gh release create "$TAG" --verify-tag --latest \
             --title "Storage node $TAG" --notes-file notes.md \
             ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig \
@@ -282,7 +312,8 @@ jobs:
 
   # Points :latest at the image the Build workflow made from this commit. A
   # job of its own, after the approved publish, so it holds no signing key and
-  # can be re-run alone. The image is the one that run smoke-tested and pushed
+  # can be re-run alone, which needs no approval: so it moves :latest only
+  # forward (below). The image is the one that run smoke-tested and pushed
   # as :<commit>, found by the digest the run recorded, so a later run pushing
   # the same commit tag can't change what :latest gets. The run is the one the
   # checks job waited for: from the push of this commit to main, and green.
@@ -291,6 +322,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       actions: read
+      attestations: read
       contents: read
       packages: write
     env:
@@ -337,6 +369,87 @@ jobs:
           if [[ "$reported" != "ant-node $VERSION" ]]; then
             echo "::error::$IMAGE@$DIGEST has '$reported', not ant-node $VERSION"
             exit 1
+          fi
+
+      # :latest moves forward only: its node must be older than this
+      # release's, unless :latest already has this image (a re-run after the
+      # move, which the next step leaves as it is). Otherwise latest.yml
+      # moved :latest after this release was published: to a new image with
+      # this release's node (an image release), or back to an image it held
+      # before (a withdrawal). A re-run of this job, which asks for no
+      # approval, must not undo either. Versions are ordered as latest.yml
+      # orders them. The run's summary names the image :latest had, and the
+      # command that takes :latest back to it if this release is withdrawn
+      # when that image has a record that doesn't expire, which latest.yml
+      # needs once its Build run's storage-node-digest artifact has expired:
+      # its attestation, or its line in docker/release-images on main.
+      # Without one, the summary says so in place of the command.
+      - name: Check latest's node is older than this release's
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          current=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
+          if [[ ! "$current" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::$IMAGE:latest has no digest that can be read ('$current')"
+            exit 1
+          fi
+          if [[ "$current" == "$DIGEST" ]]; then
+            echo "- $IMAGE:latest already is $DIGEST, and stays so." >> "$GITHUB_STEP_SUMMARY"
+          else
+            current_version=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$current" --version)
+            if ! order=$(jq -rn --arg new "ant-node $VERSION" --arg current "$current_version" '
+                def node_version:
+                  capture("^ant-node (?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)(\\+ds\\.(?<build>[1-9][0-9]*))?$")
+                    // error("not ant-node X.Y.Z or X.Y.Z+ds.N: \(.)")
+                  | [.major, .minor, .patch, (.build // "0")] | map(tonumber);
+                ($new | node_version) as $n | ($current | node_version) as $c
+                | if $n > $c then "newer than" elif $n == $c then "the same as" else "older than" end'); then
+              echo "::error::ant-node $VERSION and $IMAGE:latest's '$current_version' can't be ordered"
+              exit 1
+            fi
+            if [[ "$order" != "newer than" ]]; then
+              echo "::error::$IMAGE:latest is $current, whose node, $current_version, is not older than $VERSION: latest.yml moved it after this release (an image release or a withdrawal), and is the way to move it now"
+              exit 1
+            fi
+            # The commit that image was built from, for a withdrawal: its
+            # image marker, or, for an image with none, which only a release
+            # put on :latest, the commit of that release's tag. Moving back
+            # from this release's image, with a marker, to one with none
+            # needs allow_unmarked, so the command sets it then.
+            current_marker=$(docker run --rm --entrypoint cat "$IMAGE@$current" /opt/ant/image-version 2>/dev/null || true)
+            built_from=$current_marker
+            if [[ ! "$built_from" =~ ^[0-9a-f]{40}$ ]]; then
+              built_from=$(gh api "repos/$GH_REPO/commits/refs/tags/v${current_version#ant-node }" --jq .sha 2>/dev/null || true)
+            fi
+            release_marker=$(docker run --rm --entrypoint cat "$IMAGE@$DIGEST" /opt/ant/image-version 2>/dev/null || true)
+            back=""
+            if [[ ! "$current_marker" =~ ^[0-9a-f]{40}$ && "$release_marker" =~ ^[0-9a-f]{40}$ ]]; then
+              back=" -f allow_unmarked=true"
+            fi
+            lasting=""
+            if [[ "$built_from" =~ ^[0-9a-f]{40}$ ]]; then
+              attested=$(gh attestation verify "oci://$IMAGE@$current" --repo "$GH_REPO" \
+                --signer-workflow "$GH_REPO/.github/workflows/build.yml" \
+                --source-ref refs/heads/main --source-digest "$built_from" --format json \
+                --jq '[.[].verificationResult.signature.certificate | select(.buildTrigger == "push") | .runInvocationURI] | first // empty' || true)
+              listed=$(gh api "repos/$GH_REPO/contents/docker/release-images?ref=main" -H 'Accept: application/vnd.github.raw+json' || true)
+              if [[ -n "$attested" ]]; then
+                lasting="its attestation"
+              elif awk -v base="$built_from" -v current="$current" '!/^#/ && NF == 3 && $2 == base && $3 == current { found = 1 } END { exit !found }' <<<"$listed"; then
+                lasting="its line in docker/release-images"
+              fi
+            fi
+            {
+              echo "- $IMAGE:latest is $current, whose node, $current_version, is older than $VERSION."
+              if [[ -n "$lasting" ]]; then
+                echo "- To withdraw this release, delete it, then move :latest back (the image before is recorded for good by $lasting): \`gh workflow run latest.yml --ref main -f commit=$built_from -f digest=$current -f withdraw=true$back\`"
+                if [[ -n "$back" ]]; then
+                  echo "- The command sets allow_unmarked: $current has no image marker, so its node manager is Autonomi's, and this release's image has one."
+                fi
+              else
+                echo "- **$current has no record that doesn't expire** (no attestation from the push of ${built_from:-its commit, not found,} to main, and no line in docker/release-images on main): a withdrawal of this release to it is refused once its Build run's storage-node-digest artifact has expired, 30 days after that run."
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # --prefer-index=false copies the manifest as it is, so :latest has the

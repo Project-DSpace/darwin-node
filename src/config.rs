@@ -1222,7 +1222,8 @@ rewards_address = "0x0000000000000000000000000000000000000001"
                 "e0f627986c0438de0e314b644f3c8aa21d3f4f6b",
             ),
         ] {
-            let network = custom_network("https://rpc.ordofi.network", token, vault, None);
+            let network =
+                custom_network("https://robinhood-rpc.publicnode.com", token, vault, None);
             assert_eq!(
                 network.vault_deployment_block(),
                 built_in,

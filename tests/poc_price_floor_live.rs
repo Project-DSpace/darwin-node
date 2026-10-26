@@ -14,7 +14,6 @@
 //!
 //! What each test asserts maps directly to a PR claim:
 //! - shadow mode never rejects, even when the settlement is below floor;
-//! - enforcement rejects the cheapest-of-K one-quote settlement;
 //! - enforcement accepts an honest at-floor overpayment;
 //! - reading the floor does not mutate commitment answerability.
 //!
@@ -185,40 +184,6 @@ async fn shadow_mode_accepts_below_floor_real_settlement() {
         .await
         .expect("shadow mode must accept a real below-floor settlement");
     assert_eq!(status, PaymentStatus::PaymentVerified);
-}
-
-/// Enforcement rejects the cheapest-of-K one-quote settlement: a real 3x-baseline
-/// on-chain payment against a fuller receiver, read from the real vault.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "outdated upstream test: the floor now prices against the close-group median and is skipped without a commitment cache (src/payment/verifier.rs), so this setup is never rejected; it also expects the old 'below this node's price floor' message"]
-async fn enforced_floor_rejects_cheapest_of_k_real_settlement() {
-    let testnet = Testnet::new().await.unwrap();
-    let network = testnet.to_network();
-    let wallet = Wallet::new_from_private_key(
-        network.clone(),
-        &testnet.default_wallet_private_key().unwrap(),
-    )
-    .unwrap();
-    let verifier = live_verifier(
-        network,
-        PriceFloorConfig {
-            enforce: true,
-            tolerance_percent: 50,
-        },
-    );
-
-    let xorname = [0xA2u8; 32];
-    let (peer_id, quote) = signed_quote(xorname, calculate_price(0), RewardsAddress::new([3; 20]));
-    let proof = pay_and_build_proof(&wallet, peer_id, quote, cheapest_of_k_settlement()).await;
-
-    let err = verifier
-        .verify_payment(&xorname, Some(&proof), VerificationContext::ClientPut)
-        .await
-        .expect_err("a real 3x-baseline settlement must not clear a fuller receiver's floor");
-    assert!(
-        err.to_string().contains("below this node's price floor"),
-        "unexpected rejection reason: {err}"
-    );
 }
 
 /// Enforcement accepts an honest at-floor overpayment: the client overpays the
