@@ -1,6 +1,7 @@
 //! The line every hourly commitment tick logs, rotated or not: the number of
-//! records the current commitment commits to (K), and whether the tick signed
-//! a new commitment. A file of its own, which upstream doesn't have, so a
+//! records the current commitment commits to (K), whether the tick signed a
+//! new commitment, and the weight total (m) the node quotes clients that pay
+//! by size at. A file of its own, which upstream doesn't have, so a
 //! merge can't drop it while resolving a conflict in the engine's tests.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -66,6 +67,8 @@ fn every_tick_logs_its_key_count_and_whether_it_rotated() {
         "{line}"
     );
 
+    assert!(line.contains(" weight_total=unknown"), "{line}");
+
     let rotated = CommitmentTick {
         rotated: true,
         ..CommitmentTick::unchanged(&commitment)
@@ -74,7 +77,23 @@ fn every_tick_logs_its_key_count_and_whether_it_rotated() {
 
     let none = logged(&CommitmentTick::NONE);
     assert!(
-        none.contains("Storage commitment tick key_count=0 pointers=0 rotated=false hash=none"),
+        none.contains(
+            "Storage commitment tick key_count=0 pointers=0 rotated=false hash=none weight_total=0"
+        ),
         "{none}"
     );
+}
+
+#[test]
+fn the_tick_logs_the_weight_total_once_it_is_known() {
+    let commitment = built(5, 1);
+    // Five full chunks and a pointer: 5 + 259/1,024, rounded up.
+    let m = commitment.set_weight_total(&[Some(4 * 1024 * 1024); 5]);
+    assert_eq!(m, 6);
+    let line = logged(&CommitmentTick::unchanged(&commitment));
+    assert!(line.contains(" weight_total=6"), "{line}");
+    let tiny = built(8, 0);
+    assert_eq!(tiny.set_weight_total(&[Some(1); 8]), 3);
+    assert!(logged(&CommitmentTick::unchanged(&tiny)).contains("key_count=8 pointers=0"));
+    assert!(logged(&CommitmentTick::unchanged(&tiny)).contains(" weight_total=3"));
 }

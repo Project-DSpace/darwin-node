@@ -28,7 +28,7 @@
 //! `2 × (key_count × ~64 bytes + signature_size)` — for 10k keys, ~1.3 MB.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
@@ -160,6 +160,11 @@ pub struct BuiltCommitment {
     /// `O(log n)` — so no separate `sorted_keys` Vec is kept (it duplicated the
     /// keys already in `tree.leaves`, §14).
     tree: MerkleTree,
+    /// The weight total m of the committed records, in whole full chunks,
+    /// once their lengths have been read ([`Self::set_weight_total`]). Not
+    /// saved to disk: an unchanged root means an unchanged m, so it is read
+    /// once per built or reloaded commitment.
+    weight_total: OnceLock<u64>,
 }
 
 impl BuiltCommitment {
@@ -225,6 +230,7 @@ impl BuiltCommitment {
             commitment,
             cached_hash,
             tree,
+            weight_total: OnceLock::new(),
         })
     }
 
@@ -306,8 +312,72 @@ impl BuiltCommitment {
             commitment,
             cached_hash,
             tree,
+            weight_total: OnceLock::new(),
         })
     }
+
+    /// The keys committed as chunks, in the tree's sorted order: every leaf
+    /// that is not a pointer.
+    #[must_use]
+    pub fn chunk_leaf_keys(&self) -> Vec<XorName> {
+        self.tree
+            .leaf_keys()
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| !self.tree.is_pointer_leaf(*idx))
+            .map(|(_, key)| key)
+            .collect()
+    }
+
+    /// The weight total m of the committed records, if it has been set.
+    #[must_use]
+    pub fn weight_total(&self) -> Option<u64> {
+        self.weight_total.get().copied()
+    }
+
+    /// Set the weight total m from the stored lengths of the committed chunks
+    /// (one per [`Self::chunk_leaf_keys`] entry, `None` where the length isn't
+    /// known) and the committed pointers, and return it. A chunk whose length
+    /// isn't known, and a chunk missing from `chunk_lens`, counts as a full
+    /// chunk, so m is never below what the records weigh. Set once: a later
+    /// call returns the m already set.
+    pub fn set_weight_total(&self, chunk_lens: &[Option<u64>]) -> u64 {
+        *self.weight_total.get_or_init(|| {
+            weight_total_of(chunk_lens, self.chunk_count(), self.tree.pointer_count())
+        })
+    }
+
+    /// How many leaves commit a chunk.
+    fn chunk_count(&self) -> usize {
+        usize::try_from(self.commitment.key_count)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(self.tree.pointer_count())
+    }
+}
+
+/// The weight total m of `chunks` chunks and `pointers` pointers, in whole
+/// full chunks.
+///
+/// It is `ant_protocol`'s `weight_total` over each record's weight, with the
+/// chunks' lengths in `chunk_lens`. A chunk whose length is `None`, or past
+/// the end of `chunk_lens`, weighs as a full chunk.
+#[must_use]
+pub fn weight_total_of(chunk_lens: &[Option<u64>], chunks: usize, pointers: usize) -> u64 {
+    use crate::ant_protocol::DATA_TYPE_CHUNK;
+    use ant_protocol::payment::pricing::{record_weight, weight_total, RecordWeight};
+    use ant_protocol::pointer::DATA_TYPE_POINTER;
+
+    let chunk_weights = (0..chunks).map(|idx| {
+        chunk_lens
+            .get(idx)
+            .copied()
+            .flatten()
+            .map_or(RecordWeight::FULL, |len| {
+                record_weight(DATA_TYPE_CHUNK, usize::try_from(len).unwrap_or(usize::MAX))
+            })
+    });
+    let pointer_weights = std::iter::repeat_n(record_weight(DATA_TYPE_POINTER, 0), pointers);
+    weight_total(chunk_weights.chain(pointer_weights))
 }
 
 /// Expected steady-state count of retained recently-gossiped commitments (the
@@ -869,6 +939,7 @@ impl crate::payment::quote::CommitmentSource for ResponderCommitmentState {
             .map(|built| crate::payment::quote::QuoteBinding {
                 key_count: built.commitment().key_count,
                 pin: built.hash(),
+                weight_total: built.weight_total(),
             })
     }
 
@@ -880,6 +951,7 @@ impl crate::payment::quote::CommitmentSource for ResponderCommitmentState {
             .map(|built| crate::payment::quote::QuoteBinding {
                 key_count: built.commitment().key_count,
                 pin: built.hash(),
+                weight_total: built.weight_total(),
             })
     }
 
@@ -1281,6 +1353,78 @@ mod tests {
         )
         .unwrap();
         assert!(built.proof_for(&key(99)).is_none());
+    }
+
+    /// m is the weight total of the committed records: each chunk by its
+    /// stored length's class, a pointer by its own, a chunk whose length
+    /// isn't known as a full chunk. It is set once and reaches the quote
+    /// binding; a reloaded commitment starts without it.
+    #[test]
+    fn the_weight_total_reaches_the_quote_binding_once_it_is_set() {
+        use crate::payment::quote::CommitmentSource;
+        use ant_protocol::payment::pricing::{record_weight, weight_total, RecordWeight};
+
+        let built = mixed(&[1, 2, 3, 4, 5, 6], &[10, 11]);
+        assert_eq!(built.chunk_leaf_keys().len(), 6);
+        assert_eq!(built.weight_total(), None);
+        let state = ResponderCommitmentState::new();
+        state.rotate(built);
+        let binding = state.current_binding_for_quote().expect("binding");
+        assert_eq!((binding.key_count, binding.weight_total), (8, None));
+
+        // Four tiny chunks, one of 300 KiB, one unknown, and two pointers.
+        let lens = [
+            Some(1),
+            Some(100),
+            Some(16 * 1024),
+            Some(0),
+            Some(300 * 1024),
+            None,
+        ];
+        let current = state.current().expect("current");
+        let m = current.set_weight_total(&lens);
+        let expected = weight_total(
+            [0usize, 0, 0, 0, 300 * 1024]
+                .iter()
+                .map(|&len| record_weight(crate::ant_protocol::DATA_TYPE_CHUNK, len))
+                .chain([RecordWeight::FULL])
+                .chain([record_weight(ant_protocol::pointer::DATA_TYPE_POINTER, 0); 2]),
+        );
+        assert_eq!(m, expected);
+        assert!((1..8).contains(&m), "m = {m}");
+        // Set once.
+        assert_eq!(current.set_weight_total(&[None; 6]), m);
+        assert_eq!(
+            state
+                .current_binding_for_quote()
+                .expect("binding")
+                .weight_total,
+            Some(m)
+        );
+        assert_eq!(
+            state
+                .current_binding_snapshot()
+                .expect("snapshot")
+                .weight_total,
+            Some(m)
+        );
+
+        // A reloaded commitment has no m until it is weighed again.
+        let fresh = ResponderCommitmentState::new();
+        fresh.restore(&state.snapshot());
+        assert_eq!(fresh.current().expect("reloaded").weight_total(), None);
+    }
+
+    /// Every record unknown, or missing from the lengths, counts as a full
+    /// chunk: m = K.
+    #[test]
+    fn unknown_lengths_count_as_full_chunks() {
+        assert_eq!(weight_total_of(&[], 5, 0), 5);
+        assert_eq!(weight_total_of(&[None, None], 2, 0), 2);
+        assert_eq!(weight_total_of(&[Some(4 * 1024 * 1024)], 3, 0), 3);
+        // Four tiny chunks: 4 × 259 / 1,024, rounded up.
+        assert_eq!(weight_total_of(&[Some(1); 4], 4, 0), 2);
+        assert_eq!(weight_total_of(&[], 0, 0), 0);
     }
 
     #[test]

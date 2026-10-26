@@ -56,7 +56,9 @@ pub use proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, serialize_merkle_proof,
     serialize_single_node_proof, PaymentProof, ProofType,
 };
-pub use quote::{wire_ml_dsa_signer, QuoteGenerator, XorName};
+pub use quote::{
+    wire_ml_dsa_signer, QuoteGenerator, QuotePricing, XorName, SIZE_PRICED_SETTLEMENT_VERSION,
+};
 pub use settlement::{CLIENT_STORE_WAIT, PUT_PAYMENT_DEADLINE};
 // Wire-side signature verification lives in ant-protocol. Re-exported here
 // so `ant_node::payment::verify_*` keeps working for downstream callers.

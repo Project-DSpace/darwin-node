@@ -1,6 +1,7 @@
 //! Pricing by record size: the functions in the vendored ant-protocol
 //! (`vendor/ant-protocol/src/payment/pricing.rs`) that weigh a record by its
-//! size class, the amount a client pays for it, and a node's weight total.
+//! size class, the amount a client pays for it, a node's weight total and the
+//! band of prices every quote check accepts.
 //! Every store check requires `weighted_amount` for the class of the bytes it
 //! holds (`src/payment/verifier.rs`, `Held`); nodes and clients must compute
 //! the same values, so these tests fail if a function or one of its
@@ -16,9 +17,9 @@ use ant_protocol::chunk::{DATA_TYPE_CHUNK, MAX_CHUNK_SIZE};
 use ant_protocol::evm::Amount;
 use ant_protocol::payment::calculate_price;
 use ant_protocol::payment::pricing::{
-    record_weight, size_class_top, weight_total, weighted_amount, RecordWeight,
-    FIXED_SHARE_DENOMINATOR, FIXED_SHARE_NUMERATOR, FULL_RECORD_BYTES, SMALLEST_CLASS_BYTES,
-    WEIGHT_DENOMINATOR,
+    band_bottom_count, price_band, price_in_band, record_weight, size_class_top, weight_total,
+    weighted_amount, RecordWeight, FIXED_SHARE_DENOMINATOR, FIXED_SHARE_NUMERATOR,
+    FULL_RECORD_BYTES, SMALLEST_CLASS_BYTES, WEIGHT_DENOMINATOR,
 };
 use ant_protocol::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
 
@@ -227,4 +228,48 @@ fn the_weight_total_is_never_above_the_key_count_and_equals_it_for_full_chunks()
     // One tiny record still counts as 1.
     assert_eq!(weight_total([chunk(1)]), 1);
     assert_eq!(weight_total(std::iter::empty()), 0);
+}
+
+#[test]
+fn the_band_runs_from_every_record_in_the_smallest_class_to_every_record_a_full_chunk() {
+    // floor(259 × K / 1,024).
+    for k in [0u64, 1, 3, 4, 5, 7, 100, 1_000, 6_000, 1_000_000] {
+        assert_eq!(band_bottom_count(k), k * 259 / 1024, "K = {k}");
+        let (bottom, top) = price_band(k);
+        assert_eq!(
+            bottom,
+            calculate_price(usize::try_from(k * 259 / 1024).unwrap())
+        );
+        assert_eq!(top, calculate_price(usize::try_from(k).unwrap()));
+        // Both ends are in the band, one wei past either end is not.
+        assert!(price_in_band(&bottom, k) && price_in_band(&top, k));
+        assert!(!price_in_band(&(top + Amount::from(1u64)), k));
+        assert!(!price_in_band(&(bottom - Amount::from(1u64)), k));
+    }
+    // With no records the band is the one baseline price.
+    assert_eq!(price_band(0), (calculate_price(0), calculate_price(0)));
+    // Below four records the bottom is 0 records: the baseline price.
+    assert_eq!(band_bottom_count(3), 0);
+    assert_eq!(band_bottom_count(4), 1);
+    // The smallest class's weight is w_min: the bottom is the weight total
+    // of K records of the smallest class, rounded down.
+    for k in [1u64, 4, 7, 1_000] {
+        let smallest = (0..k).map(|_| chunk(0));
+        let m = weight_total(smallest);
+        assert!(band_bottom_count(k) <= m && m <= k, "K = {k}, m = {m}");
+    }
+}
+
+#[test]
+fn an_honest_weight_total_is_always_priced_in_the_band() {
+    let sizes = [0, 5303, 16 * KIB + 1, 300 * KIB, MAX_CHUNK_SIZE];
+    for k in 1..=sizes.len() * 4 {
+        let weights = sizes.iter().cycle().take(k).map(|&len| chunk(len));
+        let m = weight_total(weights);
+        let k = k as u64;
+        assert!(
+            price_in_band(&calculate_price(usize::try_from(m).unwrap()), k),
+            "m = {m} for K = {k}"
+        );
+    }
 }

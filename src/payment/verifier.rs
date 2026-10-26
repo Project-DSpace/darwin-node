@@ -2611,12 +2611,14 @@ impl PaymentVerifier {
         Ok(())
     }
 
-    /// ADR-0004: enforce that every quoted price lies exactly on the public
-    /// pricing curve.
+    /// ADR-0004: enforce that every quoted price lies in the band its signed
+    /// count allows.
     ///
-    /// **Scope**: the price is forced by the quote's own signed
+    /// **Scope**: the price is bound by the quote's own signed
     /// `committed_key_count`, not merely required to be *somewhere* on the
-    /// curve. `PaymentQuote` now carries `committed_key_count` and
+    /// curve. A node quotes at its weight total, so the price may be anywhere
+    /// from `calculate_price(floor(w_min × K))` to `calculate_price(K)`
+    /// ([`Self::binding_violation`]). `PaymentQuote` now carries `committed_key_count` and
     /// `commitment_pin`, both covered by the quote signature and the quote
     /// hash, so [`Self::binding_violation`] can hold the price to the count the
     /// quoter committed to. What this gate does not do is resolve the pin
@@ -2627,8 +2629,8 @@ impl PaymentVerifier {
     /// because it carries a trust penalty rather than being reject-only.
     ///
     /// **Check**: exact recomputation, never price-inversion. The price is
-    /// compared against `calculate_price(committed_key_count)` recomputed from
-    /// the signed count. Inverting the price to a count would silently accept
+    /// compared against the band's two ends, both recomputed from the signed
+    /// count. Inverting the price to a count would silently accept
     /// any value between two curve points, and would also let a quote price
     /// itself off one count while committing to another.
     ///
@@ -2697,8 +2699,14 @@ impl PaymentVerifier {
     ///    without a pin is unauditable, and a pin without a count is incoherent.
     /// 2. **Cap.** `committed_key_count <= MAX_COMMITMENT_KEY_COUNT`; a count a
     ///    commitment could never legitimately attest is rejected before pricing.
-    /// 3. **Forced price.** `price == calculate_price(committed_key_count)`, by
-    ///    exact recomputation.
+    /// 3. **Price in the band.** `calculate_price(floor(w_min × K)) <= price <=
+    ///    calculate_price(K)`, with K the committed key count and `w_min` the
+    ///    smallest size class's weight: a node quotes at its weight total,
+    ///    which lies between every record in the smallest class and every
+    ///    record a full chunk. Both ends are exact forward computations, never
+    ///    an inversion of the price, and the ceiling is today's exact price, so
+    ///    no quote is ever above what its count allows. With K = 0 the band is
+    ///    the one baseline price.
     fn binding_violation(
         committed_key_count: u32,
         commitment_pin: Option<[u8; 32]>,
@@ -2726,14 +2734,14 @@ impl PaymentVerifier {
                 crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT
             ));
         }
-        let expected = calculate_price(Self::candidate_count_to_usize(u64::from(
-            committed_key_count,
-        )));
-        if &expected == price {
+        let key_count = u64::from(committed_key_count);
+        if crate::payment::pricing::price_in_band(price, key_count) {
             None
         } else {
+            let (bottom, top) = crate::payment::pricing::price_band(key_count);
             Some(format!(
-                "price {price} does not equal calculate_price(committed_key_count={committed_key_count}) = {expected}"
+                "price {price} is outside the band for committed_key_count={committed_key_count}:                  calculate_price({}) = {bottom} to calculate_price({committed_key_count}) = {top}",
+                crate::payment::pricing::band_bottom_count(key_count)
             ))
         }
     }
@@ -3193,7 +3201,8 @@ impl PaymentVerifier {
     }
 
     /// ADR-0004 sister gate for the merkle batch path: every candidate's
-    /// `price` field must lie on the pricing curve, by exact recomputation.
+    /// `price` field must lie in the band its signed count allows, by exact
+    /// recomputation of both ends.
     /// See [`Self::validate_quote_arithmetic`] for the rationale; semantics
     /// (reject-only, rollout-gated, no trust evidence) are identical.
     fn validate_merkle_candidate_arithmetic(
@@ -5683,6 +5692,7 @@ mod tests {
             Some(crate::payment::quote::QuoteBinding {
                 key_count: self.key_count,
                 pin: [0u8; 32],
+                weight_total: None,
             })
         }
 
@@ -9849,13 +9859,35 @@ mod tests {
     }
 
     #[test]
-    fn binding_bound_ok_only_with_pin_and_exact_price() {
+    fn binding_bound_ok_only_with_pin_and_a_price_in_the_band() {
         let pin = [9u8; 32];
-        // (n>0, Some(pin)) priced exactly is valid.
-        assert!(PaymentVerifier::binding_violation(500, Some(pin), &cp(500)).is_none());
-        // (n>0, Some(pin)) priced for a DIFFERENT count is rejected (on-curve
-        // but wrong count — stronger than canonicality).
-        assert!(PaymentVerifier::binding_violation(500, Some(pin), &cp(499)).is_some());
+        let one = Amount::from(1u64);
+        // K = 500: the band runs from calculate_price(floor(259 × 500 / 1,024))
+        // = calculate_price(126) to calculate_price(500).
+        assert_eq!(crate::payment::pricing::band_bottom_count(500), 126);
+        // Both ends, and a weight total between them, are valid.
+        for price in [cp(126), cp(300), cp(499), cp(500)] {
+            assert!(PaymentVerifier::binding_violation(500, Some(pin), &price).is_none());
+        }
+        // One wei above the top, a count above K, one wei below the bottom
+        // and a count below the bottom are rejected.
+        for price in [cp(500) + one, cp(501), cp(126) - one, cp(125)] {
+            let detail = PaymentVerifier::binding_violation(500, Some(pin), &price)
+                .expect("a price outside the band is rejected");
+            assert!(detail.contains("outside the band"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn binding_band_at_zero_keys_is_the_baseline_alone() {
+        let one = Amount::from(1u64);
+        assert!(PaymentVerifier::binding_violation(0, None, &cp(0)).is_none());
+        assert!(PaymentVerifier::binding_violation(0, None, &(cp(0) + one)).is_some());
+        assert!(PaymentVerifier::binding_violation(0, None, &(cp(0) - one)).is_some());
+        // Below four keys the bottom is the baseline.
+        let pin = [9u8; 32];
+        assert!(PaymentVerifier::binding_violation(3, Some(pin), &cp(0)).is_none());
+        assert!(PaymentVerifier::binding_violation(3, Some(pin), &(cp(0) - one)).is_some());
     }
 
     #[test]

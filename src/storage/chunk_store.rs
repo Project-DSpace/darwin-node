@@ -788,6 +788,10 @@ impl CorruptReports {
     }
 }
 
+/// How many chunk files [`ChunkStore::stored_lens`] reads in one blocking
+/// task.
+const STORED_LENS_BATCH: usize = 4096;
+
 /// Content-addressed store holding one immutable file per chunk.
 ///
 /// The filesystem is the sole authority. The in-memory index is a cache of what the
@@ -1717,6 +1721,38 @@ impl ChunkStore {
             })
             .await
             .map_err(|e| Error::Storage(format!("Chunk store length task failed: {e}")))?
+    }
+
+    /// The lengths of `addresses`' chunk files, in order, from their metadata
+    /// as [`Self::stored_len`] reads them: `None` where there is no file or
+    /// its metadata can't be read. Reads [`STORED_LENS_BATCH`] files per
+    /// blocking task, so a commitment of any size is weighed in a bounded
+    /// number of tasks without holding every path at once.
+    pub async fn stored_lens(&self, addresses: &[XorName]) -> Vec<Option<u64>> {
+        let mut lens = Vec::with_capacity(addresses.len());
+        for batch in addresses.chunks(STORED_LENS_BATCH) {
+            let paths: Vec<PathBuf> = batch
+                .iter()
+                .map(|address| self.chunk_path(address))
+                .collect();
+            let read = self
+                .blocking_tracker
+                .spawn_blocking(move || {
+                    paths
+                        .iter()
+                        .map(|path| match std::fs::symlink_metadata(path) {
+                            Ok(metadata) if metadata.is_file() => Some(metadata.len()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            match read {
+                Ok(batch_lens) => lens.extend(batch_lens),
+                Err(_) => lens.extend(std::iter::repeat_n(None, batch.len())),
+            }
+        }
+        lens
     }
 
     /// Queue keys whose raw bytes were found not to hash to them, for

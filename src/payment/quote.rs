@@ -39,6 +39,42 @@ pub struct QuoteBinding {
     pub key_count: u32,
     /// Hash of the pinned commitment.
     pub pin: [u8; 32],
+    /// The weight total m of the pinned commitment's records, in whole full
+    /// chunks (`ant_protocol::payment::pricing::weight_total`), once it is
+    /// known. `None` until the record lengths have been read, and then the
+    /// node quotes at `key_count`, the top of the band.
+    pub weight_total: Option<u64>,
+}
+
+/// The first settlement version whose clients pay by size: a quote request
+/// declaring it, or a later one, is quoted at the node's weight total.
+pub const SIZE_PRICED_SETTLEMENT_VERSION: u32 = 2;
+
+/// Which count a quote is priced at.
+///
+/// Both carry the committed key count K and the pin; only the price differs,
+/// and both prices are in the band every quote check accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotePricing {
+    /// `calculate_price(K)`: today's price, for unversioned clients and
+    /// clients settling under version 1, which pay the full amount whatever a
+    /// record's size.
+    KeyCount,
+    /// `calculate_price(m)`, the weight total, for clients that pay by size
+    /// (settlement version 2 and up). Until m is known, `calculate_price(K)`.
+    WeightTotal,
+}
+
+impl QuotePricing {
+    /// The pricing for a quote request declaring `settlement_version`.
+    #[must_use]
+    pub const fn for_settlement_version(settlement_version: u32) -> Self {
+        if settlement_version >= SIZE_PRICED_SETTLEMENT_VERSION {
+            Self::WeightTotal
+        } else {
+            Self::KeyCount
+        }
+    }
 }
 
 /// Source of the live storage commitment a quote prices against (ADR-0004).
@@ -171,7 +207,12 @@ impl QuoteGenerator {
     ///
     /// Shared by both quote-generation paths so they stay byte-for-byte
     /// consistent in how they bind price to commitment.
-    fn resolve_quote_pricing(&self) -> (u32, Option<[u8; 32]>, usize) {
+    ///
+    /// `pricing` picks the price count: K for [`QuotePricing::KeyCount`], and
+    /// the weight total m for [`QuotePricing::WeightTotal`] once m is known
+    /// (K until then). m is never taken above K, so the price never exceeds
+    /// today's. The quote's count field carries K either way.
+    fn resolve_quote_pricing(&self, pricing: QuotePricing) -> (u32, Option<[u8; 32]>, usize) {
         // Resolve (and drop) the lock guard before branching: the binding is a
         // plain `Copy` value, so the commitment-source lock is never held.
         let binding = self
@@ -180,10 +221,15 @@ impl QuoteGenerator {
             .as_ref()
             .and_then(|src| src.current_binding_for_quote());
         binding.map_or((0u32, None, 0usize), |binding| {
+            let key_count = u64::from(binding.key_count);
+            let price_count = match (pricing, binding.weight_total) {
+                (QuotePricing::WeightTotal, Some(weight_total)) => weight_total.min(key_count),
+                (QuotePricing::WeightTotal, None) | (QuotePricing::KeyCount, _) => key_count,
+            };
             (
                 binding.key_count,
                 Some(binding.pin),
-                usize::try_from(binding.key_count).unwrap_or(usize::MAX),
+                usize::try_from(price_count).unwrap_or(usize::MAX),
             )
         })
     }
@@ -228,17 +274,9 @@ impl QuoteGenerator {
         Ok(())
     }
 
-    /// Generate a payment quote for storing data.
-    ///
-    /// # Arguments
-    ///
-    /// * `content` - The `XorName` of the content to store
-    /// * `data_size` - Size of the data in bytes
-    /// * `data_type` - Type index of the data (0 for chunks)
-    ///
-    /// # Returns
-    ///
-    /// A signed `PaymentQuote` that the client can use to pay on-chain.
+    /// Generate a payment quote for storing data at today's price,
+    /// `calculate_price(K)`: [`Self::create_priced_quote`] with
+    /// [`QuotePricing::KeyCount`].
     ///
     /// # Errors
     ///
@@ -248,6 +286,32 @@ impl QuoteGenerator {
         content: XorName,
         data_size: usize,
         data_type: u32,
+    ) -> Result<PaymentQuote> {
+        self.create_priced_quote(content, data_size, data_type, QuotePricing::KeyCount)
+    }
+
+    /// Generate a payment quote for storing data.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The `XorName` of the content to store
+    /// * `data_size` - Size of the data in bytes
+    /// * `data_type` - Type index of the data (0 for chunks)
+    /// * `pricing` - The count the price is computed from
+    ///
+    /// # Returns
+    ///
+    /// A signed `PaymentQuote` that the client can use to pay on-chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if signing is not configured.
+    pub fn create_priced_quote(
+        &self,
+        content: XorName,
+        data_size: usize,
+        data_type: u32,
+        pricing: QuotePricing,
     ) -> Result<PaymentQuote> {
         let sign_fn = self
             .sign_fn
@@ -264,7 +328,8 @@ impl QuoteGenerator {
         // `calculate_price(0)`, NOT a price off the on-disk count (see
         // `resolve_quote_pricing`: an unpinned, above-baseline price would be a
         // forgeable shape).
-        let (committed_key_count, commitment_pin, price_count) = self.resolve_quote_pricing();
+        let (committed_key_count, commitment_pin, price_count) =
+            self.resolve_quote_pricing(pricing);
         let price = calculate_price(price_count);
 
         // Convert XorName to xor_name::XorName
@@ -363,8 +428,10 @@ impl QuoteGenerator {
 
         // ADR-0004 forced price for the merkle-batch candidate, mirroring the
         // single-node path: bind to the live commitment when present, else
-        // baseline with no pin.
-        let (committed_key_count, commitment_pin, price_count) = self.resolve_quote_pricing();
+        // baseline with no pin. Merkle batches are refused by this fork, so
+        // this unused path keeps today's price.
+        let (committed_key_count, commitment_pin, price_count) =
+            self.resolve_quote_pricing(QuotePricing::KeyCount);
         let price = calculate_price(price_count);
 
         // ADR-0004: sign the commitment binding into the merkle candidate
@@ -485,12 +552,14 @@ mod tests {
     struct FixedCommitmentSource {
         key_count: u32,
         pin: [u8; 32],
+        weight_total: Option<u64>,
     }
     impl CommitmentSource for FixedCommitmentSource {
         fn current_binding_for_quote(&self) -> Option<QuoteBinding> {
             Some(QuoteBinding {
                 key_count: self.key_count,
                 pin: self.pin,
+                weight_total: self.weight_total,
             })
         }
 
@@ -525,7 +594,11 @@ mod tests {
         });
 
         let pin = [7u8; 32];
-        generator.attach_commitment_source(Arc::new(FixedCommitmentSource { key_count: 25, pin }));
+        generator.attach_commitment_source(Arc::new(FixedCommitmentSource {
+            key_count: 25,
+            pin,
+            weight_total: None,
+        }));
 
         let quote = generator
             .create_quote([42u8; 32], 1024, 0)
@@ -541,6 +614,98 @@ mod tests {
             "quote carries committed count"
         );
         assert_eq!(quote.commitment_pin, Some(pin), "quote pins the commitment");
+    }
+
+    fn generator_with(key_count: u32, weight_total: Option<u64>) -> QuoteGenerator {
+        let generator = create_test_generator();
+        generator.attach_commitment_source(Arc::new(FixedCommitmentSource {
+            key_count,
+            pin: [7u8; 32],
+            weight_total,
+        }));
+        generator
+    }
+
+    /// A client paying by size is quoted at the weight total m; every other
+    /// client at today's price, K. Both quotes carry K and the pin, and both
+    /// prices are in the band.
+    #[test]
+    fn a_size_priced_request_is_quoted_at_the_weight_total_and_others_at_today_price() {
+        let generator = generator_with(1_000, Some(400));
+        let content = [42u8; 32];
+        let weighted = generator
+            .create_priced_quote(content, 1024, 0, QuotePricing::WeightTotal)
+            .expect("weighted quote");
+        assert_eq!(weighted.price, calculate_price(400));
+        let today = generator
+            .create_priced_quote(content, 1024, 0, QuotePricing::KeyCount)
+            .expect("today quote");
+        assert_eq!(today.price, calculate_price(1_000));
+        assert_eq!(
+            generator
+                .create_quote(content, 1024, 0)
+                .expect("quote")
+                .price,
+            calculate_price(1_000),
+            "create_quote keeps today's price"
+        );
+        for quote in [&weighted, &today] {
+            assert_eq!(quote.committed_key_count, 1_000);
+            assert_eq!(quote.commitment_pin, Some([7u8; 32]));
+            assert!(crate::payment::pricing::price_in_band(&quote.price, 1_000));
+        }
+    }
+
+    /// Until m is known the node quotes the top of the band, and an m above
+    /// K is never quoted above today's price.
+    #[test]
+    fn an_unknown_weight_total_quotes_the_top_of_the_band() {
+        let unknown = generator_with(1_000, None);
+        let quote = unknown
+            .create_priced_quote([1u8; 32], 1024, 0, QuotePricing::WeightTotal)
+            .expect("quote");
+        assert_eq!(quote.price, calculate_price(1_000));
+        let above = generator_with(1_000, Some(5_000));
+        let quote = above
+            .create_priced_quote([1u8; 32], 1024, 0, QuotePricing::WeightTotal)
+            .expect("quote");
+        assert_eq!(quote.price, calculate_price(1_000));
+    }
+
+    /// With no commitment both pricings give the baseline quote.
+    #[test]
+    fn a_node_without_a_commitment_quotes_the_baseline_to_every_client() {
+        let generator = create_test_generator();
+        for pricing in [QuotePricing::KeyCount, QuotePricing::WeightTotal] {
+            let quote = generator
+                .create_priced_quote([1u8; 32], 1024, 0, pricing)
+                .expect("quote");
+            assert_eq!(quote.price, calculate_price(0));
+            assert_eq!((quote.committed_key_count, quote.commitment_pin), (0, None));
+        }
+    }
+
+    /// Version 2 and later pay by size; version 1, and the unversioned
+    /// requests that never reach this, are quoted at today's price.
+    #[test]
+    fn settlement_version_2_and_up_is_size_priced() {
+        assert_eq!(SIZE_PRICED_SETTLEMENT_VERSION, 2);
+        assert_eq!(
+            QuotePricing::for_settlement_version(0),
+            QuotePricing::KeyCount
+        );
+        assert_eq!(
+            QuotePricing::for_settlement_version(1),
+            QuotePricing::KeyCount
+        );
+        assert_eq!(
+            QuotePricing::for_settlement_version(2),
+            QuotePricing::WeightTotal
+        );
+        assert_eq!(
+            QuotePricing::for_settlement_version(3),
+            QuotePricing::WeightTotal
+        );
     }
 
     /// ADR-0004 baseline: with NO commitment source (fresh node, pre first

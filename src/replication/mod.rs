@@ -10485,6 +10485,9 @@ struct CommitmentTick {
     rotated: bool,
     /// The current commitment's hash, if there is one.
     hash: Option<[u8; 32]>,
+    /// m, the weight total the node quotes clients that pay by size at:
+    /// 0 when the node has no commitment, `None` while it isn't known.
+    weight_total: Option<u64>,
 }
 
 impl CommitmentTick {
@@ -10494,6 +10497,7 @@ impl CommitmentTick {
         pointers: 0,
         rotated: false,
         hash: None,
+        weight_total: Some(0),
     };
 
     /// The tick of a node keeping `built`, unchanged.
@@ -10503,11 +10507,15 @@ impl CommitmentTick {
             pointers: built.tree().pointer_count(),
             rotated: false,
             hash: Some(built.hash()),
+            weight_total: built.weight_total(),
         }
     }
 
     fn log(&self, message: &str) {
         let hash = self.hash.map_or_else(|| "none".to_string(), hex::encode);
+        let weight_total = self
+            .weight_total
+            .map_or_else(|| "unknown".to_string(), |m| m.to_string());
         // Kept first at the full line (crate::log_files::KEEP_FIRST_TARGETS).
         info!(
             target: "ant_node::replication::commitment_tick",
@@ -10515,6 +10523,7 @@ impl CommitmentTick {
             pointers = self.pointers,
             rotated = self.rotated,
             hash = %hash,
+            weight_total = %weight_total,
             "{message}"
         );
     }
@@ -10705,6 +10714,9 @@ async fn rebuild_and_rotate_commitment(
             // committed key set is frozen here for many rotations. Without this,
             // the no-op guard would pin a stale slot — and its key — forever.
             state.age_out();
+            // m of an unchanged root is read only once: for a commitment
+            // reloaded at start, by the build at start.
+            weigh_commitment(storage, &current).await;
             return Ok(CommitmentTick::unchanged(&current));
         }
     }
@@ -10722,6 +10734,8 @@ async fn rebuild_and_rotate_commitment(
         &pk_bytes,
     )
     .map_err(|e| Error::Crypto(format!("commitment build: {e}")))?;
+    // Weighed before it is current, so its first quote is already at m.
+    weigh_commitment(storage, &built).await;
 
     let tick = CommitmentTick {
         rotated: true,
@@ -10729,6 +10743,17 @@ async fn rebuild_and_rotate_commitment(
     };
     state.rotate(built);
     Ok(tick)
+}
+
+/// Set `built`'s weight total m from the stored lengths of its chunks, unless
+/// it is already set. A chunk whose length can't be read counts as a full
+/// chunk.
+async fn weigh_commitment(storage: &ChunkStore, built: &commitment_state::BuiltCommitment) {
+    if built.weight_total().is_some() {
+        return;
+    }
+    let lens = storage.stored_lens(&built.chunk_leaf_keys()).await;
+    built.set_weight_total(&lens);
 }
 
 #[cfg(test)]

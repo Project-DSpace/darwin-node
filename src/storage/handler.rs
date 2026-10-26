@@ -41,8 +41,8 @@ use crate::listings::ListingService;
 use crate::logging::{debug, info, warn};
 use crate::payment::settlement::Lane;
 use crate::payment::{
-    Held, PaymentVerifier, QuoteGenerator, VerificationContext, BATCH_PAYMENTS_REFUSED,
-    PUT_PAYMENT_DEADLINE,
+    Held, PaymentVerifier, QuoteGenerator, QuotePricing, VerificationContext,
+    BATCH_PAYMENTS_REFUSED, PUT_PAYMENT_DEADLINE,
 };
 use crate::pointer::PointerService;
 use crate::replication::admission;
@@ -1065,8 +1065,19 @@ impl AntProtocol {
         }
     }
 
-    /// Handle a quote request.
+    /// Handle a quote request that declares no settlement version: quoted at
+    /// today's price, which every node accepts.
     fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
+        self.handle_priced_quote(request, QuotePricing::KeyCount)
+    }
+
+    /// Handle a quote request, priced by `pricing`: today's price, or the
+    /// weight total for a client that pays by size.
+    fn handle_priced_quote(
+        &self,
+        request: &ChunkQuoteRequest,
+        pricing: QuotePricing,
+    ) -> ChunkQuoteResponse {
         let addr_hex = hex::encode(request.address);
         let data_size = request.data_size;
         debug!("Handling quote request for {addr_hex} (size: {data_size})");
@@ -1113,10 +1124,12 @@ impl AntProtocol {
             });
         }
 
-        match self
-            .quote_generator
-            .create_quote(request.address, data_size_usize, request.data_type)
-        {
+        match self.quote_generator.create_priced_quote(
+            request.address,
+            data_size_usize,
+            request.data_type,
+            pricing,
+        ) {
             Ok(quote) => {
                 // ADR-0004: ship the signed commitment the price was bound to
                 // alongside the quote ("the commitment arrived with the quote"),
@@ -1146,18 +1159,24 @@ impl AntProtocol {
 
     /// Handle a version-declaring storage quote request.
     ///
-    /// Refuse first, then fall through to the existing unversioned handler
-    /// with the same request. The gate is the only difference between the two
-    /// paths, so nothing else is duplicated and the two cannot drift.
+    /// Refuse first, then fall through to the handler unversioned requests
+    /// use, with the same request. The gate and the price are the only
+    /// differences between the two paths, so nothing else is duplicated and
+    /// the two cannot drift: a client settling under version 2 or later pays
+    /// by size and is quoted at the weight total; every other client at
+    /// today's price.
     fn handle_quote_v2(&self, request: &ChunkQuoteRequestV2) -> ChunkQuoteResponse {
         if let Some(refusal) = settlement_gate(request.settlement_version, "single_node") {
             return ChunkQuoteResponse::Error(refusal);
         }
-        self.handle_quote(&ChunkQuoteRequest {
-            address: request.address,
-            data_size: request.data_size,
-            data_type: request.data_type,
-        })
+        self.handle_priced_quote(
+            &ChunkQuoteRequest {
+                address: request.address,
+                data_size: request.data_size,
+                data_type: request.data_type,
+            },
+            QuotePricing::for_settlement_version(request.settlement_version),
+        )
     }
 
     /// Handle a version-declaring merkle candidate quote request.
@@ -2080,6 +2099,108 @@ mod tests {
             )) => {}
             other => panic!("expected ClientUpdateRequired, got: {other:?}"),
         }
+    }
+
+    /// A commitment of `keys` chunks weighed at `weight_total`, attached to
+    /// `protocol`'s quote generator.
+    fn attach_weighed_commitment(protocol: &AntProtocol, keys: u32, weight_total: u64) {
+        use saorsa_pqc::api::sig::ml_dsa_65;
+        let (pk, sk) = ml_dsa_65().generate_keypair().expect("keypair");
+        let entries: Vec<([u8; 32], [u8; 32])> = (0..keys)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[..4].copy_from_slice(&i.to_le_bytes());
+                (key, key)
+            })
+            .collect();
+        let built = crate::replication::commitment_state::BuiltCommitment::build(
+            entries,
+            &[0xAB; 32],
+            &sk,
+            &pk.to_bytes(),
+        )
+        .expect("build commitment");
+        let state = Arc::new(crate::replication::commitment_state::ResponderCommitmentState::new());
+        state.rotate(built);
+        // Every chunk in the smallest class, then read back as m.
+        let lens = vec![Some(1u64); usize::try_from(keys).expect("keys")];
+        let m = state.current().expect("current").set_weight_total(&lens);
+        assert_eq!(m, weight_total, "the test's weight total");
+        protocol.quote_generator.attach_commitment_source(state);
+    }
+
+    /// The price of the quote `body` was answered with.
+    async fn quoted_price(
+        protocol: &AntProtocol,
+        body: ChunkMessageBody,
+    ) -> evmlib::common::Amount {
+        let msg = ChunkMessage {
+            request_id: 710,
+            body,
+        };
+        let response_bytes = protocol
+            .try_handle_request(&msg.encode().expect("encode request"))
+            .await
+            .expect("handle quote")
+            .expect("expected response");
+        match ChunkMessage::decode(&response_bytes).expect("decode").body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote, .. }) => {
+                let quote: evmlib::PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
+                assert_eq!(quote.committed_key_count, 1_000, "the count is K");
+                quote.price
+            }
+            other => panic!("expected a quote, got: {other:?}"),
+        }
+    }
+
+    /// An unversioned client, and a client settling under version 1, are
+    /// quoted at today's price, `calculate_price(K)`, whatever the node's
+    /// weight total. A client paying by size is quoted at the weight total.
+    #[tokio::test]
+    async fn only_a_client_paying_by_size_is_quoted_at_the_weight_total() {
+        use crate::payment::pricing::calculate_price;
+        use crate::payment::SIZE_PRICED_SETTLEMENT_VERSION;
+
+        let (protocol, _temp) = create_test_protocol().await;
+        // 1,000 records in the smallest class: m = ceil(1,000 × 259 / 1,024).
+        attach_weighed_commitment(&protocol, 1_000, 253);
+
+        let unversioned = ChunkMessageBody::QuoteRequest(ChunkQuoteRequest::new([0xC1; 32], 1));
+        assert_eq!(
+            quoted_price(&protocol, unversioned).await,
+            calculate_price(1_000)
+        );
+
+        let mut v1 = ChunkQuoteRequestV2::new([0xC2; 32], 1);
+        v1.settlement_version = 1;
+        assert_eq!(
+            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v1)).await,
+            calculate_price(1_000)
+        );
+
+        // The request reaches the handler's pricing once the gate admits it.
+        let request = ChunkQuoteRequest::new([0xC3; 32], 1);
+        let pricing = QuotePricing::for_settlement_version(SIZE_PRICED_SETTLEMENT_VERSION);
+        match protocol.handle_priced_quote(&request, pricing) {
+            ChunkQuoteResponse::Success { quote, .. } => {
+                let quote: evmlib::PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
+                assert_eq!(quote.price, calculate_price(253));
+                assert_eq!(quote.committed_key_count, 1_000);
+            }
+            other => panic!("expected a quote, got: {other:?}"),
+        }
+
+        // At this node's own settlement version, the price follows it.
+        let mut current = ChunkQuoteRequestV2::new([0xC4; 32], 1);
+        current.settlement_version = CURRENT_SETTLEMENT_VERSION;
+        let expected = match QuotePricing::for_settlement_version(CURRENT_SETTLEMENT_VERSION) {
+            QuotePricing::WeightTotal => calculate_price(253),
+            QuotePricing::KeyCount => calculate_price(1_000),
+        };
+        assert_eq!(
+            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(current)).await,
+            expected
+        );
     }
 
     /// A settlement version this node has never heard of is refused, because
