@@ -7,8 +7,10 @@
 //!   stored" answer when it lists K;
 //! - a notice with a proof, which every release sends only after storing K,
 //!   and this release only while it holds K: at announce, and when its hold
-//!   ends or as the node stops only if its store still holds K then, never
-//!   from an offer dropped because its copy was found gone or unreadable;
+//!   ends or as the node stops only if its store still holds K then, or,
+//!   when its copy was unreadable for the moment as the hold ended, once a
+//!   read-back finds it; never from an offer dropped because its copy was
+//!   found gone or unreadable;
 //! - a fresh offer whose bytes hash to K.
 //!
 //! **A hint for sending only.** A holding notice is the sender's own claim,

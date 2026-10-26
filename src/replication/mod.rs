@@ -2749,7 +2749,9 @@ impl ReplicationEngine {
     /// failed read is retried up to `MAX_FRESH_READ_ATTEMPTS` times, backing
     /// off over about a minute with the permit released in between, so a
     /// transient I/O fault does not lose the write's replication. The retry
-    /// waits on its own task, never on the dispatcher.
+    /// waits on its own task, never on the dispatcher. A write whose record
+    /// was unreadable as its hold ended carries the notices with the slim
+    /// proof it deferred, sent by the first read that finds the record.
     fn start_fresh_offer_dispatcher(
         &mut self,
         mut rx: mpsc::UnboundedReceiver<fresh::FreshOfferEvent>,
@@ -2791,6 +2793,7 @@ impl ReplicationEngine {
                 // with the slim proof when the hold ended (`fresh::fresh_read`).
                 let read = storage.get_or_quarantine(&event.key).await;
                 let read = fresh::fresh_read(read, event.read_attempts, MAX_FRESH_READ_ATTEMPTS);
+                let deferred_notices = fresh::deferred_notices_after(&read, &event.proof_notices);
                 let data = match read {
                     fresh::FreshRead::Offer(data) => data,
                     fresh::FreshRead::Gone => {
@@ -2840,6 +2843,21 @@ impl ReplicationEngine {
                         continue;
                     }
                 };
+                // The record was unreadable as its hold ended, so the peers
+                // not heard from have had only a holding notice: this read
+                // found it, so they get the slim proof now, before any offer.
+                if !deferred_notices.is_empty() {
+                    fresh::send_notice(
+                        &event.key,
+                        event.payment_proof.clone(),
+                        deferred_notices.iter(),
+                        &ctx.p2p_node,
+                        fresh_metrics::FreshCounter::ProofNoticesSent,
+                    );
+                }
+                if event.targets.is_empty() {
+                    continue;
+                }
                 fresh::send_fresh_offers(
                     &ctx,
                     &event.key,
@@ -6991,7 +7009,8 @@ async fn dispatch_paid_notify(
 ///
 /// The sender holds the key: every release sends a notice only after storing
 /// it, and this one sends the proof at a hold's end only if its store still
-/// holds the key then, and none from an offer it drops because its copy is
+/// holds the key then, or, deferred from a hold that ended while its copy was
+/// unreadable, once a read-back finds it, and none from an offer it drops because its copy is
 /// gone or unreadable (`fresh::fresh_read`). The note comes before admission and before the "already known" drop,
 /// and is only ever read to skip an offer. A holding notice (an empty proof)
 /// carries nothing to record, so it never takes an admission slot or a worker.

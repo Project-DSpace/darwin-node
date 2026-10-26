@@ -1833,6 +1833,18 @@ impl ChunkStore {
         self.index.read().contains(address)
     }
 
+    /// Is this chunk indexed but unreadable for the moment, and not proven wrong?
+    ///
+    /// The one state of a chunk [`Self::exists`] denies that a later read can settle: a
+    /// read that works clears it. A chunk proven wrong, or no longer indexed, is not
+    /// suspect.
+    #[must_use]
+    pub fn is_suspect(&self, address: &XorName) -> bool {
+        self.is_indexed(address)
+            && self.suspect.read().contains(address)
+            && !self.known_wrong.read().contains(address)
+    }
+
     /// Delete a chunk, returning whether it was present.
     ///
     /// `unlink` returns the blocks to the filesystem immediately. That is the whole

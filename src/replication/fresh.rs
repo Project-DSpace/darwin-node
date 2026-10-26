@@ -106,9 +106,10 @@ impl HeldNotices {
 }
 
 /// A write whose hold has ended and whose chunk offer is waiting for a
-/// pending-offer permit. Carries no chunk bytes, and no notice: its targets
-/// got the notice with the slim proof when the hold ended, so neither the
-/// queue nor the permits ever delay a peer's paid-list evidence.
+/// pending-offer permit. Carries no chunk bytes. Its targets got the notice
+/// with the slim proof when the hold ended, so neither the queue nor the
+/// permits delay a peer's paid-list evidence, unless the record could not be
+/// read then: those notices wait in `proof_notices` for a read that works.
 pub(crate) struct FreshOfferEvent {
     pub(crate) key: XorName,
     pub(crate) payment_proof: Vec<u8>,
@@ -117,6 +118,11 @@ pub(crate) struct FreshOfferEvent {
     /// The close-group peers to offer the record to: those not heard from and
     /// not marked full when the hold ended.
     pub(crate) targets: Vec<PeerId>,
+    /// The notices with the slim proof deferred because the record was
+    /// indexed but unreadable for the moment as its hold ended: sent, before
+    /// any offer, once a read-back finds it ([`deferred_notices_after`]), and
+    /// never if it is gone or the reads give up. Empty for a record held then.
+    pub(crate) proof_notices: Vec<PeerId>,
 }
 
 /// Handles shared by everything that sends fresh offers, so the offer
@@ -370,8 +376,10 @@ pub(crate) enum FreshRead<T, E> {
 /// its targets got the notice with the slim proof when the hold ended, while
 /// this node held the record, and a notice sent now would come from a node
 /// that has just found it holds no readable copy, which receivers would
-/// count as heard from and skip offering. No possession check is scheduled
-/// for a dropped offer's targets.
+/// count as heard from and skip offering. The notices deferred because the
+/// record was unreadable as the hold ended go only with a read that works
+/// ([`deferred_notices_after`]). No possession check is scheduled for a
+/// dropped offer's targets.
 pub(crate) fn fresh_read<T, E>(
     read: Result<Option<T>, E>,
     prior_attempts: u32,
@@ -388,6 +396,58 @@ pub(crate) fn fresh_read<T, E>(
                 FreshRead::Retry { attempts, error }
             }
         }
+    }
+}
+
+/// The deferred notices with the slim proof a dispatcher read-back sends:
+/// all of them once the read finds the record, so they come from a node that
+/// has just read its copy, and none while it cannot be read, once it is gone
+/// or once the reads give up.
+pub(crate) fn deferred_notices_after<'a, T, E>(
+    read: &FreshRead<T, E>,
+    deferred: &'a [PeerId],
+) -> &'a [PeerId] {
+    match read {
+        FreshRead::Offer(_) => deferred,
+        FreshRead::Gone | FreshRead::GiveUp { .. } | FreshRead::Retry { .. } => &[],
+    }
+}
+
+/// What a hold's end finds of its record in this node's store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordAtEnd {
+    /// Stored and claimed: the notices with the slim proof go now.
+    Held,
+    /// Indexed, but a read failed and none has worked since: the notices
+    /// wait for the dispatcher's read-back of the record.
+    Unreadable,
+    /// Removed, quarantined or proven wrong: no notice goes.
+    Gone,
+}
+
+/// The notices with the slim proof a hold's end sends now and those it
+/// defers to the record's read-back, as (now, deferred), from the
+/// [`proof_notice_recipients`] of a record not gone.
+fn proof_notices_at_end(
+    record: RecordAtEnd,
+    recipients: Vec<PeerId>,
+) -> (Vec<PeerId>, Vec<PeerId>) {
+    match record {
+        RecordAtEnd::Held => (recipients, Vec::new()),
+        RecordAtEnd::Unreadable => (Vec::new(), recipients),
+        RecordAtEnd::Gone => (Vec::new(), Vec::new()),
+    }
+}
+
+/// Where a hold's record stands as the hold ends. In-memory lookups only, no
+/// read-back.
+pub(crate) fn record_at_hold_end(storage: &ChunkStore, key: &XorName) -> RecordAtEnd {
+    if matches!(storage.exists(key), Ok(true)) {
+        RecordAtEnd::Held
+    } else if storage.is_suspect(key) {
+        RecordAtEnd::Unreadable
+    } else {
+        RecordAtEnd::Gone
     }
 }
 
@@ -848,7 +908,8 @@ impl HoldContext {
         let open = self.holds.take_due(Instant::now(), Duration::ZERO);
         let mut sends = Vec::new();
         for hold in open {
-            let (_, _, proof_notices) = self.split(&hold).await;
+            // A record unreadable now sends nothing: no read-back follows.
+            let (_, _, proof_notices, _) = self.split(&hold).await;
             sends.extend(send_notice(
                 &hold.key,
                 hold.proof,
@@ -864,9 +925,11 @@ impl HoldContext {
 
     /// How a hold's peers are served when it ends: the close group now, its
     /// split by skip reasons, and who gets the notice with the slim proof:
-    /// no one when the record was quarantined or removed during the hold
-    /// (an in-memory index lookup, no read-back).
-    async fn split(&self, hold: &Hold) -> (Vec<PeerId>, Serving, Vec<PeerId>) {
+    /// now while the record is held; once a read-back finds it (the last
+    /// list) while it is indexed but unreadable for the moment; and no one
+    /// when it was quarantined, removed or proven wrong during the hold
+    /// ([`record_at_hold_end`], no read-back).
+    async fn split(&self, hold: &Hold) -> (Vec<PeerId>, Serving, Vec<PeerId>, Vec<PeerId>) {
         let close_group = close_group_peers(&hold.key, &self.p2p_node, &self.config).await;
         let now = Instant::now();
         let serving = serve(skip_reasons(&self.heard_from, &hold.key, &close_group, now));
@@ -876,15 +939,24 @@ impl HoldContext {
             &left_close_group(&hold.close_group, &close_group),
             now,
         );
-        let still_stored = matches!(self.storage.exists(&hold.key), Ok(true));
-        if !still_stored && hold.recorded {
+        let record = record_at_hold_end(&self.storage, &hold.key);
+        let recipients =
+            proof_notice_recipients(&serving, &left, hold.recorded, record != RecordAtEnd::Gone);
+        if record == RecordAtEnd::Unreadable && !recipients.is_empty() {
+            debug!(
+                "Chunk {} unreadable for now as its hold ends, deferring its proof notices \
+                 to its read-back",
+                hex::encode(hold.key)
+            );
+        }
+        if record == RecordAtEnd::Gone && hold.recorded {
             debug!(
                 "Chunk {} no longer stored as its hold ends, sending no proof notices",
                 hex::encode(hold.key)
             );
         }
-        let proof_notices = proof_notice_recipients(&serving, &left, hold.recorded, still_stored);
-        (close_group, serving, proof_notices)
+        let (proof_notices, deferred) = proof_notices_at_end(record, recipients);
+        (close_group, serving, proof_notices, deferred)
     }
 
     /// End every hold that has ended by now: at its time, or early once every
@@ -904,8 +976,10 @@ impl HoldContext {
     }
 
     /// End one hold: each peer [`proof_notice_recipients`] names gets the
-    /// notice with the slim proof now, while the record is still held, and each close-group peer in this
-    /// node's view now that was not heard from and is not marked full is then
+    /// notice with the slim proof now while the record is still held, or
+    /// once the dispatcher's read-back finds it while it is indexed but
+    /// unreadable for the moment, and each close-group peer in this node's
+    /// view now that was not heard from and is not marked full is then
     /// offered the record; every skipped peer's possession check is scheduled
     /// now.
     async fn end_hold(&self, hold: Hold, end: HoldEnd) {
@@ -925,7 +999,7 @@ impl HoldContext {
                 );
             }
         }
-        let (close_group, serving, proof_notices) = self.split(&hold).await;
+        let (close_group, serving, proof_notices, deferred) = self.split(&hold).await;
         let unserved = serving.unserved(close_group.len());
         if unserved > 0 {
             fresh_metrics::add(FreshCounter::PeersLeftUnserved, unserved as u64);
@@ -955,7 +1029,10 @@ impl HoldContext {
                 peers: serving.skipped,
             });
         }
-        if serving.offered.is_empty() {
+        // A record unreadable for the moment still goes to the dispatcher with
+        // no peer to offer it to: its read-back is what sends the deferred
+        // notices.
+        if serving.offered.is_empty() && deferred.is_empty() {
             return;
         }
         let offered = serving.offered.len();
@@ -966,6 +1043,7 @@ impl HoldContext {
                 payment_proof: hold.proof,
                 read_attempts: 0,
                 targets: serving.offered,
+                proof_notices: deferred,
             })
             .is_err()
         {
@@ -1216,6 +1294,90 @@ mod tests {
         assert_eq!(
             proof_notice_recipients(&serving, &left_reasons, true, true),
             vec![p[1], p[2], p[5]]
+        );
+    }
+
+    /// A record indexed but unreadable for the moment as its hold ends sends
+    /// no notice with the slim proof then and none with a read-back that
+    /// still fails: the notices wait in the offer event and go with the
+    /// first read-back that finds the record. A record proven wrong defers
+    /// nothing, and reads that give up send nothing.
+    #[tokio::test]
+    async fn a_record_unreadable_as_its_hold_ends_sends_its_proof_once_read() {
+        use crate::replication::config::MAX_FRESH_READ_ATTEMPTS;
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            ..crate::storage::ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("open store");
+        let content = b"unreadable-for-a-moment".to_vec();
+        let key = crate::client::compute_address(&content);
+        store.put(&key, &content).await.expect("put");
+        assert_eq!(record_at_hold_end(&store, &key), RecordAtEnd::Held);
+
+        // The file is briefly something the store refuses to read: the read
+        // fails, and the chunk stays indexed but suspect.
+        let path = store.test_chunk_path(&key);
+        let aside = path.with_extension("aside");
+        std::fs::rename(&path, &aside).expect("move the file aside");
+        std::fs::create_dir(&path).expect("a directory in its place");
+        assert!(store.get(&key).await.is_err(), "the read fails");
+        assert_eq!(record_at_hold_end(&store, &key), RecordAtEnd::Unreadable);
+
+        let p = peers(1..4);
+        let serving = serve(p.iter().map(|peer| (*peer, None)).collect());
+        let record = record_at_hold_end(&store, &key);
+        let recipients = proof_notice_recipients(&serving, &[], true, record != RecordAtEnd::Gone);
+        let (now, deferred) = proof_notices_at_end(record, recipients);
+        assert!(now.is_empty(), "no notice while the record is unreadable");
+        assert_eq!(deferred, p, "every peer not heard from waits for the read");
+
+        // Read-backs while it is still unreadable send nothing, and keep it.
+        for prior in 0..2 {
+            let read = fresh_read(
+                store.get_or_quarantine(&key).await,
+                prior,
+                MAX_FRESH_READ_ATTEMPTS,
+            );
+            assert!(matches!(read, FreshRead::Retry { .. }), "read {prior}");
+            assert!(deferred_notices_after(&read, &deferred).is_empty());
+        }
+        assert!(store.is_indexed(&key), "an unreadable file is kept");
+
+        // The fault clears: the next read-back finds the record and sends.
+        std::fs::remove_dir(&path).expect("remove the directory");
+        std::fs::rename(&aside, &path).expect("put the file back");
+        let read = fresh_read(
+            store.get_or_quarantine(&key).await,
+            2,
+            MAX_FRESH_READ_ATTEMPTS,
+        );
+        assert!(matches!(read, FreshRead::Offer(_)), "the read works");
+        assert_eq!(deferred_notices_after(&read, &deferred), p.as_slice());
+        assert_eq!(record_at_hold_end(&store, &key), RecordAtEnd::Held);
+
+        // Reads that give up send nothing.
+        let gave_up: FreshRead<Vec<u8>, ()> = FreshRead::GiveUp {
+            attempts: MAX_FRESH_READ_ATTEMPTS,
+            error: (),
+        };
+        assert!(deferred_notices_after(&gave_up, &deferred).is_empty());
+
+        // A record proven wrong is gone for the hold, not unreadable: its
+        // notices are neither sent nor deferred.
+        let wrong_content = b"proven-wrong".to_vec();
+        let wrong = crate::client::compute_address(&wrong_content);
+        store.put(&wrong, &wrong_content).await.expect("put");
+        std::fs::write(store.test_chunk_path(&wrong), b"tampered").expect("tamper");
+        assert!(store.get(&wrong).await.is_err(), "verification fails");
+        assert!(store.is_indexed(&wrong), "a plain read removes nothing");
+        assert_eq!(record_at_hold_end(&store, &wrong), RecordAtEnd::Gone);
+        let recipients = proof_notice_recipients(&serving, &[], true, false);
+        assert_eq!(
+            proof_notices_at_end(RecordAtEnd::Gone, recipients),
+            (Vec::new(), Vec::new())
         );
     }
 

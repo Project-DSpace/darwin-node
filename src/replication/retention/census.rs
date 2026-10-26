@@ -2193,6 +2193,16 @@ const PROOF_SENDERS: &[Reviewed] = &[
         "send_notice",
         1,
     ),
+    // The same notices, deferred because the record was indexed but
+    // unreadable for the moment as its hold ended: sent by the dispatcher
+    // with the proof the hold carried, once a read-back finds the record,
+    // before its offers.
+    (
+        "src/replication/mod.rs",
+        "ReplicationEngine::start_fresh_offer_dispatcher",
+        "send_notice",
+        1,
+    ),
     // When the node stops: the same notices for the holds still open.
     (
         "src/replication/fresh.rs",
