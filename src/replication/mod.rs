@@ -5935,18 +5935,26 @@ async fn handle_replication_message(
             }
             Ok(())
         }
-        // A refusal of a root-paid fresh offer this node sent: the refusing
-        // peer is left out of that key's possession check.
+        // A refusal of a root-paid fresh offer this node sent: a refusing
+        // peer the proof holds no quote from is left out of that key's
+        // possession check; a quoted one stays in it. The reason is the
+        // peer's own text and is only logged.
         ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
             key,
             reason,
         }) => {
-            if ctx.root_offers.note_refusal(msg.request_id, source, &key) {
-                debug!(
-                    "Root-paid fresh offer for {} refused by {source}, left out of its \
-                     possession check: {reason}",
+            match ctx.root_offers.note_refusal(msg.request_id, source, &key) {
+                fresh::Refusal::Excused => debug!(
+                    "Root-paid fresh offer for {} refused by {source}, which the proof holds \
+                     no quote from, left out of its possession check: {reason}",
                     hex::encode(key)
-                );
+                ),
+                fresh::Refusal::Charged => debug!(
+                    "Root-paid fresh offer for {} refused by {source}, which quoted it for \
+                     the root payment, kept in its possession check: {reason}",
+                    hex::encode(key)
+                ),
+                fresh::Refusal::Untracked => {}
             }
             Ok(())
         }
@@ -6119,9 +6127,13 @@ fn fresh_offer_structural_rejection(
 
 /// Tell `source` its offer for `key` was not taken.
 ///
-/// Note the sender does not currently read this: `fresh::send_fresh_offers` uses
-/// one-way `send_message`, so the refusal is observed only as a later absence by
-/// the delayed possession check. Recorded in ADR-0005 as a known gap.
+/// The sender reads this only for a root-paid offer: if the root proof holds
+/// no quote from this node, the sender leaves this node out of the key's
+/// delayed possession check (`fresh::RootOfferRefusals`); if it holds one,
+/// this node stays in the check. For a single-node offer the refusal is still
+/// not read: `fresh::send_fresh_offers` uses one-way `send_message`, so it is
+/// observed only as a later absence by the delayed possession check, the
+/// known gap recorded in ADR-0005.
 async fn refuse_fresh_offer(
     source: &PeerId,
     key: XorName,

@@ -73,10 +73,13 @@ never ran.
   an older node, answers it `StorerUpdateRequired` naming version 2 before
   quoting, so a client never pays through the root vault to a node that
   can't check the payment. The minimum stays version 1. A node that stores
-  a root-paid chunk leaves out of the chunk's possession check any
+  a root-paid chunk leaves out of the chunk's possession check a
   close-group peer that answers its fresh offer with a refusal, as an older
-  node or one with no root vault does; neighbour sync places the chunk with
-  it later. The traffic lines count quote requests by settlement version and
+  node or one with no root vault does, when the root proof holds no quote
+  from that peer; neighbour sync places the chunk with it later. A peer the
+  proof holds a quote from answered the client's version-3 request, so its
+  refusal, whatever its reason, is checked and charged as a refusal of a
+  single-node offer is. The traffic lines count quote requests by settlement version and
   settled proofs by tag, and the record read as a kind of its own. Tests in
   `src/payment/verifier/root_tests.rs` check root proofs through the real
   reads against a stub chain with a root vault; `tests/fork_pins.rs` pins a

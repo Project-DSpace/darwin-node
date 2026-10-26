@@ -20,7 +20,7 @@ use saorsa_core::P2PNode;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::ant_protocol::XorName;
-use crate::payment::{detect_proof_type, ProofType};
+use crate::payment::{deserialize_root_proof, detect_proof_type, ProofType};
 use crate::replication::config::{
     ReplicationConfig, FRESH_REPLICATION_DELIVERY_MAX_RETRIES, REPLICATION_PROTOCOL_ID,
 };
@@ -73,19 +73,31 @@ pub(crate) struct FreshOfferContext {
 }
 
 /// Root-paid fresh offers (proof tag `0x03`) waiting for their delayed
-/// possession check, by the offer's request id, each with the peers that
-/// answered it with a refusal.
+/// possession check, by the offer's request id, each with the peers excused
+/// for refusing it.
 ///
 /// A client pays through the root vault only when every node it was quoted
-/// by accepts root proofs, but this node offers the record to its own view of
-/// the close group, which can hold a peer the client never asked: an older
-/// node, or one that knows no root vault. Such a peer can't check the proof
-/// and refuses the offer, saying so in a `FreshReplicationResponse::Rejected`
-/// with the offer's request id. It is dropped from that key's possession
-/// check, so an honest refusal is never charged as a missing chunk; neighbour
-/// sync places the record with it later. Single-node offers are not tracked,
-/// and a peer that accepts a root-paid offer, or doesn't answer, is checked
-/// as before.
+/// by accepts root proofs: a node quotes a settlement-version-3 request only
+/// when it knows a root vault, and an older node or one with none answers it
+/// `StorerUpdateRequired`. This node, though, offers the record to its own
+/// view of the close group, which can hold a peer the client never asked,
+/// and that peer may be one that can't check the proof. It refuses the offer
+/// with a `FreshReplicationResponse::Rejected` carrying the offer's request
+/// id, and is dropped from that key's possession check, so an honest refusal
+/// is never charged as a missing chunk; neighbour sync places the record
+/// with it later.
+///
+/// Only a peer the proof holds no quote from is excused. A peer the proof
+/// holds a quote from answered the client's version-3 request, so it said it
+/// can check a root proof; its refusal, whatever reason it gives, leaves it
+/// in the possession check, charged as a missing chunk as every refusal of a
+/// single-node offer is. The reason a peer gives is its own text and decides
+/// nothing. The quotes are not signature-checked here: a client that lists a
+/// peer it never asked only takes that peer's excuse away, leaving it where
+/// a single-node offer leaves every peer.
+///
+/// Single-node offers are not tracked, and a peer that accepts a root-paid
+/// offer, or doesn't answer, is checked as before.
 ///
 /// An entry lives from the offer's send to its possession check, as the
 /// check's own event does, so the map holds no more entries than there are
@@ -95,40 +107,68 @@ pub(crate) struct RootOfferRefusals {
     offers: parking_lot::Mutex<HashMap<u64, RootOffer>>,
 }
 
-/// One root-paid offer: the key, the peers it was sent to, and those that
-/// refused it.
+/// One root-paid offer: the key, the peers it was sent to, those of them
+/// the proof holds a quote from, and those excused for refusing it.
 struct RootOffer {
     key: XorName,
     targets: HashSet<PeerId>,
+    quoted: HashSet<PeerId>,
     refused: HashSet<PeerId>,
 }
 
+/// What a refusal of a fresh offer does to the key's possession check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Not a refusal of a tracked root-paid offer, by a peer it was sent to,
+    /// naming its key: nothing changes.
+    Untracked,
+    /// The proof holds no quote from the peer, which may be one that can't
+    /// check a root proof: it is left out of the possession check.
+    Excused,
+    /// The peer quoted the key for its root payment, so it said it can check
+    /// a root proof: it stays in the possession check.
+    Charged,
+}
+
 impl RootOfferRefusals {
-    /// Track the root-paid offer `request_id` of `key`, sent to `targets`.
-    pub(crate) fn open(&self, request_id: u64, key: XorName, targets: &[PeerId]) {
+    /// Track the root-paid offer `request_id` of `key`, sent to `targets`,
+    /// whose proof holds a quote from each of `quoted`.
+    pub(crate) fn open(
+        &self,
+        request_id: u64,
+        key: XorName,
+        targets: &[PeerId],
+        quoted: &HashSet<PeerId>,
+    ) {
+        let targets: HashSet<PeerId> = targets.iter().copied().collect();
+        let quoted = targets.intersection(quoted).copied().collect();
         self.offers.lock().insert(
             request_id,
             RootOffer {
                 key,
-                targets: targets.iter().copied().collect(),
+                targets,
+                quoted,
                 refused: HashSet::new(),
             },
         );
     }
 
     /// Note that `source` refused the offer `request_id` of `key`. Only a
-    /// peer the offer was sent to, naming the offer's key, counts. Returns
-    /// whether the refusal was noted.
-    pub(crate) fn note_refusal(&self, request_id: u64, source: &PeerId, key: &XorName) -> bool {
+    /// peer the offer was sent to, naming the offer's key, counts, and only
+    /// one the proof holds no quote from is excused.
+    pub(crate) fn note_refusal(&self, request_id: u64, source: &PeerId, key: &XorName) -> Refusal {
         let mut offers = self.offers.lock();
         let Some(offer) = offers.get_mut(&request_id) else {
-            return false;
+            return Refusal::Untracked;
         };
         if offer.key != *key || !offer.targets.contains(source) {
-            return false;
+            return Refusal::Untracked;
+        }
+        if offer.quoted.contains(source) {
+            return Refusal::Charged;
         }
         offer.refused.insert(*source);
-        true
+        Refusal::Excused
     }
 
     /// Close the offer `request_id`: `peers` without those that refused it.
@@ -150,12 +190,22 @@ impl RootOfferRefusals {
     }
 }
 
-/// Whether `proof_of_payment` pays through the root vault, so a peer that
-/// can't check a root proof may refuse its offer.
-fn is_root_paid(proof_of_payment: &[u8]) -> bool {
+/// For a proof that pays through the root vault, the peers it holds a quote
+/// from; a peer outside them that can't check a root proof may refuse the
+/// offer. `None` for any other proof, and for a root proof that doesn't
+/// decode, whose offer is then checked as a single-node one is.
+fn root_quoted_peers(proof_of_payment: &[u8]) -> Option<HashSet<PeerId>> {
     match detect_proof_type(proof_of_payment) {
-        Some(ProofType::Root) => true,
-        Some(ProofType::SingleNode | ProofType::Merkle) | None => false,
+        Some(ProofType::Root) => deserialize_root_proof(proof_of_payment).ok().map(|proof| {
+            proof
+                .payment
+                .proof_of_payment
+                .peer_quotes
+                .iter()
+                .map(|(peer, _)| PeerId::from_bytes(*peer.as_bytes()))
+                .collect()
+        }),
+        Some(ProofType::SingleNode | ProofType::Merkle) | None => None,
     }
 }
 
@@ -226,7 +276,7 @@ pub(crate) async fn send_fresh_offers(
         .map(|n| n.peer_id)
         .collect();
 
-    let root_paid = is_root_paid(&proof_of_payment);
+    let root_quoted = root_quoted_peers(&proof_of_payment);
     let offer = FreshReplicationOffer {
         key: *key,
         data,
@@ -253,10 +303,13 @@ pub(crate) async fn send_fresh_offers(
         _pending: pending_offer,
     });
     // Tracked before any send, so a refusal that comes back at once is noted.
-    let root_offer = (root_paid && !target_peers.is_empty()).then(|| {
-        ctx.root_offers.open(request_id, *key, &target_peers);
-        request_id
-    });
+    let root_offer = root_quoted
+        .filter(|_| !target_peers.is_empty())
+        .map(|quoted| {
+            ctx.root_offers
+                .open(request_id, *key, &target_peers, &quoted);
+            request_id
+        });
     for peer in &target_peers {
         let p2p = Arc::clone(&ctx.p2p_node);
         let offer = encoded.clone();
@@ -401,17 +454,29 @@ mod tests {
         PeerId::from_bytes([byte; 32])
     }
 
-    /// Only a root proof makes an offer one a peer may refuse unpenalised.
-    #[test]
-    fn only_a_root_proof_is_root_paid() {
-        use crate::ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE};
+    /// A root proof whose quotes come from `quoted`.
+    fn root_proof(quoted: &[PeerId]) -> Vec<u8> {
         use crate::payment::{serialize_root_proof, PaymentProof, RootPaymentProof};
 
-        let root = serialize_root_proof(&RootPaymentProof {
+        let peer_quotes = quoted
+            .iter()
+            .map(|peer| {
+                let quote = evmlib::PaymentQuote {
+                    content: xor_name::XorName([0x42; 32]),
+                    timestamp: std::time::SystemTime::now(),
+                    price: evmlib::common::Amount::from(1u64),
+                    rewards_address: evmlib::RewardsAddress::new([1; 20]),
+                    committed_key_count: 0,
+                    commitment_pin: None,
+                    pub_key: Vec::new(),
+                    signature: Vec::new(),
+                };
+                (evmlib::EncodedPeerId::new(*peer.as_bytes()), quote)
+            })
+            .collect();
+        serialize_root_proof(&RootPaymentProof {
             payment: PaymentProof {
-                proof_of_payment: evmlib::ProofOfPayment {
-                    peer_quotes: Vec::new(),
-                },
+                proof_of_payment: evmlib::ProofOfPayment { peer_quotes },
                 tx_hashes: Vec::new(),
                 commitment_sidecars: Vec::new(),
             },
@@ -421,12 +486,26 @@ mod tests {
             leaf_count: 1,
             path: Vec::new(),
         })
-        .expect("encode");
-        assert!(is_root_paid(&root));
-        assert!(!is_root_paid(&[PROOF_TAG_SINGLE_NODE, 0x90]));
-        assert!(!is_root_paid(&[PROOF_TAG_MERKLE, 0x90]));
-        assert!(!is_root_paid(&[0x7f, 0x90]));
-        assert!(!is_root_paid(&[]));
+        .expect("encode")
+    }
+
+    /// Only a root proof makes an offer one a peer may refuse unpenalised,
+    /// and it names the peers it holds a quote from.
+    #[test]
+    fn only_a_root_proof_is_root_paid() {
+        use crate::ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_ROOT, PROOF_TAG_SINGLE_NODE};
+
+        assert_eq!(root_quoted_peers(&root_proof(&[])), Some(HashSet::new()));
+        assert_eq!(
+            root_quoted_peers(&root_proof(&[peer(4), peer(5)])),
+            Some([peer(4), peer(5)].into_iter().collect())
+        );
+        assert_eq!(root_quoted_peers(&[PROOF_TAG_SINGLE_NODE, 0x90]), None);
+        assert_eq!(root_quoted_peers(&[PROOF_TAG_MERKLE, 0x90]), None);
+        assert_eq!(root_quoted_peers(&[0x7f, 0x90]), None);
+        assert_eq!(root_quoted_peers(&[]), None);
+        // A root tag that doesn't decode is checked as a single-node offer.
+        assert_eq!(root_quoted_peers(&[PROOF_TAG_ROOT, 0x90]), None);
     }
 
     /// A peer that refuses a root-paid offer is left out of that key's
@@ -438,21 +517,52 @@ mod tests {
         let offers = RootOfferRefusals::default();
         let key = [0x42; 32];
         let targets = vec![peer(1), peer(2), peer(3)];
-        offers.open(7, key, &targets);
+        offers.open(7, key, &targets, &HashSet::new());
         assert_eq!(offers.pending(), 1);
 
-        assert!(offers.note_refusal(7, &peer(2), &key));
-        assert!(!offers.note_refusal(7, &peer(9), &key), "not a target");
-        assert!(
-            !offers.note_refusal(7, &peer(3), &[0x43; 32]),
+        assert_eq!(offers.note_refusal(7, &peer(2), &key), Refusal::Excused);
+        assert_eq!(
+            offers.note_refusal(7, &peer(9), &key),
+            Refusal::Untracked,
+            "not a target"
+        );
+        assert_eq!(
+            offers.note_refusal(7, &peer(3), &[0x43; 32]),
+            Refusal::Untracked,
             "another key"
         );
-        assert!(!offers.note_refusal(8, &peer(1), &key), "another offer");
+        assert_eq!(
+            offers.note_refusal(8, &peer(1), &key),
+            Refusal::Untracked,
+            "another offer"
+        );
 
         assert_eq!(offers.close(7, targets.clone()), vec![peer(1), peer(3)]);
         assert_eq!(offers.pending(), 0);
         // Closed: a late refusal is ignored, and the id no longer filters.
-        assert!(!offers.note_refusal(7, &peer(1), &key));
+        assert_eq!(offers.note_refusal(7, &peer(1), &key), Refusal::Untracked);
         assert_eq!(offers.close(7, targets.clone()), targets);
+    }
+
+    /// A peer the root proof holds a quote from answered the client's
+    /// settlement-version-3 request, so it said it can check a root proof. If
+    /// it refuses the offer anyway, whatever its reason, it stays in the
+    /// key's possession check, as a refuser of a single-node offer does; an
+    /// unquoted peer that refuses beside it is still left out.
+    #[test]
+    fn a_peer_quoted_at_version_3_that_refuses_a_root_paid_offer_stays_in_its_possession_check() {
+        let offers = RootOfferRefusals::default();
+        let key = [0x42; 32];
+        let targets = vec![peer(1), peer(2), peer(3)];
+        let proof = root_proof(&[peer(1), peer(2), peer(8)]);
+        let quoted = root_quoted_peers(&proof).expect("a root proof");
+        offers.open(7, key, &targets, &quoted);
+
+        assert_eq!(offers.note_refusal(7, &peer(1), &key), Refusal::Charged);
+        assert_eq!(offers.note_refusal(7, &peer(3), &key), Refusal::Excused);
+        // A quoted peer the offer was not sent to counts for nothing.
+        assert_eq!(offers.note_refusal(7, &peer(8), &key), Refusal::Untracked);
+
+        assert_eq!(offers.close(7, targets), vec![peer(1), peer(2)]);
     }
 }

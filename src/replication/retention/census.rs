@@ -2280,19 +2280,33 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
         "deserialize_root_proof",
         2,
     ),
-    // Whether a fresh offer is root-paid, so a peer that refuses it is left
+    // Whether a fresh offer is root-paid, and which peers its proof holds a
+    // quote from, so a refusing peer the proof holds no quote from is left
     // out of the key's possession check: root proofs only; single-node,
-    // merkle and unknown tags are checked as before.
+    // merkle, unknown tags and a root proof that doesn't decode are checked
+    // as before.
     (
         "src/replication/fresh.rs",
-        "is_root_paid",
+        "root_quoted_peers",
         "detect_proof_type",
+        1,
+    ),
+    (
+        "src/replication/fresh.rs",
+        "root_quoted_peers",
+        "deserialize_root_proof",
         1,
     ),
     (
         "src/replication/fresh.rs",
         "<module>",
         "detect_proof_type",
+        1,
+    ),
+    (
+        "src/replication/fresh.rs",
+        "<module>",
+        "deserialize_root_proof",
         1,
     ),
     // An envelope's listing: found from a single-node or a root proof's
