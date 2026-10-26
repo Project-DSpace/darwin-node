@@ -1934,7 +1934,28 @@ fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
             1,
         ),
     ];
-    const LANES: &[(Option<&str>, &str)] = &[(Some("Lane"), "*")];
+    // The lanes of `full::Lane` by name, not `Lane::*`: the payment reads'
+    // own `Lane` (`Lane::Put`, `Lane::Background`, node-1a's settlement
+    // reads) shares the type's last name, and isn't a lane of this penalty.
+    // The list is checked against `full::Lane::ALL` below.
+    const LANES: &[(Option<&str>, &str)] = &[
+        (Some("Lane"), "Fetch"),
+        (Some("Lane"), "ResponsibleAudit"),
+        (Some("Lane"), "ReplicaHint"),
+        (Some("Lane"), "PossessionNoAnswer"),
+        (Some("Lane"), "PossessionFailed"),
+        (Some("Lane"), "PruneAudit"),
+        (Some("Lane"), "PointerPossession"),
+    ];
+    let every_lane: Vec<String> = crate::replication::full::Lane::ALL
+        .iter()
+        .map(|lane| format!("{lane:?}"))
+        .collect();
+    let listed: Vec<String> = LANES.iter().map(|(_, name)| (*name).to_string()).collect();
+    assert_eq!(
+        listed, every_lane,
+        "the census names every lane of full::Lane, and only those"
+    );
     const NAMED: &[Reviewed] = &[
         (
             "src/replication/mod.rs",
