@@ -1729,15 +1729,17 @@ impl PaymentVerifier {
         }
 
         Self::validate_quote_structure(payment)?;
-        // ADR-0004: re-run the `price == calculate_price(committed_key_count)`
-        // arithmetic/binding check on EVERY quote in the bundle (all single-node
-        // quotes), per the ADR's "every storer re-runs the
-        // price-equals-formula-of-count check on every quote in the bundle"
-        // rule — bundle-level, before median selection (the candidate loop below
-        // only sees median-priced quotes). This hard cutover also RETIRES the
-        // percentage-based own-quote price-staleness gate: a quote's price is
-        // now exactly bound to its committed count here (both the `(n>0, Some)`
-        // and baseline `(0, None)` shapes), and the committed responsible count
+        // ADR-0004 as ADR-0025 amends it: re-run the arithmetic/binding check,
+        // the price within the band its committed count allows
+        // (`calculate_price(band_bottom_count(K)) <= price <=
+        // calculate_price(K)`), on EVERY quote in the bundle (all single-node
+        // quotes), per the ADR's "every storer re-runs the check on every quote
+        // in the bundle" rule — bundle-level, before median selection (the
+        // candidate loop below only sees median-priced quotes). This hard
+        // cutover also RETIRES the percentage-based own-quote price-staleness
+        // gate: a quote's price is now bound to its committed count here (both
+        // the `(n>0, Some)` and baseline `(0, None)` shapes, the baseline's band
+        // being the one price `calculate_price(0)`), and the committed responsible count
         // legitimately differs from the on-disk count, so the old gate would
         // FALSE-REJECT healthy ADR quotes. The binding gate supersedes it.
         Self::validate_quote_arithmetic(payment)?;
@@ -2707,8 +2709,8 @@ impl PaymentVerifier {
     /// quote in **both** quote types — all 7 single-node quotes
     /// ([`Self::validate_quote_arithmetic`]) and all 16 merkle candidates
     /// ([`Self::validate_merkle_candidate_arithmetic`]) — because the rule
-    /// "every storer re-runs the price-equals-formula-of-count check on every
-    /// quote in the bundle" (ADR-0004) needs no peer-specific state and depends
+    /// "every storer re-runs the price-in-the-band-of-count check on every
+    /// quote in the bundle" (ADR-0004, ADR-0025) needs no peer-specific state and depends
     /// only on the bundle itself, so every honest storer reaches the same
     /// verdict with no split-brain risk.
     ///
@@ -2740,9 +2742,12 @@ impl PaymentVerifier {
     /// diagnostic iff the quote violates it. Shared by single-node quotes and
     /// merkle candidates via [`Self::binding_violation`].
     ///
-    /// The rule is the ADR's exact one — `price == calculate_price(
-    /// committed_key_count)`, recomputed, never inverted from the price (which
-    /// rounds) — PLUS a binding-shape check. There is no "legacy degradation"
+    /// The rule is the band ADR-0025 gives ADR-0004's binding — the price lies
+    /// between `calculate_price(band_bottom_count(committed_key_count))` and
+    /// `calculate_price(committed_key_count)`, both ends recomputed, never
+    /// inverted from the price (which rounds) — PLUS a binding-shape check. A
+    /// quote priced at a node's weight total, below its count, is in the band;
+    /// one priced at today's exact price is its top. There is no "legacy degradation"
     /// that infers an old quote from its field values: a `(0, None)` quote is
     /// rejected unless its price is exactly `calculate_price(0)`, closing the
     /// bypass where a modified node strips the pin yet prices above baseline.
@@ -2809,7 +2814,8 @@ impl PaymentVerifier {
         } else {
             let (bottom, top) = crate::payment::pricing::price_band(key_count);
             Some(format!(
-                "price {price} is outside the band for committed_key_count={committed_key_count}:                  calculate_price({}) = {bottom} to calculate_price({committed_key_count}) = {top}",
+                "price {price} is outside the band for committed_key_count={committed_key_count}: \
+                 calculate_price({}) = {bottom} to calculate_price({committed_key_count}) = {top}",
                 crate::payment::pricing::band_bottom_count(key_count)
             ))
         }
@@ -3988,7 +3994,7 @@ impl PaymentVerifier {
             }
         }
 
-        // ADR-0004: every storer re-runs the price-equals-formula-of-count
+        // ADR-0004: every storer re-runs the price-in-the-band-of-count
         // check on every merkle candidate, in every context, before median
         // reconstruction. Runs AFTER signature verification so observe-only
         // telemetry cannot be spoofed by unauthenticated senders. Reject-only
@@ -9880,9 +9886,10 @@ mod tests {
 
         // Set every candidate price to calculate_price(500) so the pool is
         // honestly on-curve to start. The binding must move with the price:
-        // ADR-0004 requires `price == calculate_price(committed_key_count)`, so
-        // repricing at 500 records while leaving the count at 0 would make the
-        // pool dishonest rather than honest.
+        // the price must lie in the band its committed count allows, whose
+        // only price at count 0 is `calculate_price(0)`, so repricing at 500
+        // records while leaving the count at 0 would make the pool dishonest
+        // rather than honest.
         let on_curve = crate::payment::pricing::calculate_price(500);
         for c in &mut candidates {
             c.price = on_curve;

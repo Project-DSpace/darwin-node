@@ -368,7 +368,8 @@ async fn a_client_paying_todays_price_is_stored_by_a_size_pricing_node() {
             .unwrap_or_else(|e| panic!("a {size}-byte record paid at today's price: {e}"));
         assert!(
             outcome.stored_acks >= CLOSE_GROUP_MAJORITY,
-            "a {size}-byte record paid at today's price was stored by {} storers              ({})",
+            "a {size}-byte record paid at today's price was stored by {} storers \
+             ({})",
             outcome.stored_acks,
             hex::encode(address)
         );
