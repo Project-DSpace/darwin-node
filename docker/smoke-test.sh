@@ -414,7 +414,9 @@ for _ in $(seq 1 30); do
 done
 ids=$(peer_ids "$WORK/previous")
 (( $(wc -w <<<"$ids") == 3 )) || fail "the release before's nodes did not publish their browser addresses"
-layout() { registry "$WORK/previous" '.nodes | map_values({id, service_name, node_port, data_dir, log_dir, binary_path}) | tojson'; }
+# Sorted keys (-S): the manager may write the registry's nodes in another
+# order without changing any of them.
+layout() { sudo jq -cS '.nodes | map_values({id, service_name, node_port, data_dir, log_dir, binary_path})' "$WORK/previous/manager/ant/node_registry.json"; }
 layout_before=$(layout)
 docker stop -t 120 previous >/dev/null && docker rm previous >/dev/null
 # The browser address files are written again as each node starts.
