@@ -14,9 +14,10 @@
 //! value = the size class the key's payment covers, one byte ([`PaidClass`]),
 //! or an empty byte slice, which reads as the full class. A payment notice
 //! writes the class its settled amount covers, and a paid-list quorum the
-//! class the quorum's entries record when that is below the full class;
-//! every other path writes the empty value. A recorded class is only ever
-//! raised. A paid-list query is answered with the entry's class. Membership
+//! class the quorum's entries record. The full class is always written as
+//! the empty value, whichever path writes it, so a full-class entry holds the
+//! empty value and a one-byte value is a class below the full class. A
+//! recorded class is only ever raised. A paid-list query is answered with the entry's class. Membership
 //! (`contains`, `count`, `all_keys`) ignores the value, so a node that never
 //! reads it opens the same list.
 //!
@@ -212,7 +213,9 @@ impl PaidList {
     /// Record `key` as paid for `class`, as a payment notice does: insert it
     /// with the class as its value, or raise the class an entry already
     /// records. A class is never lowered, and an entry with the empty value
-    /// already records the full class.
+    /// already records the full class. The full class is written as the
+    /// empty value, as [`Self::insert`] writes it, so raising an entry to the
+    /// full class leaves the same value a plain insert of a new key does.
     ///
     /// Returns `true` if the key was newly added.
     ///
@@ -260,7 +263,9 @@ impl PaidList {
                     return Ok((false, false));
                 }
 
-                db.put(&mut wtxn, &key_owned, &class.to_value())
+                let byte = class.to_value();
+                let value: &[u8] = if class == PaidClass::FULL { &[] } else { &byte };
+                db.put(&mut wtxn, &key_owned, value)
                     .map_err(|e| Error::Storage(format!("Failed to insert into paid-list: {e}")))?;
                 wtxn.commit().map_err(|e| {
                     Error::Storage(format!("Failed to commit paid-list insert: {e}"))
@@ -676,9 +681,8 @@ mod tests {
     }
 
     /// A key written with the empty value (before notices recorded a class,
-    /// by a presence quorum or a paid-list quorum at the full class, or by a
-    /// node that never reads values) reads as the full class, which a notice
-    /// never lowers.
+    /// at the full class by any path, or by a node that never reads values)
+    /// reads as the full class, which a notice never lowers.
     #[tokio::test]
     async fn an_empty_value_reads_as_the_full_class_and_is_never_lowered() {
         let (pl, _temp) = create_test_paid_list().await;
@@ -701,6 +705,40 @@ mod tests {
             pl.class(&noticed).expect("class"),
             Some(PaidClass::SMALLEST)
         );
+    }
+
+    /// The full class is stored as the empty value, both for a new key and
+    /// for an entry raised to it, and a smaller class as its one byte.
+    #[tokio::test]
+    async fn the_full_class_is_stored_as_the_empty_value() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let raw = |key: &XorName| -> Vec<u8> {
+            let rtxn = pl.env.read_txn().expect("read txn");
+            pl.db
+                .get(&rtxn, key)
+                .expect("get")
+                .expect("present")
+                .to_vec()
+        };
+
+        let new: XorName = [0xA6; 32];
+        assert!(pl
+            .insert_class(&new, PaidClass::FULL)
+            .await
+            .expect("insert"));
+        assert_eq!(raw(&new), Vec::<u8>::new());
+
+        let raised: XorName = [0xA7; 32];
+        pl.insert_class(&raised, PaidClass::SMALLEST)
+            .await
+            .expect("insert");
+        assert_eq!(raw(&raised), PaidClass::SMALLEST.to_value().to_vec());
+        assert!(!pl
+            .insert_class(&raised, PaidClass::FULL)
+            .await
+            .expect("insert"));
+        assert_eq!(raw(&raised), Vec::<u8>::new());
+        assert_eq!(pl.class(&raised).expect("class"), Some(PaidClass::FULL));
     }
 
     /// Membership ignores the values, so a node that never reads them lists

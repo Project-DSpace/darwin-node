@@ -85,9 +85,11 @@ impl PaidClass {
 
     /// The class a paid-list value records. An empty value reads as the full
     /// class: every key written before notices recorded a class, every key
-    /// admitted with its bytes or learned by a presence quorum, and every key
-    /// a paid-list quorum reports at the full class, holds one. A value that
-    /// isn't one byte naming a class reads as the full class too.
+    /// admitted with its bytes, and every key a notice, a presence quorum or
+    /// a paid-list quorum records at the full class, holds one, since the
+    /// paid list writes the full class as the empty value. A value that isn't
+    /// one byte naming a class reads as the full class too, so the full
+    /// class's own byte reads the same as the empty value.
     #[must_use]
     pub fn from_value(value: &[u8]) -> Self {
         match value {

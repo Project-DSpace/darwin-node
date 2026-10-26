@@ -114,7 +114,8 @@ channel error otherwise.
 A payment notice carries no bytes, so it is admitted at the smallest class's amount. The
 class its settled amount covers is written as the paid-list entry's value: one byte, the
 base-2 logarithm of the class top (14 for 16 KiB up to 22 for 4 MiB), in the same
-transaction as the key. A value is only ever raised. An empty value reads as the full
+transaction as the key. A value is only ever raised. The full class itself is written as
+the empty value, whichever path writes it, and an empty value reads as the full
 class, which covers every key admitted before this release, every key admitted with its
 bytes or learned through a presence quorum of holders, and every key admitted under an
 older release. Older releases never read the value: membership, counts and key listings
@@ -135,8 +136,9 @@ class; once a quorum of a key's paid group answers that way, a new node records 
 class too, so a smaller class can spread to full through older nodes. It takes a quorum of
 the paid group, not one node, and nothing in the node prevents it: the guard is the
 client's, which pays by size only once the node census shows no storer before this
-release (below). A full-class quorum raises an entry this node already records at a
-smaller class, as a smaller-class quorum does, and never lowers one.
+release (below). A presence quorum or a full-class paid-list quorum raises an entry this
+node already records at a smaller class, as a smaller-class quorum does, and never lowers
+one.
 
 When a fetched chunk arrives, the node re-reads the recorded class. Only a presence quorum
 of holders, majority storage, accepts the bytes whatever the paid list records. Where the

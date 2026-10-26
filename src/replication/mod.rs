@@ -9312,10 +9312,11 @@ fn apply_fetch_result(
 /// Records a key the network round verified in the paid list (Step 4). A
 /// presence quorum is majority storage and records the full class, the empty
 /// value. A paid-list quorum records the class its entries record, so a
-/// payment noticed at a smaller class stays that class here. That write only
-/// raises, the full class included: a notice that recorded a smaller class
-/// for the key after Step 1 is raised to the quorum's class, so the fetch's
-/// re-check of this entry doesn't refuse bytes the quorum records as paid.
+/// payment noticed at a smaller class stays that class here. Both writes only
+/// raise, the full class included: a notice that recorded a smaller class for
+/// the key after Step 1 is raised to the quorum's class, so the entry and the
+/// class this node reports to peers' paid-list queries match the bytes the
+/// quorum records as paid, and the fetch's re-check doesn't refuse them.
 /// Nothing for a key that wasn't verified.
 async fn record_verified_key(
     paid_list: &PaidList,
@@ -9323,7 +9324,9 @@ async fn record_verified_key(
     outcome: &KeyVerificationOutcome,
 ) -> Result<()> {
     match outcome {
-        KeyVerificationOutcome::QuorumVerified { .. } => paid_list.insert(key).await.map(drop),
+        KeyVerificationOutcome::QuorumVerified { .. } => {
+            paid_list.insert_class(key, PaidClass::FULL).await.map(drop)
+        }
         KeyVerificationOutcome::PaidListVerified { class, .. } => {
             paid_list.insert_class(key, *class).await.map(drop)
         }
@@ -14484,11 +14487,18 @@ mod tests {
         }
 
         // A notice that recorded a smaller class after the key went to the
-        // network round is raised to a full-class quorum's class, so the
-        // fetch's re-check doesn't refuse the bytes the quorum records as paid.
-        for (byte, class) in [(0xD3, Some(PaidClass::FULL)), (0xD4, None)] {
-            let raced = test_key(byte);
-            let outcome = learn(raced, class);
+        // network round is raised to a full-class quorum's class, a presence
+        // quorum's included, so the fetch's re-check doesn't refuse the bytes
+        // the quorum records as paid and the class reported to peers' queries
+        // is the full class.
+        let present = KeyVerificationOutcome::QuorumVerified {
+            sources: vec![paid_peers[0]],
+        };
+        for (raced, outcome) in [
+            (test_key(0xD3), learn(test_key(0xD3), Some(PaidClass::FULL))),
+            (test_key(0xD4), learn(test_key(0xD4), None)),
+            (test_key(0xD5), present),
+        ] {
             paid_list
                 .insert_class(&raced, PaidClass::SMALLEST)
                 .await
