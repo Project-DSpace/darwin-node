@@ -128,7 +128,15 @@ before it and reads as recording the full class for every key, as its entries do
 that learns a key from a paid-list quorum alone records the class a quorum of those entries
 record or exceed (the `ConfirmNeeded`-th largest), not the full class: a majority of paid
 lists is not storage, so a payment noticed at a smaller class doesn't become a full one by
-spreading.
+spreading. Reading a reply without classes as the full class holds only once no older
+storer is left. Until then an older node that learns a smaller-class key from a quorum of
+new nodes writes the empty value, fetches the bytes with no re-check and answers with no
+class; once a quorum of a key's paid group answers that way, a new node records the full
+class too, so a smaller class can spread to full through older nodes. It takes a quorum of
+the paid group, not one node, and nothing in the node prevents it: the guard is the
+client's, which pays by size only once the node census shows no storer before this
+release (below). A full-class quorum raises an entry this node already records at a
+smaller class, as a smaller-class quorum does, and never lowers one.
 
 When a fetched chunk arrives, the node re-reads the recorded class. Only a presence quorum
 of holders, majority storage, accepts the bytes whatever the paid list records. Where the
