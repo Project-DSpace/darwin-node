@@ -1636,8 +1636,11 @@ mod payment_reads {
 /// mismatch the test prints the bytes as they are now, for review.
 mod payment_encodings {
     use ant_node::payment::proof::deserialize_single_node_proof;
-    use ant_node::payment::{serialize_single_node_proof, PaymentProof};
-    use evmlib::common::{Amount, TxHash};
+    use ant_node::payment::{
+        deserialize_root_proof, serialize_root_proof, serialize_single_node_proof, PaymentProof,
+        RootPaymentProof,
+    };
+    use evmlib::common::{Amount, Hash, QuoteHash, TxHash};
     use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
     use std::fmt::Write as _;
     use std::time::{Duration, SystemTime};
@@ -1683,6 +1686,27 @@ mod payment_encodings {
     /// hashes, the commitment sidecars.
     const PINNED_PROOF: &str = "0193919292dc0020515151515151515151515151515151515151515151515151515151515151515198dc0020101010101010101010101010101010101010101010101010101010101010101092ce6acfc000ce075bccbcc420000000000000000000000000000000000000000000000000000b5e620f480010c4141111111111111111111111111111111111111111931212129413131313ce00011170dc0020141414141414141414141414141414141414141414141414141414141414141492dc0020525252525252525252525252525252525252525252525252525252525252525298dc0020202020202020202020202020202020202020202020202020202020202020202092ce6acfc000ce075bccbcc420000000000000000000000000000000000000000000000000000b5e620f480020c414212121212121212121212121212121212121212193222222942323232300c091c4207a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a9193ccc0ccc1ccc2";
 
+    /// A root proof (tag 03): `proof()` as its payment, then the paid quote's
+    /// hash, the amount the wave pays it, its place in the wave, the wave's
+    /// leaf count and the path, each struct an array of its fields in order.
+    /// The client writes these bytes and every node decodes them: client and
+    /// node each keep their own copy of the struct, and the same hex belongs
+    /// in darwin-client's pins, so a field moved, retyped or added on either
+    /// side fails here or there.
+    const PINNED_ROOT_PROOF: &str = "039693919292dc0020515151515151515151515151515151515151515151515151515151515151515198dc0020101010101010101010101010101010101010101010101010101010101010101092ce6acfc000ce075bccbcc420000000000000000000000000000000000000000000000000000b5e620f480010c4141111111111111111111111111111111111111111931212129413131313ce00011170dc0020141414141414141414141414141414141414141414141414141414141414141492dc0020525252525252525252525252525252525252525252525252525252525252525298dc0020202020202020202020202020202020202020202020202020202020202020202092ce6acfc000ce075bccbcc420000000000000000000000000000000000000000000000000000b5e620f480020c414212121212121212121212121212121212121212193222222942323232300c091c4207a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a9193ccc0ccc1ccc2c4203c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3cc42000000000000000000000000000000000000000000000000000221b262dd8003002cd012c92c4209191919191919191919191919191919191919191919191919191919191919191c4209292929292929292929292929292929292929292929292929292929292929292";
+
+    /// The root proof `PINNED_ROOT_PROOF` holds.
+    fn root_proof() -> RootPaymentProof {
+        RootPaymentProof {
+            payment: proof(),
+            quote_hash: QuoteHash::from([0x3C; 32]),
+            amount: Amount::from(9_600_000_000_000_048_u64),
+            index: 2,
+            leaf_count: 300,
+            path: vec![Hash::from([0x91; 32]), Hash::from([0x92; 32])],
+        }
+    }
+
     /// Each quote of `proof()`, as `MessagePack` writes it (an array of its 8
     /// fields; the time as seconds and nanoseconds, the price as 32 bytes, an
     /// absent pin as nil), and its hash: the key the vault records its
@@ -1719,6 +1743,38 @@ mod payment_encodings {
         assert_eq!(decoded.tx_hashes, sample.tx_hashes);
         assert_eq!(decoded.commitment_sidecars, sample.commitment_sidecars);
         assert_eq!(serialize_single_node_proof(&decoded).unwrap(), pinned);
+    }
+
+    #[test]
+    fn a_root_proof_keeps_its_bytes() {
+        let sample = root_proof();
+        let bytes = hex::encode(serialize_root_proof(&sample).unwrap());
+        assert!(
+            bytes == PINNED_ROOT_PROOF,
+            "\nA root payment proof no longer matches its pinned bytes in \
+             tests/fork_pins.rs. Clients write these bytes and nodes decode them in every \
+             root-paid PUT and fresh offer. Its bytes now:\n\n{bytes}\n"
+        );
+
+        // The pinned bytes decode to the same proof, and encode back to them.
+        let pinned = hex::decode(PINNED_ROOT_PROOF).unwrap();
+        let decoded = deserialize_root_proof(&pinned)
+            .unwrap_or_else(|e| panic!("the pinned root proof doesn't decode: {e}"));
+        assert_eq!(
+            decoded.payment.proof_of_payment,
+            sample.payment.proof_of_payment
+        );
+        assert_eq!(decoded.payment.tx_hashes, sample.payment.tx_hashes);
+        assert_eq!(
+            decoded.payment.commitment_sidecars,
+            sample.payment.commitment_sidecars
+        );
+        assert_eq!(decoded.quote_hash, sample.quote_hash);
+        assert_eq!(decoded.amount, sample.amount);
+        assert_eq!(decoded.index, sample.index);
+        assert_eq!(decoded.leaf_count, sample.leaf_count);
+        assert_eq!(decoded.path, sample.path);
+        assert_eq!(serialize_root_proof(&decoded).unwrap(), pinned);
     }
 
     #[test]
