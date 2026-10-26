@@ -128,9 +128,9 @@ full. Then it:
 - keeps serving and proving what it holds: its audit and possession replies keep their
   format, real digests for held keys and the absent digest for others;
 - tells its peers with a one-way `FullNotice`, appended to the replication messages (body
-  index 23 on this branch; node-1b-sync's two page messages keep 23 and 24, so the notice
-  takes 25 whenever it merges after them: one constant, `BEFORE_FULL_NOTICE_LAST_INDEX`,
-  moves to 24) and
+  index 25: node-1b-sync's two page messages keep 23 and 24, and the notice, merged after
+  them in node-1b, takes the next; the merge moved one constant,
+  `BEFORE_FULL_NOTICE_LAST_INDEX`, from 22 to 24) and
   sent only to peers whose user agent names the release that reads it, or that sent one
   themselves, renewed every 10 minutes while it stays full; a peer once found to read it
   is remembered (at most 4,096) until it leaves the routing table, so a renewal still
