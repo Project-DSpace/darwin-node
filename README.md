@@ -63,18 +63,27 @@ never ran.
   The address is built in for the production network (DARWIN through its
   payment vault), so a node whose binary was upgraded alone knows it too; a
   custom network gives one with `--evm-root-vault` (`ANT_EVM_ROOT_VAULT`),
-  and with none, root proofs are refused. The node's payment vault, which the
-  image and browsers check, stays the payment vault. Settlement version 3
-  means root proofs are accepted: a node quotes a version-3 request as a
-  version-2 one, and an older node answers it `StorerUpdateRequired` before
+  and with none, root proofs are refused. A production-network node whose
+  setting gives a root vault other than the built-in one warns at start. The
+  node's payment vault, which the image and browsers check, stays the
+  payment vault. Settlement version 3 means root proofs are accepted: a node
+  that knows a root vault quotes a version-3 request as a version-2 one,
+  paid by size the same way, and the root proof's amount is held to the
+  same weighted rule as a per-chunk proof's. A node with no root vault, like
+  an older node, answers it `StorerUpdateRequired` naming version 2 before
   quoting, so a client never pays through the root vault to a node that
-  can't check the payment. The minimum stays version 1. The traffic lines
-  count quote requests by settlement version and settled proofs by tag, and
-  the record read as a kind of its own. Tests in
+  can't check the payment. The minimum stays version 1. A node that stores
+  a root-paid chunk leaves out of the chunk's possession check any
+  close-group peer that answers its fresh offer with a refusal, as an older
+  node or one with no root vault does; neighbour sync places the chunk with
+  it later. The traffic lines count quote requests by settlement version and
+  settled proofs by tag, and the record read as a kind of its own. Tests in
   `src/payment/verifier/root_tests.rs` check root proofs through the real
-  reads against a stub chain with a root vault; the census lists the Root
-  type, each place that decides by proof type, the record read, and the
-  per-quote cache's single vault.
+  reads against a stub chain with a root vault; `tests/fork_pins.rs` pins a
+  root proof's bytes; the census lists the
+  Root type, each place that decides by proof type (by `detect_proof_type`
+  or a proof decoder), the record read, and the per-quote cache's single
+  vault.
 - **Payment checks fall back across RPCs** (from ds.8). A node reads a
   storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a

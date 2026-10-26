@@ -8,6 +8,7 @@
 //!    bounded by the pending-offer permits so a write burst cannot pile up
 //!    chunk-sized buffers.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use saorsa_core::P2PNode;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::ant_protocol::XorName;
+use crate::payment::{detect_proof_type, ProofType};
 use crate::replication::config::{
     ReplicationConfig, FRESH_REPLICATION_DELIVERY_MAX_RETRIES, REPLICATION_PROTOCOL_ID,
 };
@@ -65,6 +67,96 @@ pub(crate) struct FreshOfferContext {
     /// Offers encoded and handed to at least one per-peer send, so tests can
     /// tell a write that went out from one lost to back-pressure.
     pub(crate) dispatched: Arc<AtomicU64>,
+    /// Root-paid offers whose possession check is pending, and the peers that
+    /// refused them.
+    pub(crate) root_offers: Arc<RootOfferRefusals>,
+}
+
+/// Root-paid fresh offers (proof tag `0x03`) waiting for their delayed
+/// possession check, by the offer's request id, each with the peers that
+/// answered it with a refusal.
+///
+/// A client pays through the root vault only when every node it was quoted
+/// by accepts root proofs, but this node offers the record to its own view of
+/// the close group, which can hold a peer the client never asked: an older
+/// node, or one that knows no root vault. Such a peer can't check the proof
+/// and refuses the offer, saying so in a `FreshReplicationResponse::Rejected`
+/// with the offer's request id. It is dropped from that key's possession
+/// check, so an honest refusal is never charged as a missing chunk; neighbour
+/// sync places the record with it later. Single-node offers are not tracked,
+/// and a peer that accepts a root-paid offer, or doesn't answer, is checked
+/// as before.
+///
+/// An entry lives from the offer's send to its possession check, as the
+/// check's own event does, so the map holds no more entries than there are
+/// checks pending.
+#[derive(Default)]
+pub(crate) struct RootOfferRefusals {
+    offers: parking_lot::Mutex<HashMap<u64, RootOffer>>,
+}
+
+/// One root-paid offer: the key, the peers it was sent to, and those that
+/// refused it.
+struct RootOffer {
+    key: XorName,
+    targets: HashSet<PeerId>,
+    refused: HashSet<PeerId>,
+}
+
+impl RootOfferRefusals {
+    /// Track the root-paid offer `request_id` of `key`, sent to `targets`.
+    pub(crate) fn open(&self, request_id: u64, key: XorName, targets: &[PeerId]) {
+        self.offers.lock().insert(
+            request_id,
+            RootOffer {
+                key,
+                targets: targets.iter().copied().collect(),
+                refused: HashSet::new(),
+            },
+        );
+    }
+
+    /// Note that `source` refused the offer `request_id` of `key`. Only a
+    /// peer the offer was sent to, naming the offer's key, counts. Returns
+    /// whether the refusal was noted.
+    pub(crate) fn note_refusal(&self, request_id: u64, source: &PeerId, key: &XorName) -> bool {
+        let mut offers = self.offers.lock();
+        let Some(offer) = offers.get_mut(&request_id) else {
+            return false;
+        };
+        if offer.key != *key || !offer.targets.contains(source) {
+            return false;
+        }
+        offer.refused.insert(*source);
+        true
+    }
+
+    /// Close the offer `request_id`: `peers` without those that refused it.
+    /// Unknown ids leave `peers` as they are.
+    pub(crate) fn close(&self, request_id: u64, peers: Vec<PeerId>) -> Vec<PeerId> {
+        let Some(offer) = self.offers.lock().remove(&request_id) else {
+            return peers;
+        };
+        peers
+            .into_iter()
+            .filter(|peer| !offer.refused.contains(peer))
+            .collect()
+    }
+
+    /// How many root-paid offers wait for their possession check.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.offers.lock().len()
+    }
+}
+
+/// Whether `proof_of_payment` pays through the root vault, so a peer that
+/// can't check a root proof may refuse its offer.
+fn is_root_paid(proof_of_payment: &[u8]) -> bool {
+    match detect_proof_type(proof_of_payment) {
+        Some(ProofType::Root) => true,
+        Some(ProofType::SingleNode | ProofType::Merkle) | None => false,
+    }
 }
 
 /// An encoded fresh offer and the pending-offer permit it holds.
@@ -134,6 +226,7 @@ pub(crate) async fn send_fresh_offers(
         .map(|n| n.peer_id)
         .collect();
 
+    let root_paid = is_root_paid(&proof_of_payment);
     let offer = FreshReplicationOffer {
         key: *key,
         data,
@@ -158,6 +251,11 @@ pub(crate) async fn send_fresh_offers(
     let encoded = Bytes::from_owner(EncodedOffer {
         bytes: encoded,
         _pending: pending_offer,
+    });
+    // Tracked before any send, so a refusal that comes back at once is noted.
+    let root_offer = (root_paid && !target_peers.is_empty()).then(|| {
+        ctx.root_offers.open(request_id, *key, &target_peers);
+        request_id
     });
     for peer in &target_peers {
         let p2p = Arc::clone(&ctx.p2p_node);
@@ -212,10 +310,14 @@ pub(crate) async fn send_fresh_offers(
     // close-group peers. A closed receiver (engine shutting down) is ignored.
     if !target_peers.is_empty() {
         ctx.dispatched.fetch_add(1, Ordering::Relaxed);
-        let _ = ctx.possession_check_tx.send(PossessionCheckEvent {
+        let sent = ctx.possession_check_tx.send(PossessionCheckEvent {
             key: *key,
             peers: target_peers,
+            root_offer,
         });
+        if let (Err(_), Some(id)) = (sent, root_offer) {
+            ctx.root_offers.close(id, Vec::new());
+        }
     }
 }
 
@@ -293,5 +395,64 @@ mod tests {
         assert_eq!(permits.available_permits(), 0);
         drop(held_elsewhere);
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    fn peer(byte: u8) -> PeerId {
+        PeerId::from_bytes([byte; 32])
+    }
+
+    /// Only a root proof makes an offer one a peer may refuse unpenalised.
+    #[test]
+    fn only_a_root_proof_is_root_paid() {
+        use crate::ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE};
+        use crate::payment::{serialize_root_proof, PaymentProof, RootPaymentProof};
+
+        let root = serialize_root_proof(&RootPaymentProof {
+            payment: PaymentProof {
+                proof_of_payment: evmlib::ProofOfPayment {
+                    peer_quotes: Vec::new(),
+                },
+                tx_hashes: Vec::new(),
+                commitment_sidecars: Vec::new(),
+            },
+            quote_hash: evmlib::common::QuoteHash::from([1; 32]),
+            amount: evmlib::common::Amount::from(1u64),
+            index: 0,
+            leaf_count: 1,
+            path: Vec::new(),
+        })
+        .expect("encode");
+        assert!(is_root_paid(&root));
+        assert!(!is_root_paid(&[PROOF_TAG_SINGLE_NODE, 0x90]));
+        assert!(!is_root_paid(&[PROOF_TAG_MERKLE, 0x90]));
+        assert!(!is_root_paid(&[0x7f, 0x90]));
+        assert!(!is_root_paid(&[]));
+    }
+
+    /// A peer that refuses a root-paid offer is left out of that key's
+    /// possession check; one that accepted or never answered stays in it. A
+    /// refusal from a peer the offer was not sent to, naming another key, or
+    /// for another offer, is ignored, and closing the offer forgets it.
+    #[test]
+    fn a_peer_that_refuses_a_root_paid_offer_is_left_out_of_its_possession_check() {
+        let offers = RootOfferRefusals::default();
+        let key = [0x42; 32];
+        let targets = vec![peer(1), peer(2), peer(3)];
+        offers.open(7, key, &targets);
+        assert_eq!(offers.pending(), 1);
+
+        assert!(offers.note_refusal(7, &peer(2), &key));
+        assert!(!offers.note_refusal(7, &peer(9), &key), "not a target");
+        assert!(
+            !offers.note_refusal(7, &peer(3), &[0x43; 32]),
+            "another key"
+        );
+        assert!(!offers.note_refusal(8, &peer(1), &key), "another offer");
+
+        assert_eq!(offers.close(7, targets.clone()), vec![peer(1), peer(3)]);
+        assert_eq!(offers.pending(), 0);
+        // Closed: a late refusal is ignored, and the id no longer filters.
+        assert!(!offers.note_refusal(7, &peer(1), &key));
+        assert_eq!(offers.close(7, targets.clone()), targets);
     }
 }

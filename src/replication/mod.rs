@@ -1858,6 +1858,9 @@ pub struct ReplicationEngine {
     possession_check_tx: mpsc::UnboundedSender<possession::PossessionCheckEvent>,
     /// Receiver paired with `possession_check_tx`; taken by the scheduler task.
     possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
+    /// Root-paid fresh offers awaiting their possession check, and the peers
+    /// that refused them, who are left out of it.
+    root_offers: Arc<fresh::RootOfferRefusals>,
     /// ADR-0004: sender the payment verifier clones to surface monetized pins
     /// for a deterministic first audit. The matching receiver is drained by
     /// `start_first_audit_drainer`. BOUNDED (Amendment 2): the producer
@@ -1995,6 +1998,7 @@ impl ReplicationEngine {
             listings: None,
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
+            root_offers: Arc::new(fresh::RootOfferRefusals::default()),
             monetized_pin_tx,
             monetized_pin_rx: Some(monetized_pin_rx),
             first_audit_observability: Arc::new(FirstAuditObservability::default()),
@@ -2562,6 +2566,7 @@ impl ReplicationEngine {
             send_semaphore: Arc::clone(&self.send_semaphore),
             possession_check_tx: self.possession_check_tx.clone(),
             dispatched: Arc::clone(&self.fresh_offers_dispatched),
+            root_offers: Arc::clone(&self.root_offers),
         }
     }
 
@@ -2755,6 +2760,7 @@ impl ReplicationEngine {
         let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let shutdown = self.shutdown.clone();
         let detached_task_tracker = self.detached_task_tracker.clone();
+        let root_offers = Arc::clone(&self.root_offers);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2762,6 +2768,7 @@ impl ReplicationEngine {
                     () = shutdown.cancelled() => break,
                     event = rx.recv() => {
                         let Some(event) = event else { break };
+                        let root_offers = Arc::clone(&root_offers);
                         // Spawn a per-chunk delayed check so the drain loop
                         // keeps pace with the write rate. Each check sleeps the
                         // randomised settle delay, then probes every peer.
@@ -2794,9 +2801,15 @@ impl ReplicationEngine {
                                 () = shutdown.cancelled() => {}
                                 () = async {
                                     tokio::time::sleep(delay).await;
+                                    // A peer that refused a root-paid offer
+                                    // is not charged for the chunk it refused.
+                                    let peers = match event.root_offer {
+                                        Some(id) => root_offers.close(id, event.peers),
+                                        None => event.peers,
+                                    };
                                     possession::run_possession_check(
                                         event.key,
-                                        event.peers,
+                                        peers,
                                         &p2p,
                                         &storage,
                                         &config,
@@ -3117,6 +3130,7 @@ impl ReplicationEngine {
         let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
         let fresh_offer_responder_inflight = Arc::clone(&self.fresh_offer_responder_inflight);
         let fresh_offer_in_flight = Arc::clone(&self.fresh_offer_in_flight);
+        let root_offers = Arc::clone(&self.root_offers);
         let paid_notify_worker_semaphore = Arc::clone(&self.paid_notify_worker_semaphore);
         let paid_notify_admission_semaphore = Arc::clone(&self.paid_notify_admission_semaphore);
         let paid_notify_responder_inflight = Arc::clone(&self.paid_notify_responder_inflight);
@@ -3170,6 +3184,7 @@ impl ReplicationEngine {
             fresh_offer_admission_semaphore,
             fresh_offer_responder_inflight,
             fresh_offer_in_flight,
+            root_offers,
             paid_notify_worker_semaphore,
             paid_notify_admission_semaphore,
             paid_notify_responder_inflight,
@@ -4650,6 +4665,8 @@ struct ReplicationMessageHandlerContext {
     fresh_offer_admission_semaphore: Arc<Semaphore>,
     fresh_offer_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_in_flight: FreshOfferInFlight,
+    /// Root-paid fresh offers this node sent, and the peers that refused them.
+    root_offers: Arc<fresh::RootOfferRefusals>,
     paid_notify_worker_semaphore: Arc<Semaphore>,
     paid_notify_admission_semaphore: Arc<Semaphore>,
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
@@ -5918,8 +5935,25 @@ async fn handle_replication_message(
             }
             Ok(())
         }
+        // A refusal of a root-paid fresh offer this node sent: the refusing
+        // peer is left out of that key's possession check.
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+            key,
+            reason,
+        }) => {
+            if ctx.root_offers.note_refusal(msg.request_id, source, &key) {
+                debug!(
+                    "Root-paid fresh offer for {} refused by {source}, left out of its \
+                     possession check: {reason}",
+                    hex::encode(key)
+                );
+            }
+            Ok(())
+        }
         // Response messages are handled by their respective request initiators.
-        ReplicationMessageBody::FreshReplicationResponse(_)
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Accepted {
+            ..
+        })
         | ReplicationMessageBody::NeighborSyncResponse(_)
         | ReplicationMessageBody::VerificationResponse(_)
         | ReplicationMessageBody::FetchResponse(_)

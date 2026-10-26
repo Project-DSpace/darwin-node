@@ -59,6 +59,10 @@ pub struct PossessionCheckEvent {
     pub key: XorName,
     /// Close-group peers responsible for holding it (excludes self).
     pub peers: Vec<PeerId>,
+    /// The request id of a root-paid fresh offer
+    /// ([`RootOfferRefusals`](crate::replication::fresh::RootOfferRefusals)):
+    /// the peers that refused it are left out of the check.
+    pub root_offer: Option<u64>,
 }
 
 /// Verdict of cryptographically probing a single peer for possession of a chunk.

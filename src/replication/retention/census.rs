@@ -1983,8 +1983,7 @@ fn the_per_quote_cache_takes_the_per_quote_vaults_logs_alone() {
 /// ([`PROOF_TYPE_SITES`]).
 #[test]
 fn every_place_that_decides_by_proof_type_is_reviewed() {
-    const DETECT: &[(Option<&str>, &str)] = &[(None, "detect_proof_type")];
-    let report = unreviewed(Counting::Mentions(DETECT), PROOF_TYPE_SITES);
+    let report = unreviewed(Counting::Mentions(PROOF_TYPE_DECIDERS), PROOF_TYPE_SITES);
     assert!(
         report.is_empty(),
         "\nProduction code decides by a payment proof's type somewhere new.\n\n{report}\n\
@@ -2142,14 +2141,58 @@ const PROOF_TYPES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The functions that decide by a payment proof's type: `detect_proof_type`,
+/// and each tag's decoder, which refuses every other tag. A place that calls
+/// a decoder directly takes that one type alone, as the listing service once
+/// took single-node proofs alone, so it is counted as a place that decides.
+const PROOF_TYPE_DECIDERS: &[(Option<&str>, &str)] = &[
+    (None, "detect_proof_type"),
+    (None, "deserialize_single_node_proof"),
+    (None, "deserialize_merkle_proof"),
+    (None, "deserialize_root_proof"),
+    (None, "deserialize_proof"),
+];
+
 /// Every place in production code that decides by a payment proof's type,
-/// found by its mentions of `detect_proof_type`, with what each type does
+/// found by its mentions of [`PROOF_TYPE_DECIDERS`], with what each type does
 /// there. Each decides with a `match` that names every type, so a new type
 /// doesn't build until each place handles it; this list catches a new place.
 const PROOF_TYPE_SITES: &[Reviewed] = &[
-    // Re-exports of the vendored protocol's function: no decision.
+    // Re-exports of the vendored protocol's functions: no decision.
     ("src/payment/mod.rs", "<module>", "detect_proof_type", 1),
+    (
+        "src/payment/mod.rs",
+        "<module>",
+        "deserialize_merkle_proof",
+        1,
+    ),
+    ("src/payment/mod.rs", "<module>", "deserialize_proof", 1),
+    (
+        "src/payment/mod.rs",
+        "<module>",
+        "deserialize_root_proof",
+        1,
+    ),
     ("src/payment/proof.rs", "<module>", "detect_proof_type", 1),
+    (
+        "src/payment/proof.rs",
+        "<module>",
+        "deserialize_merkle_proof",
+        1,
+    ),
+    ("src/payment/proof.rs", "<module>", "deserialize_proof", 1),
+    (
+        "src/payment/proof.rs",
+        "<module>",
+        "deserialize_root_proof",
+        1,
+    ),
+    (
+        "src/payment/proof.rs",
+        "<module>",
+        "deserialize_single_node_proof",
+        1,
+    ),
     // The dispatch: single-node and root proofs are verified, each against
     // its own vault; merkle proofs are refused first; an unknown tag is
     // refused.
@@ -2157,6 +2200,26 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
         "src/payment/verifier.rs",
         "PaymentVerifier::verify_payment_inner",
         "detect_proof_type",
+        1,
+    ),
+    (
+        "src/payment/verifier.rs",
+        "PaymentVerifier::verify_payment_inner",
+        "deserialize_single_node_proof",
+        1,
+    ),
+    (
+        "src/payment/verifier.rs",
+        "PaymentVerifier::verify_payment_inner",
+        "deserialize_root_proof",
+        1,
+    ),
+    // Upstream's merkle check, which the dispatch never reaches: merkle
+    // proofs are refused first. Kept for cheap merges, and unit-tested.
+    (
+        "src/payment/verifier.rs",
+        "PaymentVerifier::verify_merkle_payment",
+        "deserialize_merkle_proof",
         1,
     ),
     // The metrics label: "single_node", "merkle", "root", else "unknown".
@@ -2172,6 +2235,24 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
         "detect_proof_type",
         1,
     ),
+    (
+        "src/payment/verifier.rs",
+        "<module>",
+        "deserialize_merkle_proof",
+        1,
+    ),
+    (
+        "src/payment/verifier.rs",
+        "<module>",
+        "deserialize_root_proof",
+        1,
+    ),
+    (
+        "src/payment/verifier.rs",
+        "<module>",
+        "deserialize_single_node_proof",
+        1,
+    ),
     // The sidecar strip before a stored chunk is offered to its close
     // group: single-node, merkle and root proofs alike lose their sidecars;
     // an unknown tag is forwarded unchanged.
@@ -2180,6 +2261,39 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
         "AntProtocol::strip_commitment_sidecars",
         "detect_proof_type",
         2,
+    ),
+    (
+        "src/storage/handler.rs",
+        "AntProtocol::strip_commitment_sidecars",
+        "deserialize_single_node_proof",
+        2,
+    ),
+    (
+        "src/storage/handler.rs",
+        "AntProtocol::strip_commitment_sidecars",
+        "deserialize_merkle_proof",
+        2,
+    ),
+    (
+        "src/storage/handler.rs",
+        "AntProtocol::strip_commitment_sidecars",
+        "deserialize_root_proof",
+        2,
+    ),
+    // Whether a fresh offer is root-paid, so a peer that refuses it is left
+    // out of the key's possession check: root proofs only; single-node,
+    // merkle and unknown tags are checked as before.
+    (
+        "src/replication/fresh.rs",
+        "is_root_paid",
+        "detect_proof_type",
+        1,
+    ),
+    (
+        "src/replication/fresh.rs",
+        "<module>",
+        "detect_proof_type",
+        1,
     ),
     // An envelope's listing: found from a single-node or a root proof's
     // transactions; refused for a merkle proof or an unknown tag.
@@ -2191,8 +2305,32 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
     ),
     (
         "src/listings/service.rs",
+        "ListingService::find_payment",
+        "deserialize_single_node_proof",
+        1,
+    ),
+    (
+        "src/listings/service.rs",
+        "ListingService::find_payment",
+        "deserialize_root_proof",
+        1,
+    ),
+    (
+        "src/listings/service.rs",
         "<module>",
         "detect_proof_type",
+        1,
+    ),
+    (
+        "src/listings/service.rs",
+        "<module>",
+        "deserialize_single_node_proof",
+        1,
+    ),
+    (
+        "src/listings/service.rs",
+        "<module>",
+        "deserialize_root_proof",
         1,
     ),
 ];
