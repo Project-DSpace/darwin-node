@@ -188,31 +188,55 @@ static TX_COUNT: [AtomicU64; ChunkResponseKey::N] =
 static SEND_FAILED_BYTES: AtomicU64 = AtomicU64::new(0);
 static SEND_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The settlement versions single-node quote requests are counted by: each
-/// version up to the root release's, 3, and every other in slot 0.
-const QUOTE_VERSIONS: usize = 4;
-static QUOTE_VERSION_COUNT: [AtomicU64; QUOTE_VERSIONS] =
-    [const { AtomicU64::new(0) }; QUOTE_VERSIONS];
-
-/// The slot of settlement version `version` in [`QUOTE_VERSION_COUNT`].
-fn quote_version_slot(version: u32) -> usize {
-    usize::try_from(version)
-        .ok()
-        .filter(|slot| (1..QUOTE_VERSIONS).contains(slot))
-        .unwrap_or(0)
+/// Which quote path a versioned quote request came in on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotePath {
+    SingleNode,
+    Merkle,
 }
 
-/// Record one version-declaring single-node quote request by the settlement
-/// version it declares, whether or not it is then quoted.
-pub fn record_quote_version(version: u32) {
-    QUOTE_VERSION_COUNT[quote_version_slot(version)].fetch_add(1, Ordering::Relaxed);
+/// The settlement version a versioned quote request declared: 1 (pays every
+/// record as a full chunk), 2 (pays a record by its size class), 3 (accepts
+/// root proofs as well), or any other.
+const DECLARED_VERSIONS: usize = 4;
+
+/// A version in the last slot: every version but 1, 2 and 3 shares it.
+const OTHER_VERSION: u32 = 0;
+
+/// Versioned quote requests by path and declared settlement version, browser
+/// quotes at the next protocol version included (they are asked as version 2).
+/// Indices: `path × DECLARED_VERSIONS + version slot`.
+static DECLARED_VERSION_COUNT: [AtomicU64; 2 * DECLARED_VERSIONS] =
+    [const { AtomicU64::new(0) }; 2 * DECLARED_VERSIONS];
+
+const fn declared_version_index(path: QuotePath, settlement_version: u32) -> usize {
+    let path = match path {
+        QuotePath::SingleNode => 0,
+        QuotePath::Merkle => 1,
+    };
+    let version = match settlement_version {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        _ => 3,
+    };
+    path * DECLARED_VERSIONS + version
 }
 
-/// The quote requests declaring settlement version `version` counted so far
-/// in this process: for a version above 3, all of those.
+/// Record one versioned quote request by the settlement version it declared,
+/// whether or not the node then quotes it.
+pub fn record_declared_settlement_version(path: QuotePath, settlement_version: u32) {
+    DECLARED_VERSION_COUNT[declared_version_index(path, settlement_version)]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// The single-node quote requests declaring settlement version `version`
+/// counted so far in this process: for a version other than 1, 2 and 3, all
+/// of those.
 #[cfg(test)]
 pub fn quote_versions(version: u32) -> u64 {
-    QUOTE_VERSION_COUNT[quote_version_slot(version)].load(Ordering::Relaxed)
+    DECLARED_VERSION_COUNT[declared_version_index(QuotePath::SingleNode, version)]
+        .load(Ordering::Relaxed)
 }
 
 /// Record one inbound chunk message at decode time (wire length).
@@ -243,6 +267,11 @@ pub fn record_send_failed(bytes: usize) {
 /// (`group = 1`), chunk and quote tx by kind × outcome (`group = 2`), and
 /// pointer tx by kind × outcome (`group = 3`). Pointers take a line of their
 /// own because `group = 2` is already close to `tracing`'s 32-field cap.
+///
+/// The rx line also splits versioned quote requests by the settlement version
+/// they declared (`quote_v2_settlement_{1,2,3,other}_count` and the same for
+/// merkle), counted where the settlement gate reads it, so a browser quote at
+/// the next protocol version counts as version 2.
 pub fn log_chunk_rpc_traffic_summary() {
     use ChunkRequestKind as Q;
     use ChunkResponseKey as R;
@@ -251,8 +280,9 @@ pub fn log_chunk_rpc_traffic_summary() {
     let rc = |k: Q| RX_COUNT[k.index()].load(Ordering::Relaxed);
     let tb = |k: R| TX_BYTES[k.index()].load(Ordering::Relaxed);
     let tc = |k: R| TX_COUNT[k.index()].load(Ordering::Relaxed);
-    let qv =
-        |version: u32| QUOTE_VERSION_COUNT[quote_version_slot(version)].load(Ordering::Relaxed);
+    let vc = |path: QuotePath, version: u32| {
+        DECLARED_VERSION_COUNT[declared_version_index(path, version)].load(Ordering::Relaxed)
+    };
 
     crate::logging::info!(
         target: "ant_node::storage::traffic",
@@ -262,14 +292,20 @@ pub fn log_chunk_rpc_traffic_summary() {
         quote_rx_bytes = rb(Q::Quote), quote_rx_count = rc(Q::Quote),
         merkle_quote_rx_bytes = rb(Q::MerkleQuote), merkle_quote_rx_count = rc(Q::MerkleQuote),
         quote_v2_rx_bytes = rb(Q::QuoteV2), quote_v2_rx_count = rc(Q::QuoteV2),
-        quote_v2_settlement_1_count = qv(1), quote_v2_settlement_2_count = qv(2),
-        quote_v2_settlement_3_count = qv(3), quote_v2_settlement_other_count = qv(0),
         merkle_quote_v2_rx_bytes = rb(Q::MerkleQuoteV2),
         merkle_quote_v2_rx_count = rc(Q::MerkleQuoteV2),
         pointer_get_rx_bytes = rb(Q::PointerGet), pointer_get_rx_count = rc(Q::PointerGet),
         pointer_put_rx_bytes = rb(Q::PointerPut), pointer_put_rx_count = rc(Q::PointerPut),
         other_rx_bytes = rb(Q::Other), other_rx_count = rc(Q::Other),
         decode_error_rx_bytes = rb(Q::DecodeError), decode_error_rx_count = rc(Q::DecodeError),
+        quote_v2_settlement_1_count = vc(QuotePath::SingleNode, 1),
+        quote_v2_settlement_2_count = vc(QuotePath::SingleNode, 2),
+        quote_v2_settlement_3_count = vc(QuotePath::SingleNode, 3),
+        quote_v2_settlement_other_count = vc(QuotePath::SingleNode, OTHER_VERSION),
+        merkle_quote_v2_settlement_1_count = vc(QuotePath::Merkle, 1),
+        merkle_quote_v2_settlement_2_count = vc(QuotePath::Merkle, 2),
+        merkle_quote_v2_settlement_3_count = vc(QuotePath::Merkle, 3),
+        merkle_quote_v2_settlement_other_count = vc(QuotePath::Merkle, OTHER_VERSION),
         "chunk rpc traffic summary (cumulative)"
     );
 
@@ -371,21 +407,83 @@ mod tests {
         }
     }
 
-    /// Quote requests are counted by settlement version: 1, 2 and 3 apart,
-    /// and every other version together.
+    /// Versioned quotes are split by path and by declared version 1, 2, 3
+    /// or any other, each in a slot of its own.
     #[test]
-    fn quote_requests_are_counted_by_settlement_version() {
-        let slots: Vec<usize> = [1, 2, 3].into_iter().map(quote_version_slot).collect();
-        assert_eq!(slots, [1, 2, 3]);
-        for other in [0, 4, u32::MAX] {
-            assert_eq!(quote_version_slot(other), 0, "{other}");
+    fn versioned_quotes_are_counted_by_path_and_declared_version() {
+        let mut seen = std::collections::HashSet::new();
+        for path in [QuotePath::SingleNode, QuotePath::Merkle] {
+            for version in [1, 2, 3, 0] {
+                assert!(seen.insert(declared_version_index(path, version)));
+            }
+            for other in [0, 4, u32::MAX] {
+                assert_eq!(
+                    declared_version_index(path, other),
+                    declared_version_index(path, 0)
+                );
+            }
         }
+        assert_eq!(seen.len(), 2 * DECLARED_VERSIONS);
+        assert!(seen.iter().all(|&i| i < 2 * DECLARED_VERSIONS));
+
+        let count = |path, version| {
+            DECLARED_VERSION_COUNT[declared_version_index(path, version)].load(Ordering::Relaxed)
+        };
+        let before = count(QuotePath::Merkle, 2);
+        record_declared_settlement_version(QuotePath::Merkle, 2);
+        assert!(count(QuotePath::Merkle, 2) > before);
         let before = quote_versions(3);
         let before_other = quote_versions(9);
-        record_quote_version(3);
-        record_quote_version(9);
+        record_declared_settlement_version(QuotePath::SingleNode, 3);
+        record_declared_settlement_version(QuotePath::SingleNode, 9);
         assert!(quote_versions(3) > before);
         assert!(quote_versions(0) > before_other);
+    }
+
+    /// The summary's rx line carries the eight version counts.
+    #[test]
+    #[cfg(feature = "logging")]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn the_rx_summary_line_carries_the_version_counts() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::writer::{MakeWriter, MutexGuardWriter};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl<'a> MakeWriter<'a> for Sink {
+            type Writer = MutexGuardWriter<'a, Vec<u8>>;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.0.make_writer()
+            }
+        }
+
+        record_declared_settlement_version(QuotePath::SingleNode, 1);
+        let sink = Sink::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(sink.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, log_chunk_rpc_traffic_summary);
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let rx = text
+            .lines()
+            .find(|line| line.contains("group=1"))
+            .expect("the rx line");
+        for field in [
+            "quote_v2_settlement_1_count=",
+            "quote_v2_settlement_2_count=",
+            "quote_v2_settlement_3_count=",
+            "quote_v2_settlement_other_count=",
+            "merkle_quote_v2_settlement_1_count=",
+            "merkle_quote_v2_settlement_2_count=",
+            "merkle_quote_v2_settlement_3_count=",
+            "merkle_quote_v2_settlement_other_count=",
+            "decode_error_rx_count=",
+        ] {
+            assert!(rx.contains(field), "{field} missing: {rx}");
+        }
+        assert!(!rx.contains(" quote_v2_settlement_1_count=0 "), "{rx}");
     }
 
     #[test]

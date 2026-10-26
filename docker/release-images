@@ -1,0 +1,12 @@
+# The image each node release put on the storage-node image's :latest
+# before the Build workflow attested the images it pushes: the release's
+# tag, the commit the image was built from and the image's digest, as the
+# release's Release run moved :latest to it, which the commit's Build run
+# recorded in its storage-node-digest artifact and the registry has as
+# storage-node:<commit>. That artifact, these images' only other record,
+# expires 30 days after its run. .github/workflows/latest.yml takes a line
+# here as the record of a withdrawal's image, for a v*+ds.* tag on the
+# commit, and scripts/check-workflows.sh holds this file to these lines.
+v0.23.0+ds.13 cbd133ba3665b38b81890a6932ae1657d7a32712 sha256:2ae69c3f66c44a16aa77aba712eafdaa3b7e99a3fe75ff46c238a003510b84e9
+v0.23.0+ds.14 bbfdf5e4f2ec7b117be4032f3a129c9e51058a6c sha256:70d2647fdc12ce3f2c2ac8a87ab7bf801294049ef405af26dfef4225955487ce
+v0.23.0+ds.15 20fbb745d06909a5adee55bcd9fc9113e466ce16 sha256:edd2e1623fa31176f37c99ff6d3e0f40743fba0680f86dc2eac59b5b974e0208

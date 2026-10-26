@@ -2396,6 +2396,7 @@ mod tests {
                     // Confirmation from a peer outside the target set.
                     (outsider, PaidListEvidence::Confirmed),
                 ]),
+                paid_classes: HashMap::new(),
             },
         );
 

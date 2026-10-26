@@ -7,7 +7,10 @@ use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::cache::{CacheStats, PaidKey, VerifiedCache, XorName};
-use crate::payment::pricing::{calculate_price, derive_records_stored_from_price};
+use crate::payment::paid_class::PaidClass;
+use crate::payment::pricing::{
+    band_bottom_count, calculate_price, derive_records_stored_from_price,
+};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_root_proof, deserialize_single_node_proof,
     detect_proof_type, ProofType, RootPaymentProof,
@@ -318,6 +321,14 @@ struct LegacyMedianCandidate<'a> {
     encoded_peer_id: &'a evmlib::EncodedPeerId,
     quote: &'a PaymentQuote,
     expected_amount: Amount,
+}
+
+/// A payment that verified: the paid (median) quote's price, and the amount
+/// the vault recorded for that quote.
+#[derive(Clone, Copy)]
+struct Settled {
+    median_price: Amount,
+    amount: Amount,
 }
 
 /// How a median-priced candidate that passed every check before the chain
@@ -1436,7 +1447,6 @@ impl PaymentVerifier {
         // future update of a pointer as already paid — the 1.0 free-update
         // defect — so the cache is keyed separately, and never shares a key
         // with the chunk whose address happens to equal this state.
-        let xorname = target.content();
         let cache_key = *target;
         // First check if payment is required
         let status = self.check_payment_required_keyed(cache_key, context);
@@ -1448,102 +1458,152 @@ impl PaymentVerifier {
             }
             PaymentStatus::PaymentRequired => {
                 // EVM verification is always on — verify the proof
-                if let Some(proof) = payment_proof {
-                    let proof_len = proof.len();
-                    if proof_len < MIN_PAYMENT_PROOF_SIZE_BYTES {
-                        return Err(Error::Payment(format!(
-                            "Payment proof too small: {proof_len} bytes (min {MIN_PAYMENT_PROOF_SIZE_BYTES})"
-                        )));
-                    }
-                    if proof_len > MAX_PAYMENT_PROOF_SIZE_BYTES {
-                        return Err(Error::Payment(format!(
-                            "Payment proof too large: {proof_len} bytes (max {MAX_PAYMENT_PROOF_SIZE_BYTES} bytes)"
-                        )));
-                    }
-
-                    // Detect proof type from version tag byte. No arm
-                    // stands for several types, so a new one doesn't build
-                    // until it is handled here.
-                    match detect_proof_type(proof) {
-                        // Darwin refuses batch payments in every context
-                        // (see `BATCH_PAYMENTS_REFUSED`). Neighbour-sync
-                        // repair carries no proof and never reaches here, so
-                        // chunks already stored keep being repaired.
-                        Some(ProofType::Merkle) => {
-                            return Err(Error::Payment(BATCH_PAYMENTS_REFUSED.to_string()));
-                        }
-                        Some(ProofType::SingleNode) => {
-                            let parsed = deserialize_single_node_proof(proof).map_err(|e| {
-                                Error::Payment(format!("Failed to deserialize payment proof: {e}"))
-                            })?;
-
-                            if !parsed.tx_hashes.is_empty() {
-                                debug!(
-                                    "Proof includes {} transaction hash(es)",
-                                    parsed.tx_hashes.len()
-                                );
-                            }
-                            // Their receipts may spare the per-quote reads;
-                            // they never stand in for them.
-                            let tx_hashes: Vec<[u8; 32]> =
-                                parsed.tx_hashes.iter().map(|tx_hash| tx_hash.0).collect();
-
-                            self.verify_evm_payment(
-                                target,
-                                weight,
-                                &parsed.proof_of_payment,
-                                &tx_hashes,
-                                &parsed.commitment_sidecars,
-                                context,
-                            )
-                            .await?;
-                            crate::payment::traffic::record_settlement(
-                                crate::payment::traffic::SettledProof::SingleNode,
-                            );
-                        }
-                        // A payment recorded in a root vault's wave: settled
-                        // in the root vault's record of the wave, never in
-                        // the per-quote vault's.
-                        Some(ProofType::Root) => {
-                            let parsed = deserialize_root_proof(proof).map_err(|e| {
-                                Error::Payment(format!("Failed to deserialize root proof: {e}"))
-                            })?;
-                            self.verify_root_payment(target, weight, &parsed, context)
-                                .await?;
-                            crate::payment::traffic::record_settlement(
-                                crate::payment::traffic::SettledProof::Root,
-                            );
-                        }
-                        None => {
-                            let tag = proof.first().copied().unwrap_or(0);
-                            return Err(Error::Payment(format!(
-                                "Unknown payment proof type tag: 0x{tag:02x}"
-                            )));
-                        }
-                    }
-
-                    // Cache the verified xorname at the context's verification
-                    // strength. Stronger entries satisfy weaker future lookups,
-                    // but not the reverse.
-                    if context.is_store_admission() {
-                        self.cache.insert_key(cache_key);
-                    } else {
-                        self.cache.insert_paid_list_verified_key(cache_key);
-                    }
-
-                    Ok(PaymentStatus::PaymentVerified)
-                } else {
-                    // No payment provided in production mode
-                    let xorname_hex = hex::encode(xorname);
-                    Err(Error::Payment(format!(
-                        "Payment required for new data {xorname_hex}"
-                    )))
-                }
+                self.verify_proof(target, weight, payment_proof, context)
+                    .await?;
+                Ok(PaymentStatus::PaymentVerified)
             }
             PaymentStatus::PaymentVerified => Err(Error::Payment(
                 "Unexpected PaymentVerified status from check_payment_required".to_string(),
             )),
         }
+    }
+
+    /// Verify `payment_proof` for `target` at `weight`, whatever the
+    /// verified-proof cache holds, then cache the key at the context's
+    /// strength. Returns the paid quote's price and the amount settled for it.
+    async fn verify_proof(
+        &self,
+        target: &PaymentTarget,
+        weight: RecordWeight,
+        payment_proof: Option<&[u8]>,
+        context: VerificationContext,
+    ) -> Result<Settled> {
+        let xorname = target.content();
+        let cache_key = *target;
+        let Some(proof) = payment_proof else {
+            // No payment provided in production mode
+            let xorname_hex = hex::encode(xorname);
+            return Err(Error::Payment(format!(
+                "Payment required for new data {xorname_hex}"
+            )));
+        };
+        let proof_len = proof.len();
+        if proof_len < MIN_PAYMENT_PROOF_SIZE_BYTES {
+            return Err(Error::Payment(format!(
+                "Payment proof too small: {proof_len} bytes (min {MIN_PAYMENT_PROOF_SIZE_BYTES})"
+            )));
+        }
+        if proof_len > MAX_PAYMENT_PROOF_SIZE_BYTES {
+            return Err(Error::Payment(format!(
+                "Payment proof too large: {proof_len} bytes (max {MAX_PAYMENT_PROOF_SIZE_BYTES} bytes)"
+            )));
+        }
+
+        // Detect proof type from version tag byte. No arm stands for several
+        // types, so a new one doesn't build until it is handled here.
+        let settled = match detect_proof_type(proof) {
+            // Darwin refuses batch payments in every context
+            // (see `BATCH_PAYMENTS_REFUSED`). Neighbour-sync
+            // repair carries no proof and never reaches here, so
+            // chunks already stored keep being repaired.
+            Some(ProofType::Merkle) => {
+                return Err(Error::Payment(BATCH_PAYMENTS_REFUSED.to_string()));
+            }
+            Some(ProofType::SingleNode) => {
+                let parsed = deserialize_single_node_proof(proof).map_err(|e| {
+                    Error::Payment(format!("Failed to deserialize payment proof: {e}"))
+                })?;
+
+                if !parsed.tx_hashes.is_empty() {
+                    debug!(
+                        "Proof includes {} transaction hash(es)",
+                        parsed.tx_hashes.len()
+                    );
+                }
+                // Their receipts may spare the per-quote reads;
+                // they never stand in for them.
+                let tx_hashes: Vec<[u8; 32]> =
+                    parsed.tx_hashes.iter().map(|tx_hash| tx_hash.0).collect();
+
+                let settled = self
+                    .verify_evm_payment(
+                        target,
+                        weight,
+                        &parsed.proof_of_payment,
+                        &tx_hashes,
+                        &parsed.commitment_sidecars,
+                        context,
+                    )
+                    .await?;
+                crate::payment::traffic::record_settlement(
+                    crate::payment::traffic::SettledProof::SingleNode,
+                );
+                settled
+            }
+            // A payment recorded in a root vault's wave: settled in the root
+            // vault's record of the wave, never in the per-quote vault's.
+            Some(ProofType::Root) => {
+                let parsed = deserialize_root_proof(proof).map_err(|e| {
+                    Error::Payment(format!("Failed to deserialize root proof: {e}"))
+                })?;
+                let settled = self
+                    .verify_root_payment(target, weight, &parsed, context)
+                    .await?;
+                crate::payment::traffic::record_settlement(
+                    crate::payment::traffic::SettledProof::Root,
+                );
+                settled
+            }
+            None => {
+                let tag = proof.first().copied().unwrap_or(0);
+                return Err(Error::Payment(format!(
+                    "Unknown payment proof type tag: 0x{tag:02x}"
+                )));
+            }
+        };
+
+        // Cache the verified xorname at the context's verification
+        // strength. Stronger entries satisfy weaker future lookups,
+        // but not the reverse.
+        if context.is_store_admission() {
+            self.cache.insert_key(cache_key);
+        } else {
+            self.cache.insert_paid_list_verified_key(cache_key);
+        }
+
+        Ok(settled)
+    }
+
+    /// Verify a chunk's payment as [`Self::verify_payment`] does, requiring
+    /// `held`'s weight, and return the largest size class the settled amount
+    /// covers: what a payment notice records in the paid list.
+    ///
+    /// The class comes from the payment itself, so a key the verified-proof
+    /// cache holds from a paid-list admission is verified again; the payment
+    /// facts usually spare that a chain read. A key it holds from a store
+    /// admission was verified against its own bytes, whose class the payment
+    /// covered, so it counts as [`PaidClass::FULL`] with no read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Payment`] where [`Self::verify_payment`] refuses.
+    pub async fn verify_paid_class(
+        &self,
+        xorname: &XorName,
+        held: Held,
+        payment_proof: &[u8],
+        context: VerificationContext,
+    ) -> Result<PaidClass> {
+        let target = PaymentTarget::same(*xorname);
+        if self.cache.contains_client_put_verified_key(&target) {
+            return Ok(PaidClass::FULL);
+        }
+        let weight = held.weight();
+        let settled = self
+            .verify_proof(&target, weight, Some(payment_proof), context)
+            .await?;
+        Ok(PaidClass::covered_by(settled.median_price, settled.amount)
+            .unwrap_or_else(|| PaidClass::of_weight(weight)))
     }
 
     /// Verify that a pointer state was paid for.
@@ -1691,7 +1751,7 @@ impl PaymentVerifier {
         tx_hashes: &[[u8; 32]],
         commitment_sidecars: &[Vec<u8>],
         context: VerificationContext,
-    ) -> Result<()> {
+    ) -> Result<Settled> {
         // `content` is what a quote must name; `routing` is whose close group
         // may issue it. For a chunk they are one address, for a pointer they
         // are not.
@@ -1705,15 +1765,17 @@ impl PaymentVerifier {
         }
 
         Self::validate_quote_structure(payment)?;
-        // ADR-0004: re-run the `price == calculate_price(committed_key_count)`
-        // arithmetic/binding check on EVERY quote in the bundle (all single-node
-        // quotes), per the ADR's "every storer re-runs the
-        // price-equals-formula-of-count check on every quote in the bundle"
-        // rule — bundle-level, before median selection (the candidate loop below
-        // only sees median-priced quotes). This hard cutover also RETIRES the
-        // percentage-based own-quote price-staleness gate: a quote's price is
-        // now exactly bound to its committed count here (both the `(n>0, Some)`
-        // and baseline `(0, None)` shapes), and the committed responsible count
+        // ADR-0004 as ADR-0025 amends it: re-run the arithmetic/binding check,
+        // the price within the band its committed count allows
+        // (`calculate_price(band_bottom_count(K)) <= price <=
+        // calculate_price(K)`), on EVERY quote in the bundle (all single-node
+        // quotes), per the ADR's "every storer re-runs the check on every quote
+        // in the bundle" rule — bundle-level, before median selection (the
+        // candidate loop below only sees median-priced quotes). This hard
+        // cutover also RETIRES the percentage-based own-quote price-staleness
+        // gate: a quote's price is now bound to its committed count here (both
+        // the `(n>0, Some)` and baseline `(0, None)` shapes, the baseline's band
+        // being the one price `calculate_price(0)`), and the committed responsible count
         // legitimately differs from the on-disk count, so the old gate would
         // FALSE-REJECT healthy ADR quotes. The binding gate supersedes it.
         Self::validate_quote_arithmetic(payment)?;
@@ -1866,7 +1928,10 @@ impl PaymentVerifier {
             let xorname_hex = hex::encode(xorname);
             info!("EVM payment verified for {xorname_hex}");
         }
-        Ok(())
+        Ok(Settled {
+            median_price: paid_price,
+            amount: settled_amount,
+        })
     }
 
     /// Verify a root proof: the paid quote's payment recorded in a root
@@ -1886,7 +1951,8 @@ impl PaymentVerifier {
     /// must pay for the record's size class: `weighted_amount(median,
     /// weight)`, the same rule [`Self::verify_evm_payment`] applies. The price floor, the off-curve telemetry, the commitment
     /// cross-check and the first-audit nomination follow as for a single-node
-    /// proof, with the leaf's amount as the settled amount.
+    /// proof, with the leaf's amount as the settled amount, which it returns
+    /// beside the paid quote's price.
     ///
     /// The key binds the payee's whole address, where the per-quote vault's
     /// record holds its leading 16 bytes.
@@ -1896,7 +1962,7 @@ impl PaymentVerifier {
         weight: RecordWeight,
         proof: &RootPaymentProof,
         context: VerificationContext,
-    ) -> Result<()> {
+    ) -> Result<Settled> {
         let xorname = target.content();
         let payment = &proof.payment.proof_of_payment;
         Self::validate_quote_structure(payment)?;
@@ -1977,7 +2043,10 @@ impl PaymentVerifier {
                 hex::encode(key)
             );
         }
-        Ok(())
+        Ok(Settled {
+            median_price: paid_price,
+            amount: proof.amount,
+        })
     }
 
     /// Whether the root vault recorded a wave of `leaf_count` payments under
@@ -2401,9 +2470,10 @@ impl PaymentVerifier {
     /// and on the measured fleet spread one rank is worth roughly 15% of price
     /// while a 65% tolerance buys 1.54x. So **about a quarter of the sample**
     /// suffices in either direction: measured on this crate's own fixture, 4 of
-    /// 15 overstating neighbours reject an honest payment sitting at the true
-    /// median, and 4 of 15 understating ones (placed above the median, where an
-    /// attacker would put them) admit a cheapest-of-K underpayment.
+    /// 15 overstating neighbours reject an honest payment sitting at the bottom
+    /// of the true median's price band, and 4 of 15 understating ones (placed
+    /// above the median, where an attacker would put them) admit a
+    /// cheapest-of-K underpayment.
     ///
     /// Counts above `MAX_COMMITMENT_KEY_COUNT` are dropped outright, since
     /// gossip ingest authenticates the sender without bounding the count. That
@@ -2507,7 +2577,13 @@ impl PaymentVerifier {
             .get((sample.total.saturating_sub(1)) / 2)
             .copied()
             .unwrap_or_default();
-        let reference = calculate_price(usize::try_from(median_key_count).unwrap_or_default());
+        // At the bottom of the median count's price band: the price of a node
+        // committing to that many records, all in the smallest size class.
+        // A node may quote anywhere in its band, by its weight total, so an
+        // honest payment to any of them already settled clears this
+        // reference, whatever the sizes of the records the group holds.
+        let bottom = band_bottom_count(u64::from(median_key_count));
+        let reference = calculate_price(usize::try_from(bottom).unwrap_or(usize::MAX));
         (Some(reference), sample)
     }
 
@@ -2515,8 +2591,9 @@ impl PaymentVerifier {
     ///
     /// Requires the settled on-chain amount to also clear
     /// `PAID_QUOTE_PAYMENT_MULTIPLIER × tolerance% ×` the close group's median
-    /// commitment-bound price (see [`Self::group_reference_price`]) × `weight`,
-    /// the record's size class, rounded up as the per-quote requirement is.
+    /// commitment-bound price at the bottom of its band (see
+    /// [`Self::group_reference_price`]) × `weight`, the record's size class,
+    /// rounded up as the per-quote requirement is.
     /// Together with the per-quote check above, the effective rule is
     /// `settled >= 3 × max(paid_price, tolerated_floor) × weight`, so the
     /// floor never asks a small record for a full chunk's amount.
@@ -2640,7 +2717,7 @@ impl PaymentVerifier {
     }
 
     /// The RPCs a payment is read through: the node's own, then, if it is one
-    /// of Robinhood Chain's public RPCs, the others.
+    /// of Robinhood Chain's public RPCs or one retired from them, the others.
     fn payment_rpc_urls(&self) -> Vec<reqwest::Url> {
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(urls) = self.test_payment_rpc_urls_override.read().as_ref() {
@@ -2650,7 +2727,8 @@ impl PaymentVerifier {
     }
 
     /// The RPCs payments on `network` are read through: its own, then, if it
-    /// is one of Robinhood Chain's public RPCs, the others.
+    /// is one of Robinhood Chain's public RPCs or one retired from them, the
+    /// others ([`crate::listings::listings_rpc_urls`]).
     fn network_rpc_urls(network: &EvmNetwork) -> Vec<reqwest::Url> {
         let own = network.rpc_url();
         let mut urls: Vec<reqwest::Url> = crate::listings::listings_rpc_urls(own.as_str())
@@ -2842,8 +2920,8 @@ impl PaymentVerifier {
     /// quote in **both** quote types — all 7 single-node quotes
     /// ([`Self::validate_quote_arithmetic`]) and all 16 merkle candidates
     /// ([`Self::validate_merkle_candidate_arithmetic`]) — because the rule
-    /// "every storer re-runs the price-equals-formula-of-count check on every
-    /// quote in the bundle" (ADR-0004) needs no peer-specific state and depends
+    /// "every storer re-runs the price-in-the-band-of-count check on every
+    /// quote in the bundle" (ADR-0004, ADR-0025) needs no peer-specific state and depends
     /// only on the bundle itself, so every honest storer reaches the same
     /// verdict with no split-brain risk.
     ///
@@ -2875,9 +2953,12 @@ impl PaymentVerifier {
     /// diagnostic iff the quote violates it. Shared by single-node quotes and
     /// merkle candidates via [`Self::binding_violation`].
     ///
-    /// The rule is the ADR's exact one — `price == calculate_price(
-    /// committed_key_count)`, recomputed, never inverted from the price (which
-    /// rounds) — PLUS a binding-shape check. There is no "legacy degradation"
+    /// The rule is the band ADR-0025 gives ADR-0004's binding — the price lies
+    /// between `calculate_price(band_bottom_count(committed_key_count))` and
+    /// `calculate_price(committed_key_count)`, both ends recomputed, never
+    /// inverted from the price (which rounds) — PLUS a binding-shape check. A
+    /// quote priced at a node's weight total, below its count, is in the band;
+    /// one priced at today's exact price is its top. There is no "legacy degradation"
     /// that infers an old quote from its field values: a `(0, None)` quote is
     /// rejected unless its price is exactly `calculate_price(0)`, closing the
     /// bypass where a modified node strips the pin yet prices above baseline.
@@ -2944,7 +3025,8 @@ impl PaymentVerifier {
         } else {
             let (bottom, top) = crate::payment::pricing::price_band(key_count);
             Some(format!(
-                "price {price} is outside the band for committed_key_count={committed_key_count}:                  calculate_price({}) = {bottom} to calculate_price({committed_key_count}) = {top}",
+                "price {price} is outside the band for committed_key_count={committed_key_count}: \
+                 calculate_price({}) = {bottom} to calculate_price({committed_key_count}) = {top}",
                 crate::payment::pricing::band_bottom_count(key_count)
             ))
         }
@@ -4123,7 +4205,7 @@ impl PaymentVerifier {
             }
         }
 
-        // ADR-0004: every storer re-runs the price-equals-formula-of-count
+        // ADR-0004: every storer re-runs the price-in-the-band-of-count
         // check on every merkle candidate, in every context, before median
         // reconstruction. Runs AFTER signature verification so observe-only
         // telemetry cannot be spoofed by unauthenticated senders. Reject-only
@@ -4736,7 +4818,21 @@ mod tests {
             [
                 "https://rpc.mainnet.chain.robinhood.com",
                 "https://robinhood-rpc.publicnode.com",
+            ]
+        );
+        // A node still on rpc.ordofi.network, retired from the defaults,
+        // reads through it and then both defaults.
+        let urls: Vec<String> = verifier_reading_through("https://rpc.ordofi.network")
+            .payment_rpc_urls()
+            .iter()
+            .map(|url| url.as_str().trim_end_matches('/').to_string())
+            .collect();
+        assert_eq!(
+            urls,
+            [
                 "https://rpc.ordofi.network",
+                "https://robinhood-rpc.publicnode.com",
+                "https://rpc.mainnet.chain.robinhood.com",
             ]
         );
         // An operator's own RPC (a local chain here) is the only one.
@@ -4789,8 +4885,8 @@ mod tests {
             })
             .await;
         let rounds = usize::try_from(PAYMENT_READ_ROUNDS).unwrap_or(usize::MAX);
-        assert_eq!(calls, 3 * rounds);
-        assert_eq!(answer, Err(format!("failure {}", 3 * rounds)));
+        assert_eq!(calls, 2 * rounds);
+        assert_eq!(answer, Err(format!("failure {}", 2 * rounds)));
     }
 
     /// One request a stub RPC received: its method, its parameters and when.
@@ -5932,9 +6028,9 @@ mod tests {
     }
 
     /// The settled amount the floor requires: 3x the tolerated fraction of the
-    /// close group's median commitment-bound price.
+    /// close group's median commitment-bound price, at the bottom of its band.
     fn group_floor_required_amount() -> Amount {
-        let tolerated = price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize)
+        let tolerated = price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize)
             * Amount::from(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT)
             / Amount::from(100u64);
         tolerated * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER)
@@ -5954,27 +6050,55 @@ mod tests {
         serialize_proof(peer_quotes)
     }
 
-    /// Close-group commitment counts used by the group-median floor tests.
+    /// The bottoms of the price bands of the close-group commitment counts
+    /// the group-median floor tests use: the counts the floor prices at.
     ///
     /// Exactly [`PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`] entries, so these tests
     /// sit on the gate rather than comfortably past it: drop one and the floor
     /// must skip. Spread widely enough that the cheapest sits below the tolerated
-    /// fraction of the median (asserted in the rejection test), and kept in the
-    /// low thousands because each entry builds a real signed merkle commitment.
-    const GROUP_TEST_KEY_COUNTS: [u32; 15] = [
+    /// fraction of the median (asserted in the rejection test).
+    const GROUP_TEST_BAND_BOTTOMS: [u32; 15] = [
         500, 800, 1_100, 1_400, 1_700, 2_000, 2_300, 2_600, 2_900, 3_200, 3_500, 3_800, 4_100,
         4_400, 4_700,
     ];
 
-    /// The LOWER median of [`GROUP_TEST_KEY_COUNTS`] plus this node's own
-    /// [`FLOOR_TEST_LOCAL_KEY_COUNT`].
+    /// The close-group commitment counts: for each of
+    /// [`GROUP_TEST_BAND_BOTTOMS`], the smallest count whose band starts there,
+    /// `ceil(1024 × bottom / 259)` (pinned by
+    /// `group_test_counts_start_their_bands_at_the_listed_bottoms`). Kept in the
+    /// low tens of thousands because each entry builds a real signed merkle
+    /// commitment.
+    const GROUP_TEST_KEY_COUNTS: [u32; 15] = [
+        1_977, 3_163, 4_350, 5_536, 6_722, 7_908, 9_094, 10_280, 11_466, 12_652, 13_838, 15_024,
+        16_211, 17_397, 18_583,
+    ];
+
+    /// The bottom of the band of the LOWER median of [`GROUP_TEST_KEY_COUNTS`]
+    /// plus this node's own [`FLOOR_TEST_LOCAL_KEY_COUNT`].
     ///
-    /// Sixteen samples, so the lower median is the eighth smallest: `2_600`. The
-    /// receiver's own count is an extreme outlier at the top and does not move
-    /// it, which is exactly the robustness a median buys. An even sample is
-    /// deliberate — it is the case where upper and lower median differ, and the
-    /// lower one is what production safety depends on.
-    const GROUP_TEST_MEDIAN_KEY_COUNT: u32 = 2_600;
+    /// Sixteen samples, so the lower median is the eighth smallest, `10_280`,
+    /// whose band starts at `2_600`. The receiver's own count is an extreme
+    /// outlier at the top and does not move it, which is exactly the
+    /// robustness a median buys. An even sample is deliberate — it is the case
+    /// where upper and lower median differ, and the lower one is what
+    /// production safety depends on.
+    ///
+    /// A quote at this count's price is the cheapest an honest node at the
+    /// median may give: one committing to the median count, every record in
+    /// the smallest size class.
+    const GROUP_TEST_MEDIAN_BAND_BOTTOM: u32 = 2_600;
+
+    #[test]
+    fn group_test_counts_start_their_bands_at_the_listed_bottoms() {
+        for (count, bottom) in GROUP_TEST_KEY_COUNTS.iter().zip(GROUP_TEST_BAND_BOTTOMS) {
+            assert_eq!(band_bottom_count(u64::from(*count)), u64::from(bottom));
+            assert!(band_bottom_count(u64::from(*count) - 1) < u64::from(bottom));
+        }
+        assert_eq!(
+            GROUP_TEST_BAND_BOTTOMS.get(7).copied(),
+            Some(GROUP_TEST_MEDIAN_BAND_BOTTOM)
+        );
+    }
 
     /// Build a gossip commitment cache holding one fresh commitment per entry of
     /// `key_counts`, attach it, and return the peer ids so the caller can put
@@ -6114,8 +6238,8 @@ mod tests {
         );
         assert_eq!(
             reference,
-            price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize),
-            "the reference must be the group median price, not this node's own"
+            price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize),
+            "the reference must be the price at the bottom of the group median's band, not this node's own"
         );
         assert!(
             reference < price_at_records(FLOOR_TEST_LOCAL_KEY_COUNT as usize),
@@ -6137,7 +6261,7 @@ mod tests {
         let neighbours =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
 
-        let median_price = price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize);
+        let median_price = price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize);
         let own_price = price_at_records(FLOOR_TEST_LOCAL_KEY_COUNT as usize);
         assert!(
             own_price > median_price * Amount::from(2u64),
@@ -6149,7 +6273,7 @@ mod tests {
         let proof_bytes = group_floor_proof(
             &verifier,
             xorname,
-            GROUP_TEST_MEDIAN_KEY_COUNT as usize,
+            GROUP_TEST_MEDIAN_BAND_BOTTOM as usize,
             settled,
             &neighbours,
         );
@@ -6178,9 +6302,10 @@ mod tests {
         let neighbours =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
 
-        let cheapest = GROUP_TEST_KEY_COUNTS.first().copied().unwrap_or(0) as usize;
+        // The cheapest group member, quoting at the bottom of its band.
+        let cheapest = GROUP_TEST_BAND_BOTTOMS.first().copied().unwrap_or(0) as usize;
         let cheapest_price = price_at_records(cheapest);
-        let tolerated = price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize)
+        let tolerated = price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize)
             * Amount::from(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT)
             / Amount::from(100u64);
         assert!(
@@ -6225,7 +6350,8 @@ mod tests {
 
         // A bundle stuffed with baseline-priced quotes: the client's own median
         // is now the floor price, which is exactly what it would want.
-        let cheapest = GROUP_TEST_KEY_COUNTS.first().copied().unwrap_or(0) as usize;
+        // The cheapest group member, quoting at the bottom of its band.
+        let cheapest = GROUP_TEST_BAND_BOTTOMS.first().copied().unwrap_or(0) as usize;
         let mut peer_quotes = Vec::new();
         let mut k_closest: Vec<[u8; 32]> = neighbours.clone();
         for seed in 1..=CLOSE_GROUP_SIZE {
@@ -6281,10 +6407,12 @@ mod tests {
 
         // Deep underpayment that this sample, if it were used, would reject.
         let settled = three_times(price_at_records(0));
-        let would_be_median = thin.get(thin.len() / 2).copied().unwrap_or_default();
+        let would_be_median = band_bottom_count(u64::from(
+            thin.get(thin.len() / 2).copied().unwrap_or_default(),
+        ));
         assert!(
             settled
-                < price_at_records(would_be_median as usize)
+                < price_at_records(usize::try_from(would_be_median).unwrap_or(usize::MAX))
                     * Amount::from(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT)
                     / Amount::from(100u64)
                     * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER),
@@ -6465,12 +6593,13 @@ mod tests {
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
         forge_key_counts(&verifier, neighbours.get(..4), MAX_COMMITMENT_KEY_COUNT).await;
 
-        // A completely honest payment, priced at the TRUE group median.
-        let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize));
+        // A completely honest payment, priced at the bottom of the TRUE group
+        // median's band.
+        let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize));
         let proof_bytes = group_floor_proof(
             &verifier,
             xorname,
-            GROUP_TEST_MEDIAN_KEY_COUNT as usize,
+            GROUP_TEST_MEDIAN_BAND_BOTTOM as usize,
             honest,
             &neighbours,
         );
@@ -6544,10 +6673,10 @@ mod tests {
     /// The bound is real but partial, and worth stating precisely rather than
     /// claiming immunity. Each liar shifts the order statistic up by one rank,
     /// so what protects the payment is the tolerance headroom, not the median
-    /// itself. In this fixture three liars move the reference `2_600` ->
-    /// `3_500` and an at-median payment still clears, by only 1.9%; four move it
-    /// to `3_800`
-    /// and the same payment is REJECTED (pinned by
+    /// itself. In this fixture three liars move the reference's band bottom
+    /// `2_600` -> `3_500` and a payment at the bottom of the median's band
+    /// still clears, by only 1.9%; four move it to `3_800` and the same payment
+    /// is REJECTED (pinned by
     /// `group_median_is_griefed_by_four_overstated_commitments`). The griefing
     /// bound is therefore about a quarter of the sample, the same as the
     /// disarming one — NOT "roughly half", which was the incorrect claim this
@@ -6567,12 +6696,13 @@ mod tests {
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
         forge_key_counts(&verifier, neighbours.get(..3), MAX_COMMITMENT_KEY_COUNT).await;
 
-        // An honest payment at the TRUE group median must still be admitted.
-        let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize));
+        // An honest payment at the bottom of the TRUE group median's band must
+        // still be admitted.
+        let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize));
         let proof_bytes = group_floor_proof(
             &verifier,
             xorname,
-            GROUP_TEST_MEDIAN_KEY_COUNT as usize,
+            GROUP_TEST_MEDIAN_BAND_BOTTOM as usize,
             honest,
             &neighbours,
         );
@@ -6693,7 +6823,7 @@ mod tests {
         );
         assert_eq!(
             reference,
-            Some(price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize)),
+            Some(price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize)),
             "the reference must be the fresh-only median; counting the stale cheap \
              entries would drag it below"
         );
@@ -9984,9 +10114,10 @@ mod tests {
 
         // Set every candidate price to calculate_price(500) so the pool is
         // honestly on-curve to start. The binding must move with the price:
-        // ADR-0004 requires `price == calculate_price(committed_key_count)`, so
-        // repricing at 500 records while leaving the count at 0 would make the
-        // pool dishonest rather than honest.
+        // the price must lie in the band its committed count allows, whose
+        // only price at count 0 is `calculate_price(0)`, so repricing at 500
+        // records while leaving the count at 0 would make the pool dishonest
+        // rather than honest.
         let on_curve = crate::payment::pricing::calculate_price(500);
         for c in &mut candidates {
             c.price = on_curve;
@@ -10463,7 +10594,7 @@ mod tests {
         let neighbours =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
         let held = Held::Bytes(1);
-        let median_price = price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize);
+        let median_price = price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize);
         let settled = weighted(median_price, held.weight());
         assert!(
             settled < group_floor_required_amount(),
@@ -10472,7 +10603,7 @@ mod tests {
         let proof_bytes = group_floor_proof(
             &verifier,
             xorname,
-            GROUP_TEST_MEDIAN_KEY_COUNT as usize,
+            GROUP_TEST_MEDIAN_BAND_BOTTOM as usize,
             settled,
             &neighbours,
         );
@@ -10488,6 +10619,158 @@ mod tests {
                 .await
                 .expect("a correct weighted payment clears the enforced floor"),
             PaymentStatus::PaymentVerified
+        );
+    }
+
+    /// The floor prices the group's median count at the bottom of its band, so
+    /// a payment to a node quoting there (one committing to the median count,
+    /// every record in the smallest class) clears an enforced floor, though it
+    /// is below a floor priced at the median count itself.
+    #[tokio::test]
+    async fn the_floor_prices_the_group_median_at_the_bottom_of_its_band() {
+        let verifier = floor_test_verifier(true);
+        let xorname = [0x6Fu8; 32];
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
+        verifier.set_paid_quote_k_closest_for_tests(neighbours.clone());
+        let (reference, _) = verifier.group_reference_price(&xorname).await;
+        assert_eq!(
+            reference,
+            Some(price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize))
+        );
+
+        let median_count = GROUP_TEST_KEY_COUNTS.get(7).copied().unwrap_or_default();
+        let floor_at_the_count = price_at_records(median_count as usize)
+            * Amount::from(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT)
+            / Amount::from(100u64);
+        let settled = three_times(price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize));
+        assert!(
+            settled < three_times(floor_at_the_count),
+            "only meaningful when a floor at the median count would refuse it"
+        );
+        let proof_bytes = group_floor_proof(
+            &verifier,
+            xorname,
+            GROUP_TEST_MEDIAN_BAND_BOTTOM as usize,
+            settled,
+            &neighbours,
+        );
+
+        assert_eq!(
+            verifier
+                .verify_payment(
+                    &xorname,
+                    FULL_CHUNK,
+                    Some(&proof_bytes),
+                    VerificationContext::ClientPut
+                )
+                .await
+                .expect("a payment at the bottom of the median's band clears the floor"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    /// A notice's payment is verified at the smallest class, and the class
+    /// it reports is the largest the settled amount covers.
+    #[tokio::test]
+    async fn a_notice_reports_the_largest_class_its_payment_covers() {
+        let xorname = [0x70u8; 32];
+        for class in [
+            PaidClass::SMALLEST,
+            PaidClass::of_len(100 * 1024),
+            PaidClass::FULL,
+        ] {
+            let verifier = create_test_verifier();
+            let proof = weighted_test_proof(&verifier, xorname, |median| {
+                weighted(median, class.weight())
+            });
+            assert_eq!(
+                verifier
+                    .verify_paid_class(
+                        &xorname,
+                        Held::Notice,
+                        &proof,
+                        VerificationContext::PaidListAdmission
+                    )
+                    .await
+                    .expect("a notice paying a class is admitted"),
+                class
+            );
+        }
+
+        // One wei below the next class up still reports the class below it.
+        let verifier = create_test_verifier();
+        let next = PaidClass::of_len(32 * 1024);
+        let proof = weighted_test_proof(&verifier, xorname, |median| {
+            weighted(median, next.weight()) - Amount::from(1u64)
+        });
+        assert_eq!(
+            verifier
+                .verify_paid_class(
+                    &xorname,
+                    Held::Notice,
+                    &proof,
+                    VerificationContext::PaidListAdmission
+                )
+                .await
+                .expect("above the smallest class is admitted"),
+            PaidClass::SMALLEST
+        );
+
+        // Below the smallest class is refused.
+        let verifier = create_test_verifier();
+        let proof = weighted_test_proof(&verifier, xorname, |median| {
+            weighted(median, PaidClass::SMALLEST.weight()) - Amount::from(1u64)
+        });
+        assert!(verifier
+            .verify_paid_class(
+                &xorname,
+                Held::Notice,
+                &proof,
+                VerificationContext::PaidListAdmission
+            )
+            .await
+            .is_err());
+    }
+
+    /// The class comes from the payment, so a key the cache holds from a
+    /// paid-list admission is verified again; one it holds from a store
+    /// admission was checked against its own bytes and counts as full.
+    #[tokio::test]
+    async fn a_notice_class_is_never_taken_from_a_paid_list_cache_entry() {
+        let xorname = [0x71u8; 32];
+        let verifier = create_test_verifier();
+        let proof = weighted_test_proof(&verifier, xorname, |median| {
+            weighted(median, PaidClass::SMALLEST.weight())
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                verifier
+                    .verify_paid_class(
+                        &xorname,
+                        Held::Notice,
+                        &proof,
+                        VerificationContext::PaidListAdmission
+                    )
+                    .await
+                    .expect("the smallest class admits a notice"),
+                PaidClass::SMALLEST
+            );
+        }
+
+        let stored = [0x72u8; 32];
+        verifier.cache_insert(stored);
+        assert_eq!(
+            verifier
+                .verify_paid_class(
+                    &stored,
+                    Held::Notice,
+                    &[0u8; 1],
+                    VerificationContext::PaidListAdmission
+                )
+                .await
+                .expect("a store admission's entry needs no proof"),
+            PaidClass::FULL
         );
     }
 }

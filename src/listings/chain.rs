@@ -94,21 +94,28 @@ impl Search {
 /// payments through the others too: a provider can refuse a method these
 /// reads need (PublicNode refuses `eth_getLogs`, which finding a payment
 /// whose transaction hash is hidden takes).
-const ROBINHOOD_PUBLIC_RPCS: [&str; 3] = [
+const ROBINHOOD_PUBLIC_RPCS: [&str; 2] = [
     "https://robinhood-rpc.publicnode.com",
-    "https://rpc.ordofi.network",
     "https://rpc.mainnet.chain.robinhood.com",
 ];
 
+/// Robinhood Chain public RPCs that are no longer among
+/// [`ROBINHOOD_PUBLIC_RPCS`]. A node still on one of them (an install whose
+/// compose file or environment names it) falls back across all of
+/// [`ROBINHOOD_PUBLIC_RPCS`] after it; no node falls back to one of these.
+const RETIRED_PUBLIC_RPCS: [&str; 1] = ["https://rpc.ordofi.network"];
+
 /// The RPCs a node on `rpc_url` reads listings' payments through: its own,
-/// then, if it is one of Robinhood Chain's public RPCs, the others. Storage
+/// then, if it is one of Robinhood Chain's public RPCs (or one retired from
+/// them, [`RETIRED_PUBLIC_RPCS`]), the others in [`ROBINHOOD_PUBLIC_RPCS`].
+/// Any other RPC (an operator's own, a local chain) is read alone. Storage
 /// payments are checked through the same RPCs (`PaymentVerifier`, from
 /// ds.8), so one busy provider doesn't make a node refuse a paid chunk.
 #[must_use]
 pub fn listings_rpc_urls(rpc_url: &str) -> Vec<String> {
     let own = rpc_url.trim_end_matches('/');
     let mut urls = vec![rpc_url.to_string()];
-    if ROBINHOOD_PUBLIC_RPCS.contains(&own) {
+    if ROBINHOOD_PUBLIC_RPCS.contains(&own) || RETIRED_PUBLIC_RPCS.contains(&own) {
         urls.extend(
             ROBINHOOD_PUBLIC_RPCS
                 .iter()
@@ -1388,7 +1395,6 @@ pub mod tests {
             listings_rpc_urls("https://robinhood-rpc.publicnode.com/"),
             vec![
                 "https://robinhood-rpc.publicnode.com/",
-                "https://rpc.ordofi.network",
                 "https://rpc.mainnet.chain.robinhood.com",
             ]
         );
@@ -1397,9 +1403,26 @@ pub mod tests {
             vec![
                 "https://rpc.mainnet.chain.robinhood.com",
                 "https://robinhood-rpc.publicnode.com",
-                "https://rpc.ordofi.network",
             ]
         );
+        // A public RPC retired from the defaults: its own first, then both
+        // of the defaults; no node falls back to it.
+        assert_eq!(
+            listings_rpc_urls("https://rpc.ordofi.network/"),
+            vec![
+                "https://rpc.ordofi.network/",
+                "https://robinhood-rpc.publicnode.com",
+                "https://rpc.mainnet.chain.robinhood.com",
+            ]
+        );
+        for own in ROBINHOOD_PUBLIC_RPCS {
+            assert!(
+                !listings_rpc_urls(own)
+                    .iter()
+                    .any(|url| url.contains("rpc.ordofi.network")),
+                "{own}"
+            );
+        }
         // Its own provider, or a local chain: that one alone.
         assert_eq!(
             listings_rpc_urls("http://127.0.0.1:8545"),

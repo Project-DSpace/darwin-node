@@ -533,11 +533,13 @@ const _: () = assert!(
 
 /// Rollout gate for ADR-0004 quote-arithmetic enforcement.
 ///
-/// When `true`, the payment verifier rejects any quote whose signed price does
-/// not lie exactly on the public pricing curve, i.e. there is no integer
-/// `key_count` for which `calculate_price(key_count) == quote.price`. The check
-/// is exact recomputation against the curve, never price-inversion (which
-/// rounds), per ADR-0004's "never by inverting the price" rule.
+/// When `true`, the payment verifier rejects any quote whose signed price lies
+/// outside the band its signed `committed_key_count` K allows (ADR-0025):
+/// `calculate_price(band_bottom_count(K)) <= quote.price <= calculate_price(K)`,
+/// so a quote priced at a node's weight total is accepted and none is above
+/// today's price for its count. Both ends are exact recomputations, never
+/// price-inversion (which rounds), per ADR-0004's "never by inverting the
+/// price" rule.
 ///
 /// When `false`, the check still runs and logs every would-be rejection, but
 /// does not reject — matching the ADR-0004 rollout: ship observe-only first,

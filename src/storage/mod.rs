@@ -68,6 +68,9 @@ pub(crate) use chunk_store::{rename_with_retry, Reservation};
 // Crate-private, as it was before the two stores became one: `CapacityVerdict` was
 // `pub(crate)` on the old store and has no caller outside this crate.
 pub(crate) use chunk_store::CapacityVerdict;
+/// The handler's test protocol, for the browser listener's quote tests.
+#[cfg(test)]
+pub(crate) use handler::tests as handler_tests;
 pub use handler::AntProtocol;
 pub(crate) use handler::ChunkRequestContext;
 pub use handler::SELF_CLOSENESS_GATE_WIDTH;

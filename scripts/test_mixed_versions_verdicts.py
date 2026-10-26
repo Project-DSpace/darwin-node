@@ -2,15 +2,19 @@
 """Tests the mixed-version harness's verdicts (scripts/test_mixed_versions.py)
 on made-up results: what a mixed run's penalties, refused PUTs and message
 families are measured against, with one all-old run and with several, and
-what counts as a new failure reason; and that the report and summary.json
+what counts as a new failure reason; that the report and summary.json
 list every count measured, with its excess and limit, within the limit or
-not. The Test workflow runs it; run it by hand with
+not; and what the quotes of records paid by size must show, and which
+penalties for them are reported apart. The Test workflow runs it; run it by hand with
 `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
 """
 
 import argparse
+import datetime
 import importlib.util
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent / "test_mixed_versions.py"
@@ -22,7 +26,7 @@ INCUMBENTS_FAIL = ("incumbent", "incumbent", "application_failure")
 JOINERS_TIME_OUT = ("joiner", "joiner", "connection_timeout")
 
 
-def result(penalties=None, refusals=None, families=None):
+def result(penalties=None, refusals=None, families=None, sized_quotes=None, releases=None):
     """One run's analysis as verdicts() reads it: `penalties` by (observer,
     target, reason), `refusals` by role, and the message families each role
     received, by role; every role gets neighbour sync."""
@@ -36,7 +40,8 @@ def result(penalties=None, refusals=None, families=None):
     return {
         "stalled_seconds": 0, "decode_failures": [], "audits": {}, "records": [],
         "checks": [], "full_evidence": {}, "traffic": traffic, "roles": roles,
-        "releases": {}, "ran": {}, "unanswered": {}, "penalties_on_refusals": {},
+        "releases": releases or {}, "ran": {}, "unanswered": {}, "penalties_on_refusals": {},
+        "sized_quotes": sized_quotes or {}, "penalties_on_sized": {},
         "penalties_on_full": {}, "between_releases": {},
         "penalties": {key: (count, float(count)) for key, count in (penalties or {}).items()},
         "refusals": refusals or {},
@@ -156,6 +161,99 @@ def listed(args):
                   "old-hosts-new": harness.comparisons(results["old-hosts-new"], baselines, args)})
 
 
+def sized(args):
+    """The quotes of records paid by size (settlement version 2): the
+    previous release must answer every one StorerUpdateRequired, this tree
+    none, and a run with both releases must ask the previous one."""
+    mixed = {"incumbent-00": "new", "joiner-00": "old"}
+    two = {"all-old": result(), "all-old-2": result()}
+    right = {"old": {"storer_update_required": 9}, "new": {"quoted": 30}}
+    expect("records paid by size, refused by the previous release and quoted by this tree, "
+           "pass",
+           {**two, "new-hosts-old": result(sized_quotes=right, releases=mixed)}, args, [])
+    expect("a node of the previous release that quotes a version-2 request fails",
+           {**two, "new-hosts-old": result(
+               sized_quotes={"old": {"storer_update_required": 8, "quoted": 1},
+                             "new": {"quoted": 30}}, releases=mixed)},
+           args, ["nodes of the previous release quoted 1 version-2 quote(s)"])
+    expect("a node of this tree that answers StorerUpdateRequired fails",
+           {**two, "old-hosts-new": result(
+               sized_quotes={"old": {"storer_update_required": 9},
+                             "new": {"quoted": 29, "storer_update_required": 1}},
+               releases=mixed)},
+           args, ["nodes of this tree answered 1 version-2 quote(s) StorerUpdateRequired"])
+    expect("a run with both releases where the previous one was never asked fails",
+           {**two, "new-hosts-old": result(sized_quotes={"new": {"quoted": 30}},
+                                           releases=mixed)},
+           args, ["no node of the previous release answered a version-2 quote"])
+    expect("a run of this tree alone needs no refusal",
+           {"all-new": result(sized_quotes={"new": {"quoted": 30}},
+                              releases={"incumbent-00": "new", "joiner-00": "new"})},
+           args, [])
+    expect("a run with no records paid by size has nothing to show",
+           {**two, "new-hosts-old": result(releases=mixed)}, args, [])
+
+
+def sized_penalties_apart():
+    """analyze() books the possession-check and audit penalties a node of the
+    previous release takes for a record paid by size apart, reported and not
+    compared, and every other penalty as before."""
+    start = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    window = (start, start + datetime.timedelta(hours=1))
+    old_peer, new_peer = "a" * 64, "b" * 64
+    sized_key, plain_key = "c" * 64, "d" * 64
+    stamp = "2026-01-01T00:10:00.000000Z"
+
+    def trust(target):
+        return (f"{stamp} INFO peer trust score changed peer_id={target} "
+                f"reason=application_failure delta=-0.5 weight=5")
+
+    lines = [
+        f"{stamp} WARN Possession check: {old_peer} failed to prove possession for {sized_key}",
+        trust(old_peer),
+        f"{stamp} ERROR Audit failure for {old_peer}: reason=KeyAbsent, "
+        f"first_failed_key=0x{sized_key[:16]}",
+        trust(old_peer),
+        f"{stamp} WARN Possession check: {old_peer} failed to prove possession for {plain_key}",
+        trust(old_peer),
+        f"{stamp} WARN Possession check: {new_peer} failed to prove possession for {sized_key}",
+        trust(new_peer),
+    ]
+    with tempfile.TemporaryDirectory() as folder:
+        folder = Path(folder)
+        (folder / "devnet.log").write_text("")
+        (folder / "joiner-00.log").write_text("")
+        (folder / "incumbent-00.log").write_text("\n".join(lines) + "\n")
+        record = {"quotes": [{"peer": old_peer, "outcome": "QuoteError(StorerUpdateRequired)"},
+                             {"peer": new_peer, "outcome": "quoted"}],
+                  "puts": [{"peer": new_peer, "outcome": "stored"}]}
+        run = {
+            "window": window, "folder": folder, "devnet_peers": [], "network": "new",
+            "nodes": [{"name": "incumbent-00", "role": "incumbent", "release": "new",
+                       "peer_id": new_peer, "full": False, "log": "incumbent-00.log",
+                       "ran": "x"},
+                      {"name": "joiner-00", "role": "joiner", "release": "old",
+                       "peer_id": old_peer, "full": False, "log": "joiner-00.log",
+                       "ran": "x"}],
+            "uploads": [{"client": "e" * 64, "records": [{**record, "address": plain_key}]},
+                        {"client": "e" * 64, "settlement_version": 2,
+                         "records": [{**record, "address": sized_key}]}],
+            "checks": [],
+        }
+        found = harness.analyze(run)
+    expect_equal("the previous release's penalties for a record paid by size are booked apart",
+                 found["penalties_on_sized"],
+                 {("incumbent", "joiner", "application_failure"): (2, 10.0)})
+    expect_equal("every other penalty is booked as before",
+                 found["penalties"],
+                 {("incumbent", "joiner", "application_failure"): (1, 5.0),
+                  ("incumbent", "incumbent", "application_failure"): (1, 5.0)})
+    expect_equal("the quotes of records paid by size are counted by release",
+                 found["sized_quotes"],
+                 {"old": {"storer_update_required": 1}, "new": {"quoted": 1}})
+    json.dumps(harness.summary_json({"new-hosts-old": found}, [], {}, options()), default=str)
+
+
 def main():
     one = {"all-old": result({INCUMBENTS_FAIL: 5, JOINERS_TIME_OUT: 8})}
     expect("against one all-old run, a count PENALTY_SLACK above it passes",
@@ -229,6 +327,8 @@ def main():
            options(), [])
 
     listed(options())
+    sized(options())
+    sized_penalties_apart()
 
     names = ["all-old", "all-old-2", "all-old-12", "all-old-1", "all-old-x", "new-hosts-old"]
     baselines = [name for name in names if harness.is_baseline(name)]

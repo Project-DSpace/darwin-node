@@ -39,7 +39,9 @@
 # set aside in /data/unregistered, and NODE_COUNT is made up with new nodes; a
 # data folder mounted noexec is refused;
 # production mode warns above 2 nodes; the old PublicNode RPC_URL is pointed
-# out; an RPC_URL of only spaces leaves the image's RPCs in place;
+# out; an RPC_URL of only spaces leaves RPC_URLS in place, where
+# https://rpc.ordofi.network and any other form of rpc.ordofi.network are
+# each pointed out;
 # ANT_RELAY_SERVING=false reaches every node and switches its relay server
 # off, while nodes without it keep serving; and an ANT_RELAY_SERVING other
 # than true or false is refused, an empty one ignored.
@@ -413,7 +415,9 @@ for _ in $(seq 1 30); do
 done
 ids=$(peer_ids "$WORK/previous")
 (( $(wc -w <<<"$ids") == 3 )) || fail "the release before's nodes did not publish their browser addresses"
-layout() { registry "$WORK/previous" '.nodes | map_values({id, service_name, node_port, data_dir, log_dir, binary_path}) | tojson'; }
+# Sorted keys (-S): the manager may write the registry's nodes in another
+# order without changing any of them.
+layout() { sudo jq -cS '.nodes | map_values({id, service_name, node_port, data_dir, log_dir, binary_path})' "$WORK/previous/manager/ant/node_registry.json"; }
 layout_before=$(layout)
 docker stop -t 120 previous >/dev/null && docker rm previous >/dev/null
 # The browser address files are written again as each node starts.
@@ -509,11 +513,15 @@ wait_for noexec 'mounted noexec' 1 30 || fail "a noexec data folder was not refu
 (( $(count noexec 'WARNING: NODE_COUNT is 3') >= 1 )) || fail "no warning for 3 nodes in production mode"
 (( $(count noexec 'RPC_URL is PublicNode') >= 1 )) || fail "no notice for the old PublicNode RPC_URL"
 
-echo "== an RPC_URL of only spaces leaves the image's RPCs in place; an empty ANT_RELAY_SERVING is ignored"
+echo "== an RPC_URL of only spaces leaves RPC_URLS in place, where each form of rpc.ordofi.network is pointed out; an empty ANT_RELAY_SERVING is ignored"
 # Refused at the noexec data folder too, which is checked after the settings.
 docker run -d --name rpc "${COMMON[@]}" -e MANAGER_PORT=12605 --tmpfs /data:rw,noexec,size=100m \
-    -e RPC_URL=" " -e ANT_RELAY_SERVING= -e PORT_START=10950 "$IMAGE" >/dev/null
+    -e RPC_URL=" " -e RPC_URLS="https://rpc.mainnet.chain.robinhood.com https://rpc.ordofi.network/ http://rpc.ordofi.network" \
+    -e ANT_RELAY_SERVING= -e PORT_START=10950 "$IMAGE" >/dev/null
 wait_for rpc 'mounted noexec' 1 30 || fail "an RPC_URL of only spaces or an empty ANT_RELAY_SERVING was refused"
+(( $(count rpc 'https://rpc.ordofi.network is no longer') >= 1 )) || fail "no notice for https://rpc.ordofi.network/ in RPC_URLS"
+(( $(count rpc 'other than as https://rpc.ordofi.network: a node on it reads payments through') >= 1 )) \
+    || fail "no notice for http://rpc.ordofi.network in RPC_URLS"
 
 echo "== an ANT_RELAY_SERVING other than true or false is refused"
 docker run -d --name relay "${COMMON[@]}" -e MANAGER_PORT=12606 --tmpfs /data:rw,noexec,size=100m \

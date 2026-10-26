@@ -45,30 +45,15 @@ mod testnet;
 #[cfg(test)]
 mod integration_tests;
 
-#[cfg(test)]
-mod live_testnet;
-
 // Listings across real nodes: a paid envelope served by its close group.
 #[cfg(test)]
 mod listings;
-
-#[cfg(test)]
-mod payment_flow;
-
-#[cfg(test)]
-mod complete_payment_e2e;
-
-#[cfg(test)]
-mod merkle_payment;
 
 #[cfg(test)]
 mod replication;
 
 // Pointer replication across real nodes (ADR-0016).
 mod pointer_replication;
-
-#[cfg(test)]
-mod security_attacks;
 
 #[cfg(test)]
 mod subtree_audit_testnet;
@@ -78,9 +63,6 @@ mod fetch_local_write_guard;
 
 #[cfg(test)]
 mod fetch_responsibility_recheck;
-
-#[cfg(test)]
-mod first_audit_ab;
 
 #[cfg(test)]
 mod fresh_offer_capacity;

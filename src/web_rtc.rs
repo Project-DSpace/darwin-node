@@ -2392,6 +2392,23 @@ async fn process_get_chunk(
     response
 }
 
+/// The chunk-protocol quote request a browser's `quote_chunk` is asked as:
+/// a settlement-version-2 request for an N + 1 request (`size_priced`),
+/// quoted at the weight total, and an unversioned one for a plain N request,
+/// quoted at today's price.
+fn browser_quote_body(address: [u8; 32], size: u64, size_priced: bool) -> ChunkMessageBody {
+    if size_priced {
+        ChunkMessageBody::QuoteRequestV2(ChunkQuoteRequestV2 {
+            address,
+            data_size: size,
+            data_type: DATA_TYPE_CHUNK,
+            settlement_version: crate::payment::SIZE_PRICED_SETTLEMENT_VERSION,
+        })
+    } else {
+        ChunkMessageBody::QuoteRequest(ChunkQuoteRequest::new(address, size))
+    }
+}
+
 /// `size_priced` for an N + 1 request ([`SIZE_PRICED_BROWSER_VERSION`]),
 /// which is asked of the chunk protocol as a settlement-version-2 quote; a
 /// plain N request is asked as an unversioned one, at today's price.
@@ -2427,16 +2444,7 @@ async fn process_quote_chunk(
         );
     };
 
-    let body = if size_priced {
-        ChunkMessageBody::QuoteRequestV2(ChunkQuoteRequestV2 {
-            address: address_bytes,
-            data_size: size,
-            data_type: DATA_TYPE_CHUNK,
-            settlement_version: crate::payment::SIZE_PRICED_SETTLEMENT_VERSION,
-        })
-    } else {
-        ChunkMessageBody::QuoteRequest(ChunkQuoteRequest::new(address_bytes, size))
-    };
+    let body = browser_quote_body(address_bytes, size, size_priced);
     let message = ChunkMessage { request_id, body };
     let response = match handle_ant_message(ant_protocol, message).await {
         Ok(response) => response,
@@ -3833,6 +3841,59 @@ max_concurrent_requests = 12",
             let request: Request = serde_json::from_str(&other).expect("valid json");
             assert!(!browser_version_accepted(&request), "{other}");
         }
+    }
+
+    /// An N + 1 browser quote is quoted at the node's weight total, and a
+    /// plain N quote at today's price, `calculate_price(K)`, both through the
+    /// handler's own quote path.
+    #[tokio::test]
+    async fn an_n_plus_1_browser_quote_is_priced_at_the_weight_total_and_n_at_todays_price() {
+        use crate::payment::pricing::calculate_price;
+        use crate::storage::handler_tests::{attach_weighed_commitment, create_test_protocol};
+
+        let (protocol, _temp) = create_test_protocol().await;
+        // 1,000 records in the smallest class: m = 253.
+        attach_weighed_commitment(&protocol, 1_000, 253);
+        let price = |body| {
+            let protocol = &protocol;
+            async move {
+                let response = handle_ant_message(
+                    protocol,
+                    ChunkMessage {
+                        request_id: 11,
+                        body,
+                    },
+                )
+                .await
+                .expect("a quote response");
+                match response.body {
+                    ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                        quote, ..
+                    }) => {
+                        let quote: PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
+                        assert_eq!(quote.committed_key_count, 1_000, "the count is K");
+                        quote.price
+                    }
+                    other => panic!("expected a quote, got: {other:?}"),
+                }
+            }
+        };
+
+        let size_priced = browser_quote_body([0xD1; 32], 4096, true);
+        assert!(matches!(
+            &size_priced,
+            ChunkMessageBody::QuoteRequestV2(ChunkQuoteRequestV2 {
+                settlement_version: 2,
+                data_type: DATA_TYPE_CHUNK,
+                data_size: 4096,
+                ..
+            })
+        ));
+        assert_eq!(price(size_priced).await, calculate_price(253));
+
+        let plain = browser_quote_body([0xD2; 32], 4096, false);
+        assert!(matches!(&plain, ChunkMessageBody::QuoteRequest(_)));
+        assert_eq!(price(plain).await, calculate_price(1_000));
     }
 
     #[test]

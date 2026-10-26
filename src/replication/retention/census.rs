@@ -1844,6 +1844,28 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
     );
 }
 
+/// No penalty spares a peer by the release it advertises (ADR-0025). A node
+/// before settlement version 2 can't verify a payment by size, so it refuses
+/// the fresh offers and drops the notices of a record paid that way, and the
+/// possession check and the audits then charge it for the record it doesn't
+/// hold, as any peer. The rollout answers that, not an exemption: clients pay
+/// by size only once the node census shows no storer before release 2. A
+/// release is the peer's own claim, so sparing peers by it would let any node
+/// escape the penalty for every record paid by size. Production code reads no
+/// peer's user agent; a new reading is reviewed here first.
+#[test]
+fn no_penalty_spares_a_peer_by_the_release_it_advertises() {
+    const RELEASE: &[(Option<&str>, &str)] = &[(None, "peer_user_agent")];
+    let found = unreviewed(Counting::Mentions(RELEASE), &[]);
+    assert!(
+        found.is_empty(),
+        "\nProduction code reads a peer's user agent.\n\n{found}\n\
+         A penalty is never spared by the release a peer advertises: the switch to paying \
+         by size waits until no storer before release 2 is left (ADR-0025). If this reading \
+         serves something else, review it and list it here.\n"
+    );
+}
+
 /// Upstream's merkle (batch) payment code stays compiled, so that merges stay
 /// cheap, but no production code reaches it: a merkle quote request is refused
 /// before anything is signed, and a merkle proof before it is verified.
@@ -1878,7 +1900,7 @@ fn the_merkle_payment_code_is_not_reached() {
          This node refuses merkle (batch) payments: a merkle candidate quote request is \
          answered with BATCH_PAYMENTS_REFUSED before anything is signed \
          (AntProtocol::handle_merkle_candidate_quote), and a merkle proof is refused before \
-         it is verified, for chunks and pointers alike (PaymentVerifier::verify_payment_inner). \
+         it is verified, for chunks and pointers alike (PaymentVerifier::verify_proof). \
          A batch is paid on chain before any node sees a PUT, so a node that took the \
          quote and then refused the PUT would let the client pay for nothing.\n"
     );
@@ -2098,6 +2120,164 @@ fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
     );
 }
 
+/// Every mention of the price curve, `calculate_price`, and of a quote's
+/// committed key count in production code, at the reviewed number of sites.
+/// Size pricing changed what a quote is priced at (the weight total m for a
+/// client that pays by size) and what every quote check accepts (a band, not
+/// one price), so a price computed somewhere new, or a count read somewhere
+/// new, is a place the band or the weight may have been missed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
+    const PRICING: &[(Option<&str>, &str)] =
+        &[(None, "calculate_price"), (None, "committed_key_count")];
+    const REVIEWED: &[Reviewed] = &[
+        // The curve's re-exports and imports.
+        ("src/payment/mod.rs", "<module>", "calculate_price", 1),
+        ("src/payment/pricing.rs", "<module>", "calculate_price", 1),
+        ("src/payment/quote.rs", "<module>", "calculate_price", 1),
+        ("src/payment/verifier.rs", "<module>", "calculate_price", 1),
+        // The fields of a quote-commitment mismatch's evidence, in the
+        // verifier's event and in the replication failure it is reported as.
+        (
+            "src/payment/verifier.rs",
+            "<module>",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/replication/types.rs",
+            "<module>",
+            "committed_key_count",
+            1,
+        ),
+        // A single-node quote: priced at the count resolve_quote_pricing gives
+        // (the weight total for a client that pays by size, else the key
+        // count), and carrying the key count K.
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_priced_quote",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_priced_quote",
+            "committed_key_count",
+            3,
+        ),
+        // A merkle candidate quote: today's price at K. This fork refuses merkle
+        // payments, so no one pays it.
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_merkle_candidate_quote",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_merkle_candidate_quote",
+            "committed_key_count",
+            3,
+        ),
+        // The one price check every quote goes through: the band at K, with
+        // the shape and key-cap rules.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::binding_violation",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::quote_arithmetic_violation",
+            "committed_key_count",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::validate_merkle_candidate_arithmetic",
+            "committed_key_count",
+            1,
+        ),
+        // The cross-check of a quote's K against its pinned commitment's key
+        // count, which size pricing leaves as it was, and its evidence.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_binding",
+            "committed_key_count",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_quotes",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_merkle_candidates",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::handle_cross_check",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::emit_mismatch_evidence",
+            "committed_key_count",
+            1,
+        ),
+        // The price floor's reference: the price at the bottom of the median
+        // count's band.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::group_reference_price",
+            "calculate_price",
+            1,
+        ),
+        // Telemetry: whether a price is on the curve at all, at any count.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::price_off_curve_diagnostics",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::log_off_curve_merkle",
+            "committed_key_count",
+            1,
+        ),
+        // A browser quote carries the quote's K over unchanged, both ways.
+        (
+            "src/web_rtc.rs",
+            "browser_quote_from_quote",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/web_rtc.rs",
+            "payment_quote_from_browser_quote",
+            "committed_key_count",
+            2,
+        ),
+    ];
+    let report = unreviewed(Counting::Mentions(PRICING), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nThe price curve or a quote's committed key count is used somewhere new.\n\n{report}\n\
+         A quote is priced at the weight total for a client that pays by size and at the key \
+         count for every other (QuoteGenerator::resolve_quote_pricing), and every quote check \
+         accepts the band from the bottom count's price to the key count's (price_in_band). \
+         Check that the new use follows both, and list it here.\n"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Wire messages
 // ---------------------------------------------------------------------------
@@ -2180,7 +2360,7 @@ const LISTINGS_MESSAGES: &[(&str, &str)] = &[
 
 /// Every kind of payment proof the vendored protocol tells apart
 /// (`ProofType`), with what the payment check does with it
-/// (`PaymentVerifier::verify_payment_inner`).
+/// (`PaymentVerifier::verify_proof`).
 const PROOF_TYPES: &[(&str, &str)] = &[
     (
         "SingleNode",
@@ -2255,19 +2435,19 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
     // refused.
     (
         "src/payment/verifier.rs",
-        "PaymentVerifier::verify_payment_inner",
+        "PaymentVerifier::verify_proof",
         "detect_proof_type",
         1,
     ),
     (
         "src/payment/verifier.rs",
-        "PaymentVerifier::verify_payment_inner",
+        "PaymentVerifier::verify_proof",
         "deserialize_single_node_proof",
         1,
     ),
     (
         "src/payment/verifier.rs",
-        "PaymentVerifier::verify_payment_inner",
+        "PaymentVerifier::verify_proof",
         "deserialize_root_proof",
         1,
     ),

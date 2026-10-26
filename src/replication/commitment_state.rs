@@ -1415,6 +1415,44 @@ mod tests {
         assert_eq!(fresh.current().expect("reloaded").weight_total(), None);
     }
 
+    /// m is not saved: the retention file a node writes reads the same with m
+    /// set or not, at the format version releases before size pricing write
+    /// and read. So the retention file of this release loads in the release
+    /// before it, and the reverse, and a rollback or an upgrade keeps every
+    /// retained slot answerable.
+    #[test]
+    fn the_retention_file_is_the_same_with_or_without_the_weight_total() {
+        assert_eq!(RETENTION_FORMAT_VERSION, 1);
+        assert_eq!(POINTER_LEAVES_FORMAT_VERSION, 1);
+
+        let state = ResponderCommitmentState::new();
+        state.rotate(mixed(&[1, 2, 3], &[10]));
+        let unweighed = state.snapshot();
+        let file = unweighed.to_bytes().expect("encode");
+        let sidecar = unweighed.pointer_leaves_bytes().expect("encode");
+
+        state
+            .current()
+            .expect("current")
+            .set_weight_total(&[Some(1), Some(1), Some(1)]);
+        let weighed = state.snapshot();
+        assert_eq!(weighed.to_bytes().expect("encode"), file);
+        assert_eq!(weighed.pointer_leaves_bytes().expect("encode"), sidecar);
+
+        // The same bytes reload as the same commitment, without m.
+        let mut reloaded = PersistedRetention::from_bytes(&file).expect("decode");
+        assert!(reloaded.attach_pointer_leaves(&sidecar));
+        let fresh = ResponderCommitmentState::new();
+        fresh.restore(&reloaded);
+        let current = fresh.current().expect("reloaded");
+        assert_eq!(
+            current.hash(),
+            state.current().expect("current").hash(),
+            "the signed commitment survives unchanged"
+        );
+        assert_eq!(current.weight_total(), None);
+    }
+
     /// Every record unknown, or missing from the lengths, counts as a full
     /// chunk: m = K.
     #[test]

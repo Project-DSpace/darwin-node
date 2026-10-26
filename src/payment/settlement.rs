@@ -25,13 +25,14 @@
 //! someone else's payment) is checked exactly as before.
 //!
 //! Every read goes through one pool of connections to the node's RPCs: the
-//! node's own, then, where it is one of Robinhood Chain's public RPCs, the
-//! others ([`crate::listings::listings_rpc_urls`]). A read starts with the RPC
-//! that answered last. An RPC that answered busy, or didn't answer in time, is
-//! asked after the others for [`HOLD_OFF`]; it is still asked when they fail,
-//! so being held off changes only the order. A failed call moves on to the
-//! next RPC at once, and a read of payment records that fails on every RPC is
-//! made again in a second round, [`PAYMENT_READ_BACKOFF`] later.
+//! node's own, then, where it is one of Robinhood Chain's public RPCs or one
+//! retired from them, the others ([`crate::listings::listings_rpc_urls`]). A
+//! read starts with the RPC that answered last. An RPC that answered busy, or
+//! didn't answer in time, is asked after the others for [`HOLD_OFF`]; it is
+//! still asked when they fail, so being held off changes only the order. A
+//! failed call moves on to the next RPC at once, and a read of payment records
+//! that fails on every RPC is made again in a second round,
+//! [`PAYMENT_READ_BACKOFF`] later.
 //!
 //! While a read of payment records is in flight, further reads wait for it and
 //! then go together, as one JSON-RPC batch; an RPC that refuses batches, or
@@ -109,13 +110,12 @@ pub const PUT_CALL_TIMEOUT: Duration = Duration::from_millis(2_500);
 /// goes to the next RPC as well. The first good answer counts.
 pub const PUT_SECOND_RPC_AFTER: Duration = Duration::from_secs(2);
 
-/// On a store's path, how long the receipts of a proof's transactions are
-/// read alone before the per-quote read of a quote they haven't settled
-/// starts beside them. Claude's proposal: a receipt from an RPC that answers
-/// in a round trip settles its quotes within it, saving their reads, and
-/// with every RPC slow (about 2.3 s a call) the per-quote read, read empty,
-/// the pause and the read again (about 6.1 s) still end inside
-/// [`PUT_PAYMENT_DEADLINE`].
+/// On a store's path, how long the receipts of a proof's transactions are read
+/// alone before the per-quote read of a quote they haven't settled starts
+/// beside them. A receipt from an RPC that answers in a round trip settles its
+/// quotes within it, saving their reads, and with every RPC slow (about 2.3 s
+/// a call) the per-quote read, read empty, the pause and the read again (about
+/// 6.1 s) still end inside [`PUT_PAYMENT_DEADLINE`].
 pub const PUT_RECEIPTS_HEAD_START: Duration = Duration::from_millis(500);
 
 /// How long one call nobody is waiting on may take: reads for fresh
@@ -163,9 +163,9 @@ const BLOCKS_CAPACITY: usize = 1_024;
 const MAX_BATCH: usize = 32;
 
 /// The reads of a batch no RPC answered in time are made one at a time, at
-/// most this many at once. Claude's proposal: an RPC that stalled is sent a
-/// few calls, not a whole batch's worth at once; a batch of `MAX_BATCH`
-/// answered in about a second a call is read in about 8 seconds.
+/// most this many at once, so an RPC that stalled is sent a few calls, not a
+/// whole batch's worth at once; a batch of `MAX_BATCH` answered in about a
+/// second a call is read in about 8 seconds.
 const SINGLES_AFTER_TIMED_OUT_BATCH: usize = 4;
 
 /// `completedPayments(bytes32)`'s selector: the first four bytes of the
