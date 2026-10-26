@@ -294,8 +294,8 @@ async fn a_notify_records_the_class_it_paid_and_a_later_one_raises_it() {
 }
 
 /// A key the paid list holds with no class, as every key written before
-/// notifies recorded one, or learned by sync or the paid-list quorum, is
-/// known at the full class: its notifies are dropped.
+/// notifies recorded one, or learned by a presence quorum or from paid lists
+/// that record none, is known at the full class: its notifies are dropped.
 #[tokio::test]
 async fn a_key_listed_with_no_class_is_known_at_the_full_class() {
     let (paid_list, _dir) = paid_list().await;

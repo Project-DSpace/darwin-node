@@ -4,9 +4,12 @@
 //! A release that changes messages between nodes keeps the rule in the
 //! README's "Messages between nodes": a new message type is appended to
 //! `ReplicationMessageBody` and goes only to peers known to read it; no field
-//! is added to an existing message; no variant is added to a reply older
-//! nodes receive. An older node can't decode what breaks that rule, and an
-//! auditor that can't decode a reply fails every key it challenged.
+//! is added to an existing message, except one appended at the very end of a
+//! reply and read so that a reply without it decodes as before
+//! (`VerificationResponse::paid_classes`, pinned both ways below); no variant
+//! is added to a reply older nodes receive. An older node can't decode what
+//! breaks that rule, and an auditor that can't decode a reply fails every key
+//! it challenged.
 //!
 //! Each sample below is pinned to its bytes. A change to an existing message
 //! fails here, and so does a variant added to a message or to one of its
@@ -259,6 +262,7 @@ fn samples() -> Vec<ReplicationMessageBody> {
                     paid: Some(false),
                 },
             ],
+            paid_classes: vec![0, 22, 0],
         }),
         B::FetchRequest(FetchRequest { key: key(0x10) }),
         B::FetchResponse(FetchResponse::Success {
@@ -408,7 +412,7 @@ const PINNED: &[(&str, &str)] = &[
     ),
     (
         "VerificationResponse",
-        "b42406030d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d01000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0001010f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f000100",
+        "b42406030d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d01000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0001010f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f00010003001600",
     ),
     (
         "FetchRequest",
@@ -672,4 +676,74 @@ fn the_variants_are_the_pinned_ones() {
              decoder makes of it.\n"
         );
     }
+}
+
+/// The verification reply as ds.15 writes it: the pinned sample's bytes up to
+/// the classes appended after its results.
+const DS15_VERIFICATION_RESPONSE: &str = "b42406030d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d01000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0001010f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f000100";
+
+/// The classes appended to a verification reply are read both ways. ds.15's
+/// decoder, which knows only the results, reads this tree's reply and stops
+/// before the classes; this tree reads ds.15's reply, which ends before them,
+/// with no classes, so every confirmation in it reads as the full class.
+#[test]
+fn the_classes_appended_to_a_verification_reply_are_read_both_ways() {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Ds15KeyVerificationResult {
+        key: [u8; 32],
+        present: bool,
+        paid: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    struct Ds15VerificationResponse {
+        results: Vec<Ds15KeyVerificationResult>,
+    }
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    enum Ds15Body {
+        NeighborSyncRequest(()),
+        NeighborSyncResponse(()),
+        FreshReplicationOffer(()),
+        FreshReplicationResponse(()),
+        PaidNotify(()),
+        VerificationRequest(()),
+        VerificationResponse(Ds15VerificationResponse),
+    }
+    #[derive(Deserialize)]
+    struct Ds15Message {
+        request_id: u64,
+        body: Ds15Body,
+    }
+
+    let sample = samples()
+        .into_iter()
+        .find(|body| name(body) == "VerificationResponse")
+        .unwrap();
+    let ReplicationMessageBody::VerificationResponse(written) = &sample else {
+        unreachable!()
+    };
+    let new_bytes = encode(sample.clone());
+    let old_bytes = hex::decode(DS15_VERIFICATION_RESPONSE).unwrap();
+    assert!(new_bytes.starts_with(&old_bytes));
+
+    let read: Ds15Message = postcard::from_bytes(&new_bytes).expect("ds.15 reads the new reply");
+    assert_eq!(read.request_id, REQUEST_ID);
+    let Ds15Body::VerificationResponse(read) = read.body else {
+        panic!("ds.15 read another message")
+    };
+    assert_eq!(read.results.len(), written.results.len());
+    for (read, written) in read.results.iter().zip(&written.results) {
+        assert_eq!(
+            (read.key, read.present, read.paid),
+            (written.key, written.present, written.paid)
+        );
+    }
+
+    let decoded = ReplicationMessage::decode(&old_bytes).expect("this tree reads ds.15's reply");
+    let ReplicationMessageBody::VerificationResponse(decoded) = decoded.body else {
+        panic!("ds.15's reply read as another message")
+    };
+    assert_eq!(decoded.results.len(), written.results.len());
+    assert!(decoded.paid_classes.is_empty());
 }

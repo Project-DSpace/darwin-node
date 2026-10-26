@@ -7323,7 +7323,9 @@ async fn handle_verification_request(
     #[derive(Clone, Copy)]
     enum CachedPaidLookup {
         NotChecked,
-        Checked(Option<bool>),
+        /// The class the entry records, `Some(None)` for no entry, `None`
+        /// when the paid list couldn't be read.
+        Checked(Option<Option<PaidClass>>),
     }
 
     #[derive(Clone, Copy)]
@@ -7337,7 +7339,17 @@ async fn handle_verification_request(
             "Verification request from {source} has {} keys, exceeding max {MAX_INCOMING_VERIFICATION_KEYS}; rejecting batch",
             request.keys.len(),
         );
-        send_verification_results(source, p2p_node, request_id, Vec::new(), rr_message_id).await;
+        send_verification_results(
+            source,
+            p2p_node,
+            request_id,
+            VerificationResponse {
+                results: Vec::new(),
+                paid_classes: Vec::new(),
+            },
+            rr_message_id,
+        )
+        .await;
         return Ok(());
     }
 
@@ -7349,7 +7361,17 @@ async fn handle_verification_request(
             request.paid_list_check_indices.len(),
             request.keys.len(),
         );
-        send_verification_results(source, p2p_node, request_id, Vec::new(), rr_message_id).await;
+        send_verification_results(
+            source,
+            p2p_node,
+            request_id,
+            VerificationResponse {
+                results: Vec::new(),
+                paid_classes: Vec::new(),
+            },
+            rr_message_id,
+        )
+        .await;
         return Ok(());
     }
 
@@ -7372,6 +7394,7 @@ async fn handle_verification_request(
         .collect();
 
     let mut results = Vec::with_capacity(requested_keys.len());
+    let mut paid_classes = Vec::with_capacity(requested_keys.len());
     let mut lookup_cache: HashMap<XorName, CachedVerificationLookup> = HashMap::new();
     for (i, key) in requested_keys.iter().enumerate() {
         let needs_paid = paid_check_set.contains(&u32::try_from(i).unwrap_or(u32::MAX));
@@ -7393,8 +7416,8 @@ async fn handle_verification_request(
         });
 
         if needs_paid && matches!(cached.paid, CachedPaidLookup::NotChecked) {
-            cached.paid = CachedPaidLookup::Checked(match paid_list.contains(key) {
-                Ok(paid) => Some(paid),
+            cached.paid = CachedPaidLookup::Checked(match paid_list.class(key) {
+                Ok(class) => Some(class),
                 Err(e) => {
                     warn!(
                         "Verification request from {source}: failed to check paid-list for {}: {e}",
@@ -7405,14 +7428,15 @@ async fn handle_verification_request(
             });
         }
 
-        let paid = if needs_paid {
+        let paid_class = if needs_paid {
             match cached.paid {
-                CachedPaidLookup::Checked(paid) => paid,
+                CachedPaidLookup::Checked(class) => class,
                 CachedPaidLookup::NotChecked => None,
             }
         } else {
             None
         };
+        let paid = paid_class.map(|class| class.is_some());
 
         if cached.present.is_none() && paid.is_none() {
             continue;
@@ -7423,9 +7447,20 @@ async fn handle_verification_request(
             present: cached.present.unwrap_or(false),
             paid,
         });
+        paid_classes.push(paid_class.flatten().map_or(0, |class| class.to_value()[0]));
     }
 
-    send_verification_results(source, p2p_node, request_id, results, rr_message_id).await;
+    send_verification_results(
+        source,
+        p2p_node,
+        request_id,
+        VerificationResponse {
+            results,
+            paid_classes,
+        },
+        rr_message_id,
+    )
+    .await;
 
     Ok(())
 }
@@ -7514,14 +7549,14 @@ async fn send_verification_results(
     source: &PeerId,
     p2p_node: &Arc<P2PNode>,
     request_id: u64,
-    results: Vec<protocol::KeyVerificationResult>,
+    response: VerificationResponse,
     rr_message_id: Option<&str>,
 ) {
     send_replication_response(
         source,
         p2p_node,
         request_id,
-        ReplicationMessageBody::VerificationResponse(VerificationResponse { results }),
+        ReplicationMessageBody::VerificationResponse(response),
         rr_message_id,
     )
     .await;
@@ -8804,20 +8839,20 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             }
         } // read lock released
 
-        // Step 4: Insert verified keys into PaidForList (no lock held).
-        let mut paid_insert_keys: Vec<XorName> = Vec::new();
+        // Step 4: Insert verified keys into PaidForList (no lock held). A
+        // presence quorum is majority storage and records the full class. A
+        // paid-list quorum records the class its paid lists record, so a
+        // payment noticed at a smaller class stays that class here, and the
+        // fetch it authorises is checked against it: majority paid lists are
+        // not storage. A key whose class couldn't be written isn't fetched
+        // this round, since its fetch would have nothing to be checked against.
+        let mut paid_class_unrecorded: HashSet<XorName> = HashSet::new();
         for (key, outcome) in &evaluated {
-            if matches!(
-                outcome,
-                KeyVerificationOutcome::QuorumVerified { .. }
-                    | KeyVerificationOutcome::PaidListVerified { .. }
-            ) {
-                paid_insert_keys.push(*key);
-            }
-        }
-        for key in &paid_insert_keys {
-            if let Err(e) = paid_list.insert(key).await {
+            if let Err(e) = record_verified_key(paid_list, key, outcome).await {
                 warn!("Failed to add verified key to PaidForList: {e}");
+                if matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }) {
+                    paid_class_unrecorded.insert(*key);
+                }
             }
         }
 
@@ -8836,7 +8871,8 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 outcome,
                 KeyVerificationOutcome::QuorumVerified { .. }
                     | KeyVerificationOutcome::PaidListVerified { .. }
-            ) && !storage.exists(key).unwrap_or(false)
+            ) && !paid_class_unrecorded.contains(key)
+                && !storage.exists(key).unwrap_or(false)
                 && is_storage_admitted(&self_id, key, p2p_node, config).await
             {
                 fetch_allowed_keys.insert(*key);
@@ -8858,9 +8894,10 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     *bad_singleton_hints.entry(source).or_insert(0) += 1;
                 }
             }
+            let authority = verified_fetch_authority(&outcome);
             match outcome {
                 KeyVerificationOutcome::QuorumVerified { sources }
-                | KeyVerificationOutcome::PaidListVerified { sources } => {
+                | KeyVerificationOutcome::PaidListVerified { sources, .. } => {
                     let mut fetch_sources = sources;
                     add_replica_hint_sources(&mut fetch_sources, &replica_hint_sources);
                     let fetch_eligible = fetch_allowed_keys.contains(&key);
@@ -8882,7 +8919,8 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         // Atomic remove+enqueue: on fetch_queue capacity miss
                         // the pending entry is preserved so this verified key
                         // is retried on the next cycle (no silent drop).
-                        let _ = q.promote_pending_to_fetch(key, distance, fetch_sources);
+                        let _ =
+                            q.promote_pending_to_fetch_by(key, distance, fetch_sources, authority);
                         // Not terminal — either moved to fetch queue, or
                         // retained as pending until queue drains.
                     } else if fetch_eligible && fetch_sources.is_empty() {
@@ -9182,7 +9220,8 @@ enum FetchResult {
     /// the fetch was serving has lapsed, so no alternate source is tried and
     /// no trust event is reported: the source did nothing wrong.
     NoLongerResponsible,
-    /// The fetch's only authority was this node's own paid-list entry, and
+    /// The fetch's only authority was this node's paid-list entry (one a
+    /// notice wrote, or one written from a paid-list quorum's classes), and
     /// the class that entry records is below the class of the bytes that
     /// arrived: a payment notice paid for a smaller chunk than this one.
     /// Terminal for this fetch only: the bytes aren't stored, no other source
@@ -9267,6 +9306,42 @@ fn apply_fetch_result(
                 FetchFollowUp::Terminal
             }
         }
+    }
+}
+
+/// Records a key the network round verified in the paid list (Step 4). A
+/// presence quorum is majority storage and records the full class, the empty
+/// value. A paid-list quorum records the class its entries record, so a
+/// payment noticed at a smaller class stays that class here. Nothing for a
+/// key that wasn't verified.
+async fn record_verified_key(
+    paid_list: &PaidList,
+    key: &XorName,
+    outcome: &KeyVerificationOutcome,
+) -> Result<()> {
+    match outcome {
+        KeyVerificationOutcome::QuorumVerified { .. }
+        | KeyVerificationOutcome::PaidListVerified {
+            class: PaidClass::FULL,
+            ..
+        } => paid_list.insert(key).await.map(drop),
+        KeyVerificationOutcome::PaidListVerified { class, .. } => {
+            paid_list.insert_class(key, *class).await.map(drop)
+        }
+        KeyVerificationOutcome::QuorumFailed | KeyVerificationOutcome::QuorumInconclusive => Ok(()),
+    }
+}
+
+/// What authorises the fetch of a key the network round verified. Only a
+/// presence quorum, majority storage, accepts the bytes whatever the paid list
+/// records. A paid-list quorum authorises them up to the class
+/// [`record_verified_key`] wrote, so the fetch re-reads this node's entry: a
+/// majority of paid lists is not storage.
+fn verified_fetch_authority(outcome: &KeyVerificationOutcome) -> FetchAuthority {
+    if matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }) {
+        FetchAuthority::OwnPaidList
+    } else {
+        FetchAuthority::Majority
     }
 }
 
@@ -9531,8 +9606,9 @@ async fn execute_single_fetch(
                     if let Some(paid_list) = &paid_class_check {
                         if let Some(recorded) = paid_class_below_held(paid_list, &key, data.len()) {
                             info!(
-                                "Fetched {} ({} bytes) on this node's paid-list entry alone, \
-                                 which records payment up to {} bytes; not storing",
+                                "Fetched {} ({} bytes) on a paid-list entry alone, with no \
+                                 presence quorum, which records payment up to {} bytes; \
+                                 not storing",
                                 hex::encode(key),
                                 data.len(),
                                 recorded.top()
@@ -11477,6 +11553,7 @@ mod tests {
         let mut evidence = types::KeyVerificationEvidence {
             presence: HashMap::from([(source, PresenceEvidence::Absent)]),
             paid_list: HashMap::new(),
+            paid_classes: HashMap::new(),
         };
         let failed = KeyVerificationOutcome::QuorumFailed;
 
@@ -14272,6 +14349,7 @@ mod tests {
                 })
                 .collect(),
             paid_list: HashMap::new(),
+            paid_classes: HashMap::new(),
         };
 
         assert_eq!(
@@ -14290,8 +14368,9 @@ mod tests {
 
     /// The re-check refuses only where the entry records a class below the
     /// bytes' class. An entry with no class (paid before notices recorded
-    /// one, or learned by sync or the paid-list quorum) passes at any
-    /// length, and so does a key no longer listed.
+    /// one, admitted with its bytes, or learned by a presence quorum or from
+    /// paid lists that record none) passes at any length, and so does a key
+    /// no longer listed.
     #[tokio::test]
     async fn the_class_recheck_refuses_only_a_recorded_class_below_the_bytes() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -14326,6 +14405,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(paid_class_below_held(&paid_list, &small, full), None);
+    }
+
+    /// A key this node learns only from a paid-list quorum is recorded at
+    /// the class the quorum's entries record and fetched on that entry: a
+    /// majority of paid lists is not storage. Where every confirming peer
+    /// records the smallest class, as a payment notice does, bytes past it
+    /// are refused; where they hold the empty value, or give no class as an
+    /// older node does, the key is repaired at any length.
+    #[tokio::test]
+    async fn a_key_known_only_through_smallest_entries_is_refused_past_its_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paid_list = PaidList::new(dir.path()).await.unwrap();
+        let config = config::ReplicationConfig::default();
+        let paid_peers: Vec<PeerId> = (0x30..0x35).map(test_peer).collect();
+        let full = crate::ant_protocol::MAX_CHUNK_SIZE;
+
+        let learn = |key: XorName, class: Option<PaidClass>| {
+            let mut targets = quorum::VerificationTargets::default();
+            targets.quorum_targets.insert(key, Vec::new());
+            targets.paid_targets.insert(key, paid_peers.clone());
+            targets.paid_group_sizes.insert(key, paid_peers.len());
+            let evidence = types::KeyVerificationEvidence {
+                presence: HashMap::new(),
+                paid_list: paid_peers
+                    .iter()
+                    .map(|peer| (*peer, types::PaidListEvidence::Confirmed))
+                    .collect(),
+                paid_classes: class.map_or_else(HashMap::new, |class| {
+                    paid_peers.iter().map(|peer| (*peer, class)).collect()
+                }),
+            };
+            quorum::evaluate_key_evidence(&key, &evidence, &targets, &config)
+        };
+
+        let noticed = test_key(0xD0);
+        let outcome = learn(noticed, Some(PaidClass::SMALLEST));
+        assert!(
+            matches!(
+                outcome,
+                KeyVerificationOutcome::PaidListVerified {
+                    class: PaidClass::SMALLEST,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            verified_fetch_authority(&outcome),
+            FetchAuthority::OwnPaidList
+        );
+        record_verified_key(&paid_list, &noticed, &outcome)
+            .await
+            .unwrap();
+        assert_eq!(
+            paid_list.class(&noticed).unwrap(),
+            Some(PaidClass::SMALLEST)
+        );
+        assert_eq!(paid_class_below_held(&paid_list, &noticed, 16 * 1024), None);
+        assert_eq!(
+            paid_class_below_held(&paid_list, &noticed, 16 * 1024 + 1),
+            Some(PaidClass::SMALLEST)
+        );
+
+        for (byte, class) in [(0xD1, Some(PaidClass::FULL)), (0xD2, None)] {
+            let plain = test_key(byte);
+            let outcome = learn(plain, class);
+            assert_eq!(
+                verified_fetch_authority(&outcome),
+                FetchAuthority::OwnPaidList
+            );
+            record_verified_key(&paid_list, &plain, &outcome)
+                .await
+                .unwrap();
+            assert_eq!(paid_list.class(&plain).unwrap(), Some(PaidClass::FULL));
+            for len in [0, 16 * 1024 + 1, full] {
+                assert_eq!(paid_class_below_held(&paid_list, &plain, len), None);
+            }
+        }
+
+        // A presence quorum is majority storage, whatever the paid lists say.
+        let held = KeyVerificationOutcome::QuorumVerified {
+            sources: vec![paid_peers[0]],
+        };
+        assert_eq!(verified_fetch_authority(&held), FetchAuthority::Majority);
     }
 
     #[test]

@@ -966,6 +966,31 @@ pub struct KeyVerificationResult {
 pub struct VerificationResponse {
     /// Per-key results (one per requested key, in request order).
     pub results: Vec<KeyVerificationResult>,
+    /// The size class each result's paid-list entry records, one byte per
+    /// result in `results` order: the entry's value as
+    /// [`PaidClass::to_value`](crate::payment::PaidClass::to_value) writes it,
+    /// or 0 where the result isn't `paid: Some(true)`.
+    ///
+    /// Appended after every field an older node writes, at the very end of
+    /// the message, so an older node's decoder stops before it, and read with
+    /// [`appended_or_default`], so a reply from an older node, which ends
+    /// before it, reads as empty. Empty, or not one byte per result, every
+    /// confirmation reads as the full class, as an older node's means.
+    #[serde(default, deserialize_with = "appended_or_default")]
+    pub paid_classes: Vec<u8>,
+}
+
+/// Reads a field appended at the very end of a message. postcard reads a
+/// struct's fields in order with no count, so bytes that end before the
+/// field, an older node's message, fail its read; here they read as the
+/// field's default. Only for a message's last field: a field after it would
+/// be read from the wrong bytes.
+fn appended_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(T::deserialize(deserializer).unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -1739,7 +1764,10 @@ mod tests {
                 keys: vec![],
                 paid_list_check_indices: vec![],
             }),
-            ReplicationMessageBody::VerificationResponse(VerificationResponse { results: vec![] }),
+            ReplicationMessageBody::VerificationResponse(VerificationResponse {
+                results: vec![],
+                paid_classes: Vec::new(),
+            }),
             ReplicationMessageBody::FetchRequest(FetchRequest { key: z }),
             ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { key: z }),
             ReplicationMessageBody::AuditChallenge(AuditChallenge {
@@ -2367,7 +2395,10 @@ mod tests {
         ];
         let msg = ReplicationMessage {
             request_id: 8,
-            body: ReplicationMessageBody::VerificationResponse(VerificationResponse { results }),
+            body: ReplicationMessageBody::VerificationResponse(VerificationResponse {
+                results,
+                paid_classes: Vec::new(),
+            }),
         };
         let encoded = msg.encode().expect("encode should succeed");
         let decoded = ReplicationMessage::decode(&encoded).expect("decode should succeed");

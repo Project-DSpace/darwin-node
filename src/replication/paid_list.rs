@@ -11,11 +11,14 @@
 //! ```
 //!
 //! One unnamed database stores set membership: key = 32-byte `XorName`,
-//! value = the size class a payment notice's settled amount covers, one byte
-//! ([`PaidClass`]), or an empty byte slice, which reads as the full class.
-//! Every path but a payment notice writes the empty value, and a recorded
-//! class is only ever raised. Membership (`contains`, `count`, `all_keys`)
-//! ignores the value, so a node that never reads it opens the same list.
+//! value = the size class the key's payment covers, one byte ([`PaidClass`]),
+//! or an empty byte slice, which reads as the full class. A payment notice
+//! writes the class its settled amount covers, and a paid-list quorum the
+//! class the quorum's entries record when that is below the full class;
+//! every other path writes the empty value. A recorded class is only ever
+//! raised. A paid-list query is answered with the entry's class. Membership
+//! (`contains`, `count`, `all_keys`) ignores the value, so a node that never
+//! reads it opens the same list.
 //!
 //! ## Out-of-range timestamps
 //!
@@ -41,8 +44,8 @@ use crate::ant_protocol::XORNAME_LEN;
 
 /// Default LMDB map size for the paid list: 256 MiB.
 ///
-/// The paid list stores only 32-byte keys with empty values, so this is
-/// generous even for very large close-group memberships.
+/// The paid list stores only 32-byte keys with values of at most one byte,
+/// so this is generous even for very large close-group memberships.
 const DEFAULT_MAP_SIZE: usize = 256 * 1_024 * 1_024;
 
 /// Persistent paid-for-list backed by LMDB.
@@ -52,7 +55,8 @@ const DEFAULT_MAP_SIZE: usize = 256 * 1_024 * 1_024;
 pub struct PaidList {
     /// LMDB environment.
     env: Env,
-    /// The unnamed default database (key = `XorName` bytes, value = empty).
+    /// The unnamed default database (key = `XorName` bytes, value = the
+    /// one-byte class, or empty for the full class).
     db: Database<Bytes, Bytes>,
     /// In-memory: when each paid key first went out of `PaidCloseGroup` range.
     /// Cleared on restart (safe: hysteresis clock restarts from zero).
@@ -672,8 +676,9 @@ mod tests {
     }
 
     /// A key written with the empty value (before notices recorded a class,
-    /// by neighbour sync or the paid-list quorum, or by a node that never
-    /// reads values) reads as the full class, which a notice never lowers.
+    /// by a presence quorum or a paid-list quorum at the full class, or by a
+    /// node that never reads values) reads as the full class, which a notice
+    /// never lowers.
     #[tokio::test]
     async fn an_empty_value_reads_as_the_full_class_and_is_never_lowered() {
         let (pl, _temp) = create_test_paid_list().await;

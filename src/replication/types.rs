@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
+use crate::payment::PaidClass;
 use crate::replication::config::REPAIR_HINT_MIN_AGE;
 use saorsa_core::identity::PeerId;
 
@@ -207,13 +208,14 @@ impl PartialOrd for FetchOrder {
 /// key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FetchAuthority {
-    /// Majority evidence: a presence quorum of the close group, or the paid
-    /// lists of a majority of the paid close group. The bytes are accepted
-    /// whatever this node's paid list records.
+    /// Majority storage: a presence quorum of the close group holding the
+    /// key. The bytes are accepted whatever this node's paid list records.
     #[default]
     Majority,
-    /// This node's own paid-list entry, and nothing else. The bytes must be
-    /// in the size class the entry records, or a smaller one.
+    /// This node's paid-list entry: one it held already, or one written from
+    /// the class a paid-list quorum's entries record. A majority of paid lists
+    /// is not storage, so the bytes must be in the size class the entry
+    /// records, or a smaller one.
     OwnPaidList,
 }
 
@@ -285,6 +287,10 @@ pub struct KeyVerificationEvidence {
     pub presence: HashMap<PeerId, PresenceEvidence>,
     /// Paid-list evidence per peer (from `PaidTargets`).
     pub paid_list: HashMap<PeerId, PaidListEvidence>,
+    /// The size class each confirming peer's paid-list entry records, as its
+    /// reply gave it. A confirming peer missing here, an older node or a reply
+    /// without classes, records the full class.
+    pub paid_classes: HashMap<PeerId, PaidClass>,
 }
 
 // ---------------------------------------------------------------------------

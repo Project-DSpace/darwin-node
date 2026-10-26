@@ -361,8 +361,11 @@ never ran.
   between nodes appends a new message type to `ReplicationMessageBody` and
   sends it only to a peer known to read it: one that has sent that type
   itself, or whose user agent names a release that reads it (an unknown
-  agent counts as old). It never adds a field to an existing message, nor a
-  variant to a reply older nodes receive; never counts silence, a decode
+  agent counts as old). It never adds a field to an existing message,
+  except one appended at the very end of a reply and read so that a reply
+  without it decodes as before, with a test each way
+  (`VerificationResponse::paid_classes`), nor a variant to a reply older
+  nodes receive; never counts silence, a decode
   failure or a timeout on a new message type against a peer; and answers an
   older requester within its 15 seconds.
   `scripts/test_mixed_versions.py` runs this tree's nodes and the previous

@@ -5,7 +5,9 @@
 //! admitted at the smallest class's amount. The class its settled amount
 //! covers is kept as the paid-list entry's value, one byte, so a fetch that
 //! this entry alone authorises can be checked against the length of the bytes
-//! that arrive.
+//! that arrive. A node answers a paid-list query with that byte too, and a
+//! node that learns a key from a paid-list quorum records the class the
+//! quorum's entries record.
 
 use ant_protocol::chunk::DATA_TYPE_CHUNK;
 use ant_protocol::payment::pricing::{
@@ -82,9 +84,10 @@ impl PaidClass {
     }
 
     /// The class a paid-list value records. An empty value reads as the full
-    /// class: every key written before notices recorded a class, and every
-    /// key learned by neighbour sync or the paid-list quorum, holds one. A
-    /// value that isn't one byte naming a class reads as the full class too.
+    /// class: every key written before notices recorded a class, every key
+    /// admitted with its bytes or learned by a presence quorum, and every key
+    /// a paid-list quorum reports at the full class, holds one. A value that
+    /// isn't one byte naming a class reads as the full class too.
     #[must_use]
     pub fn from_value(value: &[u8]) -> Self {
         match value {
