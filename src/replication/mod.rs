@@ -2624,13 +2624,15 @@ impl ReplicationEngine {
             p2p_node: Arc::clone(&self.p2p_node),
             config: Arc::clone(&self.config),
             paid_list: Arc::clone(&self.paid_list),
+            storage: Arc::clone(&self.storage),
             heard_from: Arc::clone(&self.heard_from),
             holds: Arc::new(fresh::Holds::default()),
             offer_tx: offer_tx.clone(),
             possession_check_tx: self.possession_check_tx.clone(),
         };
-        self.start_fresh_write_drainer(writes, holds.clone());
-        self.start_hold_keeper(holds);
+        let (drainer_done_tx, drainer_done_rx) = tokio::sync::oneshot::channel();
+        self.start_fresh_write_drainer(writes, holds.clone(), drainer_done_tx);
+        self.start_hold_keeper(holds, drainer_done_rx);
         self.start_fresh_offer_dispatcher(offer_rx, offer_tx);
     }
 
@@ -2638,7 +2640,16 @@ impl ReplicationEngine {
     /// dispatcher. Each hold ends at its own time, so the sends keep the
     /// spacing the writes arrived with; every [`fresh::HOLD_POLL`] the task
     /// also ends the holds whose close group has all been heard from.
-    fn start_hold_keeper(&mut self, holds: fresh::HoldContext) {
+    ///
+    /// As the node stops it waits for the drainer to stop (`drainer_done`
+    /// resolves when the drainer's sender drops) before flushing, so a hold
+    /// the drainer adds for a write it was announcing at shutdown is flushed
+    /// with the others.
+    fn start_hold_keeper(
+        &mut self,
+        holds: fresh::HoldContext,
+        drainer_done: tokio::sync::oneshot::Receiver<()>,
+    ) {
         let shutdown = self.shutdown.clone();
         let handle = tokio::spawn(async move {
             let mut next_poll = Instant::now() + fresh::HOLD_POLL;
@@ -2661,7 +2672,10 @@ impl ReplicationEngine {
             // a holding notice, which records nothing: send them the slim
             // proof before the node stops, so a restart doesn't leave them
             // without this storer's paid-list evidence. Bounded by the
-            // engine's task drain.
+            // engine's task drain. The drainer checks for shutdown only
+            // between writes, so a write it was announcing may still add a
+            // hold: wait for it to stop first.
+            let _ = drainer_done.await;
             holds.flush_on_shutdown().await;
             debug!("Fresh-offer hold keeper shut down");
         });
@@ -2669,11 +2683,13 @@ impl ReplicationEngine {
     }
 
     /// Spawn a task that drains the fresh-write channel: it announces each
-    /// newly-stored chunk and holds its offers.
+    /// newly-stored chunk and holds its offers. `done` is dropped as the
+    /// task ends, which tells the hold keeper no hold will be added after.
     fn start_fresh_write_drainer(
         &mut self,
         mut rx: mpsc::UnboundedReceiver<fresh::FreshWriteEvent>,
         holds: fresh::HoldContext,
+        done: tokio::sync::oneshot::Sender<()>,
     ) {
         let p2p = Arc::clone(&self.p2p_node);
         let paid_list = Arc::clone(&self.paid_list);
@@ -2720,6 +2736,7 @@ impl ReplicationEngine {
                 holds.hold(event.key, event.payment_proof, announced).await;
             }
             debug!("Fresh-write drainer shut down");
+            drop(done);
         });
         self.task_handles.push(handle);
     }
@@ -6973,7 +6990,8 @@ async fn dispatch_paid_notify(
 /// notify goes on to admission: only one with a proof does.
 ///
 /// The sender holds the key: every release sends a notice only after storing
-/// it, and this one sends none from an offer it drops because its copy is
+/// it, and this one sends the proof at a hold's end only if its store still
+/// holds the key then, and none from an offer it drops because its copy is
 /// gone or unreadable (`fresh::fresh_read`). The note comes before admission and before the "already known" drop,
 /// and is only ever read to skip an offer. A holding notice (an empty proof)
 /// carries nothing to record, so it never takes an admission slot or a worker.

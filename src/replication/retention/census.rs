@@ -2184,8 +2184,9 @@ const PROOF_SENDERS: &[Reviewed] = &[
     ),
     // When a hold ends: the notice with the slim proof the PUT handler
     // built, to every peer of the close group, as announced or as it is now,
-    // not heard from. Sent before any offer is queued: an offer, and the
-    // dispatcher that drops one, send no notice.
+    // not heard from, while the store still holds the record. Sent before
+    // any offer is queued: an offer, and the dispatcher that drops one, send
+    // no notice.
     (
         "src/replication/fresh.rs",
         "HoldContext::end_hold",

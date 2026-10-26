@@ -46,6 +46,7 @@ use crate::replication::possession::PossessionCheckEvent;
 use crate::replication::protocol::{
     self, FreshReplicationOffer, PaidNotify, ReplicationMessage, ReplicationMessageBody,
 };
+use crate::storage::ChunkStore;
 
 /// A newly-stored chunk that needs fresh replication.
 ///
@@ -763,13 +764,17 @@ fn left_close_group(announced: &[PeerId], now: &[PeerId]) -> Vec<PeerId> {
 /// this storer.
 ///
 /// Nothing when this node's own paid-list write failed at announce: the
-/// whole paid group got the slim proof then.
+/// whole paid group got the slim proof then. Nothing either when this node
+/// no longer holds the record (`held`, checked as the hold ends): a receiver
+/// notes the sender of a proof as heard from and skips offering it, so the
+/// notice goes only from a node that still holds the record.
 fn proof_notice_recipients(
     serving: &Serving,
     left: &[(PeerId, Option<Served>)],
     recorded: bool,
+    held: bool,
 ) -> Vec<PeerId> {
-    if !recorded {
+    if !recorded || !held {
         return Vec::new();
     }
     serving
@@ -791,6 +796,7 @@ pub(crate) struct HoldContext {
     pub(crate) p2p_node: Arc<P2PNode>,
     pub(crate) config: Arc<ReplicationConfig>,
     pub(crate) paid_list: Arc<PaidList>,
+    pub(crate) storage: Arc<ChunkStore>,
     pub(crate) heard_from: Arc<HeardFrom>,
     pub(crate) holds: Arc<Holds>,
     pub(crate) offer_tx: mpsc::UnboundedSender<FreshOfferEvent>,
@@ -857,7 +863,9 @@ impl HoldContext {
     }
 
     /// How a hold's peers are served when it ends: the close group now, its
-    /// split by skip reasons, and who gets the notice with the slim proof.
+    /// split by skip reasons, and who gets the notice with the slim proof:
+    /// no one when the record was quarantined or removed during the hold
+    /// (an in-memory index lookup, no read-back).
     async fn split(&self, hold: &Hold) -> (Vec<PeerId>, Serving, Vec<PeerId>) {
         let close_group = close_group_peers(&hold.key, &self.p2p_node, &self.config).await;
         let now = Instant::now();
@@ -868,7 +876,14 @@ impl HoldContext {
             &left_close_group(&hold.close_group, &close_group),
             now,
         );
-        let proof_notices = proof_notice_recipients(&serving, &left, hold.recorded);
+        let still_stored = matches!(self.storage.exists(&hold.key), Ok(true));
+        if !still_stored && hold.recorded {
+            debug!(
+                "Chunk {} no longer stored as its hold ends, sending no proof notices",
+                hex::encode(hold.key)
+            );
+        }
+        let proof_notices = proof_notice_recipients(&serving, &left, hold.recorded, still_stored);
         (close_group, serving, proof_notices)
     }
 
@@ -889,7 +904,7 @@ impl HoldContext {
     }
 
     /// End one hold: each peer [`proof_notice_recipients`] names gets the
-    /// notice with the slim proof now, and each close-group peer in this
+    /// notice with the slim proof now, while the record is still held, and each close-group peer in this
     /// node's view now that was not heard from and is not marked full is then
     /// offered the record; every skipped peer's possession check is scheduled
     /// now.
@@ -1174,12 +1189,34 @@ mod tests {
             (p[2], None),
             (p[3], None),
         ]);
-        let notices = proof_notice_recipients(&serving, &[], true);
+        let notices = proof_notice_recipients(&serving, &[], true, true);
         assert_eq!(notices, vec![p[1], p[2], p[3]]);
         for target in &serving.offered {
             assert!(notices.contains(target), "offered {target:?} has no notice");
         }
-        assert!(proof_notice_recipients(&serving, &[], false).is_empty());
+        assert!(proof_notice_recipients(&serving, &[], false, true).is_empty());
+    }
+
+    /// A record quarantined or removed during its hold gets no notice with
+    /// the slim proof when the hold ends: a receiver would note this node as
+    /// heard from and skip offering it. The peers to be offered still get
+    /// their offer queued, which the dispatcher drops when it finds the
+    /// record gone, and the skipped peers' possession checks still run.
+    #[test]
+    fn a_record_no_longer_held_sends_no_proof_when_the_hold_ends() {
+        let p = peers(1..8);
+        let serving = serve(vec![
+            (p[0], Some(Served::HeardFrom)),
+            (p[1], Some(Served::MarkedFull)),
+            (p[2], None),
+        ]);
+        let left_reasons = vec![(p[5], None)];
+        assert!(proof_notice_recipients(&serving, &left_reasons, true, false).is_empty());
+        assert!(proof_notice_recipients(&serving, &left_reasons, false, false).is_empty());
+        assert_eq!(
+            proof_notice_recipients(&serving, &left_reasons, true, true),
+            vec![p[1], p[2], p[5]]
+        );
     }
 
     /// A peer that left the close group during the hold, but was in it at
@@ -1196,7 +1233,7 @@ mod tests {
         let serving = serve(now.iter().map(|peer| (*peer, None)).collect());
         assert_eq!(serving.unserved(now.len()), 0);
         let left_reasons = vec![(left[0], Some(Served::HeardFrom)), (left[1], None)];
-        let notices = proof_notice_recipients(&serving, &left_reasons, true);
+        let notices = proof_notice_recipients(&serving, &left_reasons, true, true);
         assert!(!notices.contains(&left[0]), "a peer heard from is skipped");
         assert!(notices.contains(&left[1]), "a peer that left is notified");
         assert!(!serving.offered.contains(&left[1]), "and not offered");
