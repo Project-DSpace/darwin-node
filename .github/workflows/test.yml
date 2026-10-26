@@ -138,18 +138,26 @@ jobs:
       # built, and one target at a time, so every target reports even if an
       # earlier one fails. The ones upstream ran single-threaded (e2e flakes
       # on hosted runners otherwise; the disk tests measure the disk) still
-      # are.
+      # are. Weekly, the targets in `weekly` also run their ignored tests:
+      # webrtc_direct_devnet's browser upload and download over a five-node
+      # devnet, too slow for every push.
       - name: Integration tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
+        env:
+          WEEKLY: ${{ github.event_name == 'schedule' }}
         run: |
           shopt -s nullglob
           serial=" e2e chunk_store_crash_safety storage_scale "
+          weekly=" webrtc_direct_devnet "
           failed=()
           for target in tests/*.rs tests/*/mod.rs; do
             name=${target#tests/}; name=${name%/mod.rs}; name=${name%.rs}
             args=()
             if [[ "$serial" == *" $name "* ]]; then args=(-- --test-threads=1); fi
+            if [[ "$WEEKLY" == true && "$weekly" == *" $name "* ]]; then
+              args=(-- --include-ignored "${args[@]:1}")
+            fi
             echo "::group::$name"
             cargo test --locked --features test-utils --test "$name" "${args[@]}" || failed+=("$name")
             echo "::endgroup::"

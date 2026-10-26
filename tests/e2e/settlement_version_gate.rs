@@ -339,9 +339,9 @@ async fn settlement_version_gate_observed_on_live_network() {
 #[tokio::test]
 #[serial]
 async fn a_client_paying_todays_price_is_stored_by_a_size_pricing_node() {
-    use super::first_audit_ab::paid_upload;
     use super::TestAnvil;
     use ant_node::ant_protocol::CLOSE_GROUP_MAJORITY;
+    use paid::paid_upload;
 
     assert_eq!(CURRENT_SETTLEMENT_VERSION, 2);
     assert_eq!(MIN_SUPPORTED_SETTLEMENT_VERSION, 1);
@@ -377,4 +377,233 @@ async fn a_client_paying_todays_price_is_stored_by_a_size_pricing_node() {
 
     harness.teardown().await.expect("teardown");
     anvil.shutdown().await;
+}
+
+/// A paid upload as an unversioned client sends it, kept from the A/B load
+/// driver (`first_audit_ab.rs`) when that file was removed.
+mod paid {
+    use ant_node::ant_protocol::{
+        ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest,
+        ChunkQuoteResponse, CLOSE_GROUP_SIZE,
+    };
+    use ant_node::client::send_and_await_chunk_response;
+    use ant_node::payment::{serialize_single_node_proof, PaymentProof};
+    use evmlib::common::Amount;
+    use evmlib::{EncodedPeerId, ProofOfPayment};
+    use rand::Rng;
+    use saorsa_core::identity::PeerId;
+    use saorsa_core::P2PNode;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The verifier accepts a settlement of at least 3x the median quote
+    /// price. Mirrors `PAID_QUOTE_PAYMENT_MULTIPLIER` (private to the
+    /// verifier).
+    const PAYMENT_MULTIPLIER: u64 = 3;
+
+    /// Per-request timeout for quote and PUT round trips.
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// One collected quote: the issuing peer, the decoded quote, and the raw
+    /// commitment sidecar blob (when the quote pinned a commitment).
+    struct CollectedQuote {
+        peer: PeerId,
+        quote: evmlib::PaymentQuote,
+        sidecar: Option<Vec<u8>>,
+    }
+
+    /// Request a signed, unversioned quote (plus its commitment sidecar) from
+    /// one peer.
+    async fn request_quote(
+        client: &Arc<P2PNode>,
+        peer: &PeerId,
+        address: [u8; 32],
+        data_size: u64,
+    ) -> Result<CollectedQuote, String> {
+        let request_id: u64 = rand::thread_rng().gen();
+        let message = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+                address,
+                data_size,
+                data_type: 0,
+            }),
+        };
+        let message_bytes = message
+            .encode()
+            .map_err(|e| format!("encode quote request: {e}"))?;
+
+        let (quote_bytes, sidecar) = send_and_await_chunk_response(
+            client,
+            peer,
+            message_bytes,
+            request_id,
+            REQUEST_TIMEOUT,
+            &[],
+            |body| match body {
+                ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                    quote,
+                    already_stored: _,
+                    commitment,
+                }) => Some(Ok((quote, commitment))),
+                ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => {
+                    Some(Err(format!("quote error: {e:?}")))
+                }
+                _ => None,
+            },
+            |e| format!("send quote request: {e}"),
+            || "quote request timed out".to_string(),
+        )
+        .await?;
+
+        let quote: evmlib::PaymentQuote =
+            rmp_serde::from_slice(&quote_bytes).map_err(|e| format!("decode quote: {e}"))?;
+        Ok(CollectedQuote {
+            peer: *peer,
+            quote,
+            sidecar,
+        })
+    }
+
+    /// Send a paid PUT to one peer; `Ok(true)` when it stored (or already
+    /// had it).
+    async fn paid_put(
+        client: &Arc<P2PNode>,
+        peer: &PeerId,
+        address: [u8; 32],
+        data: &[u8],
+        proof_bytes: Vec<u8>,
+    ) -> Result<bool, String> {
+        let request_id: u64 = rand::thread_rng().gen();
+        let message = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::PutRequest(ChunkPutRequest::with_payment(
+                address,
+                bytes::Bytes::copy_from_slice(data),
+                proof_bytes,
+            )),
+        };
+        let message_bytes = message
+            .encode()
+            .map_err(|e| format!("encode put request: {e}"))?;
+
+        send_and_await_chunk_response(
+            client,
+            peer,
+            message_bytes,
+            request_id,
+            REQUEST_TIMEOUT,
+            &[],
+            |body| match body {
+                ChunkMessageBody::PutResponse(
+                    ChunkPutResponse::Success { .. } | ChunkPutResponse::AlreadyExists { .. },
+                ) => Some(Ok(true)),
+                ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
+                    Some(Err(format!("payment required: {message}")))
+                }
+                ChunkMessageBody::PutResponse(ChunkPutResponse::Error(e)) => {
+                    Some(Err(format!("put error: {e:?}")))
+                }
+                _ => None,
+            },
+            |e| format!("send put: {e}"),
+            || "put timed out".to_string(),
+        )
+        .await
+    }
+
+    /// Outcome of one full paid upload.
+    pub struct UploadOutcome {
+        /// How many storers accepted the PUT (stored, or held it already).
+        pub stored_acks: usize,
+    }
+
+    /// One production-shaped paid upload: collect quotes from the close
+    /// group, pay the median issuer 3x on chain, then PUT the chunk (with the
+    /// full quote bundle and sidecars) to every close-group peer. The quotes
+    /// are unversioned, as a client released before settlement versions asks
+    /// them, so they are priced and paid at today's price whatever the
+    /// chunk's size.
+    pub async fn paid_upload(
+        client: &Arc<P2PNode>,
+        client_peer: &PeerId,
+        wallet: &evmlib::wallet::Wallet,
+        data: &[u8],
+    ) -> Result<(UploadOutcome, [u8; 32]), String> {
+        let address = ant_node::compute_address(data);
+
+        let closest = client
+            .dht()
+            .find_closest_nodes(&address, CLOSE_GROUP_SIZE + 1)
+            .await
+            .map_err(|e| format!("find closest: {e}"))?;
+        let storers: Vec<PeerId> = closest
+            .iter()
+            .map(|n| n.peer_id)
+            .filter(|p| p != client_peer)
+            .take(CLOSE_GROUP_SIZE)
+            .collect();
+        if storers.is_empty() {
+            return Err("no close-group peers found".to_string());
+        }
+
+        let mut quotes: Vec<CollectedQuote> = Vec::with_capacity(storers.len());
+        for peer in &storers {
+            match request_quote(client, peer, address, data.len() as u64).await {
+                Ok(q) => quotes.push(q),
+                Err(e) => eprintln!("paid upload: quote from {peer} failed: {e}"),
+            }
+        }
+        if quotes.is_empty() {
+            return Err("no quotes collected".to_string());
+        }
+
+        // Median selection mirrors the node verifier: sort by price, index
+        // len/2, settle 3x that price to the median issuer.
+        quotes.sort_by_key(|q| q.quote.price);
+        let median = quotes
+            .get(quotes.len() / 2)
+            .ok_or_else(|| "median index out of range".to_string())?;
+        let amount = median
+            .quote
+            .price
+            .checked_mul(Amount::from(PAYMENT_MULTIPLIER))
+            .ok_or_else(|| "payment amount overflow".to_string())?;
+        let (tx_by_quote, _gas) = wallet
+            .pay_for_quotes(vec![(
+                median.quote.hash(),
+                median.quote.rewards_address,
+                amount,
+            )])
+            .await
+            .map_err(|e| format!("pay_for_quotes: {e:?}"))?;
+        let tx_hashes: Vec<evmlib::common::TxHash> = tx_by_quote.values().copied().collect();
+
+        let proof = PaymentProof {
+            proof_of_payment: ProofOfPayment {
+                peer_quotes: quotes
+                    .iter()
+                    .map(|q| (EncodedPeerId::new(*q.peer.as_bytes()), q.quote.clone()))
+                    .collect(),
+            },
+            tx_hashes,
+            commitment_sidecars: quotes.iter().filter_map(|q| q.sidecar.clone()).collect(),
+        };
+        let proof_bytes =
+            serialize_single_node_proof(&proof).map_err(|e| format!("serialize proof: {e}"))?;
+
+        let mut stored_acks = 0usize;
+        for peer in &storers {
+            match paid_put(client, peer, address, data, proof_bytes.clone()).await {
+                Ok(true) => stored_acks += 1,
+                Ok(false) => {}
+                Err(e) => eprintln!("paid upload: put to {peer} failed: {e}"),
+            }
+        }
+        if stored_acks == 0 {
+            return Err("no storer accepted the paid put".to_string());
+        }
+
+        Ok((UploadOutcome { stored_acks }, address))
+    }
 }

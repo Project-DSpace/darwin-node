@@ -49,7 +49,12 @@ never ran.
 - **Payment checks fall back across RPCs** (from ds.8). A node reads a
   storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a
-  second apart. Only a failed call moves on: any answer, even that nothing
+  second apart. The public RPCs built in are PublicNode and Robinhood Chain's
+  own. A node on `https://rpc.ordofi.network`, an earlier default, reads
+  through it first and then falls back to both of these (no node falls back to
+  it), while any other form of it (`http://`, a path or a query) is read alone,
+  and the image points out an `RPC_URL` or `RPC_URLS` that still names it; a
+  node on any other RPC reads through it alone. Only a failed call moves on: any answer, even that nothing
   was paid, settles the check. Upstream reads once, through one RPC, so a
   provider answering `-32005 the network is busy` made nodes refuse paid
   chunks. Reads of listings' payments have fallen back the same way since
@@ -293,23 +298,138 @@ never ran.
   `src/upgrade/apply/ds_ordering.rs`). `tests/fork_pins.rs` pins the
   repository and the SHA-256 of the release key, and the Build workflow, as
   release.yml does for a tag, checks that the key compiled into the node is
-  that key. The storage-node image's `:latest` moves
-  only when a release is published (from ds.10): release.yml then points it
-  at the image the Build workflow made from the release's commit. A push to
-  main publishes the image as `:<commit>` only. From ds.13 a release
-  publishes nothing until the tagged commit's newest Test run (from its push
-  to main, or one run by hand) and its Build run from the push to main have
-  succeeded: release.yml's `checks` job waits for both, and the release's
-  approval is asked for only after that. `scripts/check-workflows.sh`, which
-  the Build and Test workflows run, fails unless `.github/workflows` holds
-  only build.yml, release.yml and test.yml, every action is pinned to a
-  commit, release.yml keeps its tag trigger, empty default permissions,
-  key check, release environment, that order of jobs and the only write of
-  `:latest`, test.yml's test job runs every test: the library and
+  that key. The storage-node image's `:latest` moves when a release is
+  published (from ds.10): release.yml then points it at the image the Build
+  workflow made from the release's commit, forward only. Its `latest` job,
+  which can be re-run without an approval, refuses unless `:latest`'s node
+  is older than the release's, or `:latest` already has that image (a re-run
+  after the move, which leaves it as it is), so a re-run can't undo an
+  image release or a withdrawal. A push to main publishes the image as
+  `:<commit>` only. Otherwise only the Latest workflow
+  (`.github/workflows/latest.yml`) moves `:latest`, run by hand from main
+  and approved in the `latest` environment: for an image release, a new
+  image with the node release `:latest` already has (a new node manager,
+  say), and to withdraw a release, taking `:latest` back to an image it held
+  before. A withdrawal first deletes the withdrawn release on GitHub, so
+  nodes still waiting to install it drop it and its Release run can't move
+  `:latest` to it again, then runs the Latest workflow with `withdraw`. The
+  workflow is given a commit on main, the digest of the image the Build
+  workflow made from it, `withdraw` for a withdrawal, `node_code` when the
+  node's code changed since its release, and, in a withdrawal alone,
+  `allow_unmarked` to take `:latest` from an image with an image marker to
+  one with none (below). Each run's title names
+  the digest it moves `:latest` to, then the commit. Its `checks` job, which
+  can write nothing, runs `scripts/check-workflows.sh` on the commit the
+  workflow runs from (main's head when it was dispatched), and checks that
+  the run is from main, that the `latest` environment asks for the
+  approval of exactly one required reviewer, the user the job's `REVIEWER`
+  names (no other user, no team), which administrators can't bypass, and
+  admits only main (`prevent_self_review` is left unchecked, as that one
+  reviewer also dispatches the runs) (GitHub makes an environment a job names, with no protection, when
+  there is none), that the commit is on main, that the commit's Build run
+  from its push to main succeeded, smoke test included, and so did its
+  newest Test run (from the push, or one run by hand without the listings
+  cross-test), and that the digest is the image that Build run pushed: by
+  the build provenance attestation the run made for it (signed for
+  build.yml on main at the commit, by a run a push started), by the run's
+  `storage-node-digest` artifact while that is kept (30 days), or, for a
+  withdrawal, by `docker/release-images`, which records for good the image
+  each release put on `:latest` before the Build workflow attested its
+  images (ds.13 to ds.15), as each Release run moved `:latest` to it. An
+  image with none of these is refused, and a run without `withdraw` needs
+  the attestation, so every image it puts on `:latest` has a record that
+  doesn't expire for a later withdrawal. `:<commit>` in the registry is only
+  noted: a later run by hand can push that tag again. The image's node must
+  be a published release, which the `latest` job checks again after the
+  approval, as a release can be withdrawn while a run waits for it. It is the Build workflow's own build of the
+  commit, as in every release image, checked only by the version it
+  reports, so node code changed since that release's tag without a version
+  bump would ship under its version. So, unless the run is a withdrawal,
+  any change since the tag to what the node is built from (`src`,
+  `vendor`, `Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain`,
+  `rust-toolchain.toml` and `.cargo`) is refused unless `node_code` is the
+  fingerprint the refusal prints: a SHA-256 of each of those paths' git
+  objects at the tag and at the commit, which names that change and no
+  other. The run's summary lists the changes (`git diff --stat`).
+  `rust-toolchain.toml` pins the exact Rust release every workflow builds
+  with (1.99.1, which built ds.15), so an image release's node is built
+  with its release's compiler, and a compiler change is a node code change
+  like any other. ds.15's tag predates the file, so the first image release
+  after it shows that one change and needs its `node_code`. A
+  withdrawal's image was on `:latest` before, a release's image, built from
+  the release's own commit, or one a Latest run moved `:latest` to. A node
+  takes the image's binary only when it is newer than its own, so an image
+  release's binary goes only to new nodes, and existing nodes keep their
+  signed release binary. For a withdrawal, the job also checks that
+  `:latest` held the image before: an earlier Latest run from main moved
+  `:latest` to that digest, by the run's title, or it is the image of a
+  `v*+ds.*` tag on the commit whose Release run succeeded, which the digest
+  the commit's Build run recorded names while that record is kept, or the
+  tag's line in `docker/release-images`. Once the record has expired, for
+  an image that file doesn't list, any image attested as built by the push
+  of that commit is taken, as the summary says. It also reads, from the
+  node's newest successful Release run and the successful Latest runs
+  started after it, the images `:latest` held with the image's node, in
+  order (a withdrawal drops the images after the one it goes back to). Its
+  `latest` job then
+  refuses an image whose node is newer than the one `:latest` has, which
+  goes to `:latest` only with its release, and, unless the run is a
+  withdrawal, one whose node is older, or that was built from a commit
+  before the one `:latest`'s image was built from (the commit its image
+  marker names, or, for an image with none, its release's tag): `withdraw`
+  is needed for any move to an older image, not only to an older node. It
+  refuses a move from an image with an image marker (`darwin-nodes` as its
+  node manager) to one with none (Autonomi's manager, which deletes a
+  node's data when its disk runs low) unless the run is a withdrawal and
+  `allow_unmarked` is set, which only withdrawing the first image release
+  needs, and the summary then says so in bold. A withdrawal goes back one
+  step, never further: to an older node only once the withdrawn release is
+  deleted (or a draft or a pre-release) and no other published release is
+  newer than the image's, and to the same node only to the image `:latest`
+  held before the one it has (for the release's own image, an image of its
+  tag's commit). A floor from the root switch on, no withdrawal below the
+  root release, is to be its own check once that release exists. A Release
+  run's summary gives the command that withdraws the release only when the
+  image `:latest` had has a record that doesn't expire, and says so when it
+  has none. It writes the digest `:latest` had and the new one to the run's summary,
+  with the command that moves it back when the image it had has a record
+  that doesn't expire (an attestation, or a line in
+  `docker/release-images`), then moves `:latest` and checks it. The
+  approval is given in GitHub's interface by a required reviewer of the
+  `latest` environment, which holds no secret and admits only main; the
+  release environment, which holds the release signing key, admits only
+  `v*+ds.*` tags. Release and Latest runs share one concurrency group,
+  which keeps one run going and at most one waiting: a run queued while one
+  is waiting cancels the waiting one, as it is queued, before any of its
+  jobs starts, so nothing in the workflows can prevent it. So dispatch the
+  Latest workflow only when `gh run list` shows no Release or Latest run
+  queued, waiting or in progress, approve or reject a waiting Latest run
+  before pushing a release tag, check after pushing a tag that its Release
+  run is going (a cancelled one publishes nothing), and re-run a cancelled
+  run (`gh run rerun <id>`). Operators get an image release only by pulling
+  the image: the nodes' own upgrades replace only their binary. From ds.13
+  a release publishes nothing until the tagged commit's newest Test run
+  (from its push to main, or one run by hand) and its Build run from the
+  push to main have succeeded: release.yml's `checks` job waits for both,
+  and the release's approval is asked for only after that.
+  `scripts/check-workflows.sh`, which the Build and Test workflows and the
+  Latest workflow's `checks` job run, fails unless `.github/workflows`
+  holds only build.yml, latest.yml, release.yml and test.yml, every action
+  is pinned to a commit, release.yml keeps its tag trigger, empty default
+  permissions, key check, release environment, that order of jobs and its
+  forward-only move of `:latest`, latest.yml keeps its trigger by hand, run
+  titles, empty default permissions, checks, approval, the values its jobs
+  hand on and order of jobs, both stop a step at each refusal, only the
+  `latest` jobs of the two write to the registry, each once, to move
+  `:latest`, besides build.yml's push of `:<commit>`, only release.yml's
+  publish job runs in the release environment and only latest.yml's
+  `latest` job in the `latest` environment, `docker/release-images` keeps
+  its lines, test.yml's test job runs every test: the library and
   binaries, both vendored crates' own tests and every target in `tests/`,
   and build.yml builds the image's node manager with `--locked` from the
   pinned darwin-client commit, once it has checked that the commit is on
-  darwin-client's main, checks the binary, and gives the image its marker.
+  darwin-client's main, checks the binary, gives the image its marker and
+  attests the image.
   A darwin-client change the image needs lands on darwin-client's main
   first, merged with its commits kept; the pin then names the commit as it
   is there. Both build.yml and release.yml build the node with exactly
@@ -925,7 +1045,10 @@ Run `cargo test --features test-utils` (the EVM tests need Foundry's
 `anvil`). The library alone has about 1,400 tests. CI runs the suite on
 every push to main, weekly and by hand (`.github/workflows/test.yml`), and
 weekly, or by hand when asked, `scripts/test_e2e_listings.sh` against
-darwin-client.
+darwin-client. Every file under `tests/` is listed in a census
+(`every_test_file_is_reviewed` in `tests/fork_pins.rs`), with the upstream
+test files this fork removed and where their checks live now, so a merge
+can't add a test file or bring a removed one back unreviewed.
 
 ### Data Types Supported
 

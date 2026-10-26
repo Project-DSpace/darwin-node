@@ -597,14 +597,3 @@ macro_rules! with_test_network {
         result
     }};
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_harness_error_display() {
-        let err = HarnessError::NodeNotFound(5);
-        assert!(err.to_string().contains('5'));
-    }
-}

@@ -35,7 +35,8 @@ RUN echo "$IMAGE_VERSION" | grep -qxE '[0-9a-f]{40}' \
 # Our network, set the way our servers run it: production mode (each node's
 # routing table takes at most 2 nodes from one IP in each bucket and among the
 # 20 nearest), IPv4 only, the 3 bootstrap servers,
-# and Robinhood Chain RPCs shared out over the nodes. Operators set
+# and Robinhood Chain's own RPC (RPCs listed in RPC_URLS are shared out over
+# the nodes). Operators set
 # REWARDS_ADDRESS, NODE_COUNT and usually BROWSER_PORT_START; servers also set
 # PUBLIC_IP. RPC_URL, if set, replaces RPC_URLS with one provider of the
 # operator's choice. The token, vault (with the block it was deployed in) and
@@ -50,7 +51,7 @@ ENV ANT_NETWORK_MODE=production \
     ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK=81897121 \
     BOOTSTRAP_PEERS="142.93.32.90:10000 165.22.193.90:10000 142.93.96.232:10000" \
     RPC_URL="" \
-    RPC_URLS="https://rpc.mainnet.chain.robinhood.com https://rpc.ordofi.network" \
+    RPC_URLS="https://rpc.mainnet.chain.robinhood.com" \
     NODE_COUNT=1 \
     PORT_START=10000 \
     BROWSER_PORT_START=0 \

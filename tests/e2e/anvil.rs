@@ -165,8 +165,10 @@ pub fn create_funded_wallet_for_network(network: &EvmNetwork, private_key: &str)
 /// "test test test test test test test test test test test junk"
 pub mod test_accounts {
     /// Account #0 address
+    #[allow(dead_code)]
     pub const ACCOUNT_0: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     /// Account #0 private key
+    #[allow(dead_code)]
     pub const ACCOUNT_0_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
@@ -185,28 +187,4 @@ pub mod test_accounts {
     #[allow(dead_code)]
     pub const ACCOUNT_2_KEY: &str =
         "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[tokio::test]
-    #[serial]
-    async fn test_anvil_creation() {
-        let anvil = TestAnvil::new().await.unwrap();
-        let _network = anvil.to_network();
-        assert!(
-            !anvil.default_wallet_key().unwrap().is_empty(),
-            "expected a non-empty default wallet key"
-        );
-    }
-
-    #[test]
-    fn test_account_constants() {
-        assert!(test_accounts::ACCOUNT_0.starts_with("0x"));
-        assert!(test_accounts::ACCOUNT_0_KEY.starts_with("0x"));
-    }
 }

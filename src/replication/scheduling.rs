@@ -3056,4 +3056,32 @@ mod tests {
         );
         assert_eq!(queues.pending_count(), 1);
     }
+
+    /// A fetch dequeued from the queue moves to its next untried source when
+    /// one fails, and once every source has failed it is exhausted and can be
+    /// completed (abandoned), leaving nothing in flight (Section 18 #9 and
+    /// #10; were the e2e scenarios 9 and 10, which used no network).
+    #[test]
+    fn a_dequeued_fetch_retries_its_other_source_then_is_exhausted() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0x09);
+        let source_a = peer_id_from_byte(0xA0);
+        let source_b = peer_id_from_byte(0xB0);
+
+        queues.enqueue_fetch(key, xor_name_from_byte(0x01), vec![source_a, source_b]);
+        let candidate = queues.dequeue_fetch().expect("dequeue");
+        queues.start_dequeued_fetch(candidate, source_a);
+
+        assert_eq!(
+            queues.retry_fetch(&key),
+            Some(source_b),
+            "the first failure moves to the other source"
+        );
+        assert!(queues.retry_fetch(&key).is_none(), "no source is left");
+        assert!(
+            queues.complete_fetch(&key).is_some(),
+            "the exhausted fetch is still in flight until completed"
+        );
+        assert_eq!(queues.in_flight_count(), 0);
+    }
 }

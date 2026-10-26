@@ -1114,7 +1114,7 @@ async fn live_reads_of_a_past_payment_agree_on_every_default_rpc() {
     rpcs.extend(image_rpcs.split_whitespace().map(str::to_string));
     let mut seen = HashSet::new();
     rpcs.retain(|rpc| seen.insert(rpc.trim_end_matches('/').to_string()));
-    assert!(rpcs.len() >= 3, "{rpcs:?}");
+    assert!(rpcs.len() >= 2, "{rpcs:?}");
 
     let mut failed = Vec::new();
     for rpc in rpcs {
