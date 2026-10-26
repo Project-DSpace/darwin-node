@@ -941,6 +941,9 @@ async fn faults(
         .filter(|upload| upload.stored && upload.kind == "chunk" && !upload.one_storer)
     {
         let address = bytes32(&upload.address)?;
+        // A new client reaches only the nodes it has looked up: look up the
+        // record's nodes first, as `check` does.
+        close_group(client, &address).await?;
         let content = get_chunk(client, &address, &upload.puts).await;
         let Some(content) = content else {
             cases.push(case(
