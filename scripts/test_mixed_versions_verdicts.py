@@ -261,6 +261,17 @@ def main():
             "old-hosts-new": result(unlisted=missing("joiner", 3 + harness.PENALTY_SLACK))},
            options(),
            [f"the joiners in a paid group at upload miss {3 + harness.PENALTY_SLACK} keys"])
+    def handed_over(held):
+        found = result()
+        found["checks"] = [{"address": "ef" * 32, "storers": ["01"] * 7, "held_by_storers": 2,
+                            "one_storer": True, "held_outside_devnet": held}]
+        return found
+    expect("a record PUT to one storer, handed over to joiners, passes when a majority of "
+           "the nodes asked hold it",
+           {"all-old": handed_over(harness.MAJORITY)}, options(), [])
+    expect("a record PUT to one storer held by fewer than a majority of the nodes asked fails",
+           {"all-old": handed_over(harness.MAJORITY - 1)}, options(),
+           [f"PUT to one storer, is held at the end by {harness.MAJORITY - 1} of the nodes"])
     repeated = {"case": "repeated PUT", "address": "cd" * 32, "peer": None, "note": "",
                 "answers": [{"peer": "01", "outcome": "already_stored"},
                             {"peer": "02", "outcome": "stored"}]}

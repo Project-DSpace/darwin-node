@@ -38,7 +38,10 @@ reply that didn't decode; every record stored by a majority of its close
 group, and still held at the end by a majority of the nodes that stored it
 (a node that joins later gets a record only by repair, which waits for the
 record to age, so the nodes nearest it now are counted but not required; a
-record PUT to one storer counts its close group at upload as its storers);
+record PUT to one storer is held instead by a majority of the nodes asked for
+it, its close group at upload and the nodes nearest it now, the devnet's
+nodes left out: those never get it by an offer, and its first holders hand
+it to joiners nearer to it and drop it);
 every repeated PUT answered "already stored"; and every standalone node
 received neighbour sync. A record's one storer is never one of the devnet's
 nodes, which run no replication.
@@ -819,6 +822,14 @@ def analyze(run):
 
     records = [record for uploads in run["uploads"] for record in uploads["records"]]
     checks = [record for checks in run["checks"] for record in checks["records"]]
+    # A record PUT to one storer: held by how many of the nodes asked for it
+    # that the devnet doesn't run.
+    one_storer = {record["address"] for record in records if record.get("one_storer")}
+    for record in checks:
+        record["one_storer"] = record["address"] in one_storer
+        record["held_outside_devnet"] = sum(
+            1 for answer in record["answers"]
+            if answer["outcome"] == "held" and answer["peer"] not in run["devnet_peers"])
     full_evidence = {}
     for node in run["nodes"]:
         if node["full"]:
@@ -994,7 +1005,12 @@ def verdicts(results, args):
                 failures.append(f"{name}: record {record['address']} wasn't stored: "
                                 f"{record.get('error')}")
         for record in result["checks"]:
-            if record["held_by_storers"] < MAJORITY:
+            if record.get("one_storer"):
+                if record["held_outside_devnet"] < MAJORITY:
+                    failures.append(f"{name}: record {record['address']}, PUT to one storer, "
+                                    f"is held at the end by {record['held_outside_devnet']} "
+                                    f"of the nodes asked for it")
+            elif record["held_by_storers"] < MAJORITY:
                 failures.append(f"{name}: record {record['address']} is held at the end by "
                                 f"{record['held_by_storers']} of the "
                                 f"{len(record['storers'])} nodes that stored it")
