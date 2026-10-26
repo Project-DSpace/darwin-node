@@ -135,7 +135,10 @@ fn serialize_proof(peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>) -> Vec<u8> {
 /// on-chain settlement read and the floor as the load-bearing checks.
 fn live_verifier(network: evmlib::Network, floor: PriceFloorConfig) -> PaymentVerifier {
     let verifier = PaymentVerifier::new(PaymentVerifierConfig {
-        evm: EvmVerifierConfig { network },
+        evm: EvmVerifierConfig {
+            network,
+            root_vault: None,
+        },
         cache_capacity: 128,
         close_group_size: CLOSE_GROUP_SIZE,
         local_rewards_address: RewardsAddress::new([0x11; 20]),
@@ -253,6 +256,7 @@ async fn enforced_floor_accepts_at_floor_real_overpayment() {
     let verifier = PaymentVerifier::new(PaymentVerifierConfig {
         evm: EvmVerifierConfig {
             network: network.clone(),
+            root_vault: None,
         },
         cache_capacity: 128,
         close_group_size: CLOSE_GROUP_SIZE,

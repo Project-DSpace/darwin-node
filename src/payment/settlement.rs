@@ -55,11 +55,20 @@
 //! ([`SettlementReads::settlement_again`]). An envelope's receipt that an RPC
 //! didn't know is read once more the same way
 //! ([`SettlementReads::receipt_again`]).
+//!
+//! A root payment is read by its wave's key, from the root vault's record
+//! (`records`), through the same pool and in the same rounds
+//! ([`SettlementReads::wave_record`]). One read of a key is in flight at a
+//! time, and a key the vault has recorded is kept for good: the vault writes
+//! a wave's record once and never changes it. A record that reads empty is
+//! read once more the same way ([`SettlementReads::wave_record_again_later`]).
+//! The facts of per-quote payments come from the per-quote vault's logs only:
+//! a root vault's log never stands for a per-quote record.
 
 use crate::listings::{parse_receipt, parse_u64, quantity, vault_payments, MAX_PROOF_TXS};
 use crate::logging::debug;
 use crate::payment::traffic::{self, EvmRpcCall};
-use ant_listings::{PaymentReceipt, DATA_PAYMENT_MADE_TOPIC};
+use ant_listings::{PaymentReceipt, RootVault, DATA_PAYMENT_MADE_TOPIC};
 use evmlib::common::Amount;
 use futures::stream::{FuturesUnordered, StreamExt};
 use lru::LruCache;
@@ -163,6 +172,10 @@ const SINGLES_AFTER_TIMED_OUT_BATCH: usize = 4;
 /// Keccak-256 hash of that signature.
 const COMPLETED_PAYMENTS_SELECTOR: [u8; 4] = [0xfe, 0x3c, 0x80, 0x6e];
 
+/// `records(bytes32)`'s selector on a root vault: the first four bytes of the
+/// Keccak-256 hash of that signature.
+const ROOT_RECORDS_SELECTOR: [u8; 4] = [0x01, 0xe6, 0x47, 0x25];
+
 /// The JSON-RPC error code of a provider that is busy or limiting its rate.
 const BUSY_CODE: i64 = -32_005;
 
@@ -187,6 +200,27 @@ impl Settlement {
     }
 }
 
+/// What a root vault holds under a wave's key (`records`): the block time
+/// the wave was recorded at, its leaf count and its payer, all zero for a key
+/// never recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveRecord {
+    /// The block time the wave was recorded at.
+    pub time: u64,
+    /// How many payments the wave holds.
+    pub leaf_count: u32,
+    /// The account that paid the wave.
+    pub payer: [u8; 20],
+}
+
+impl WaveRecord {
+    /// Whether the vault recorded a wave under the key: any field set. A
+    /// recorded wave has all three set.
+    pub fn is_recorded(&self) -> bool {
+        self.time != 0 || self.leaf_count != 0 || self.payer != [0; 20]
+    }
+}
+
 /// An answer, and the RPC that gave it, by its place in the node's list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answered<T> {
@@ -197,6 +231,10 @@ pub struct Answered<T> {
 /// A record read: what the vault holds for a quote hash, or why it couldn't
 /// be read.
 pub type RecordRead = Result<Answered<Settlement>, String>;
+
+/// A wave record read: what the root vault holds under a key, or why it
+/// couldn't be read.
+pub type WaveRead = Result<Answered<WaveRecord>, String>;
 
 /// A receipt read: the receipt, `None` if the RPC didn't know the transaction,
 /// or why it couldn't be read.
@@ -243,6 +281,9 @@ impl Lane {
 enum Expect {
     /// A `completedPayments` record: 64 bytes, the payee and the amount.
     Record,
+    /// A root vault's `records` record: 96 bytes, the time, the leaf count
+    /// and the payer.
+    WaveRecord,
     /// A receipt, or `null` for a transaction the RPC doesn't know.
     Receipt,
     /// A block, or `null` for a block the RPC doesn't know.
@@ -649,6 +690,7 @@ fn answer(response: Value, expect: Expect) -> Result<Value, CallError> {
     let result = rpc_result(response)?;
     let held = match expect {
         Expect::Record => decode_record(&result).map(|_| ()),
+        Expect::WaveRecord => decode_wave_record(&result).map(|_| ()),
         Expect::Receipt => {
             if result.is_null() || result["blockNumber"].is_string() {
                 Ok(())
@@ -717,6 +759,64 @@ fn decode_record(result: &Value) -> Result<Settlement, String> {
         amount: Amount::from(u128::from_be_bytes(amount_bytes)),
         payee_prefix,
     })
+}
+
+/// A root vault's `records` record: `(uint64 time, uint32 leafCount, address
+/// payer)`, each in a 32-byte word. Anything else is no record, so an
+/// address with no code, which answers with nothing, never reads as empty.
+fn decode_wave_record(result: &Value) -> Result<WaveRecord, String> {
+    let hex_words = result
+        .as_str()
+        .ok_or("the wave record is not a hex string")?
+        .trim_start_matches("0x");
+    let bytes = hex::decode(hex_words).map_err(|e| format!("the wave record is not hex: {e}"))?;
+    let words: [u8; 96] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "the wave record is {} bytes, not the time, the leaf count and the payer in 96",
+            bytes.len()
+        )
+    })?;
+    let (time_padding, time) = words[..32].split_at(24);
+    let (count_padding, leaf_count) = words[32..64].split_at(28);
+    let (payer_padding, payer) = words[64..].split_at(12);
+    if time_padding
+        .iter()
+        .chain(count_padding)
+        .chain(payer_padding)
+        .any(|byte| *byte != 0)
+    {
+        return Err("the wave record's words are not padded with zeros".into());
+    }
+    let mut time_bytes = [0u8; 8];
+    time_bytes.copy_from_slice(time);
+    let mut count_bytes = [0u8; 4];
+    count_bytes.copy_from_slice(leaf_count);
+    let mut payer_bytes = [0u8; 20];
+    payer_bytes.copy_from_slice(payer);
+    Ok(WaveRecord {
+        time: u64::from_be_bytes(time_bytes),
+        leaf_count: u32::from_be_bytes(count_bytes),
+        payer: payer_bytes,
+    })
+}
+
+/// The `records(key)` call to the root vault at `vault`.
+fn wave_record_request(id: usize, vault: &[u8; 20], key: &[u8; 32]) -> Value {
+    request(
+        id,
+        "eth_call",
+        &json!([
+            {
+                "to": format!("0x{}", hex::encode(vault)),
+                "input": format!(
+                    "0x{}{}",
+                    hex::encode(ROOT_RECORDS_SELECTOR),
+                    hex::encode(key)
+                ),
+            },
+            "latest"
+        ]),
+    )
 }
 
 /// A JSON-RPC request object.
@@ -869,6 +969,8 @@ struct QueuedRead {
 /// the payment check and the listings (see the module's description).
 pub struct SettlementReads {
     vault: [u8; 20],
+    /// The root vault, where the network has one.
+    root: Option<RootVault>,
     pool: Pool,
     /// Payment facts, by quote hash: only positive, settled ones.
     facts: Mutex<LruCache<[u8; 32], Settlement>>,
@@ -876,6 +978,11 @@ pub struct SettlementReads {
     receipts: Mutex<LruCache<[u8; 32], Arc<PaymentReceipt>>>,
     /// Block times read, by block number.
     blocks: Mutex<LruCache<u64, u64>>,
+    /// The root vault's records read recorded, by key. A record is written
+    /// once and never changes, so one read recorded is kept for good.
+    waves: Mutex<LruCache<[u8; 32], WaveRecord>>,
+    /// Wave record reads in flight, by lane.
+    wave_flights: [Arc<Flights<WaveRead>>; Lane::COUNT],
     /// Record reads in flight, by lane.
     record_flights: [Arc<Flights<RecordRead>>; Lane::COUNT],
     /// Receipt reads in flight, by lane.
@@ -888,15 +995,30 @@ pub struct SettlementReads {
 }
 
 impl SettlementReads {
-    /// Reads of the vault at `vault` through `rpc_urls`, in that order.
+    /// Tests only: reads of the vault at `vault` through `rpc_urls`, in that
+    /// order, on a network with no root vault.
+    #[cfg(test)]
     pub fn new(vault: [u8; 20], rpc_urls: Vec<reqwest::Url>) -> Arc<Self> {
+        Self::with_root(vault, None, rpc_urls)
+    }
+
+    /// Reads of the vault at `vault`, and of the root vault `root` where the
+    /// network has one, through `rpc_urls`, in that order.
+    pub fn with_root(
+        vault: [u8; 20],
+        root: Option<RootVault>,
+        rpc_urls: Vec<reqwest::Url>,
+    ) -> Arc<Self> {
         let capacity = |capacity: usize| NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Arc::new(Self {
             vault,
+            root,
             pool: Pool::new(rpc_urls),
             facts: Mutex::new(LruCache::new(capacity(FACTS_CAPACITY))),
             receipts: Mutex::new(LruCache::new(capacity(RECEIPTS_CAPACITY))),
             blocks: Mutex::new(LruCache::new(capacity(BLOCKS_CAPACITY))),
+            waves: Mutex::new(LruCache::new(capacity(FACTS_CAPACITY))),
+            wave_flights: [Flights::new(), Flights::new()],
             record_flights: [Flights::new(), Flights::new()],
             receipt_flights: [Flights::new(), Flights::new()],
             queues: [Mutex::new(Queue::default()), Mutex::new(Queue::default())],
@@ -916,7 +1038,12 @@ impl SettlementReads {
                 .map(|rpc| rpc.url.clone())
                 .collect()
         };
-        self.vault == other.vault && urls(self) == urls(other)
+        self.vault == other.vault && self.root == other.root && urls(self) == urls(other)
+    }
+
+    /// The root vault, where the network has one.
+    pub const fn root_vault(&self) -> Option<RootVault> {
+        self.root
     }
 
     /// Tests only: read through `urls` in place of the RPCs given at start.
@@ -1279,6 +1406,106 @@ impl SettlementReads {
         self.settled(quote_hash, &answered)
     }
 
+    /// What the root vault holds under `key`, a wave's key: kept, if the
+    /// vault was read to have recorded it, or read.
+    ///
+    /// A read of the key already in flight in `lane` is joined. If it comes
+    /// back empty or failed, or is dropped before it comes back, this makes a
+    /// read of its own, so it never takes on another caller's failure. Reads
+    /// run on their own: one whose caller goes away still finishes, and keeps
+    /// a record it finds.
+    pub async fn wave_record(self: &Arc<Self>, key: [u8; 32], lane: Lane) -> WaveRead {
+        if let Some(kept) = self.kept_wave(&key) {
+            return Ok(kept);
+        }
+        let flights = &self.wave_flights[lane.index()];
+        let (receiver, leader) = match flights.join(key) {
+            Joined::Follower(receiver) => (receiver, false),
+            Joined::Leader(landing, receiver) => {
+                let reads = Arc::clone(self);
+                tokio::spawn(async move {
+                    let read = reads.read_wave(key, lane, None).await;
+                    landing.land(read);
+                });
+                (receiver, true)
+            }
+        };
+        match (leader, shared(receiver).await) {
+            (true, Some(read)) => read,
+            (false, Some(Ok(answered))) if answered.value.is_recorded() => Ok(answered),
+            // Joined a read that came back empty or failed, or one dropped
+            // before it came back: read for ourselves.
+            _ => self.read_wave(key, lane, None).await,
+        }
+    }
+
+    /// The record under `key` read once more, after `pause`, after one read
+    /// empty at the RPC `after`: a read of its own, skipping any read in
+    /// flight, on a fresh connection, starting at the RPC after `after`. The
+    /// pause and the read run in a task of their own and go on if the
+    /// caller goes away, so a record they find is kept for the client's next
+    /// try.
+    pub fn wave_record_again_later(
+        self: &Arc<Self>,
+        key: [u8; 32],
+        lane: Lane,
+        after: usize,
+        pause: Duration,
+    ) -> oneshot::Receiver<WaveRead> {
+        let (sender, receiver) = oneshot::channel();
+        let reads = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(pause).await;
+            let read = match reads.kept_wave(&key) {
+                Some(kept) => Ok(kept),
+                None => reads.read_wave(key, lane, Some(after)).await,
+            };
+            // The caller may have gone; a record found is kept all the same.
+            let _ = sender.send(read);
+        });
+        receiver
+    }
+
+    /// The record kept for `key`, if the vault was read to have recorded it.
+    fn kept_wave(&self, key: &[u8; 32]) -> Option<Answered<WaveRecord>> {
+        let kept = self.waves.lock().get(key).copied()?;
+        Some(Answered {
+            value: kept,
+            rpc: self.pool.answered.load(Ordering::Relaxed),
+        })
+    }
+
+    /// One `records(key)` call to the root vault, through the pool, in
+    /// [`PAYMENT_READ_ROUNDS`] rounds; with `again_after`, on a fresh
+    /// connection from the RPC after that one. A record that is recorded is
+    /// kept.
+    async fn read_wave(&self, key: [u8; 32], lane: Lane, again_after: Option<usize>) -> WaveRead {
+        let Some(root) = self.root else {
+            return Err("this node knows no root vault".into());
+        };
+        let body = wave_record_request(1, &root.address, &key);
+        let answered = self
+            .pool
+            .call(&Call {
+                body: &body,
+                kind: EvmRpcCall::RootRecord,
+                expect: Expect::WaveRecord,
+                lane,
+                rounds: PAYMENT_READ_ROUNDS,
+                again_after,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let record = decode_wave_record(&answered.value)?;
+        if record.is_recorded() {
+            self.waves.lock().put(key, record);
+        }
+        Ok(Answered {
+            value: record,
+            rpc: answered.rpc,
+        })
+    }
+
     /// The receipt of `tx_hash`, from those kept or read: `None` if the RPC
     /// that answered didn't know the transaction. Its vault payments are kept
     /// as facts. A read of it already in flight in `lane` is joined; if that
@@ -1355,9 +1582,16 @@ impl SettlementReads {
             });
         }
         let mut receipt = parse_receipt(tx_hash, &answered.value).map_err(|e| e.to_string())?;
-        // Only the vault's payment logs matter here, so only they are kept.
+        // Only the vaults' logs matter here, so only they are kept: the
+        // per-quote vault's payment logs, and where the network has a root
+        // vault, its logs and its token's, from which a wave is read back
+        // whole. The facts come from the per-quote vault's logs alone
+        // (`remember_payments`).
         receipt.logs.retain(|log| {
-            log.address == self.vault && log.topics.first() == Some(&DATA_PAYMENT_MADE_TOPIC)
+            (log.address == self.vault && log.topics.first() == Some(&DATA_PAYMENT_MADE_TOPIC))
+                || self
+                    .root
+                    .is_some_and(|root| [root.address, root.token].contains(&log.address))
         });
         let receipt = Arc::new(receipt);
         self.remember_payments(&receipt);

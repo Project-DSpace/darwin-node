@@ -8,7 +8,9 @@
 //! logs for a quote hash or in one block, or just a block's timestamp.
 
 use crate::error::{Error, Result};
-use ant_listings::{ListingPayment, Lookup, PaymentLog, PaymentReceipt, DATA_PAYMENT_MADE_TOPIC};
+use ant_listings::{
+    ListingPayment, Lookup, PaymentLog, PaymentReceipt, VaultSet, DATA_PAYMENT_MADE_TOPIC,
+};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -228,7 +230,7 @@ impl Chain {
         &self,
         lookup: &Lookup,
         shown: &ListingPayment,
-        vault: &[u8; 20],
+        vaults: &VaultSet,
         search: Search,
     ) -> Result<Fetched> {
         match *lookup {
@@ -248,12 +250,12 @@ impl Chain {
                     // One block: one timestamp, so only the log index can
                     // tell its payments apart.
                     Some(block) => at_log_index(
-                        self.vault_logs(vault, &topics, block, block).await?,
+                        self.vault_logs(vaults, &topics, block, block).await?,
                         shown.log_index,
                     ),
                     None => {
                         self.search_quote_logs(
-                            vault,
+                            vaults,
                             &topics,
                             search_from,
                             not_after,
@@ -271,7 +273,7 @@ impl Chain {
             } => {
                 let topics = [Some(DATA_PAYMENT_MADE_TOPIC), None, None, None];
                 let logs = at_log_index(
-                    self.vault_logs(vault, &topics, block_number, block_number)
+                    self.vault_logs(vaults, &topics, block_number, block_number)
                         .await?,
                     Some(log_index),
                 );
@@ -443,7 +445,7 @@ impl Chain {
     /// `search` goes.
     async fn search_quote_logs(
         &self,
-        vault: &[u8; 20],
+        vaults: &VaultSet,
         topics: &[Option<[u8; 32]>; 4],
         search_from: u64,
         not_after: Option<u64>,
@@ -476,7 +478,7 @@ impl Chain {
         while from <= last && budget > 0 {
             let to = from.saturating_add(range - 1).min(last);
             budget -= 1;
-            match self.vault_logs(vault, topics, from, to).await {
+            match self.vault_logs(vaults, topics, from, to).await {
                 Ok(logs) => {
                     let logs = at_log_index(logs, shown.log_index);
                     if !logs.is_empty() {
@@ -509,7 +511,7 @@ impl Chain {
             let to_block = to - 1;
             let from_block = to_block.saturating_sub(range - 1);
             budget -= 1;
-            match self.vault_logs(vault, topics, from_block, to_block).await {
+            match self.vault_logs(vaults, topics, from_block, to_block).await {
                 Ok(logs) => {
                     let logs = at_log_index(logs, shown.log_index);
                     if !logs.is_empty() {
@@ -527,11 +529,11 @@ impl Chain {
         Ok(Vec::new())
     }
 
-    /// The vault's logs matching `topics` (`None` = any) in blocks
-    /// `from..=to`.
+    /// The vaults' logs matching `topics` (`None` = any) in blocks
+    /// `from..=to`: one query for every vault of `vaults`.
     async fn vault_logs(
         &self,
-        vault: &[u8; 20],
+        vaults: &VaultSet,
         topics: &[Option<[u8; 32]>; 4],
         from: u64,
         to: u64,
@@ -544,8 +546,18 @@ impl Chain {
                 })
             })
             .collect();
+        let addresses: Vec<String> = vaults
+            .addresses()
+            .iter()
+            .map(|vault| format!("0x{}", hex::encode(vault)))
+            .collect();
+        // One vault is named alone, as before a root vault was known.
+        let address = match addresses.as_slice() {
+            [one] => json!(one),
+            _ => json!(addresses),
+        };
         let filter = json!({
-            "address": format!("0x{}", hex::encode(vault)),
+            "address": address,
             "fromBlock": quantity(from),
             "toBlock": quantity(to),
             "topics": topics,
@@ -746,6 +758,12 @@ fn parse_log(log: &Value) -> Option<PaymentLog> {
             .iter()
             .map(|topic| topic.as_str().and_then(parse_bytes))
             .collect::<Option<Vec<[u8; 32]>>>()?,
+        // A root vault's wave is read from its logs' data; a log without
+        // data has none.
+        data: match log["data"].as_str() {
+            Some(data) => hex::decode(data.trim_start_matches("0x")).ok()?,
+            None => Vec::new(),
+        },
         log_index: parse_u64(log["logIndex"].as_str()?).ok()?,
     })
 }
@@ -791,6 +809,8 @@ pub mod tests {
     use tokio::net::TcpListener;
 
     pub const VAULT: [u8; 20] = [0x69; 20];
+    /// The mock chain's vault, alone.
+    pub const VAULTS: VaultSet = VaultSet::v2_only(VAULT);
 
     /// Which calls a mock chain fails, by method and parameters.
     pub type FailingCalls = Box<dyn Fn(&str, &Value) -> bool + Send>;
@@ -882,8 +902,14 @@ pub mod tests {
                         return json!({ "jsonrpc": "2.0", "id": 1,
                             "error": { "code": -32005, "message": "range too large" } });
                     }
-                    let address: [u8; 20] =
-                        parse_bytes(filter["address"].as_str().unwrap()).unwrap();
+                    // One address, or a list of them.
+                    let addresses: Vec<[u8; 20]> = match &filter["address"] {
+                        Value::Array(list) => list
+                            .iter()
+                            .map(|a| parse_bytes(a.as_str().unwrap()).unwrap())
+                            .collect(),
+                        one => vec![parse_bytes(one.as_str().unwrap()).unwrap()],
+                    };
                     let topics: Vec<Option<[u8; 32]>> = filter["topics"]
                         .as_array()
                         .unwrap()
@@ -894,7 +920,7 @@ pub mod tests {
                         .logs
                         .iter()
                         .filter(|l| {
-                            l.log.address == address
+                            addresses.contains(&l.log.address)
                                 && (from..=to).contains(&l.block_number)
                                 && topics.iter().enumerate().all(|(i, topic)| {
                                     topic.is_none_or(|t| l.log.topics.get(i) == Some(&t))
@@ -997,6 +1023,7 @@ pub mod tests {
             "logs": receipt.logs.iter().map(|log| json!({
                 "address": format!("0x{}", hex::encode(log.address)),
                 "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
                 "logIndex": quantity(log.log_index),
             })).collect::<Vec<_>>(),
         })
@@ -1011,6 +1038,7 @@ pub mod tests {
         PaymentLog {
             address: VAULT,
             topics: vec![DATA_PAYMENT_MADE_TOPIC, rewards, amount, quote_hash],
+            data: Vec::new(),
             log_index,
         }
     }
@@ -1074,7 +1102,7 @@ pub mod tests {
             .fetch(
                 &Lookup::Transaction { tx_hash: [1; 32] },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1087,7 +1115,7 @@ pub mod tests {
             .fetch(
                 &Lookup::Transaction { tx_hash: [2; 32] },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1106,7 +1134,7 @@ pub mod tests {
                     log_index: 4,
                 },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1119,7 +1147,7 @@ pub mod tests {
                     log_index: 5,
                 },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1135,7 +1163,7 @@ pub mod tests {
                 .fetch(
                     &Lookup::Block { block_number: 3 },
                     &ListingPayment::default(),
-                    &VAULT,
+                    &VAULTS,
                     Search::Full
                 )
                 .await
@@ -1147,7 +1175,7 @@ pub mod tests {
                 .fetch(
                     &Lookup::Block { block_number: 99 },
                     &ListingPayment::default(),
-                    &VAULT,
+                    &VAULTS,
                     Search::Full
                 )
                 .await
@@ -1159,7 +1187,7 @@ pub mod tests {
                 .fetch(
                     &Lookup::Nothing,
                     &ListingPayment::default(),
-                    &VAULT,
+                    &VAULTS,
                     Search::Full
                 )
                 .await
@@ -1191,7 +1219,7 @@ pub mod tests {
                     not_after: None,
                 },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1206,7 +1234,7 @@ pub mod tests {
                     not_after: None,
                 },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1224,7 +1252,7 @@ pub mod tests {
                     not_after: None,
                 },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1242,7 +1270,7 @@ pub mod tests {
                     not_after: None,
                 },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1260,7 +1288,7 @@ pub mod tests {
                     not_after: Some(1_790_000_000 + 2 * 999),
                 },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1283,7 +1311,7 @@ pub mod tests {
             not_after: None,
         };
         let found = chain
-            .fetch(&lookup, &ListingPayment::default(), &VAULT, Search::Full)
+            .fetch(&lookup, &ListingPayment::default(), &VAULTS, Search::Full)
             .await
             .unwrap();
         assert_eq!(found.len(), 1);
@@ -1294,7 +1322,7 @@ pub mod tests {
         mock.lock().max_log_range = None;
         mock.lock().calls.clear();
         let found = chain
-            .fetch(&lookup, &ListingPayment::default(), &VAULT, Search::Full)
+            .fetch(&lookup, &ListingPayment::default(), &VAULTS, Search::Full)
             .await
             .unwrap();
         assert_eq!(found.len(), 1);
@@ -1339,17 +1367,17 @@ pub mod tests {
 
         // Through the refusing RPC alone, the search fails.
         let alone = Chain::new(urls[0].clone()).unwrap();
-        let error = alone.fetch(&lookup, &shown, &VAULT, Search::Brief).await;
+        let error = alone.fetch(&lookup, &shown, &VAULTS, Search::Brief).await;
         assert!(format!("{error:?}").contains("403"), "{error:?}");
 
         // With the second behind it, the payment is found.
         let chain = Chain::with_rpcs(urls).unwrap();
-        let found = chain.fetch(&lookup, &shown, &VAULT, Search::Brief).await;
+        let found = chain.fetch(&lookup, &shown, &VAULTS, Search::Brief).await;
         assert_eq!(found.unwrap().len(), 1);
         assert!(log_calls(&answering) > 0);
         // Later calls start at the RPC that answered.
         let refused_before = refusing.lock().calls.len();
-        let found = chain.fetch(&lookup, &shown, &VAULT, Search::Brief).await;
+        let found = chain.fetch(&lookup, &shown, &VAULTS, Search::Brief).await;
         assert_eq!(found.unwrap().len(), 1);
         assert_eq!(refusing.lock().calls.len(), refused_before);
     }
@@ -1393,12 +1421,12 @@ pub mod tests {
         let shown = ListingPayment::default();
 
         // In full: every block in one query.
-        let found = chain.fetch(&from_1970, &shown, &VAULT, Search::Full);
+        let found = chain.fetch(&from_1970, &shown, &VAULTS, Search::Full);
         assert_eq!(found.await.unwrap().len(), 1);
         assert_eq!(widest_log_range(&mock), Some(30_000));
         // Briefly: no more than BACK_LOG_RANGE blocks a query.
         mock.lock().calls.clear();
-        let found = chain.fetch(&from_1970, &shown, &VAULT, Search::Brief);
+        let found = chain.fetch(&from_1970, &shown, &VAULTS, Search::Brief);
         assert_eq!(found.await.unwrap().len(), 1);
         assert_eq!(log_calls(&mock), 3);
         assert_eq!(widest_log_range(&mock), Some(BACK_LOG_RANGE));
@@ -1406,11 +1434,11 @@ pub mod tests {
         // Paid further on than its few queries reach: not found briefly,
         // only in full.
         let (chain, mock) = client(chain_with(100_000, &[(99_000, 5)])).await;
-        let found = chain.fetch(&from_1970, &shown, &VAULT, Search::Brief);
+        let found = chain.fetch(&from_1970, &shown, &VAULTS, Search::Brief);
         assert_eq!(found.await.unwrap(), Fetched::new());
         assert_eq!(log_calls(&mock), BRIEF_LOG_CALLS);
         assert_eq!(widest_log_range(&mock), Some(BACK_LOG_RANGE));
-        let found = chain.fetch(&from_1970, &shown, &VAULT, Search::Full);
+        let found = chain.fetch(&from_1970, &shown, &VAULTS, Search::Full);
         assert_eq!(found.await.unwrap().len(), 1);
     }
 
@@ -1436,7 +1464,7 @@ pub mod tests {
                     not_after: None,
                 },
                 &ListingPayment::default(),
-                &VAULT,
+                &VAULTS,
                 Search::Full,
             )
             .await
@@ -1491,7 +1519,7 @@ pub mod tests {
         // Nothing shown to tell them apart: the earliest.
         let hidden = ListingPayment::default();
         let found = chain
-            .fetch(&lookup, &hidden, &VAULT, Search::Full)
+            .fetch(&lookup, &hidden, &VAULTS, Search::Full)
             .await
             .unwrap();
         assert_eq!(blocks(found), vec![500, 501, 502, 503]);
@@ -1503,13 +1531,13 @@ pub mod tests {
             ..ListingPayment::default()
         };
         let found = chain
-            .fetch(&lookup, &at_index, &VAULT, Search::Full)
+            .fetch(&lookup, &at_index, &VAULTS, Search::Full)
             .await
             .unwrap();
         assert_eq!(blocks(found), vec![600]);
         mock.lock().max_log_range = Some(64);
         let found = chain
-            .fetch(&lookup, &at_index, &VAULT, Search::Full)
+            .fetch(&lookup, &at_index, &VAULTS, Search::Full)
             .await
             .unwrap();
         assert_eq!(blocks(found), vec![600]);
@@ -1522,7 +1550,7 @@ pub mod tests {
             ..ListingPayment::default()
         };
         let found = chain
-            .fetch(&lookup, &at_time, &VAULT, Search::Full)
+            .fetch(&lookup, &at_time, &VAULTS, Search::Full)
             .await
             .unwrap();
         assert_eq!(blocks(found), vec![600]);
@@ -1535,7 +1563,7 @@ pub mod tests {
         };
         assert_eq!(
             chain
-                .fetch(&lookup, &between, &VAULT, Search::Full)
+                .fetch(&lookup, &between, &VAULTS, Search::Full)
                 .await
                 .unwrap(),
             Fetched::new()
@@ -1551,7 +1579,7 @@ pub mod tests {
         };
         assert_eq!(
             chain
-                .fetch(&in_block, &at_index, &VAULT, Search::Full)
+                .fetch(&in_block, &at_index, &VAULTS, Search::Full)
                 .await
                 .unwrap(),
             Fetched::new()
@@ -1561,7 +1589,7 @@ pub mod tests {
             ..ListingPayment::default()
         };
         let found = chain
-            .fetch(&in_block, &at_nine, &VAULT, Search::Full)
+            .fetch(&in_block, &at_nine, &VAULTS, Search::Full)
             .await
             .unwrap();
         assert_eq!(blocks(found), vec![500]);
@@ -1731,7 +1759,7 @@ pub mod tests {
         // Every slot taken: a search by time waits, without a call.
         let waited = tokio::time::timeout(
             Duration::from_millis(200),
-            chain.fetch(&by_time, &ListingPayment::default(), &VAULT, Search::Full),
+            chain.fetch(&by_time, &ListingPayment::default(), &VAULTS, Search::Full),
         )
         .await;
         assert!(waited.is_err());
@@ -1745,7 +1773,7 @@ pub mod tests {
         };
         assert_eq!(
             chain
-                .fetch(&in_block, &ListingPayment::default(), &VAULT, Search::Full)
+                .fetch(&in_block, &ListingPayment::default(), &VAULTS, Search::Full)
                 .await
                 .unwrap()
                 .len(),
@@ -1755,7 +1783,7 @@ pub mod tests {
         drop(running);
         assert_eq!(
             chain
-                .fetch(&by_time, &ListingPayment::default(), &VAULT, Search::Full)
+                .fetch(&by_time, &ListingPayment::default(), &VAULTS, Search::Full)
                 .await
                 .unwrap()
                 .len(),

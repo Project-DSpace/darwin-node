@@ -958,11 +958,14 @@ impl Devnet {
                 .evm_network
                 .clone()
                 .unwrap_or(EvmNetwork::ArbitrumOne),
+            // A devnet has no root vault: root proofs are refused.
+            root_vault: None,
         };
         // Listings check payments on the same chain, as on a production node.
         let listings_rpc_url = evm_config.network.rpc_url().to_string();
         let mut listings_vault = [0u8; 20];
         listings_vault.copy_from_slice(evm_config.network.payment_vault_address().as_slice());
+        let root_vault = evm_config.root_vault;
 
         let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
         let replication_config = ReplicationConfig::default();
@@ -998,7 +1001,10 @@ impl Devnet {
             disk_reserve,
             Arc::clone(&storage),
             listings_rpc_url,
-            listings_vault,
+            ant_listings::VaultSet {
+                v2: listings_vault,
+                root: root_vault,
+            },
             None,
         )
         .await

@@ -150,7 +150,7 @@ impl Node {
             DEFAULT_DISK_RESERVE,
             Arc::clone(&chunks),
             "http://127.0.0.1:9".to_string(),
-            [0; 20],
+            ant_listings::VaultSet::v2_only([0; 20]),
             None,
         )
         .await

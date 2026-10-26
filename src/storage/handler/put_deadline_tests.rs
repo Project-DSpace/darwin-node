@@ -46,7 +46,7 @@ async fn handler(providers: &[&mock::Provider], dir: &TempDir, listings: bool) -
         0,
         storage,
         providers[0].url.to_string(),
-        mock::VAULT,
+        ant_listings::VaultSet::v2_only(mock::VAULT),
         None,
     )
     .await

@@ -320,7 +320,7 @@ never ran.
   `VENDORED.md` lists, `PRICE_MULTIPLIER` and the functions that price a
   record by its size, which nothing uses yet; `vendor/webrtc` is webrtc
   0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
-  in progress; and `vendor/ant-listings` is darwin-listings 0.3.1,
+  in progress; and `vendor/ant-listings` is darwin-listings 0.4.0,
   unchanged: the envelope format, listings, their payment checks, the
   listings protocol and its change feeds. `[patch.crates-io]` puts the
   first two in place of the crates.io releases. `vendor/ant-listings` and

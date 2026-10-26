@@ -7,11 +7,13 @@
 //! quote moves nothing and logs nothing. Each provider serving the chain can
 //! be behind it, answer busy, drop calls, take calls and never answer, refuse
 //! or cut short JSON-RPC batches, or answer records without their payee.
+//! A root vault beside it holds the waves recorded on the chain, by key.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
 use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig};
+use ant_listings::root::{RootPayment, Wave};
 use ant_listings::PaymentLog;
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
@@ -25,6 +27,10 @@ use tokio::net::TcpListener;
 
 /// The vault the chain's payments go through.
 pub const VAULT: [u8; 20] = [0x69; 20];
+
+/// The chain's root vault, which records each wave of payments under one
+/// key.
+pub const ROOT_VAULT: [u8; 20] = [0x6a; 20];
 
 /// The token the vault moves, whose transfer logs fill receipts too.
 const TOKEN: [u8; 20] = [0x70; 20];
@@ -58,10 +64,21 @@ pub struct Tx {
     pub seen_from: Instant,
 }
 
-/// The chain, its transactions in chain order.
+/// A wave the root vault recorded.
+#[derive(Debug, Clone)]
+pub struct RecordedKey {
+    pub key: [u8; 32],
+    pub leaf_count: u32,
+    /// When a provider that isn't behind starts seeing it.
+    pub seen_from: Instant,
+}
+
+/// The chain, its transactions in chain order, and the waves its root vault
+/// recorded.
 #[derive(Debug, Default)]
 pub struct Chain {
     pub txs: Vec<Tx>,
+    pub waves: Vec<RecordedKey>,
 }
 
 impl Chain {
@@ -82,6 +99,32 @@ impl Chain {
             seen_from: Instant::now(),
         });
         self.txs.last_mut().unwrap()
+    }
+
+    /// Record `wave` at the root vault, seen from now.
+    pub fn record_wave(&mut self, wave: &Wave) {
+        self.waves.push(RecordedKey {
+            key: wave.key(&ROOT_VAULT),
+            leaf_count: u32::try_from(wave.leaf_count()).unwrap(),
+            seen_from: Instant::now(),
+        });
+    }
+
+    /// The root vault's record under `key`, as a provider `behind` sees it:
+    /// the time, the leaf count and the payer, each in a word, or zeros.
+    fn wave_record(&self, key: &[u8; 32], behind: Duration) -> [u8; 96] {
+        let mut words = [0u8; 96];
+        let now = Instant::now();
+        if let Some(wave) = self
+            .waves
+            .iter()
+            .find(|wave| wave.key == *key && wave.seen_from + behind <= now)
+        {
+            words[24..32].copy_from_slice(&block_time(100).to_be_bytes());
+            words[60..64].copy_from_slice(&wave.leaf_count.to_be_bytes());
+            words[76..].copy_from_slice(&[0xc1; 20]);
+        }
+        words
     }
 
     /// The transactions a provider `behind` sees now, with their places.
@@ -207,6 +250,7 @@ pub fn payment_log(
             amount_topic(amount),
             quote_hash,
         ],
+        data: Vec::new(),
         log_index: 0,
     }
 }
@@ -501,6 +545,18 @@ fn answer_call(chain: &Mutex<Chain>, spec: &Spec, call: &Value) -> Value {
                 .or_else(|| params[0]["data"].as_str())
                 .unwrap_or_default()
                 .trim_start_matches("0x");
+            let to = params[0]["to"].as_str().unwrap_or_default();
+            if to.eq_ignore_ascii_case(&format!("0x{}", hex::encode(ROOT_VAULT))) {
+                assert_eq!(
+                    &input[..8],
+                    hex::encode(super::ROOT_RECORDS_SELECTOR),
+                    "only records is read at the root vault"
+                );
+                let key: [u8; 32] = hex::decode(&input[8..]).unwrap().try_into().unwrap();
+                let words = chain.wave_record(&key, spec.behind);
+                return json!({ "jsonrpc": "2.0", "id": id,
+                    "result": format!("0x{}", hex::encode(words)) });
+            }
             let quote_hash: [u8; 32] = hex::decode(&input[8..]).unwrap().try_into().unwrap();
             assert_eq!(
                 &input[..8],
@@ -662,6 +718,64 @@ impl Bundle {
         (self.quote_hash(), self.payee(), self.amount())
     }
 
+    /// The payment a client makes for these quotes in a wave: the median
+    /// quote's, to its payee, of three times its price.
+    pub fn root_payment(&self) -> RootPayment {
+        RootPayment {
+            quote_hash: self.quote_hash(),
+            payee: self.payee(),
+            amount: Amount::from(self.amount()),
+        }
+    }
+
+    /// The root proof a client sends for its payment in `wave`, naming
+    /// `tx_hashes`.
+    pub fn root_proof_in(&self, wave: &Wave, tx_hashes: &[[u8; 32]]) -> Vec<u8> {
+        let index = wave
+            .payments()
+            .iter()
+            .position(|payment| payment.quote_hash == self.quote_hash())
+            .expect("the wave pays this quote");
+        let payment = wave.payments()[index];
+        self.root_proof(
+            payment.amount,
+            index as u64,
+            wave.leaf_count(),
+            &wave.path(index).unwrap(),
+            tx_hashes,
+        )
+    }
+
+    /// A root proof for the median quote, as it is given: the amount, the
+    /// leaf's place, the leaf count and the path, naming `tx_hashes`.
+    pub fn root_proof(
+        &self,
+        amount: Amount,
+        index: u64,
+        leaf_count: u64,
+        path: &[[u8; 32]],
+        tx_hashes: &[[u8; 32]],
+    ) -> Vec<u8> {
+        crate::payment::serialize_root_proof(&crate::payment::RootPaymentProof {
+            payment: crate::payment::PaymentProof {
+                proof_of_payment: ProofOfPayment {
+                    peer_quotes: self.quotes.clone(),
+                },
+                tx_hashes: tx_hashes
+                    .iter()
+                    .map(|tx_hash| evmlib::common::TxHash::from(*tx_hash))
+                    .collect(),
+                commitment_sidecars: Vec::new(),
+            },
+            quote_hash: self.quote_hash().into(),
+            amount,
+            index,
+            leaf_count,
+            path: path.iter().map(|hash| (*hash).into()).collect(),
+        })
+        .unwrap()
+    }
+
     /// The proof a client sends, naming `tx_hashes`.
     pub fn proof(&self, tx_hashes: &[[u8; 32]]) -> Vec<u8> {
         crate::payment::serialize_single_node_proof(&crate::payment::PaymentProof {
@@ -688,6 +802,7 @@ pub fn verifier(providers: &[&Provider]) -> PaymentVerifier {
                 &format!("0x{}", hex::encode(TOKEN)),
                 &format!("0x{}", hex::encode(VAULT)),
             ),
+            root_vault: None,
         },
         cache_capacity: 1_000,
         close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
@@ -697,6 +812,38 @@ pub fn verifier(providers: &[&Provider]) -> PaymentVerifier {
     verifier.set_payment_rpc_urls_for_tests(providers.iter().map(|p| p.url.clone()).collect());
     verifier.set_paid_quote_k_closest_for_tests(issuer_peers());
     verifier
+}
+
+/// [`verifier`], taking root proofs paid at the chain's root vault too.
+pub fn root_verifier(providers: &[&Provider]) -> PaymentVerifier {
+    let verifier = PaymentVerifier::new(PaymentVerifierConfig {
+        evm: EvmVerifierConfig {
+            network: evmlib::Network::new_custom(
+                providers[0].url.as_str(),
+                &format!("0x{}", hex::encode(TOKEN)),
+                &format!("0x{}", hex::encode(VAULT)),
+            ),
+            root_vault: Some(RootVault {
+                address: ROOT_VAULT,
+                token: TOKEN,
+            }),
+        },
+        cache_capacity: 1_000,
+        close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
+        local_rewards_address: RewardsAddress::new([0xD1; 20]),
+        price_floor: PriceFloorConfig::default(),
+    });
+    verifier.set_payment_rpc_urls_for_tests(providers.iter().map(|p| p.url.clone()).collect());
+    verifier.set_paid_quote_k_closest_for_tests(issuer_peers());
+    verifier
+}
+
+/// The wave paying each of `bundles`' median quotes, in quote-hash order, as
+/// a root vault takes it.
+pub fn wave_of(bundles: &[&Bundle]) -> Wave {
+    let mut payments: Vec<RootPayment> = bundles.iter().map(|b| b.root_payment()).collect();
+    payments.sort_by_key(|payment| payment.quote_hash);
+    Wave::new(payments).unwrap()
 }
 
 /// Reads of the chain's vault through `providers`, in that order.

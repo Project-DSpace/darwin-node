@@ -476,7 +476,14 @@ impl FeedNode {
             .await,
         );
         let listings = open_when_free(|| {
-            ListingService::new(dir, 0, Arc::clone(&chunks), NO_CHAIN.into(), VAULT, None)
+            ListingService::new(
+                dir,
+                0,
+                Arc::clone(&chunks),
+                NO_CHAIN.into(),
+                ant_listings::VaultSet::v2_only(VAULT),
+                None,
+            )
         })
         .await;
         let p2p = loopback_node(Arc::clone(identity)).await;

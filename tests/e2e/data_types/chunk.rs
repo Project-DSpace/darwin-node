@@ -441,7 +441,10 @@ mod tests {
 
         let rewards_address = RewardsAddress::new([0x01; 20]);
         let payment_verifier = PaymentVerifier::new(PaymentVerifierConfig {
-            evm: EvmVerifierConfig { network },
+            evm: EvmVerifierConfig {
+                network,
+                root_vault: None,
+            },
             cache_capacity: 100,
             close_group_size: ReplicationConfig::default().close_group_size,
             local_rewards_address: rewards_address,

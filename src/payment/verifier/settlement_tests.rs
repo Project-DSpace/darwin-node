@@ -719,6 +719,7 @@ async fn payments_on_a_chain_node_verify_from_receipts_and_from_records() {
         let verifier = PaymentVerifier::new(PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: network.clone(),
+                root_vault: None,
             },
             cache_capacity: 1_000,
             close_group_size: CLOSE_GROUP_SIZE,

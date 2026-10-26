@@ -25,10 +25,13 @@ pub enum EvmRpcCall {
     /// `eth_getBlockByNumber`, for the time of the block an envelope was paid
     /// in.
     BlockTimestamp,
+    /// A root vault's `records(key)`: whether a wave of a root payment was
+    /// recorded.
+    RootRecord,
 }
 
 impl EvmRpcCall {
-    const N: usize = 5;
+    const N: usize = 6;
 
     const fn index(self) -> usize {
         match self {
@@ -37,6 +40,7 @@ impl EvmRpcCall {
             Self::TransactionReceipt => 2,
             Self::CompletedPaymentsBatch => 3,
             Self::BlockTimestamp => 4,
+            Self::RootRecord => 5,
         }
     }
 }
@@ -78,6 +82,8 @@ pub fn log_evm_rpc_summary() {
         receipt_err_count = err(C::TransactionReceipt),
         block_ok_count = ok(C::BlockTimestamp),
         block_err_count = err(C::BlockTimestamp),
+        root_record_ok_count = ok(C::RootRecord),
+        root_record_err_count = err(C::RootRecord),
         merkle_payment_ok_count = ok(C::CompletedMerklePayment),
         merkle_payment_err_count = err(C::CompletedMerklePayment),
         "evm rpc summary (cumulative)"
@@ -98,6 +104,7 @@ mod tests {
             EvmRpcCall::TransactionReceipt,
             EvmRpcCall::CompletedPaymentsBatch,
             EvmRpcCall::BlockTimestamp,
+            EvmRpcCall::RootRecord,
         ];
         let mut indexes: Vec<usize> = kinds.iter().map(|kind| kind.index()).collect();
         indexes.sort_unstable();

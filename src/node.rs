@@ -569,9 +569,13 @@ impl NodeBuilder {
         let listings_rpc_url = evm_network.rpc_url().to_string();
         let mut listings_vault = [0u8; 20];
         listings_vault.copy_from_slice(evm_network.payment_vault_address().as_slice());
+        // The root vault root proofs are paid in, which listings read beside
+        // the per-quote vault. With none, root proofs are refused.
+        let root_vault: Option<ant_listings::RootVault> = None;
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evm_network,
+                root_vault,
             },
             cache_capacity: config.payment.cache_capacity,
             close_group_size,
@@ -620,7 +624,10 @@ impl NodeBuilder {
             disk_reserve,
             Arc::clone(&storage),
             listings_rpc_url,
-            listings_vault,
+            ant_listings::VaultSet {
+                v2: listings_vault,
+                root: root_vault,
+            },
             vault_deployment_block.block(),
         )
         .await?;
@@ -1921,7 +1928,7 @@ mod tests {
             0,
             chunks,
             "http://127.0.0.1:0".into(),
-            [0x69; 20],
+            ant_listings::VaultSet::v2_only([0x69; 20]),
             None,
         )
         .await

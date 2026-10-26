@@ -1173,7 +1173,10 @@ impl TestNetwork {
         let mut listings_vault = [0u8; 20];
         listings_vault.copy_from_slice(network.payment_vault_address().as_slice());
         let payment_config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig { network },
+            evm: EvmVerifierConfig {
+                network,
+                root_vault: None,
+            },
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
             close_group_size: replication_config.close_group_size,
             local_rewards_address: rewards_address,
@@ -1227,7 +1230,7 @@ impl TestNetwork {
             disk_reserve,
             Arc::clone(&storage),
             listings_rpc_url,
-            listings_vault,
+            ant_listings::VaultSet::v2_only(listings_vault),
             None,
         )
         .await

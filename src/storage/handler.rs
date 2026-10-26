@@ -515,15 +515,16 @@ impl AntProtocol {
 
     /// ADR-0004: return the proof with any commitment sidecars stripped, so a
     /// replicated/persisted receipt carries only the pin and count (stored
-    /// proofs do not grow). Handles BOTH proof types — single-node and
-    /// merkle-batch — since both now carry sidecars. An unknown-tagged or
-    /// unparseable proof is returned unchanged. Best-effort: any
+    /// proofs do not grow). Handles every proof type — single-node,
+    /// merkle-batch and root — since each carries sidecars. An unknown-tagged
+    /// or unparseable proof is returned unchanged. Best-effort: any
     /// deserialize/reserialize failure returns the original bytes rather than
     /// corrupting the proof.
     fn strip_commitment_sidecars(proof: Vec<u8>) -> Vec<u8> {
         use crate::payment::proof::{
-            deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type,
-            serialize_merkle_proof, serialize_single_node_proof, ProofType,
+            deserialize_merkle_proof, deserialize_root_proof, deserialize_single_node_proof,
+            detect_proof_type, serialize_merkle_proof, serialize_root_proof,
+            serialize_single_node_proof, ProofType,
         };
         match detect_proof_type(&proof) {
             Some(ProofType::SingleNode) => match deserialize_single_node_proof(&proof) {
@@ -540,7 +541,14 @@ impl AntProtocol {
                 }
                 _ => proof,
             },
-            _ => proof, // unknown tag: nothing to strip
+            Some(ProofType::Root) => match deserialize_root_proof(&proof) {
+                Ok(mut parsed) if !parsed.payment.commitment_sidecars.is_empty() => {
+                    parsed.payment.commitment_sidecars.clear();
+                    serialize_root_proof(&parsed).unwrap_or(proof)
+                }
+                _ => proof,
+            },
+            None => proof, // unknown tag: nothing to strip
         }
     }
 
@@ -2547,6 +2555,53 @@ mod tests {
         );
 
         // Idempotent: stripping an already-sidecar-free proof returns it intact.
+        let again = AntProtocol::strip_commitment_sidecars(stripped.clone());
+        assert_eq!(again, stripped, "stripping a sidecar-free proof is a no-op");
+    }
+
+    /// A root proof forwarded to the close group goes without its commitment
+    /// sidecars, as a single-node proof does, and keeps its leaf whole.
+    #[test]
+    fn strip_commitment_sidecars_clears_root_sidecars() {
+        use crate::payment::proof::{
+            deserialize_root_proof, detect_proof_type, serialize_root_proof, PaymentProof,
+            ProofType, RootPaymentProof,
+        };
+        use alloy::primitives::FixedBytes;
+        use evmlib::common::Amount;
+        use evmlib::ProofOfPayment;
+
+        let with_sidecars = RootPaymentProof {
+            payment: PaymentProof {
+                proof_of_payment: ProofOfPayment {
+                    peer_quotes: vec![],
+                },
+                tx_hashes: vec![FixedBytes::from([9u8; 32])],
+                commitment_sidecars: vec![vec![1u8; 16], vec![2u8; 16]],
+            },
+            quote_hash: FixedBytes::from([3u8; 32]),
+            amount: Amount::from(77u64),
+            index: 2,
+            leaf_count: 5,
+            path: vec![FixedBytes::from([4u8; 32]); 3],
+        };
+        let bytes = serialize_root_proof(&with_sidecars).expect("serialize");
+        let stripped = AntProtocol::strip_commitment_sidecars(bytes);
+        assert_eq!(detect_proof_type(&stripped), Some(ProofType::Root));
+        let parsed = deserialize_root_proof(&stripped).expect("deserialize stripped");
+        assert!(
+            parsed.payment.commitment_sidecars.is_empty(),
+            "a root proof's sidecars must be stripped before it is offered"
+        );
+        assert_eq!(parsed.payment.tx_hashes, with_sidecars.payment.tx_hashes);
+        assert_eq!(parsed.quote_hash, with_sidecars.quote_hash);
+        assert_eq!(parsed.amount, with_sidecars.amount);
+        assert_eq!(
+            (parsed.index, parsed.leaf_count),
+            (with_sidecars.index, with_sidecars.leaf_count)
+        );
+        assert_eq!(parsed.path, with_sidecars.path);
+
         let again = AntProtocol::strip_commitment_sidecars(stripped.clone());
         assert_eq!(again, stripped, "stripping a sidecar-free proof is a no-op");
     }

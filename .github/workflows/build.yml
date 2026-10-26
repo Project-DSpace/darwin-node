@@ -80,7 +80,7 @@ jobs:
           --output THIRD-PARTY-NOTICES.txt
           --target x86_64-unknown-linux-gnu
 
-      # vendor/ant-listings is darwin-listings 0.3.1 (tag v0.3.1, commit 84787fe)
+      # vendor/ant-listings is darwin-listings 0.4.0 (commit 7e709e0)
       # unchanged, as the notices and vendor/ant-listings/VENDORED.md say: its
       # src tree and Cargo.toml are the git objects that file records.
       - name: Check the vendored ant-listings

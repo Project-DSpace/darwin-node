@@ -677,6 +677,7 @@ mod payment_reads {
         let verifier = PaymentVerifier::new(PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evmlib::Network::new_custom(&provider.url, TOKEN, VAULT),
+                root_vault: None,
             },
             cache_capacity: 100,
             close_group_size: CLOSE_GROUP_SIZE,
@@ -931,6 +932,7 @@ mod payment_reads {
             PaymentVerifier::new(PaymentVerifierConfig {
                 evm: EvmVerifierConfig {
                     network: evmlib::Network::new_custom(rpc, TOKEN, VAULT),
+                    root_vault: None,
                 },
                 cache_capacity: 100,
                 close_group_size: CLOSE_GROUP_SIZE,

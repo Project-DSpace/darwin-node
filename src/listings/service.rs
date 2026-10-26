@@ -69,7 +69,7 @@ use crate::logging::{debug, info, warn};
 use crate::payment::settlement::{Lane, SettlementReads, EMPTY_PAYMENT_RECHECK_DELAY};
 use crate::storage::ChunkStore;
 use ::ant_protocol::evm::PaymentQuote;
-use ::ant_protocol::payment::proof::deserialize_single_node_proof;
+use ::ant_protocol::payment::proof::{deserialize_root_proof, deserialize_single_node_proof};
 use ::ant_protocol::{detect_proof_type, ProofType};
 use ant_listings::{
     check_copies, check_get_response, check_offline, choose_verified, find_payment, first_seen_at,
@@ -77,7 +77,7 @@ use ant_listings::{
     quorum_needed, support_among, verify_listing_receipts, view_hash, AddressRange, ChangesRequest,
     ChangesResponse, Envelope, FeedChange, Listing, ListingCheck, ListingKey, ListingsBody,
     ListingsMessage, Lookup, MergedListing, Payment, PaymentError, PaymentField, RangeListRequest,
-    RangeListResponse, MAX_LIST_LIMIT, MAX_WATCHERS, QUORUM_THRESHOLD, TOPIC, VIEW_PEERS,
+    RangeListResponse, VaultSet, MAX_LIST_LIMIT, MAX_WATCHERS, QUORUM_THRESHOLD, TOPIC, VIEW_PEERS,
     WATCH_LEASE,
 };
 use parking_lot::{Mutex, RwLock};
@@ -173,7 +173,9 @@ pub struct ListingService {
     /// the payment check's, once attached, so the receipts that check read
     /// serve here too ([`Self::attach_payment_reads`]).
     payment_reads: RwLock<Arc<SettlementReads>>,
-    vault: [u8; 20],
+    /// The vaults whose payments listings take: the per-quote vault, and the
+    /// root vault where the network has one.
+    vaults: VaultSet,
     /// The block the vault was deployed in, where known: a copy showing an
     /// earlier block paid something else.
     vault_deployment_block: Option<u64>,
@@ -354,8 +356,8 @@ enum Held {
 impl ListingService {
     /// Open the listing store under `root_dir`, leaving `disk_reserve` bytes
     /// of the disk free, and start watching `chunks` for newly stored
-    /// envelopes and deleted chunks. `rpc_url` and `vault` are the payment
-    /// chain's RPC endpoint and payment vault, and `vault_deployment_block`
+    /// envelopes and deleted chunks. `rpc_url` and `vaults` are the payment
+    /// chain's RPC endpoint and payment vaults, and `vault_deployment_block`
     /// the block the vault was deployed in, where known: a copy of a listing
     /// showing an earlier block paid something else, and is never taken.
     ///
@@ -369,7 +371,7 @@ impl ListingService {
         disk_reserve: u64,
         chunks: Arc<ChunkStore>,
         rpc_url: String,
-        vault: [u8; 20],
+        vaults: VaultSet,
         vault_deployment_block: Option<u64>,
     ) -> Result<Arc<Self>> {
         let store = ListingStore::open(root_dir, disk_reserve).await?;
@@ -377,8 +379,9 @@ impl ListingService {
         let (pushes_tx, pushes_rx) = mpsc::unbounded_channel();
         store.watch_feed(Self::feed_watcher(Arc::clone(&watches), pushes_tx));
         let rpc_urls = listings_rpc_urls(&rpc_url);
-        let payment_reads = SettlementReads::new(
-            vault,
+        let payment_reads = SettlementReads::with_root(
+            vaults.v2,
+            vaults.root,
             rpc_urls.iter().filter_map(|url| url.parse().ok()).collect(),
         );
         let service = Arc::new(Self {
@@ -386,7 +389,7 @@ impl ListingService {
             chunks: Arc::clone(&chunks),
             chain: Chain::with_rpcs(rpc_urls)?,
             payment_reads: RwLock::new(payment_reads),
-            vault,
+            vaults,
             vault_deployment_block,
             p2p: RwLock::new(None),
             waiting: Waiting::default(),
@@ -509,8 +512,11 @@ impl ListingService {
         Ok(Some(Listing::new(&envelope, &payment, unix_now())))
     }
 
-    /// The full payment for `address` in a single-node payment proof, looked
-    /// for in the proof's first [`MAX_PROOF_TXS`] distinct transactions. Their
+    /// The full payment for `address` in a single-node or root payment proof,
+    /// looked for in the proof's first [`MAX_PROOF_TXS`] distinct
+    /// transactions: the per-quote vault's record of the paid quote, or the
+    /// root vault's log of it in the wave the recording transaction shows
+    /// whole. Their
     /// receipts come through the payment check's reads, kept or read. A
     /// receipt the RPC didn't know is read once more, after
     /// [`EMPTY_PAYMENT_RECHECK_DELAY`], on a fresh connection at the next RPC,
@@ -521,10 +527,15 @@ impl ListingService {
         proof: &[u8],
         lane: Lane,
     ) -> std::result::Result<Payment, String> {
-        if detect_proof_type(proof) != Some(ProofType::SingleNode) {
-            return Err("an envelope must be paid with a single-node payment".into());
-        }
-        let proof = deserialize_single_node_proof(proof)?;
+        // No arm stands for several types, so a new one doesn't build until
+        // it is handled here.
+        let proof = match detect_proof_type(proof) {
+            Some(ProofType::SingleNode) => deserialize_single_node_proof(proof)?,
+            Some(ProofType::Root) => deserialize_root_proof(proof)?.payment,
+            Some(ProofType::Merkle) | None => {
+                return Err("an envelope must be paid with a single-node or root payment".into());
+            }
+        };
         let quotes: Vec<PaymentQuote> = proof
             .proof_of_payment
             .peer_quotes
@@ -603,7 +614,7 @@ impl ListingService {
             .await
             .map_err(|e| format!("could not read the payment from the chain: {e}"))?
             .ok_or("could not read the payment from the chain: the receipt's block is missing")?;
-        match find_payment(address, quotes, receipt, timestamp, &self.vault) {
+        match find_payment(address, quotes, receipt, timestamp, &self.vaults) {
             Ok(payment) => Ok(Some(payment)),
             Err(e) => {
                 debug!(
@@ -1647,7 +1658,7 @@ impl ListingService {
         };
         let now = unix_now();
         let checked = check_quorum_copy(group, asked, needed, own, |listing| {
-            verify_listing_receipts(listing, envelope, &fetched, &self.vault, now)
+            verify_listing_receipts(listing, envelope, &fetched, &self.vaults, now)
         });
         match checked {
             // Its date can differ from the one looked up for: taking it
@@ -1791,7 +1802,7 @@ impl ListingService {
             }
         }
         let decide = |fetched: &[Option<Fetched>]| {
-            decide_repair(envelope, asked, &groups, fetched, &self.vault, now, own)
+            decide_repair(envelope, asked, &groups, fetched, &self.vaults, now, own)
         };
         let mut unread = false;
         // Without the quote, a copy too few peers serve is never taken.
@@ -1883,7 +1894,7 @@ impl ListingService {
                 return false;
             };
             let checked = check_copies(group, asked, needed, |listing| {
-                verify_listing_receipts(listing, envelope, found, &self.vault, now)
+                verify_listing_receipts(listing, envelope, found, &self.vaults, now)
             });
             let (Err(error), Ok(lookup)) = (checked, payment_lookup(&listing)) else {
                 return false;
@@ -1920,7 +1931,7 @@ impl ListingService {
                 ));
             }
         }
-        check_offline(listing, envelope, &self.vault)
+        check_offline(listing, envelope, &self.vaults)
             .err()
             .map(|e| e.to_string())
     }
@@ -1950,7 +1961,7 @@ impl ListingService {
             return Ok(None);
         };
         self.chain
-            .fetch(&lookup, &listing.payment, &self.vault, search)
+            .fetch(&lookup, &listing.payment, &self.vaults, search)
             .await
             .map(Some)
     }
@@ -1981,9 +1992,14 @@ fn fails_for_good(
     fetched: &Fetched,
     finalized: u64,
 ) -> bool {
+    // A log from a contract outside the vaults, or a root vault's log whose
+    // wave the receipt doesn't show whole, is no payment either: the chain
+    // shows that as surely as it shows none.
     let shown_by_the_chain = matches!(
         error,
         PaymentError::NotPaid
+            | PaymentError::UnknownVault
+            | PaymentError::UnpaidWave(_)
             | PaymentError::Failed
             | PaymentError::WrongTransaction
             | PaymentError::WrongBlock
@@ -2166,7 +2182,7 @@ fn decide_repair<P: PartialEq>(
     asked: &[P],
     groups: &[MergedListing<P>],
     fetched: &[Option<Fetched>],
-    vault: &[u8; 20],
+    vaults: &VaultSet,
     now: u64,
     own: u64,
 ) -> Repair {
@@ -2174,7 +2190,7 @@ fn decide_repair<P: PartialEq>(
     let own = Some(own);
     let check = |group: &MergedListing<P>, fetched: &Fetched| {
         check_quorum_copy(group, asked, needed, own, |listing| {
-            verify_listing_receipts(listing, envelope, fetched, vault, now)
+            verify_listing_receipts(listing, envelope, fetched, vaults, now)
         })
     };
     if envelope.flags().shown.contains(PaymentField::Quote) {
@@ -2285,7 +2301,7 @@ fn route_response(waiting: &Waiting, source: &PeerId, request_id: u64, listing: 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(super) mod tests {
-    use super::super::chain::tests::{chain_with, vault_log, MockChain, VAULT};
+    use super::super::chain::tests::{chain_with, vault_log, MockChain, VAULTS};
     use super::super::store::tests::{signed_quote, signed_quote_at};
     use super::*;
     use crate::storage::ChunkStoreConfig;
@@ -2293,8 +2309,8 @@ pub(super) mod tests {
     use ant_listings::self_encryption::{ChunkInfo, DataMap, XorName as SeXorName};
     use ant_listings::{
         check_changes_page, check_push, check_range_page, encode_data_map, ChangesPage,
-        DigestEntry, FeedSync, Flags, ListingPayment, Metadata, PaymentReceipt, Pushed, SetHash,
-        ShownFields, MAGIC,
+        DigestEntry, FeedSync, Flags, ListingPayment, Metadata, PaymentLog, PaymentReceipt, Pushed,
+        RootVault, SetHash, ShownFields, DATA_PAYMENT_MADE_TOPIC, MAGIC,
     };
     use tempfile::TempDir;
 
@@ -2310,6 +2326,33 @@ pub(super) mod tests {
         rpc_url: &str,
     ) -> (Arc<ListingService>, Arc<ChunkStore>) {
         service_with(dir, rpc_url, None).await
+    }
+
+    /// [`service_on`], taking payments from `vaults`.
+    async fn service_with_vaults(
+        dir: &TempDir,
+        rpc_url: &str,
+        vaults: VaultSet,
+    ) -> (Arc<ListingService>, Arc<ChunkStore>) {
+        let chunks = Arc::new(
+            ChunkStore::new(ChunkStoreConfig {
+                root_dir: dir.path().to_path_buf(),
+                ..ChunkStoreConfig::test_default()
+            })
+            .await
+            .unwrap(),
+        );
+        let listings = ListingService::new(
+            dir.path(),
+            0,
+            Arc::clone(&chunks),
+            rpc_url.into(),
+            vaults,
+            None,
+        )
+        .await
+        .unwrap();
+        (listings, chunks)
     }
 
     /// [`service_on`], knowing that the vault was deployed in
@@ -2332,7 +2375,7 @@ pub(super) mod tests {
             0,
             Arc::clone(&chunks),
             rpc_url.into(),
-            VAULT,
+            VAULTS,
             vault_deployment_block,
         )
         .await
@@ -2355,7 +2398,7 @@ pub(super) mod tests {
             0,
             Arc::clone(chunks),
             DEAD_CHAIN.into(),
-            VAULT,
+            VAULTS,
             None,
         )
         .await
@@ -2793,6 +2836,158 @@ pub(super) mod tests {
             .is_err());
     }
 
+    /// The root vault of the root-paid tests, and the token it pays in.
+    const ROOT: RootVault = RootVault {
+        address: [0x6a; 20],
+        token: [0x70; 20],
+    };
+
+    /// A 32-byte word holding `bytes` at its end.
+    fn word(bytes: &[u8]) -> [u8; 32] {
+        let mut word = [0u8; 32];
+        word[32 - bytes.len()..].copy_from_slice(bytes);
+        word
+    }
+
+    /// The receipt of `tx_hash`, in `block_number`, of [`ROOT`] recording
+    /// `wave` as the vault logs it: each payment's `DataPaymentMade`, then
+    /// `RootPaid`, then the token's transfer to each payee.
+    fn wave_receipt(
+        tx_hash: [u8; 32],
+        block_number: u64,
+        wave: &ant_listings::root::Wave,
+    ) -> PaymentReceipt {
+        use ant_listings::root::{ROOT_PAID_TOPIC, TRANSFER_TOPIC};
+        let payer = [0xc1; 20];
+        let mut logs: Vec<PaymentLog> = wave
+            .payments()
+            .iter()
+            .map(|payment| PaymentLog {
+                address: ROOT.address,
+                topics: vec![
+                    DATA_PAYMENT_MADE_TOPIC,
+                    word(&payment.payee),
+                    payment.amount.to_be_bytes::<32>(),
+                    payment.quote_hash,
+                ],
+                data: Vec::new(),
+                log_index: 0,
+            })
+            .collect();
+        let mut root_paid = word(&payer).to_vec();
+        root_paid.extend_from_slice(&word(&wave.leaf_count().to_be_bytes()));
+        root_paid.extend_from_slice(&wave.total().to_be_bytes::<32>());
+        logs.push(PaymentLog {
+            address: ROOT.address,
+            topics: vec![ROOT_PAID_TOPIC, wave.key(&ROOT.address)],
+            data: root_paid,
+            log_index: 0,
+        });
+        for (payee, sum) in wave.sums() {
+            logs.push(PaymentLog {
+                address: ROOT.token,
+                topics: vec![TRANSFER_TOPIC, word(&payer), word(&payee)],
+                data: sum.to_be_bytes::<32>().to_vec(),
+                log_index: 0,
+            });
+        }
+        for (index, log) in logs.iter_mut().enumerate() {
+            log.log_index = index as u64;
+        }
+        PaymentReceipt {
+            tx_hash,
+            success: true,
+            block_number,
+            logs,
+        }
+    }
+
+    /// An envelope paid in a root vault's wave is listed from the root
+    /// proof's transaction, which recorded the wave, at its own
+    /// `DataPaymentMade` log. A merkle proof is refused.
+    #[tokio::test]
+    async fn a_root_paid_envelope_is_listed_from_its_wave() {
+        use ::ant_protocol::payment::proof::{
+            deserialize_single_node_proof, serialize_root_proof, RootPaymentProof,
+        };
+        use ant_listings::root::{RootPayment, Wave};
+
+        let listed = envelope_with(1, ShownFields::ALL, true);
+        let quote = signed_quote(listed.address(), 0, 87);
+        let mut payments = vec![
+            RootPayment {
+                quote_hash: quote.hash().0,
+                payee: quote.rewards_address.0 .0,
+                amount: ::ant_protocol::evm::Amount::from(261u64),
+            },
+            RootPayment {
+                quote_hash: [0x05; 32],
+                payee: [0xcd; 20],
+                amount: ::ant_protocol::evm::Amount::from(50u64),
+            },
+        ];
+        payments.sort_by_key(|payment| payment.quote_hash);
+        let wave = Wave::new(payments).unwrap();
+        let index = wave
+            .payments()
+            .iter()
+            .position(|payment| payment.quote_hash == quote.hash().0)
+            .unwrap();
+        let mut chain = chain_with(400, &[]);
+        chain.add_receipt(wave_receipt([0x79; 32], 300, &wave));
+        let url = MockChain::serve(Arc::new(Mutex::new(chain))).await;
+        let dir = TempDir::new().unwrap();
+        let (listings, _) = service_with_vaults(
+            &dir,
+            &url,
+            VaultSet::with_root(super::super::chain::tests::VAULT, ROOT),
+        )
+        .await;
+
+        let single = deserialize_single_node_proof(&single_node_proof(&quote, [0x79; 32])).unwrap();
+        let proof = serialize_root_proof(&RootPaymentProof {
+            payment: single,
+            quote_hash: quote.hash(),
+            amount: wave.payments()[index].amount,
+            index: index as u64,
+            leaf_count: wave.leaf_count(),
+            path: wave
+                .path(index)
+                .unwrap()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        })
+        .unwrap();
+        let listing = listings
+            .listing_for_put(
+                &listed.address(),
+                &listed.to_bytes(),
+                Some(&proof),
+                Lane::Put,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(listing.payment.tx_hash, Some([0x79; 32]));
+        assert_eq!(listing.payment.block_number, Some(300));
+        assert_eq!(listing.payment.log_index, Some(index as u64));
+        assert!(listing.validate().is_ok());
+
+        let mut merkle = proof.clone();
+        merkle[0] = crate::ant_protocol::PROOF_TAG_MERKLE;
+        let error = listings
+            .listing_for_put(
+                &listed.address(),
+                &listed.to_bytes(),
+                Some(&merkle),
+                Lane::Put,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("single-node or root"), "{error}");
+    }
+
     #[tokio::test]
     async fn a_fresh_offer_records_the_listing_too() {
         let unlisted = envelope_with(1, ShownFields::ALL, false);
@@ -2863,7 +3058,7 @@ pub(super) mod tests {
             asked,
             &groups,
             &fetched,
-            &VAULT,
+            &VAULTS,
             now,
             first_seen_at(now),
         )
@@ -3196,7 +3391,7 @@ pub(super) mod tests {
                 .collect();
             let groups = merge_copies(copies(&listing, &peers));
             let fetched: Vec<_> = groups.iter().map(|_| Some(vec![paid(&upload)])).collect();
-            decide_repair(&envelope, &ASKED, &groups, &fetched, &VAULT, now, own)
+            decide_repair(&envelope, &ASKED, &groups, &fetched, &VAULTS, now, own)
         };
         let dated = |first_seen| Listing {
             first_seen: Some(first_seen),
@@ -5724,6 +5919,8 @@ pub(super) mod tests {
         // the vault for the quote, or isn't where or when the copy says.
         for error in [
             PaymentError::NotPaid,
+            PaymentError::UnknownVault,
+            PaymentError::UnpaidWave(ant_listings::root::WaveLogError::NoRootPaid),
             PaymentError::Failed,
             PaymentError::WrongTransaction,
             PaymentError::WrongBlock,

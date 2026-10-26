@@ -1886,8 +1886,9 @@ fn the_merkle_payment_code_is_not_reached() {
 
 /// The payment vault is read only by the payment check's two reads: its
 /// records, through the pool of the payment reads (`SettlementReads`), and
-/// the merkle record, through `read_payment`. Each tries the node's RPC and
-/// then the chain's other public RPCs.
+/// the merkle record, through `read_payment`. The root vault's records of
+/// waves go through the same pool. Each tries the node's RPC and then the
+/// chain's other public RPCs.
 #[test]
 fn the_payment_vault_is_read_only_through_the_rpc_fallback() {
     const VAULT: &[(Option<&str>, &str)] = &[
@@ -1895,6 +1896,7 @@ fn the_payment_vault_is_read_only_through_the_rpc_fallback() {
         (None, "PaymentVaultHandler"),
         (Some("payment_vault"), "get_*"),
         (None, "COMPLETED_PAYMENTS_SELECTOR"),
+        (None, "ROOT_RECORDS_SELECTOR"),
     ];
     const REVIEWED: &[Reviewed] = &[
         // completedPayments' selector, defined once, and used in the one
@@ -1909,6 +1911,21 @@ fn the_payment_vault_is_read_only_through_the_rpc_fallback() {
             "src/payment/settlement.rs",
             "record_request",
             "COMPLETED_PAYMENTS_SELECTOR",
+            1,
+        ),
+        // The root vault's records, by a wave's key: the selector, defined
+        // once, and used in the one request every wave record read sends
+        // through the same pool.
+        (
+            "src/payment/settlement.rs",
+            "<module>",
+            "ROOT_RECORDS_SELECTOR",
+            1,
+        ),
+        (
+            "src/payment/settlement.rs",
+            "wave_record_request",
+            "ROOT_RECORDS_SELECTOR",
             1,
         ),
         // completedMerklePayments, through read_payment; nothing calls it.
@@ -1928,6 +1945,22 @@ fn the_payment_vault_is_read_only_through_the_rpc_fallback() {
          PaymentVerifier::read_payment; each tries the node's RPC and then the chain's \
          other public RPCs, so that one busy provider does not make the node refuse a \
          paid chunk. Read the vault through them, and list the read here.\n"
+    );
+}
+
+/// Every place that decides by a payment proof's type is a reviewed one
+/// ([`PROOF_TYPE_SITES`]).
+#[test]
+fn every_place_that_decides_by_proof_type_is_reviewed() {
+    const DETECT: &[(Option<&str>, &str)] = &[(None, "detect_proof_type")];
+    let report = unreviewed(Counting::Mentions(DETECT), PROOF_TYPE_SITES);
+    assert!(
+        report.is_empty(),
+        "\nProduction code decides by a payment proof's type somewhere new.\n\n{report}\n\
+         Each place must handle every type: single-node and root proofs taken, each \
+         settled in its own vault, and merkle proofs refused. Decide with a match that \
+         names every ProofType, with no catch-all arm, and list the place in \
+         PROOF_TYPE_SITES (src/replication/retention/census.rs).\n"
     );
 }
 
@@ -2070,6 +2103,67 @@ const PROOF_TYPES: &[(&str, &str)] = &[
         "Merkle",
         "Refused in every context, for chunks and pointers alike.",
     ),
+    (
+        "Root",
+        "Verified: the median quote, its issuer's closeness, and its leaf's place in a wave \
+         the root vault recorded, read by the wave's key; refused where the node knows no \
+         root vault.",
+    ),
+];
+
+/// Every place in production code that decides by a payment proof's type,
+/// found by its mentions of `detect_proof_type`, with what each type does
+/// there. Each decides with a `match` that names every type, so a new type
+/// doesn't build until each place handles it; this list catches a new place.
+const PROOF_TYPE_SITES: &[Reviewed] = &[
+    // Re-exports of the vendored protocol's function: no decision.
+    ("src/payment/mod.rs", "<module>", "detect_proof_type", 1),
+    ("src/payment/proof.rs", "<module>", "detect_proof_type", 1),
+    // The dispatch: single-node and root proofs are verified, each against
+    // its own vault; merkle proofs are refused first; an unknown tag is
+    // refused.
+    (
+        "src/payment/verifier.rs",
+        "PaymentVerifier::verify_payment_inner",
+        "detect_proof_type",
+        1,
+    ),
+    // The metrics label: "single_node", "merkle", "root", else "unknown".
+    (
+        "src/payment/verifier.rs",
+        "payment_proof_type_label",
+        "detect_proof_type",
+        1,
+    ),
+    (
+        "src/payment/verifier.rs",
+        "<module>",
+        "detect_proof_type",
+        1,
+    ),
+    // The sidecar strip before a stored chunk is offered to its close
+    // group: single-node, merkle and root proofs alike lose their sidecars;
+    // an unknown tag is forwarded unchanged.
+    (
+        "src/storage/handler.rs",
+        "AntProtocol::strip_commitment_sidecars",
+        "detect_proof_type",
+        2,
+    ),
+    // An envelope's listing: found from a single-node or a root proof's
+    // transactions; refused for a merkle proof or an unknown tag.
+    (
+        "src/listings/service.rs",
+        "ListingService::find_payment",
+        "detect_proof_type",
+        1,
+    ),
+    (
+        "src/listings/service.rs",
+        "<module>",
+        "detect_proof_type",
+        1,
+    ),
 ];
 
 /// The variants of the enum called `name` in `source`, in the order they are
@@ -2111,9 +2205,11 @@ fn enum_variants(source: &str, name: &str) -> Vec<String> {
 }
 
 /// Every message the chunk protocol carries, and every kind of payment proof,
-/// is one whose handling has been reviewed. Both enums are `#[non_exhaustive]`
-/// in the vendored protocol, so the compiler says nothing when a new version
-/// of it adds a variant, or when a merge adds the handling of one; this does.
+/// is one whose handling has been reviewed. The chunk messages are
+/// `#[non_exhaustive]` in the vendored protocol, so the compiler says nothing
+/// when a new version of it adds a variant, or when a merge adds the handling
+/// of one; this does. The proof types are not, so every `match` on them names
+/// each one; this keeps their list reviewed all the same.
 #[test]
 fn the_wire_messages_are_the_reviewed_ones() {
     let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor");
@@ -2154,7 +2250,7 @@ fn the_wire_messages_are_the_reviewed_ones() {
              in src/replication/retention/census.rs.\n\n  declared: {declared:?}\n  \
              not reviewed: {not_reviewed:?}\n  listed but gone: {gone:?}\n  \
              listed without a reason: {without_reason:?}\n\n\
-             Nodes take single-node payments only, and refuse merkle (batch) payments at \
+             Nodes take single-node and root payments, and refuse merkle (batch) payments at \
              quote time and on any proof. Before listing a new message or proof type, make \
              sure the node's handler (src/storage/handler.rs) and payment check \
              (src/payment/verifier.rs) take it through those rules, with tests that pin it; \

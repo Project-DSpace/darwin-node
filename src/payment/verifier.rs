@@ -9,7 +9,8 @@ use crate::logging::{debug, info, warn};
 use crate::payment::cache::{CacheStats, PaidKey, VerifiedCache, XorName};
 use crate::payment::pricing::{calculate_price, derive_records_stored_from_price};
 use crate::payment::proof::{
-    deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type, ProofType,
+    deserialize_merkle_proof, deserialize_root_proof, deserialize_single_node_proof,
+    detect_proof_type, ProofType, RootPaymentProof,
 };
 use crate::payment::settlement::{
     Answered, Lane, Settlement, SettlementReads, EMPTY_PAYMENT_RECHECK_DELAY, PAYMENT_READ_BACKOFF,
@@ -18,6 +19,8 @@ use crate::payment::settlement::{
 use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::storage::ChunkStore;
+use ant_listings::root::{leaf_key, RootPayment};
+use ant_listings::RootVault;
 use ant_protocol::chunk::DATA_TYPE_CHUNK;
 use ant_protocol::payment::pricing::{
     record_weight, weighted_amount, RecordWeight, WEIGHT_DENOMINATOR,
@@ -502,7 +505,7 @@ fn payment_proof_type_label(payment_proof: Option<&[u8]>) -> &'static str {
     match payment_proof.and_then(detect_proof_type) {
         Some(ProofType::Merkle) => "merkle",
         Some(ProofType::SingleNode) => "single_node",
-        Some(_) => "unsupported",
+        Some(ProofType::Root) => "root",
         None if payment_proof.is_some() => "unknown",
         None => "none",
     }
@@ -516,12 +519,16 @@ fn payment_proof_type_label(payment_proof: Option<&[u8]>) -> &'static str {
 pub struct EvmVerifierConfig {
     /// EVM network to use (Arbitrum One, Arbitrum Sepolia, etc.)
     pub network: EvmNetwork,
+    /// The root vault whose recorded waves root proofs (tag 0x03) are paid
+    /// in, where the network has one. With none, every root proof is refused.
+    pub root_vault: Option<RootVault>,
 }
 
 impl Default for EvmVerifierConfig {
     fn default() -> Self {
         Self {
             network: EvmNetwork::ArbitrumOne,
+            root_vault: None,
         }
     }
 }
@@ -1016,7 +1023,11 @@ impl PaymentVerifier {
         info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm=always-on, pool_cache={DEFAULT_POOL_CACHE_CAPACITY})");
         let mut vault = [0u8; 20];
         vault.copy_from_slice(config.evm.network.payment_vault_address().as_slice());
-        let reads = SettlementReads::new(vault, Self::network_rpc_urls(&config.evm.network));
+        let reads = SettlementReads::with_root(
+            vault,
+            config.evm.root_vault,
+            Self::network_rpc_urls(&config.evm.network),
+        );
 
         // Loud warning if a production binary was accidentally built with
         // `test-utils`: that feature flips the live-DHT payment-check
@@ -1436,7 +1447,9 @@ impl PaymentVerifier {
                         )));
                     }
 
-                    // Detect proof type from version tag byte
+                    // Detect proof type from version tag byte. No arm
+                    // stands for several types, so a new one doesn't build
+                    // until it is handled here.
                     match detect_proof_type(proof) {
                         // Darwin refuses batch payments in every context
                         // (see `BATCH_PAYMENTS_REFUSED`). Neighbour-sync
@@ -1471,19 +1484,20 @@ impl PaymentVerifier {
                             )
                             .await?;
                         }
+                        // A payment recorded in a root vault's wave: settled
+                        // in the root vault's record of the wave, never in
+                        // the per-quote vault's.
+                        Some(ProofType::Root) => {
+                            let parsed = deserialize_root_proof(proof).map_err(|e| {
+                                Error::Payment(format!("Failed to deserialize root proof: {e}"))
+                            })?;
+                            self.verify_root_payment(target, weight, &parsed, context)
+                                .await?;
+                        }
                         None => {
                             let tag = proof.first().copied().unwrap_or(0);
                             return Err(Error::Payment(format!(
                                 "Unknown payment proof type tag: 0x{tag:02x}"
-                            )));
-                        }
-                        // ant-protocol marks `ProofType` as `#[non_exhaustive]`.
-                        // A future proof variant that this node does not yet
-                        // understand must be rejected, not silently accepted.
-                        Some(_) => {
-                            let tag = proof.first().copied().unwrap_or(0);
-                            return Err(Error::Payment(format!(
-                                "Unsupported payment proof type tag: 0x{tag:02x} (this node's protocol version does not handle it — upgrade ant-node)"
                             )));
                         }
                     }
@@ -1831,6 +1845,182 @@ impl PaymentVerifier {
         if crate::logging::enabled!(crate::logging::Level::INFO) {
             let xorname_hex = hex::encode(xorname);
             info!("EVM payment verified for {xorname_hex}");
+        }
+        Ok(())
+    }
+
+    /// Verify a root proof: the paid quote's payment recorded in a root
+    /// vault's wave.
+    ///
+    /// Every check a single-node proof goes through runs unchanged: the
+    /// quotes' structure and ADR-0004 price binding, median-candidate
+    /// selection, content and peer binding, the issuer's closeness and the
+    /// paid quote's signature. Then the root branch: the paid quote must be a
+    /// median candidate; the leaf is rebuilt from that quote's hash, its
+    /// rewards address and the proof's amount, and hashed up the proof's path
+    /// to the wave's key; and the root vault's record under the key is read,
+    /// once more after [`EMPTY_PAYMENT_RECHECK_DELAY`] if it reads empty. A
+    /// leaf count of 0 or above the vault's leaf limit, a place outside the
+    /// wave, or a path of the wrong length is refused before any read. The
+    /// leaf's amount must be at least what a single-node payment of the quote
+    /// must pay for the record's size class: `weighted_amount(median,
+    /// weight)`, the same rule [`Self::verify_evm_payment`] applies. The price floor, the off-curve telemetry, the commitment
+    /// cross-check and the first-audit nomination follow as for a single-node
+    /// proof, with the leaf's amount as the settled amount.
+    ///
+    /// The key binds the payee's whole address, where the per-quote vault's
+    /// record holds its leading 16 bytes.
+    async fn verify_root_payment(
+        &self,
+        target: &PaymentTarget,
+        weight: RecordWeight,
+        proof: &RootPaymentProof,
+        context: VerificationContext,
+    ) -> Result<()> {
+        let xorname = target.content();
+        let payment = &proof.payment.proof_of_payment;
+        Self::validate_quote_structure(payment)?;
+        Self::validate_quote_arithmetic(payment)?;
+        let candidate = Self::legacy_median_candidates(payment, weight)?
+            .into_iter()
+            .find(|candidate| candidate.quote.hash() == proof.quote_hash)
+            .ok_or_else(|| {
+                Error::Payment(format!(
+                    "Root proof for {}: the paid quote {} is not a median-priced quote of the proof",
+                    hex::encode(xorname),
+                    hex::encode(proof.quote_hash)
+                ))
+            })?;
+        if proof.amount < candidate.expected_amount {
+            return Err(Error::Payment(format!(
+                "Root proof for {}: the median-priced quote for peer {:?} was not paid enough: expected at least {}, got {}",
+                hex::encode(xorname),
+                candidate.encoded_peer_id,
+                candidate.expected_amount,
+                proof.amount
+            )));
+        }
+        let Some(root_vault) = self.reads.root_vault() else {
+            return Err(Error::Payment(
+                "Root proofs are not accepted: this node knows no root vault".into(),
+            ));
+        };
+        let leaf = RootPayment {
+            quote_hash: proof.quote_hash.0,
+            payee: candidate.quote.rewards_address.0 .0,
+            amount: proof.amount,
+        };
+        let path: Vec<[u8; 32]> = proof.path.iter().map(|hash| hash.0).collect();
+        let key = leaf_key(
+            &root_vault.address,
+            &leaf,
+            proof.index,
+            proof.leaf_count,
+            &path,
+        )
+        .ok_or_else(|| {
+            Error::Payment(format!(
+                "Root proof for {}: leaf {} of {} with a path of {} hashes is no place in a wave",
+                hex::encode(xorname),
+                proof.index,
+                proof.leaf_count,
+                path.len()
+            ))
+        })?;
+
+        Self::validate_paid_quote_content(target.content(), candidate)?;
+        let issuer_peer_id =
+            Self::validate_paid_quote_peer_binding(candidate.encoded_peer_id, candidate.quote)?;
+        self.validate_paid_quote_issuer_k_closest(target.routing(), &issuer_peer_id)
+            .await?;
+        Self::validate_paid_quote_signature(candidate).await?;
+
+        self.wave_recorded(xorname, key, proof.leaf_count, lane_of(context))
+            .await?;
+
+        let paid_price = candidate.quote.price;
+        self.enforce_price_floor(
+            target.routing(),
+            weight,
+            paid_price,
+            proof.amount,
+            context,
+        )
+        .await?;
+        Self::log_off_curve_single_node(payment);
+        if context.is_store_admission() {
+            self.cross_check_quotes(
+                payment,
+                &proof.payment.commitment_sidecars,
+                Some(*candidate.encoded_peer_id.as_bytes()),
+            )
+            .await;
+        }
+        if crate::logging::enabled!(crate::logging::Level::INFO) {
+            info!(
+                "Root payment verified for {} (wave key {})",
+                hex::encode(xorname),
+                hex::encode(key)
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the root vault recorded a wave of `leaf_count` payments under
+    /// `key`: the record read, and read once more, on a fresh connection at
+    /// the next RPC, [`EMPTY_PAYMENT_RECHECK_DELAY`] after it reads empty. A
+    /// record found is kept for good, so a later proof of the same wave reads
+    /// nothing.
+    async fn wave_recorded(
+        &self,
+        xorname: &XorName,
+        key: [u8; 32],
+        leaf_count: u64,
+        lane: Lane,
+    ) -> Result<()> {
+        let lookup_failed =
+            |e: String| Error::Payment(format!("Root vault record lookup failed: {e}"));
+        let answered = self
+            .reads
+            .wave_record(key, lane)
+            .await
+            .map_err(lookup_failed)?;
+        let record = if answered.value.is_recorded() {
+            answered.value
+        } else {
+            debug!(
+                "The root vault's record of wave {} for {} read empty; reading it again in {:?}",
+                hex::encode(key),
+                hex::encode(xorname),
+                EMPTY_PAYMENT_RECHECK_DELAY
+            );
+            let again = self
+                .reads
+                .wave_record_again_later(key, lane, answered.rpc, EMPTY_PAYMENT_RECHECK_DELAY)
+                .await
+                .map_err(|_| lookup_failed("the read again did not come back".into()))?
+                .map_err(|e| lookup_failed(format!("read again: {e}")))?;
+            if !again.value.is_recorded() {
+                return Err(Error::Payment(format!(
+                    "Root proof for {}: the root vault has no wave recorded under key {}, read again after {EMPTY_PAYMENT_RECHECK_DELAY:?}",
+                    hex::encode(xorname),
+                    hex::encode(key)
+                )));
+            }
+            info!(
+                "The root payment for {} read empty at first, and was there {:?} later",
+                hex::encode(xorname),
+                EMPTY_PAYMENT_RECHECK_DELAY
+            );
+            again.value
+        };
+        if u64::from(record.leaf_count) != leaf_count {
+            return Err(Error::Payment(format!(
+                "Root proof for {}: the root vault's record under key {} holds {} payments, not {leaf_count}",
+                hex::encode(xorname),
+                hex::encode(key),
+                record.leaf_count
+            )));
         }
         Ok(())
     }
@@ -4312,9 +4502,11 @@ mod tests {
             context: VerificationContext,
         ) -> Result<PaymentStatus> {
             let target = PaymentTarget::same(*xorname);
-            let Some(proof) =
-                payment_proof.filter(|proof| detect_proof_type(proof) == Some(ProofType::Merkle))
-            else {
+            let merkle = payment_proof.filter(|proof| match detect_proof_type(proof) {
+                Some(ProofType::Merkle) => true,
+                Some(ProofType::SingleNode | ProofType::Root) | None => false,
+            });
+            let Some(proof) = merkle else {
                 return self
                     .verify_payment(xorname, FULL_CHUNK, payment_proof, context)
                     .await;
@@ -4508,6 +4700,7 @@ mod tests {
                     "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3",
                     "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B",
                 ),
+                root_vault: None,
             },
             cache_capacity: 100,
             close_group_size: CLOSE_GROUP_SIZE,
@@ -10287,3 +10480,6 @@ mod tests {
 
 #[cfg(test)]
 mod settlement_tests;
+
+#[cfg(test)]
+mod root_tests;

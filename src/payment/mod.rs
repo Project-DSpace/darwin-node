@@ -53,8 +53,9 @@ pub use cache::{CacheStats, VerifiedCache};
 pub use metrics::QuotingMetricsTracker;
 pub use pricing::calculate_price;
 pub use proof::{
-    deserialize_merkle_proof, deserialize_proof, detect_proof_type, serialize_merkle_proof,
-    serialize_single_node_proof, PaymentProof, ProofType,
+    deserialize_merkle_proof, deserialize_proof, deserialize_root_proof, detect_proof_type,
+    serialize_merkle_proof, serialize_root_proof, serialize_single_node_proof, PaymentProof,
+    ProofType, RootPaymentProof,
 };
 pub use quote::{
     wire_ml_dsa_signer, QuoteGenerator, QuotePricing, XorName, SIZE_PRICED_SETTLEMENT_VERSION,
