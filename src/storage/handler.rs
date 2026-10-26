@@ -891,6 +891,17 @@ impl AntProtocol {
             }
         };
 
+        // A store that fails after its payment check passed, in a test-utils
+        // build when the harness asks (`crate::test_seams::FAULTS_FILE`), so
+        // the client's next try is answered from the payment cache.
+        #[cfg(any(test, feature = "test-utils"))]
+        if crate::test_seams::fault_fires(crate::test_seams::Fault::FailStore, &address) {
+            warn!("Test seam: failing the store of {addr_hex} after its payment check");
+            return ChunkPutResponse::Error(ProtocolError::StorageFailed(
+                "test seam: the store failed".to_string(),
+            ));
+        }
+
         // 6. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {

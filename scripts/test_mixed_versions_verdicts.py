@@ -2,7 +2,9 @@
 """Tests the mixed-version harness's verdicts (scripts/test_mixed_versions.py)
 on made-up results: what a mixed run's penalties, refused PUTs and message
 families are measured against, with one all-old run and with several, and
-what counts as a new failure reason; and that the report and summary.json
+what counts as a new failure reason; proofs the previous release's nodes
+refused, paid-group members that don't list a key, and repeated PUTs not
+answered "already stored"; and that the report and summary.json
 list every count measured, with its excess and limit, within the limit or
 not. The Test workflow runs it; run it by hand with
 `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
@@ -22,7 +24,8 @@ INCUMBENTS_FAIL = ("incumbent", "incumbent", "application_failure")
 JOINERS_TIME_OUT = ("joiner", "joiner", "connection_timeout")
 
 
-def result(penalties=None, refusals=None, families=None):
+def result(penalties=None, refusals=None, families=None, proof_refusals=None,
+           unlisted=None, faults=None):
     """One run's analysis as verdicts() reads it: `penalties` by (observer,
     target, reason), `refusals` by role, and the message families each role
     received, by role; every role gets neighbour sync."""
@@ -40,6 +43,9 @@ def result(penalties=None, refusals=None, families=None):
         "penalties_on_full": {}, "between_releases": {},
         "penalties": {key: (count, float(count)) for key, count in (penalties or {}).items()},
         "refusals": refusals or {},
+        "proof_refusals": proof_refusals or {},
+        "unlisted": unlisted or [],
+        "faults": faults or [],
     }
 
 
@@ -229,6 +235,28 @@ def main():
            options(), [])
 
     listed(options())
+
+    refused_notice = {("joiner", "old", "notice"): 3}
+    expect("a proof the previous release refused in a notice, which no all-old run did, fails",
+           {**two, "new-hosts-old": result(proof_refusals=refused_notice)},
+           options(), ["the joiners of the previous release refused 3 proofs in a notice"])
+    expect("a kind of proof refusal an all-old run had too is not a failure",
+           {"all-old": result(proof_refusals={("joiner", "old", "notice"): 1}),
+            "all-old-2": result(),
+            "new-hosts-old": result(proof_refusals=refused_notice)},
+           options(), [])
+    expect("proofs this tree's nodes refused are not counted against the previous release",
+           {**two, "old-hosts-new": result(proof_refusals={("joiner", "new", "offer"): 2})},
+           options(), [])
+    expect("a paid-group member that doesn't list a key fails, in every run",
+           {"all-old": result(unlisted=[("ab" * 32, "incumbent", "old", "not_listed")])},
+           options(), ["doesn't list it: not_listed"])
+    repeated = {"case": "repeated PUT", "address": "cd" * 32, "peer": None, "note": "",
+                "answers": [{"peer": "01", "outcome": "already_stored"},
+                            {"peer": "02", "outcome": "stored"}]}
+    expect("a repeated PUT not answered already stored fails",
+           {"all-old": result(faults=[repeated])},
+           options(), ["a repeated PUT of " + "cd" * 32])
 
     names = ["all-old", "all-old-2", "all-old-12", "all-old-1", "all-old-x", "new-hosts-old"]
     baselines = [name for name in names if harness.is_baseline(name)]

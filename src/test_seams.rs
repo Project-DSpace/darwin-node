@@ -36,6 +36,88 @@ pub const PREFIX: &str = "ANT_TEST_SEAM_";
 /// parsed is a failed measurement, as a failed `statvfs` is.
 pub const FREE_SPACE_FILE: &str = "ANT_TEST_SEAM_FREE_SPACE_FILE";
 
+/// Names a file of faults the mixed-version harness injects into this node,
+/// one per line, each a word and a 32-byte value in hex:
+///
+/// - `drop-holding-to <peer id>`: every holding notice this node sends that
+///   peer is dropped, as if lost on the way, so the peer's own hold hears
+///   nothing from this node;
+/// - `fail-store <key>`: this node's first store of the key after its payment
+///   check passed fails, as a full or failing disk's would, so the client's
+///   next try is answered from the payment cache;
+/// - `fail-paid-list <key>`: this node's paid-list write when it announces a
+///   store of the key fails.
+///
+/// The file is read at each use, so the harness adds faults while the node
+/// runs; a missing or unreadable file, or a line that doesn't parse, injects
+/// nothing. Each `fail-*` fault fires once per key in this process.
+pub const FAULTS_FILE: &str = "ANT_TEST_SEAM_FAULTS_FILE";
+
+/// One kind of fault [`FAULTS_FILE`] can inject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Fault {
+    /// `drop-holding-to`: holding notices to this peer are dropped.
+    DropHoldingTo,
+    /// `fail-store`: the first store of this key fails.
+    FailStore,
+    /// `fail-paid-list`: the announce's paid-list write of this key fails.
+    FailPaidList,
+}
+
+impl Fault {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::DropHoldingTo => "drop-holding-to",
+            Self::FailStore => "fail-store",
+            Self::FailPaidList => "fail-paid-list",
+        }
+    }
+}
+
+/// The faults a `fail-*` line has already fired, so each fires once.
+static FIRED: std::sync::Mutex<Vec<(Fault, [u8; 32])>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether the faults file names `fault` for `value`.
+pub(crate) fn fault_set(fault: Fault, value: &[u8; 32]) -> bool {
+    let Some(path) = std::env::var_os(FAULTS_FILE) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    parse_faults(&text).contains(&(fault, *value))
+}
+
+/// Whether a `fail-*` fault fires now for `value`: named in the file and not
+/// fired before in this process.
+pub(crate) fn fault_fires(fault: Fault, value: &[u8; 32]) -> bool {
+    if !fault_set(fault, value) {
+        return false;
+    }
+    let Ok(mut fired) = FIRED.lock() else {
+        return false;
+    };
+    if fired.contains(&(fault, *value)) {
+        return false;
+    }
+    fired.push((fault, *value));
+    true
+}
+
+fn parse_faults(text: &str) -> Vec<(Fault, [u8; 32])> {
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let word = words.next()?;
+            let fault = [Fault::DropHoldingTo, Fault::FailStore, Fault::FailPaidList]
+                .into_iter()
+                .find(|fault| fault.word() == word)?;
+            let value: [u8; 32] = hex::decode(words.next()?).ok()?.try_into().ok()?;
+            Some((fault, value))
+        })
+        .collect()
+}
+
 /// Free and total bytes a test set for the storage partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FreeSpace {
@@ -132,5 +214,31 @@ mod tests {
     #[test]
     fn every_seam_starts_with_the_prefix() {
         assert!(FREE_SPACE_FILE.starts_with(PREFIX));
+        assert!(FAULTS_FILE.starts_with(PREFIX));
+    }
+
+    #[test]
+    fn a_faults_file_names_each_fault_and_its_value() {
+        let peer = "ab".repeat(32);
+        let key = "0c".repeat(32);
+        let text = format!(
+            "drop-holding-to {peer}
+fail-store {key}
+
+fail-paid-list {key}
+             fail-store nothex
+unknown {key}
+fail-store {}
+",
+            "0c".repeat(31)
+        );
+        assert_eq!(
+            parse_faults(&text),
+            vec![
+                (Fault::DropHoldingTo, [0xAB; 32]),
+                (Fault::FailStore, [0x0C; 32]),
+                (Fault::FailPaidList, [0x0C; 32]),
+            ]
+        );
     }
 }

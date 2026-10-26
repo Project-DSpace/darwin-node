@@ -169,7 +169,17 @@ pub(crate) async fn announce_paid_write(
     config: &ReplicationConfig,
 ) -> Announced {
     // Rule 6: Node that validates PoP adds K to PaidForList(self).
-    let recorded = match paid_list.insert(key).await {
+    #[cfg(any(test, feature = "test-utils"))]
+    let insert = if crate::test_seams::fault_fires(crate::test_seams::Fault::FailPaidList, key) {
+        Err(crate::error::Error::Storage(
+            "test seam: paid-list write failed".to_string(),
+        ))
+    } else {
+        paid_list.insert(key).await
+    };
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let insert = paid_list.insert(key).await;
+    let recorded = match insert {
         Ok(_) => true,
         Err(e) => {
             warn!("Failed to add key {} to PaidForList: {e}", hex::encode(key));
@@ -482,7 +492,10 @@ pub(crate) fn send_notice<'a>(
     p2p_node: &Arc<P2PNode>,
     counter: FreshCounter,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let mut peers = peers.peekable();
+    let holding = proof_of_payment.is_empty();
+    let mut peers = peers
+        .filter(|peer| !holding_notice_lost(holding, peer))
+        .peekable();
     if peers.peek().is_none() {
         return Vec::new();
     }
@@ -519,6 +532,21 @@ pub(crate) fn send_notice<'a>(
             })
         })
         .collect()
+}
+
+/// Whether a holding notice to `peer` is dropped, as if lost on the way: only
+/// in a `test-utils` build, when the harness names the peer
+/// ([`crate::test_seams::FAULTS_FILE`]).
+#[allow(clippy::missing_const_for_fn, unused_variables)]
+fn holding_notice_lost(holding: bool, peer: &PeerId) -> bool {
+    #[cfg(any(test, feature = "test-utils"))]
+    if holding {
+        return crate::test_seams::fault_set(
+            crate::test_seams::Fault::DropHoldingTo,
+            peer.as_bytes(),
+        );
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

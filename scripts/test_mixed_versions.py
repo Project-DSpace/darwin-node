@@ -23,13 +23,29 @@ The runs (`--runs`):
   full           this tree throughout, with --full joiners whose disk reads as
                  full through the free-space seam (run when --full is given)
 
+Each upload sends the first half of its records, and its pointers, to one
+storer only, so the rest of the close group gets them by that storer's
+offers and the paid group by its notices, with the slim proof. After the
+last upload, `darwin-harness faults` runs the fault cases: every stored
+record PUT again (answered "already stored"), and, through the faults seam
+(ANT_TEST_SEAM_FAULTS_FILE) of this tree's nodes, holding notices lost on the
+way to one storer, a failed paid-list write, and retries answered from the
+payment cache with an empty, 16-byte, merkle-tagged or garbled proof.
+
 Every run must show, over the time from the joiners' start to the last read:
 no message that failed to decode, in any node's log; no audit failed for a
 reply that didn't decode; every record stored by a majority of its close
 group, and still held at the end by a majority of the nodes that stored it
 (a node that joins later gets a record only by repair, which waits for the
-record to age, so the nodes nearest it now are counted but not required);
-and every standalone node received neighbour sync.
+record to age, so the nodes nearest it now are counted but not required; a
+record PUT to one storer counts its close group at upload as its storers);
+every member of a chunk's paid group at upload, the devnet's nodes left out,
+listing the key in its paid list at the end; every repeated PUT answered
+"already stored"; and every standalone node received neighbour sync.
+
+Each mixed run must also show no proof refused by a node of the previous
+release in a notice, an offer or a pointer offer (each kind counted for each
+role) where no all-old run had one.
 
 Each mixed run must also show no penalty heavier than the all-old runs': the
 penalties (saorsa-core's trust events that lower a peer's score) that the
@@ -150,6 +166,23 @@ CLIENT_TIMEOUT = 1800
 
 # The seam whose name, found in a binary, shows it was built with test-utils.
 FREE_SPACE_SEAM = "ANT_TEST_SEAM_FREE_SPACE_FILE"
+
+# The faults seam (src/test_seams.rs): faults this tree's nodes inject.
+FAULTS_SEAM = "ANT_TEST_SEAM_FAULTS_FILE"
+
+# How many pointers each upload stores, each at one storer.
+POINTERS_PER_UPLOAD = 2
+
+# A proof refused by a node: in a notice, an offer or a pointer offer. The
+# lines every release since ds.15 logs when it refuses one (a notice's at
+# WARN; an offer's at WARN or DEBUG; a pointer offer's at INFO).
+PROOF_REFUSED = (
+    ("notice", re.compile(r"PoP verification error for paid notify key|"
+                          r"Paid notify rejected: payment required")),
+    ("offer", re.compile(r"PoP verification error for key |"
+                         r"Fresh offer for \S+ from \S+: no payment found for this proof")),
+    ("pointer offer", re.compile(r"Fresh pointer offer for \S+ from \S+ is not paid for")),
+)
 
 # What each node logs: info, and debug for the code whose debug lines name
 # messages that didn't decode (src/replication, the chunk handler, listings).
@@ -323,7 +356,9 @@ class Release:
                 raise HarnessError(f"{binary} is missing")
         self.version = subprocess.run([str(self.node), "--version"], capture_output=True,
                                       text=True).stdout.strip()
-        self.seams = FREE_SPACE_SEAM.encode() in self.node.read_bytes()
+        binary = self.node.read_bytes()
+        self.seams = FREE_SPACE_SEAM.encode() in binary
+        self.faults = FAULTS_SEAM.encode() in binary
 
     def __str__(self):
         return f"{self.name}: {self.version}, {self.label}"
@@ -454,6 +489,9 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
     timeline = {"started": utc_now().isoformat()}
     stall = StallWatch()
     full_count = args.full if name == "full" else 0
+    faults_file = folder / "seams" / "faults"
+    faults_file.parent.mkdir(exist_ok=True)
+    faults_file.write_text("")
     try:
         manifest_path = folder / "manifest.json"
         devnet_data = folder / "devnet"
@@ -475,6 +513,8 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
             root = folder / "nodes" / node_name
             root.mkdir(parents=True)
             node_env = dict(env)
+            if release.faults:
+                node_env[FAULTS_SEAM] = str(faults_file)
             if full:
                 seam = folder / "seams" / f"{node_name}.free"
                 seam.parent.mkdir(exist_ok=True)
@@ -524,6 +564,9 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         time.sleep(args.join_seconds)
         uploads.append(upload(harness, manifest_path, folder / "uploads-after.json",
                               args.records_after))
+        new_peers = [node.peer_id for node in nodes if node.release.faults]
+        faults = run_faults(harness, manifest_path, uploads[-1], faults_file, new_peers,
+                            folder / "faults.json")
 
         log(f"{name}: observing for {args.observe_minutes} min")
         deadline = time.monotonic() + args.observe_minutes * 60
@@ -554,6 +597,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
                    "full": node.full, "log": node.process.log_path.name} for node in nodes],
         "uploads": [path.name for path in uploads],
         "checks": [path.name for path in checks],
+        "faults": faults.name,
     }
     (folder / "run.json").write_text(json.dumps(record, indent=2))
     return folder
@@ -567,6 +611,8 @@ def load_run(folder):
                              for stamp in record["window"])
     record["uploads"] = [json.loads((folder / name).read_text()) for name in record["uploads"]]
     record["checks"] = [json.loads((folder / name).read_text()) for name in record["checks"]]
+    record["faults"] = (json.loads((folder / record["faults"]).read_text())
+                        if record.get("faults") else {"cases": []})
     return record
 
 
@@ -609,8 +655,19 @@ def client(harness, arguments, out):
 
 def upload(harness, manifest, out, records):
     sizes = ",".join(str(RECORD_SIZES[index % len(RECORD_SIZES)]) for index in range(records))
-    log(f"uploading {records} records")
-    return client(harness, ["upload", "--manifest", str(manifest), "--sizes", sizes], out)
+    log(f"uploading {records} records ({records // 2} to one storer) and "
+        f"{POINTERS_PER_UPLOAD} pointers")
+    return client(harness, ["upload", "--manifest", str(manifest), "--sizes", sizes,
+                            "--one-storer", str(records // 2),
+                            "--pointers", str(POINTERS_PER_UPLOAD)], out)
+
+
+def run_faults(harness, manifest, uploads, faults_file, new_peers, out):
+    log(f"fault cases ({len(new_peers)} nodes of this tree take the seam's faults)")
+    return client(harness, ["faults", "--manifest", str(manifest), "--uploads", str(uploads),
+                            "--faults-file", str(faults_file),
+                            "--new-peers", ",".join(peer for peer in new_peers if peer)],
+                  out)
 
 
 def check(harness, manifest, uploads, out):
@@ -689,6 +746,7 @@ def analyze(run):
     sources += [(node["name"], node["role"], node["release"], folder / node["log"])
                 for node in run["nodes"]]
     decode_failures = []
+    proof_refusals = {}
     unanswered = {}
     penalties = {}
     penalties_on_full = {}
@@ -715,6 +773,10 @@ def analyze(run):
                 unanswered[key] = unanswered.get(key, 0) + 1
             if DECODE_FAILURE.search(text):
                 decode_failures.append(f"{source}: {text[:400]}")
+            for kind, pattern in PROOF_REFUSED:
+                if pattern.search(text):
+                    key = (role, release, kind)
+                    proof_refusals[key] = proof_refusals.get(key, 0) + 1
             if TRUST_LINE in text:
                 found = fields(text)
                 try:
@@ -757,8 +819,19 @@ def analyze(run):
             # A refusal for lack of space: the seam's 0 free bytes are under
             # any reserve, where the host's own disk has room.
             full_evidence[node["name"]] = "Insufficient disk space" in text
+    devnet = set(run["devnet_peers"])
+    unlisted = []
+    for record in checks:
+        for answer in record.get("paid_listed", []):
+            if answer["peer"] in devnet or answer["outcome"] == "listed":
+                continue
+            unlisted.append((record["address"], roles.get(answer["peer"], "other"),
+                             releases.get(answer["peer"], "?"), answer["outcome"]))
     return {
         "decode_failures": decode_failures,
+        "proof_refusals": proof_refusals,
+        "unlisted": unlisted,
+        "faults": run["faults"]["cases"],
         "penalties": penalties,
         "penalties_on_full": penalties_on_full,
         "penalties_on_refusals": penalties_on_refusals,
@@ -870,6 +943,23 @@ def comparisons(result, baselines, args):
     return entries
 
 
+def old_proof_refusals(result, baselines):
+    """The proofs nodes of the previous release refused in a run, by role
+    and kind, where no all-old run had one of that role and kind: as (role,
+    kind, count)."""
+    found = []
+    seen = {}
+    for (role, release, kind), count in result.get("proof_refusals", {}).items():
+        if release == "old" and count:
+            seen[(role, kind)] = seen.get((role, kind), 0) + count
+    for (role, kind), count in sorted(seen.items()):
+        before = sum(baseline.get("proof_refusals", {}).get((role, "old", kind), 0)
+                     for baseline in baselines)
+        if before == 0:
+            found.append((role, kind, count))
+    return found
+
+
 def verdicts(results, args):
     """Every failure, as text; empty when every run passed."""
     failures = []
@@ -895,6 +985,14 @@ def verdicts(results, args):
                 failures.append(f"{name}: record {record['address']} is held at the end by "
                                 f"{record['held_by_storers']} of the "
                                 f"{len(record['storers'])} nodes that stored it")
+        for address, role, release, outcome in result.get("unlisted", []):
+            failures.append(f"{name}: a {role} of the {release} release, in record "
+                            f"{address}'s paid group at upload, doesn't list it: {outcome}")
+        for case in result.get("faults", []):
+            if case["case"] == "repeated PUT" and any(
+                    answer["outcome"] != "already_stored" for answer in case["answers"]):
+                failures.append(f"{name}: a repeated PUT of {case['address']} was answered "
+                                f"{[answer['outcome'] for answer in case['answers']]}")
         for node, ok in result["full_evidence"].items():
             if not ok:
                 failures.append(f"{name}: {node} never refused for lack of space: the "
@@ -910,6 +1008,9 @@ def verdicts(results, args):
                     failures.append(f"{name}: the {role}s received no {family}")
         if not is_measured(name, baselines):
             continue
+        for role, kind, count in old_proof_refusals(result, baselines):
+            failures.append(f"{name}: the {role}s of the previous release refused {count} "
+                            f"proofs in a {kind}, which no all-old run did")
         for compared in comparisons(result, baselines, args):
             count, target, reason = compared["count"], compared["target"], compared["reason"]
             if count <= compared["limit"]:
@@ -971,6 +1072,14 @@ def report(results, args):
         for role, ran in result["ran"].items():
             lines.append(f"{role}s ran: {', '.join(ran)}")
         lines.append(f"decode failures: {len(result['decode_failures'])}")
+        refused = ", ".join(f"{role} ({release}) {kind} {count}" for (role, release, kind), count
+                            in sorted(result.get("proof_refusals", {}).items()))
+        lines.append(f"proofs refused (role, release, kind): {refused or 'none'}")
+        lines.append(f"paid-group members not listing a key: {len(result.get('unlisted', []))}")
+        for case in result.get("faults", []):
+            answers = ", ".join(answer["outcome"][:60] for answer in case["answers"])
+            lines.append(f"fault case: {case['case']} at {case['address'][:16]}: "
+                         f"{case['note']} ({answers})")
         lines.append("requests not answered in time (sender -> target, kind: count):")
         for (sender, target, kind), count in sorted(result["unanswered"].items()):
             lines.append(f"  {sender:>9} -> {target:<9} {kind:<19} {count:>5}")
@@ -1036,6 +1145,12 @@ def summary_json(results, failures, releases, args):
     def plain(result):
         return {
             "decode_failures": result["decode_failures"],
+            "proof_refusals": [{"role": r, "release": v, "kind": k, "count": c}
+                               for (r, v, k), c in
+                               sorted(result.get("proof_refusals", {}).items())],
+            "unlisted": [{"address": a, "role": r, "release": v, "outcome": o}
+                         for a, r, v, o in result.get("unlisted", [])],
+            "faults": result.get("faults", []),
             "unanswered": [{"sender": s, "target": t, "kind": k, "count": c}
                            for (s, t, k), c in sorted(result["unanswered"].items())],
             "penalties": [{"observer": o, "target": t, "reason": r, "count": c, "weight": w}
@@ -1208,7 +1323,8 @@ def main():
         log(f"{name}: done")
     (work / "releases.json").write_text(json.dumps(
         {release.name: {"version": release.version, "from": release.label,
-                        "seams": release.seams} for release in releases}, indent=2))
+                        "seams": release.seams, "faults": release.faults}
+         for release in releases}, indent=2))
     # Every run in the work folder: one run again into a folder whose other
     # runs passed is measured against the same all-old runs.
     return conclude(work, runs_in(work), args)
