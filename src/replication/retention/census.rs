@@ -1978,6 +1978,165 @@ fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
     );
 }
 
+/// Every mention of the price curve, `calculate_price`, and of a quote's
+/// committed key count in production code, at the reviewed number of sites.
+/// Size pricing changed what a quote is priced at (the weight total m for a
+/// client that pays by size) and what every quote check accepts (a band, not
+/// one price), so a price computed somewhere new, or a count read somewhere
+/// new, is a place the band or the weight may have been missed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
+    const PRICING: &[(Option<&str>, &str)] =
+        &[(None, "calculate_price"), (None, "committed_key_count")];
+    const REVIEWED: &[Reviewed] = &[
+        // The curve's re-exports and imports.
+        ("src/payment/mod.rs", "<module>", "calculate_price", 1),
+        ("src/payment/pricing.rs", "<module>", "calculate_price", 1),
+        ("src/payment/quote.rs", "<module>", "calculate_price", 1),
+        ("src/payment/verifier.rs", "<module>", "calculate_price", 1),
+        // The fields of a quote-commitment mismatch's evidence, in the
+        // verifier's event and in the replication failure it is reported as.
+        (
+            "src/payment/verifier.rs",
+            "<module>",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/replication/types.rs",
+            "<module>",
+            "committed_key_count",
+            1,
+        ),
+        // A single-node quote: priced at the count resolve_quote_pricing gives
+        // (the weight total for a client that pays by size, else the key
+        // count), and carrying the key count K.
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_priced_quote",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_priced_quote",
+            "committed_key_count",
+            3,
+        ),
+        // A merkle candidate quote: today's price at K. This fork refuses merkle
+        // payments, so no one pays it.
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_merkle_candidate_quote",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_merkle_candidate_quote",
+            "committed_key_count",
+            3,
+        ),
+        // The one price check every quote goes through: the band at K, with
+        // the shape and key-cap rules.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::binding_violation",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::quote_arithmetic_violation",
+            "committed_key_count",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::validate_merkle_candidate_arithmetic",
+            "committed_key_count",
+            1,
+        ),
+        // The cross-check of a quote's K against its pinned commitment's key
+        // count, which size pricing leaves as it was, and its evidence.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_binding",
+            "committed_key_count",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_quotes",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_merkle_candidates",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::handle_cross_check",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::emit_mismatch_evidence",
+            "committed_key_count",
+            1,
+        ),
+        // The price floor's reference: the price at the bottom of the median
+        // count's band.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::group_reference_price",
+            "calculate_price",
+            1,
+        ),
+        // Telemetry: whether a price is on the curve at all, at any count.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::price_off_curve_diagnostics",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::log_off_curve_merkle",
+            "committed_key_count",
+            1,
+        ),
+        // A browser quote carries the quote's K over unchanged, both ways.
+        (
+            "src/web_rtc.rs",
+            "browser_quote_from_quote",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/web_rtc.rs",
+            "payment_quote_from_browser_quote",
+            "committed_key_count",
+            2,
+        ),
+    ];
+    let report = unreviewed(Counting::Mentions(PRICING), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "
+The price curve or a quote's committed key count is used somewhere new.
+
+         {report}
+         A quote is priced at the weight total for a client that pays by size and at the          key count for every other (QuoteGenerator::resolve_quote_pricing), and every          quote check accepts the band from the bottom count's price to the key count's          (price_in_band). Check that the new use follows both, and list it here.
+"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Wire messages
 // ---------------------------------------------------------------------------

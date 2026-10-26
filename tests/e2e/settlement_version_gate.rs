@@ -20,9 +20,15 @@
 //! - **Above this node's current** — must come back `StorerUpdateRequired`.
 //!   A lagging node never reports a client fault.
 //!
-//! Both refusals are unreachable in production today (`MIN` and `CURRENT` are
-//! both the first declarable version), so they are driven here by crafting the
-//! versions directly, which is what a future settlement bump will make real.
+//! `CURRENT` is 2 (a payment covers its record's size class) and `MIN` stays
+//! 1, so no released client is below the minimum and none is above this
+//! node's version: both refusals are driven here by crafting the versions
+//! directly. A node of the release before settlement version 2 answers a
+//! version-2 client with `StorerUpdateRequired`, the refusal this file drives
+//! with `CURRENT + 1`.
+//!
+//! A second test pays as an unversioned client does, the full amount at
+//! today's price, and checks that this release stores it, at any size.
 //!
 //! This fork refuses merkle (batch) payments, so on the merkle path the two
 //! "served" cases come back refused with `BATCH_PAYMENTS_REFUSED` instead.
@@ -325,4 +331,49 @@ async fn settlement_version_gate_observed_on_live_network() {
     }
 
     harness.teardown().await.expect("teardown");
+}
+
+/// An unversioned client pays every record as a full chunk, at today's
+/// price, and a node that settles at version 2 stores what it paid for,
+/// whatever the record's size: no release ever refuses today's price.
+#[tokio::test]
+#[serial]
+async fn a_client_paying_todays_price_is_stored_by_a_size_pricing_node() {
+    use super::first_audit_ab::paid_upload;
+    use super::TestAnvil;
+    use ant_node::ant_protocol::CLOSE_GROUP_MAJORITY;
+
+    assert_eq!(CURRENT_SETTLEMENT_VERSION, 2);
+    assert_eq!(MIN_SUPPORTED_SETTLEMENT_VERSION, 1);
+
+    // Anvil first, so the nodes verify payments on the chain the client pays on.
+    let mut anvil = TestAnvil::new().await.expect("start anvil");
+    let wallet = anvil.create_funded_wallet().expect("funded wallet");
+    let config = TestNetworkConfig::small()
+        .with_payment_enforcement()
+        .with_evm_network(anvil.to_network());
+    let harness = TestHarness::setup_with_config(config)
+        .await
+        .expect("setup paid network");
+    harness.warmup_dht().await.expect("warmup");
+
+    let client = harness.node(CLIENT_INDEX).expect("client node");
+    let client_peer = *client.peer_id();
+    // The smallest class, a middle one and a full chunk.
+    for size in [4096, 300 * 1024, 4 * 1024 * 1024] {
+        let mut data = vec![0u8; size];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut data[..]);
+        let (outcome, address) = paid_upload(&client, &client_peer, &wallet, &data)
+            .await
+            .unwrap_or_else(|e| panic!("a {size}-byte record paid at today's price: {e}"));
+        assert!(
+            outcome.stored_acks >= CLOSE_GROUP_MAJORITY,
+            "a {size}-byte record paid at today's price was stored by {} storers              ({})",
+            outcome.stored_acks,
+            hex::encode(address)
+        );
+    }
+
+    harness.teardown().await.expect("teardown");
+    anvil.shutdown().await;
 }

@@ -297,6 +297,12 @@ static UNVERSIONED_QUOTE_REQUESTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU6
 /// different storer rather than to upgrade, because it is this node that is
 /// behind.
 fn settlement_gate(client_settlement_version: u32, path: &str) -> Option<ProtocolError> {
+    let counted = if path == "merkle" {
+        traffic::QuotePath::Merkle
+    } else {
+        traffic::QuotePath::SingleNode
+    };
+    traffic::record_declared_settlement_version(counted, client_settlement_version);
     match settlement_compatibility(client_settlement_version) {
         SettlementCompatibility::Compatible => None,
         SettlementCompatibility::ClientTooOld => {
@@ -1360,7 +1366,7 @@ mod put_deadline_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
@@ -1372,7 +1378,7 @@ mod tests {
     use saorsa_pqc::pqc::types::MlDsaSecretKey;
     use tempfile::TempDir;
 
-    async fn create_test_protocol() -> (AntProtocol, TempDir) {
+    pub async fn create_test_protocol() -> (AntProtocol, TempDir) {
         // `test_default()` sets `disk_reserve: 0`, so the disk pre-check always
         // passes for the regular tests.
         create_test_protocol_with_reserve(0).await
@@ -2103,7 +2109,7 @@ mod tests {
 
     /// A commitment of `keys` chunks weighed at `weight_total`, attached to
     /// `protocol`'s quote generator.
-    fn attach_weighed_commitment(protocol: &AntProtocol, keys: u32, weight_total: u64) {
+    pub fn attach_weighed_commitment(protocol: &AntProtocol, keys: u32, weight_total: u64) {
         use saorsa_pqc::api::sig::ml_dsa_65;
         let (pk, sk) = ml_dsa_65().generate_keypair().expect("keypair");
         let entries: Vec<([u8; 32], [u8; 32])> = (0..keys)

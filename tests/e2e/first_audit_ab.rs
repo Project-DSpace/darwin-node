@@ -212,17 +212,20 @@ async fn get_chunk(
 }
 
 /// Outcome of one full paid upload.
-struct UploadOutcome {
+pub struct UploadOutcome {
     duration: Duration,
     pinned_quotes: usize,
     total_quotes: usize,
-    stored_acks: usize,
+    /// How many storers accepted the PUT (stored, or held it already).
+    pub stored_acks: usize,
 }
 
 /// One production-shaped paid upload: collect quotes from the close group,
 /// pay the median issuer 3x on chain, then PUT the chunk (with the full quote
-/// bundle + sidecars) to every close-group peer.
-async fn paid_upload(
+/// bundle + sidecars) to every close-group peer. The quotes are unversioned,
+/// as a client released before settlement versions asks them, so they are
+/// priced and paid at today's price whatever the chunk's size.
+pub async fn paid_upload(
     client: &Arc<P2PNode>,
     client_peer: &PeerId,
     wallet: &evmlib::wallet::Wallet,

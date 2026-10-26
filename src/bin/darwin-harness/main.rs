@@ -53,6 +53,13 @@ const LOOKUP_DEADLINE: Duration = Duration::from_secs(120);
 /// The multiple of the median quote's price a client pays.
 const PAYMENT_MULTIPLIER: u64 = 3;
 
+/// The settlement version the harness declares on its quotes: 1, as the
+/// released client does, which pays every record as a full chunk. Every node
+/// release quotes it, so a mixed network stores each record as it does today.
+/// Not this crate's `CURRENT_SETTLEMENT_VERSION`: a node older than this tree
+/// refuses a version-2 quote with `StorerUpdateRequired`.
+const SETTLEMENT_VERSION: u32 = 1;
+
 /// The client side of the mixed-version harness.
 #[derive(Parser, Debug)]
 #[command(name = "darwin-harness", version)]
@@ -347,7 +354,8 @@ async fn quote(
     address: [u8; 32],
     size: usize,
 ) -> (PeerId, std::result::Result<Quoted, String>) {
-    let request = ChunkQuoteRequestV2::new(address, u64::try_from(size).unwrap_or(u64::MAX));
+    let mut request = ChunkQuoteRequestV2::new(address, u64::try_from(size).unwrap_or(u64::MAX));
+    request.settlement_version = SETTLEMENT_VERSION;
     let answer = ask(
         client,
         &peer,
