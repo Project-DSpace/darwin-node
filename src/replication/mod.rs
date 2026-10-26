@@ -1109,13 +1109,32 @@ const PAID_NOTIFY_WORKER_LIMIT: usize = 2;
 /// carry no chunk payload.
 const PAID_NOTIFY_MAX_OUTSTANDING: usize = 64;
 
-/// Maximum admitted paid-list notifications from one source peer.
+/// Paid-notify slots kept reachable by sources that hold none.
 ///
-/// A quarter of the pool. One peer legitimately supplies a whole upload's
-/// worth of notifies, so this must comfortably exceed a typical file's chunk
-/// count in flight; it exists to stop a single source evicting every other
-/// peer's durable paid-list evidence, not to ration ordinary traffic.
-const PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER: u32 = 16;
+/// A quarter of the pool, the same fraction fresh offers reserve
+/// ([`FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES`], 4 of 16), and the share every
+/// source had before the share became the pool minus this reserve.
+const PAID_NOTIFY_RESERVED_FOR_OTHER_SOURCES: usize = 16;
+
+/// Maximum admitted paid-list notifications from one source peer: the pool
+/// minus [`PAID_NOTIFY_RESERVED_FOR_OTHER_SOURCES`].
+///
+/// It exists to stop a single source evicting every other peer's durable
+/// paid-list evidence, not to ration ordinary traffic, so it is sized as a
+/// reserve rather than a quota, as fresh offers are. A close-group peer gets
+/// holding notices, which take no slot, from the storers that hold the record;
+/// the notices that reach its admission come from a storer whose hold ended
+/// without hearing from it, one per record, sent with that storer's offers at
+/// the pace the upload reached it. That is the fresh offers' traffic shape: a
+/// one-way bulk fan-out from one peer, with no reply to slow the sender. At a
+/// quarter of the pool, an ordinary 48-chunk upload from one storer had notices
+/// dropped (see `tests/e2e/fresh_offer_capacity.rs`), all of them at this
+/// share and none at the pool.
+// The cast is from a compile-time constant difference of two small literals
+// (64 - 16), so truncation is impossible.
+#[allow(clippy::cast_possible_truncation)]
+const PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER: u32 =
+    (PAID_NOTIFY_MAX_OUTSTANDING - PAID_NOTIFY_RESERVED_FOR_OTHER_SOURCES) as u32;
 
 /// Maximum fetch responses served concurrently.
 ///
@@ -12099,6 +12118,32 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// The paid-notify per-source bound keeps its reserve for a peer holding
+    /// nothing, without throttling one storer's notices at a hold's end.
+    ///
+    /// Sized as a quarter of the pool, this bound dropped notices during an
+    /// ordinary single-storer upload (see `tests/e2e/fresh_offer_capacity.rs`),
+    /// and each drop discards paid-list evidence the sender never resends.
+    #[test]
+    fn paid_notify_share_reserves_headroom_without_throttling_one_sender() {
+        let share = usize::try_from(PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER).unwrap_or(usize::MAX);
+
+        assert_eq!(
+            PAID_NOTIFY_MAX_OUTSTANDING - share,
+            PAID_NOTIFY_RESERVED_FOR_OTHER_SOURCES,
+            "a source holding none must always find a free slot"
+        );
+        assert!(
+            share < PAID_NOTIFY_MAX_OUTSTANDING,
+            "one peer must not be able to take the whole pool"
+        );
+        assert!(
+            share > PAID_NOTIFY_MAX_OUTSTANDING / 4,
+            "notices reaching admission are one storer's bulk fan-out; a \
+             quarter of the pool binds on an ordinary upload"
+        );
     }
 
     /// The fresh-offer per-source bound must guarantee headroom for a peer
