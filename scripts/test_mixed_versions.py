@@ -11,7 +11,13 @@ that join from the manifest (`--bootstrap`, `--evm-rpc-url`,
 incumbents, of the devnet's release, then the joiners. Records of random
 bytes are stored before and after the joiners join, each paid on the chain as
 a client pays (`darwin-harness upload`), and read back at the end
-(`darwin-harness check`).
+(`darwin-harness check`). Those records declare settlement version 1 and pay
+every record as a full chunk, as the released client does. In every run with
+nodes of this tree, --settlement-version 2 (the default) also stores records
+after the joiners join at settlement version 2, paid by size (3 times the
+median quote times the record's weight), as a client paying by size does: a
+node of the previous release answers those quotes StorerUpdateRequired and is
+passed over for the next nearest.
 
 The runs (`--runs`):
 
@@ -29,7 +35,10 @@ reply that didn't decode; every record stored by a majority of its close
 group, and still held at the end by a majority of the nodes that stored it
 (a node that joins later gets a record only by repair, which waits for the
 record to age, so the nodes nearest it now are counted but not required);
-and every standalone node received neighbour sync.
+and every standalone node received neighbour sync. Where records were paid
+by size: no node of the previous release quoted one, and none of this tree's
+answered StorerUpdateRequired; and in a run with nodes of both, nodes of the
+previous release answered StorerUpdateRequired.
 
 Each mixed run must also show no penalty heavier than the all-old runs': the
 penalties (saorsa-core's trust events that lower a peer's score) that the
@@ -42,7 +51,10 @@ with may come to --new-reason-allowance against them, and no more. The
 devnet's nodes answer no replication, so every release finds them silent:
 penalties on them are reported, not compared. So are the penalties for not
 holding a record whose PUT the node refused; the refused PUTs are compared
-instead, the same way. The report and summary.json list every count so
+instead, the same way. And so are the possession-check and audit penalties a
+node of the previous release takes for a record paid by size: it can't verify
+that payment, so it never holds the record, which is why clients pay by size
+only once no node before this release is left (ADR-0025). The report and summary.json list every count so
 measured, with the highest all-old count, the excess over it and the limit,
 within the limit or not, so a small excess shows before the canary. The
 penalties one release's nodes charge the other's are reported by reason. And
@@ -184,6 +196,11 @@ UNANSWERED_KIND = {"Sync with": "neighbour sync", "Verification request to": "ve
 # A possession check a peer failed: the peer and the key.
 POSSESSION_FAILED = re.compile(r"Possession check: ([0-9a-f]{64}) failed to prove possession "
                                r"for ([0-9a-f]{64})")
+# A responsible-chunk audit a peer failed: the peer, and the first 8 bytes of
+# the first key it failed.
+AUDIT_FAILED = re.compile(r"Audit failure for ([0-9a-f]{64}): .*first_failed_key=0x([0-9a-f]{16})")
+# What a node that settles under older rules than a quote declares answers it.
+STORER_UPDATE_REQUIRED = "StorerUpdateRequired"
 RUNS = ("all-old", "new-hosts-old", "old-hosts-new", "all-new", "full")
 # The all-old runs: all-old, and all-old-2 on when there are more.
 BASELINE_RUN = re.compile(r"all-old(?:-([2-9]|[1-9][0-9]+))?")
@@ -524,6 +541,10 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         time.sleep(args.join_seconds)
         uploads.append(upload(harness, manifest_path, folder / "uploads-after.json",
                               args.records_after))
+        if args.settlement_version >= 2 and "new" in (network_release.name,
+                                                      joiner_release.name):
+            uploads.append(upload(harness, manifest_path, folder / "uploads-by-size.json",
+                                  args.records_after, args.settlement_version))
 
         log(f"{name}: observing for {args.observe_minutes} min")
         deadline = time.monotonic() + args.observe_minutes * 60
@@ -607,10 +628,11 @@ def client(harness, arguments, out):
     return out
 
 
-def upload(harness, manifest, out, records):
+def upload(harness, manifest, out, records, settlement_version=1):
     sizes = ",".join(str(RECORD_SIZES[index % len(RECORD_SIZES)]) for index in range(records))
-    log(f"uploading {records} records")
-    return client(harness, ["upload", "--manifest", str(manifest), "--sizes", sizes], out)
+    log(f"uploading {records} records at settlement version {settlement_version}")
+    return client(harness, ["upload", "--manifest", str(manifest), "--sizes", sizes,
+                            "--settlement-version", str(settlement_version)], out)
 
 
 def check(harness, manifest, uploads, out):
@@ -684,6 +706,22 @@ def analyze(run):
     for peer, _ in refused:
         role = roles.get(peer, "other")
         refusals[role] = refusals.get(role, 0) + 1
+    # Records paid by size, and what each release answered their quotes.
+    by_size = {record["address"] for uploads in run["uploads"]
+               if uploads.get("settlement_version", 1) >= 2 for record in uploads["records"]}
+    by_size_prefixes = {address[:16] for address in by_size}
+    sized_quotes = {}
+    for uploads in run["uploads"]:
+        if uploads.get("settlement_version", 1) < 2:
+            continue
+        for record in uploads["records"]:
+            for answer in record["quotes"]:
+                outcome = answer["outcome"]
+                kind = ("quoted" if outcome == "quoted" else
+                        "storer_update_required" if STORER_UPDATE_REQUIRED in outcome else
+                        "other")
+                counts = sized_quotes.setdefault(releases.get(answer["peer"], "other"), {})
+                counts[kind] = counts.get(kind, 0) + 1
 
     sources = [("devnet", "devnet", run["network"], folder / "devnet.log")]
     sources += [(node["name"], node["role"], node["release"], folder / node["log"])
@@ -693,6 +731,7 @@ def analyze(run):
     penalties = {}
     penalties_on_full = {}
     penalties_on_refusals = {}
+    penalties_on_sized = {}
     between_releases = {}
     traffic = {}
     audits = {}
@@ -700,10 +739,14 @@ def analyze(run):
         traffic_groups = {}
         audit_groups = {}
         possession_failed = None
+        audit_failed = None
         for _, text in read_log(path, window):
             failed = POSSESSION_FAILED.search(text)
             if failed:
                 possession_failed = (failed.group(1), failed.group(2))
+            failed = AUDIT_FAILED.search(text)
+            if failed:
+                audit_failed = (failed.group(1), failed.group(2))
             if TRAFFIC_LINE in text:
                 traffic_groups[fields(text).get("group", "")] = fields(text)
             elif AUDIT_LINE in text:
@@ -732,6 +775,13 @@ def analyze(run):
                       and possession_failed in refused):
                     book = penalties_on_refusals
                     possession_failed = None
+                elif releases.get(target) == "old" and (
+                        (possession_failed and possession_failed[0] == target
+                         and possession_failed[1] in by_size)
+                        or (audit_failed and audit_failed[0] == target
+                            and audit_failed[1] in by_size_prefixes)):
+                    book = penalties_on_sized
+                    possession_failed = audit_failed = None
                 else:
                     book = penalties
                 key = (role, roles.get(target, "other"), reason)
@@ -762,6 +812,8 @@ def analyze(run):
         "penalties": penalties,
         "penalties_on_full": penalties_on_full,
         "penalties_on_refusals": penalties_on_refusals,
+        "penalties_on_sized": penalties_on_sized,
+        "sized_quotes": sized_quotes,
         "between_releases": between_releases,
         "refusals": refusals,
         "traffic": traffic,
@@ -908,6 +960,7 @@ def verdicts(results, args):
             for family in ("neighbor_sync_request", "neighbor_sync_response"):
                 if families.get(family, 0) == 0:
                     failures.append(f"{name}: the {role}s received no {family}")
+        failures += sized_verdicts(name, result)
         if not is_measured(name, baselines):
             continue
         for compared in comparisons(result, baselines, args):
@@ -944,6 +997,30 @@ def verdicts(results, args):
                     reached_new += received
             if reached_new == 0:
                 failures.append(f"{name}: no node of this tree received {family}")
+    return failures
+
+
+def sized_verdicts(name, result):
+    """The failures of a run's records paid by size (settlement version 2):
+    a node of the previous release quoted one, where it must answer
+    StorerUpdateRequired; a node of this tree answered StorerUpdateRequired;
+    or, in a run with nodes of both releases, no node of the previous release
+    was asked."""
+    sized = result.get("sized_quotes") or {}
+    if not sized:
+        return []
+    failures = []
+    old, new = sized.get("old", {}), sized.get("new", {})
+    if old.get("quoted", 0):
+        failures.append(f"{name}: nodes of the previous release quoted {old['quoted']} "
+                        "version-2 quote(s), where they must answer StorerUpdateRequired")
+    if new.get("storer_update_required", 0):
+        failures.append(f"{name}: nodes of this tree answered "
+                        f"{new['storer_update_required']} version-2 quote(s) "
+                        "StorerUpdateRequired")
+    if "old" in result["releases"].values() and not old.get("storer_update_required", 0):
+        failures.append(f"{name}: no node of the previous release answered a version-2 "
+                        "quote StorerUpdateRequired: the path between releases wasn't run")
     return failures
 
 
@@ -1000,6 +1077,17 @@ def report(results, args):
             for key, (count, weight) in sorted(result["penalties_on_refusals"].items()):
                 lines.append(f"  {key[0]:>9} -> {key[1]:<9} {key[2]:<19} {count:>5} "
                              f"{weight:8.2f}")
+        for release, counts in sorted((result.get("sized_quotes") or {}).items()):
+            lines.append(f"version-2 quotes answered by the {release} release: "
+                         f"{counts.get('quoted', 0)} quoted, "
+                         f"{counts.get('storer_update_required', 0)} StorerUpdateRequired, "
+                         f"{counts.get('other', 0)} other")
+        if result.get("penalties_on_sized"):
+            lines.append("penalties on nodes of the previous release for records paid by size, "
+                         "which they can't verify (reported, not compared):")
+            for key, (count, weight) in sorted(result["penalties_on_sized"].items()):
+                lines.append(f"  {key[0]:>9} -> {key[1]:<9} {key[2]:<19} {count:>5} "
+                             f"{weight:8.2f}")
         if result["between_releases"]:
             lines.append("penalties one release's nodes charged the other's "
                          "(observer's release -> target's, reason: count, weight):")
@@ -1049,6 +1137,11 @@ def summary_json(results, failures, releases, args):
                                    "weight": w}
                                   for (o, t, r), (c, w) in
                                   sorted(result["penalties_on_full"].items())],
+            "penalties_on_sized": [{"observer": o, "target": t, "reason": r, "count": c,
+                                    "weight": w}
+                                   for (o, t, r), (c, w) in
+                                   sorted((result.get("penalties_on_sized") or {}).items())],
+            "sized_quotes": result.get("sized_quotes") or {},
             "between_releases": [{"observer_release": o, "target_release": t, "reason": r,
                                   "count": c, "weight": w}
                                  for (o, t, r), (c, w) in
@@ -1107,6 +1200,10 @@ def main():
     parser.add_argument("--joiners", type=int, default=8)
     parser.add_argument("--records-before", type=int, default=8,
                         help="records stored before the joiners join")
+    parser.add_argument("--settlement-version", type=int, choices=[1, 2], default=2,
+                        help="2 (the default) also stores --records-after records paid by "
+                        "size at settlement version 2 after the joiners join, in every run "
+                        "with nodes of this tree; 1 stores none")
     parser.add_argument("--records-after", type=int, default=8,
                         help="records stored after they join")
     parser.add_argument("--settle-seconds", type=int, default=180,

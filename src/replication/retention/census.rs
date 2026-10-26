@@ -1844,6 +1844,28 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
     );
 }
 
+/// No penalty spares a peer by the release it advertises (ADR-0025). A node
+/// before settlement version 2 can't verify a payment by size, so it refuses
+/// the fresh offers and drops the notices of a record paid that way, and the
+/// possession check and the audits then charge it for the record it doesn't
+/// hold, as any peer. The rollout answers that, not an exemption: clients pay
+/// by size only once the node census shows no storer before release 2. A
+/// release is the peer's own claim, so sparing peers by it would let any node
+/// escape the penalty for every record paid by size. Production code reads no
+/// peer's user agent; a new reading is reviewed here first.
+#[test]
+fn no_penalty_spares_a_peer_by_the_release_it_advertises() {
+    const RELEASE: &[(Option<&str>, &str)] = &[(None, "peer_user_agent")];
+    let found = unreviewed(Counting::Mentions(RELEASE), &[]);
+    assert!(
+        found.is_empty(),
+        "\nProduction code reads a peer's user agent.\n\n{found}\n\
+         A penalty is never spared by the release a peer advertises: the switch to paying \
+         by size waits until no storer before release 2 is left (ADR-0025). If this reading \
+         serves something else, review it and list it here.\n"
+    );
+}
+
 /// Upstream's merkle (batch) payment code stays compiled, so that merges stay
 /// cheap, but no production code reaches it: a merkle quote request is refused
 /// before anything is signed, and a merkle proof before it is verified.

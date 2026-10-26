@@ -115,16 +115,27 @@ A payment notice carries no bytes, so it is admitted at the smallest class's amo
 class its settled amount covers is written as the paid-list entry's value: one byte, the
 base-2 logarithm of the class top (14 for 16 KiB up to 22 for 4 MiB), in the same
 transaction as the key. A value is only ever raised. An empty value reads as the full
-class, which covers every key admitted before this release, every key learned by sync or
-the paid-list quorum, and every key admitted under an older release. Older releases never
-read the value: membership, counts and key listings ignore it, and pruning a key removes
-its value with it. A notice is dropped as already known only when the full class is
-recorded, so a later notice can raise a smaller one.
+class, which covers every key admitted before this release, every key admitted with its
+bytes or learned through a presence quorum of holders, and every key admitted under an
+older release. Older releases never read the value: membership, counts and key listings
+ignore it, and pruning a key removes its value with it. A notice is dropped as already
+known only when the full class is recorded, so a later notice can raise a smaller one.
 
-When a fetched chunk arrives, the node re-reads the recorded class. If this node's own
-paid-list entry is the fetch's only authorisation (no presence quorum of holders) and the
-recorded class is below the class of the bytes, that fetch ends: no other source is tried,
-no peer is charged, and the entry and any held copy stay.
+A node answers a paid-list query with the class its entry records:
+`VerificationResponse` gains `paid_classes`, one byte per result, appended at the very end
+of the reply. An older node's decoder stops before it; a reply from an older node ends
+before it and reads as recording the full class for every key, as its entries do. A node
+that learns a key from a paid-list quorum alone records the class a quorum of those entries
+record or exceed (the `ConfirmNeeded`-th largest), not the full class: a majority of paid
+lists is not storage, so a payment noticed at a smaller class doesn't become a full one by
+spreading.
+
+When a fetched chunk arrives, the node re-reads the recorded class. Only a presence quorum
+of holders, majority storage, accepts the bytes whatever the paid list records. Where the
+fetch's authorisation is a paid-list entry (this node's own, or one written from a
+paid-list quorum's classes) and the recorded class is below the class of the bytes, that
+fetch ends: no other source is tried, no peer is charged, and the entry and any held copy
+stay.
 
 ### The revenue floor's reference (amends ADR-0006)
 
@@ -162,6 +173,18 @@ increase": version 2 lowers what a client pays, so the upper bound is load-beari
 first time. That is what the bound is for, and it holds: an older node refuses before
 quoting. Raising the minimum stays a separate decision.
 
+An older node can't verify a version-2 payment in any other message either: its exact
+check needs `calculate_price(K)` where the quotes are priced at m, and 3 × the median
+where the client paid 3 × the median × w, at every size, a full chunk included. So it
+refuses the fresh offers and drops the notices of a record paid by size, and where most
+of its paid close group is older it never learns the key at all. The possession check
+after the write and the audits then charge it for a record it doesn't hold, as they
+charge any peer: the penalty for an unheld close-group chunk is never withheld. So
+clients pay by size only once the node census shows no storer before this release; until
+then they settle at version 1, which every release verifies. Nothing spares a peer by the
+release it advertises: a release is the peer's own claim, so such an exemption would let
+any node escape the penalty for every record paid by size.
+
 The rx line of the chunk RPC traffic summary, every 300 s, splits versioned quote requests
 by declared version: `quote_v2_settlement_{1,2,other}_count` and the same for merkle,
 counted at the settlement gate, browser N+1 quotes included.
@@ -187,6 +210,10 @@ counted at the settlement gate, browser N+1 quotes included.
   reference moves to the band's bottom.
 - Until clients pay by size, nodes before this release refuse their quotes; the release
   goes to the network before clients switch.
+- The switch to paying by size waits for the last storer before this release, which
+  would otherwise be penalised for every record paid by size it can't verify. A storer
+  that never updates holds the switch back.
+- A paid-list reply carries one more byte per key.
 
 ## Tests
 
@@ -202,6 +229,13 @@ counted at the settlement gate, browser N+1 quotes included.
 - The paid class raised and never lowered, an empty value read as full, the re-check only
   where the own entry is the sole authorisation (`replication::paid_list`,
   `paid_notify_tests`, `replication::tests`).
+- A paid-list quorum's class: the class a quorum of entries record, an older node's
+  reply read as full, and a key known only through smallest-class entries refused past
+  16 KiB while one whose entries hold the empty value is repaired at any length
+  (`replication::quorum`, `replication::tests`); the appended classes read by ds.15's
+  decoder and ds.15's reply read without them (`tests/wire_format.rs`).
+- No penalty lane reads the release a peer advertises
+  (`replication::retention::census`).
 - The floor at the band's bottom never refusing a correct weighted payment
   (`payment::verifier`).
 - A live network storing a record paid at today's price at three sizes
@@ -209,4 +243,8 @@ counted at the settlement gate, browser N+1 quotes included.
 - A census of every production mention of `calculate_price` and `committed_key_count`
   (`replication::retention::census`).
 - The mixed-version harness (`scripts/test_mixed_versions.py`) against the previous
-  release, its client declaring settlement version 1.
+  release, its client declaring settlement version 1, and in every run with this tree's
+  nodes also settlement version 2 at the weighted amount (`--settlement-version 2`, the
+  default): older nodes answer those quotes `StorerUpdateRequired`, the records are stored
+  and read back, and the penalties older nodes then take for them are reported apart
+  (`scripts/test_mixed_versions_verdicts.py`).
