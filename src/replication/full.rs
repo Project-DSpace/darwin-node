@@ -1233,6 +1233,28 @@ mod tests {
         assert_eq!(FULL_NOTICE_FROM_RELEASE, 17);
     }
 
+    /// The notice ships in node release 1b with paged sync, as ds.17: the
+    /// release after node release 1a (ds.16), whose nodes neither read
+    /// pages nor the notice. This tree's version names ds.16 until 1b is
+    /// cut, or ds.17 once it is.
+    #[test]
+    fn the_notice_comes_with_paged_sync_in_the_release_after_ds16() {
+        assert_eq!(
+            FULL_NOTICE_FROM_RELEASE,
+            crate::replication::config::NEIGHBOR_SYNC_PAGES_FROM_RELEASE
+        );
+        let own = crate::replication::sync_pages::release_of(env!("CARGO_PKG_VERSION"))
+            .expect("a +ds version");
+        assert!(
+            own == 16 || own == FULL_NOTICE_FROM_RELEASE,
+            "this tree is ds.{own}: the notice comes from ds.{FULL_NOTICE_FROM_RELEASE}"
+        );
+        assert!(!agent_reads_full_notice(
+            "node/0.23.0+ds.16",
+            FULL_NOTICE_FROM_RELEASE
+        ));
+    }
+
     #[test]
     fn a_window_widens_by_one_for_each_full_peer_inside_it() {
         let full = |n: &u8| *n % 2 == 1;

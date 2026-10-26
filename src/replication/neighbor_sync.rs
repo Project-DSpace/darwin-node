@@ -2472,6 +2472,48 @@ mod tests {
         }
     }
 
+    /// A snapshot taken for hints widens a key's close group as a lookup
+    /// widened past the peers marked full does (Stage B): by one for each of
+    /// them inside it, at most `MAX_WIDENED_WIDTH`, and the batch scan gives
+    /// a peer the replica hints of every key whose widened group holds it.
+    /// With no peer marked, the groups are the plain ones.
+    #[test]
+    fn a_snapshot_for_hints_widens_past_the_peers_marked_full() {
+        let (plain, candidates) = snapshot_of(60);
+        let marked: HashSet<PeerId> = (1..=60).filter(|n| n % 3 == 0).map(spread_peer).collect();
+        let widened = plain.clone().with_full(marked.clone());
+        let keys: Vec<XorName> = (0..300).map(spread_key).collect();
+        let mut grew = 0;
+        for key in &keys {
+            assert_eq!(plain.widened_width(key, 7), 7);
+            let nearest = nearest_by_sorting(&candidates, key, full::MAX_WIDENED_WIDTH);
+            let width = full::widened_len(&nearest, 7, |peer| marked.contains(peer));
+            assert_eq!(widened.widened_width(key, 7), width);
+            assert!((7..=full::MAX_WIDENED_WIDTH).contains(&width));
+            let inside = nearest[..width]
+                .iter()
+                .filter(|p| marked.contains(*p))
+                .count();
+            assert_eq!(width, (7 + inside).min(full::MAX_WIDENED_WIDTH));
+            grew += usize::from(width > 7);
+        }
+        assert!(grew > 0, "some key's group holds a marked peer");
+
+        let targets: Vec<PeerId> = (1..=6).map(spread_peer).collect();
+        let lists = hints_from_snapshot(&widened, &targets, &keys, &[], 7, 0);
+        for peer in &targets {
+            let expected: Vec<XorName> = keys
+                .iter()
+                .filter(|key| {
+                    let width = widened.widened_width(key, 7);
+                    nearest_by_sorting(&candidates, key, width).contains(peer)
+                })
+                .copied()
+                .collect();
+            assert_eq!(lists[peer].0, expected, "{peer}");
+        }
+    }
+
     #[test]
     fn a_peer_outside_the_routing_table_is_in_no_close_group() {
         let (snapshot, _) = snapshot_of(5);

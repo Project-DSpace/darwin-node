@@ -822,6 +822,7 @@ mod tests {
             "node/0.23.0+ds.17",
             "node/0.23.1+ds.18",
             "node/0.24.0+ds.17.1",
+            "node/0.23.0+ds.17.image.0123456789abcdef0123456789abcdef01234567",
             "node/1.0.0+ds.100",
         ] {
             assert!(agent_reads_pages(agent, 17), "{agent}");
@@ -849,20 +850,28 @@ mod tests {
         }
     }
 
-    /// The release nodes page to is past ds.15, the release before pages,
-    /// whose nodes can't decode them.
+    /// The release nodes page to is past ds.15 and ds.16 (node release 1a),
+    /// the releases before pages, whose nodes can't decode them, with or
+    /// without an image marker.
     #[test]
-    fn nodes_of_the_release_before_pages_read_none() {
-        assert!(!agent_reads_pages(
+    fn nodes_of_the_releases_before_pages_read_none() {
+        for agent in [
             "node/0.23.0+ds.15",
-            NEIGHBOR_SYNC_PAGES_FROM_RELEASE
-        ));
+            "node/0.23.0+ds.16",
+            "node/0.23.0+ds.16.image.0123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(
+                !agent_reads_pages(agent, NEIGHBOR_SYNC_PAGES_FROM_RELEASE),
+                "{agent}"
+            );
+        }
     }
 
-    /// The last release whose nodes read no pages. This tree announced it, by
-    /// its version, until the release that carries pages was cut. When a
+    /// The last release whose nodes read no pages: ds.16, node release 1a,
+    /// cut before the release that carries pages. This tree announces it, by
+    /// its version, until the release that carries pages is cut. When a
     /// release without pages is cut before it, its number goes here.
-    const LAST_RELEASE_WITHOUT_PAGES: u64 = 15;
+    const LAST_RELEASE_WITHOUT_PAGES: u64 = 16;
 
     /// The release nodes page from is the one this tree is cut as: nodes of
     /// this tree page to each other only once their agents name it, and a
