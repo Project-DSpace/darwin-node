@@ -2150,12 +2150,11 @@ fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
     let report = unreviewed(Counting::Mentions(PRICING), REVIEWED);
     assert!(
         report.is_empty(),
-        "
-The price curve or a quote's committed key count is used somewhere new.
-
-         {report}
-         A quote is priced at the weight total for a client that pays by size and at the          key count for every other (QuoteGenerator::resolve_quote_pricing), and every          quote check accepts the band from the bottom count's price to the key count's          (price_in_band). Check that the new use follows both, and list it here.
-"
+        "\nThe price curve or a quote's committed key count is used somewhere new.\n\n{report}\n\
+         A quote is priced at the weight total for a client that pays by size and at the key \
+         count for every other (QuoteGenerator::resolve_quote_pricing), and every quote check \
+         accepts the band from the bottom count's price to the key count's (price_in_band). \
+         Check that the new use follows both, and list it here.\n"
     );
 }
 

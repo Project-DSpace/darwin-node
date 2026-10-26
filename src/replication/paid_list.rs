@@ -17,9 +17,9 @@
 //! class the quorum's entries record. The full class is always written as
 //! the empty value, whichever path writes it, so a full-class entry holds the
 //! empty value and a one-byte value is a class below the full class. A
-//! recorded class is only ever raised. A paid-list query is answered with the entry's class. Membership
-//! (`contains`, `count`, `all_keys`) ignores the value, so a node that never
-//! reads it opens the same list.
+//! recorded class is only ever raised. A paid-list query is answered with
+//! the entry's class, one byte. Membership (`contains`, `count`, `all_keys`)
+//! ignores the value, so a node that never reads it opens the same list.
 //!
 //! ## Out-of-range timestamps
 //!
