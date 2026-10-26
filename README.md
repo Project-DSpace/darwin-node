@@ -80,7 +80,9 @@ never ran.
   places the chunk with it later. A quote doesn't record the settlement
   version it was asked at, so a quote in a root proof may come from a node
   that can't check it. A quoted peer refusing for any other reason is
-  checked and charged as a refusal of a single-node offer is. The traffic
+  checked and charged as a refusal of a single-node offer is, and the peer
+  of the paid quote is always checked and charged, whatever its refusal
+  says: a node paid for a chunk it then can't take is charged. The traffic
   lines count quote requests by settlement version and
   settled proofs by tag, and the record read as a kind of its own. Tests in
   `src/payment/verifier/root_tests.rs` check root proofs through the real
@@ -88,7 +90,7 @@ never ran.
   root proof's bytes; the census lists the
   Root type, each place that decides by proof type (by `detect_proof_type`
   or a proof decoder), the record read, and the per-quote cache's single
-  vault.
+  vault, and pins that the paid quote's peer is always charged.
 - **Payment checks fall back across RPCs** (from ds.8). A node reads a
   storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a

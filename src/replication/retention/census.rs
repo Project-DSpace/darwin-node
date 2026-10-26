@@ -1994,6 +1994,63 @@ fn every_place_that_decides_by_proof_type_is_reviewed() {
     );
 }
 
+/// The peer whose quote a root proof paid is charged on the possession check
+/// after a write whatever its refusal of the fresh offer says: a node paid
+/// for a record it then can't take is charged. Only an unpaid quoted peer's
+/// payment-verification refusal is excused, and only where the offer's
+/// refusals are noted.
+#[test]
+fn the_paid_peer_of_a_root_offer_is_always_charged() {
+    use crate::replication::fresh::{
+        Refusal, RootOfferRefusals, RootQuotes, PAYMENT_VERIFICATION_ERROR,
+        PAYMENT_VERIFICATION_FAILED,
+    };
+    use saorsa_core::identity::PeerId;
+
+    const EXCUSE: &[(Option<&str>, &str)] = &[(None, "is_payment_refusal")];
+    const EXCUSED_AT: &[Reviewed] = &[(
+        "src/replication/fresh.rs",
+        "RootOfferRefusals::note_refusal",
+        "is_payment_refusal",
+        1,
+    )];
+
+    let paid = PeerId::from_bytes([2; 32]);
+    let unpaid = PeerId::from_bytes([1; 32]);
+    let targets = vec![unpaid, paid, PeerId::from_bytes([3; 32])];
+    let quotes = RootQuotes {
+        quoted: [unpaid, paid].into_iter().collect(),
+        paid: Some(paid),
+    };
+    let key = [0x42; 32];
+    let error = format!("{PAYMENT_VERIFICATION_ERROR}: no root vault configured");
+    let failed = format!("{PAYMENT_VERIFICATION_FAILED}: payment required");
+    for reason in [error.as_str(), failed.as_str(), "Out of space", ""] {
+        let offers = RootOfferRefusals::default();
+        offers.open(1, key, &targets, &quotes);
+        let refusal = offers.note_refusal(1, &paid, &key, reason);
+        let checked = offers.close(1, targets.clone());
+        assert!(
+            refusal == Refusal::Charged && checked.contains(&paid),
+            "\nThe peer whose quote a root proof paid was excused from the key's \
+             possession check after refusing its fresh offer with {reason:?}.\n\n\
+             A node paid for a record it then can't take is charged. The refusal's reason \
+             is the peer's own word, so the paid peer is charged whatever it says; only an \
+             unpaid quoted peer's payment-verification refusal is excused \
+             (src/replication/fresh.rs, RootOfferRefusals::note_refusal).\n"
+        );
+    }
+
+    let report = unreviewed(Counting::Calls(EXCUSE), EXCUSED_AT);
+    assert!(
+        report.is_empty(),
+        "\nA payment-verification refusal is read somewhere new.\n\n{report}\n\
+         It excuses a peer from the possession check after a write only in \
+         RootOfferRefusals::note_refusal (src/replication/fresh.rs), after the peer of the \
+         paid quote is charged.\n"
+    );
+}
+
 /// The node's configured RPC address is taken only where a list of RPCs to
 /// fall back across is built from it, or by the local devnet tool.
 #[test]
@@ -2280,9 +2337,10 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
         "deserialize_root_proof",
         2,
     ),
-    // Whether a fresh offer is root-paid, and which peers its proof holds a
-    // quote from, so a refusing peer the proof holds no quote from is left
-    // out of the key's possession check: root proofs only; single-node,
+    // Whether a fresh offer is root-paid, which peers its proof holds a quote
+    // from and whose quote it paid, so a refusing peer the proof holds no
+    // quote from is left out of the key's possession check and the paid one
+    // never is: root proofs only; single-node,
     // merkle, unknown tags and a root proof that doesn't decode are checked
     // as before.
     (
