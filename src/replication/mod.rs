@@ -4037,6 +4037,7 @@ impl ReplicationEngine {
     /// passes share one disk-pressure state. After them the node enters or
     /// leaves "full" ([`full::after_passes`]) and tells its peers, and the
     /// out-of-range clocks are saved, so they survive a restart.
+    #[allow(clippy::too_many_lines)]
     fn start_erasure_task(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
@@ -4086,25 +4087,30 @@ impl ReplicationEngine {
                         erasure_epoch: Some(epoch),
                     })
                     .await;
-                    let pointers_erased = match &pointers {
+                    let (pointers_erased, pointers_deferred) = match &pointers {
                         Some(pointers) => {
-                            pointers
+                            let result = pointers
                                 .prune_pass_in_epoch(
                                     allow_remote_prune_audits,
                                     Some(&commitment_state),
                                     &disk_retention,
                                     Some(epoch),
                                 )
-                                .await
-                                .pruned
+                                .await;
+                            (result.pruned, result.bootstrap_deferred)
                         }
-                        None => 0,
+                        None => (0, 0),
                     };
-                    records.records_pruned.saturating_add(pointers_erased)
+                    (
+                        records.records_pruned.saturating_add(pointers_erased),
+                        records
+                            .records_bootstrap_deferred
+                            .saturating_add(pointers_deferred),
+                    )
                 };
-                let erased = tokio::select! {
+                let (erased, bootstrap_deferred) = tokio::select! {
                     () = shutdown.cancelled() => break,
-                    erased = passes => erased,
+                    counts = passes => counts,
                 };
                 let not_yet_erased = erasure_gate.not_yet_erased();
                 // The notice dials peers in turn: a shutdown stops it, and
@@ -4114,8 +4120,13 @@ impl ReplicationEngine {
                 let mut stopping = false;
                 let notice = full_view.announcer.announce(
                     |announcer| {
-                        let changed =
-                            full::after_passes(&storage, &disk_retention, erased, not_yet_erased);
+                        let changed = full::after_passes(
+                            &storage,
+                            &disk_retention,
+                            erased,
+                            not_yet_erased,
+                            bootstrap_deferred,
+                        );
                         announcer.note_pass_done();
                         changed.map(|_| {
                             announcer.state_sent();
@@ -4129,9 +4140,9 @@ impl ReplicationEngine {
                     _ = notice => {}
                 }
                 if let Some(clocks) = &clocks {
-                    save_out_of_range_clocks(clocks, &paid_list, pointers.as_ref()).await;
+                    save_out_of_range_clocks(clocks, &paid_list, pointers.as_ref(), &storage).await;
                 }
-                full_view.seen.save(&root_dir).await;
+                full_view.seen.save(&root_dir, &storage).await;
                 if stopping {
                     break;
                 }
@@ -9220,7 +9231,16 @@ async fn save_out_of_range_clocks(
     clocks: &erasure::OutOfRangeClocks,
     paid_list: &PaidList,
     pointers: Option<&Arc<pointer::PointerReplication>>,
+    storage: &ChunkStore,
 ) {
+    // Each save is charged to the store's capacity guard while it is
+    // written, as a replacing write (it takes the last save's place), so the
+    // node's own writes and its free-space estimate count it; one the disk
+    // has no room for waits for the next pass.
+    let save = |kind: erasure::ClockKind, saved_at: u64, entries: Vec<(XorName, u64)>| async move {
+        let _reservation = storage.reserve_replacement(erasure::saved_clocks_len(entries.len()))?;
+        clocks.save(kind, saved_at, entries).await
+    };
     let now = Instant::now();
     let wall_now = SystemTime::now();
     let in_wall_secs = |entries: Vec<(XorName, Instant)>| -> Vec<(XorName, u64)> {
@@ -9231,18 +9251,12 @@ async fn save_out_of_range_clocks(
     };
     let saved_at = erasure::wall_secs(now, now, wall_now);
     let records = in_wall_secs(paid_list.record_out_of_range_entries());
-    if let Err(e) = clocks
-        .save(erasure::ClockKind::Records, saved_at, records)
-        .await
-    {
+    if let Err(e) = save(erasure::ClockKind::Records, saved_at, records).await {
         warn!("Could not save the records' out-of-range clocks: {e}");
     }
     if let Some(pointers) = pointers {
         let saved = in_wall_secs(pointers.out_of_range_clocks());
-        if let Err(e) = clocks
-            .save(erasure::ClockKind::Pointers, saved_at, saved)
-            .await
-        {
+        if let Err(e) = save(erasure::ClockKind::Pointers, saved_at, saved).await {
             warn!("Could not save the pointers' out-of-range clocks: {e}");
         }
     }

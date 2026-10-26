@@ -253,6 +253,33 @@ fn the_image_scripts_run_darwin_nodes_and_never_ant() {
     );
 }
 
+/// The "Node full:" lines `nodes status` reads, and the at-start line, are
+/// logged under the target the log writer keeps first at the full line
+/// (`log_files::KEEP_FIRST_TARGETS`): a node enters "full" only at the line,
+/// where other INFO lines are dropped.
+#[test]
+fn the_full_lines_nodes_status_reads_are_kept_at_the_full_line() {
+    const TARGET: &str = "ant_node::replication::full_state";
+    assert!(ant_node::log_files::KEEP_FIRST_TARGETS.contains(&TARGET));
+    let full_rs = repo_text("src/replication/full.rs");
+    let mut lines = 0;
+    for call in full_rs.split("crate::logging::info!(").skip(1) {
+        let call = call.split(");").next().unwrap_or_default();
+        if call.contains("\"Node full: ") || call.contains("at start: the node takes no new data") {
+            lines += 1;
+            assert!(
+                call.contains(&format!("target: \"{TARGET}\"")),
+                "a \"Node full:\" line is logged under another target: {call}"
+            );
+        }
+    }
+    // Since, no longer, not at start, and at the line at start.
+    assert_eq!(
+        lines, 4,
+        "the full lines in src/replication/full.rs changed"
+    );
+}
+
 /// `nodes status` lists a node as full from the last "Node full:" line in
 /// its logs, so a node that restarts with room, and logs that it isn't full
 /// at start, is no longer listed; one whose last line is still "since" is.

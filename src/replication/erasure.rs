@@ -296,8 +296,23 @@ impl ErasureGate {
             + given_back(&self.pointers_given_back)
     }
 
-    /// Note that this node answered "present" for `key` at `now`.
+    /// Note that this node answered "present" for `key` at `now`, if `key` is
+    /// being erased ([`Self::is_being_erased`]).
+    ///
+    /// A key not selected when it is answered can't be erased within the
+    /// fetch window: a later pass has to select it first, and it is erased no
+    /// sooner than [`EPOCHS_BEFORE_ERASURE`] sync cycles after that (a key
+    /// given back untried waits again from its new selection), each cycle far
+    /// longer than [`FETCH_WINDOW`]. So only selected keys are remembered:
+    /// the record stays within the selected set's size, and the answers for
+    /// the keys the node keeps anyway (its in-range keys among them) never
+    /// fill it, which would fold every key into one time
+    /// ([`Self::answered_present_lately`]) and keep the node from erasing
+    /// anything, or from entering "full", while answers keep coming.
     pub fn note_answered_present(&self, key: &XorName, now: Instant) {
+        if !self.is_being_erased(key) {
+            return;
+        }
         let mut answered = self.answered.lock();
         if answered.at.len() >= MAX_ANSWERED_PRESENT && !answered.at.contains_key(key) {
             answered
@@ -491,6 +506,13 @@ impl OutOfRangeClocks {
         .await
         .map_err(|e| Error::Storage(format!("Out-of-range save task failed: {e}")))?
     }
+}
+
+/// The bytes one save of `count` clocks writes, which the caller charges to
+/// the store's capacity guard for the write.
+#[must_use]
+pub fn saved_clocks_len(count: usize) -> u64 {
+    (1 + SAVED_AT_LEN + count.saturating_mul(ENTRY_LEN)) as u64
 }
 
 fn encode_clocks(saved_at: u64, clocks: &[(XorName, u64)]) -> Vec<u8> {
@@ -800,6 +822,7 @@ mod tests {
     fn a_key_answered_present_is_kept_for_the_fetch_window() {
         let gate = ErasureGate::default();
         let now = Instant::now();
+        let _ = gate.select(ClockKind::Records, &[key(1), key(2)], 0, 8);
         assert!(!gate.answered_present_lately(&key(1), now));
         gate.note_answered_present(&key(1), now);
         assert!(gate.answered_present_lately(
@@ -814,14 +837,44 @@ mod tests {
     fn forgotten_answers_still_keep_keys() {
         let gate = ErasureGate::default();
         let now = Instant::now();
-        for n in 0..=MAX_ANSWERED_PRESENT {
-            let mut k = [0u8; 32];
-            k[..8].copy_from_slice(&(n as u64).to_be_bytes());
-            gate.note_answered_present(&k, now);
+        let keys: Vec<XorName> = (0..=MAX_ANSWERED_PRESENT)
+            .map(|n| {
+                let mut k = [0u8; 32];
+                k[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                k
+            })
+            .collect();
+        let _ = gate.select(ClockKind::Records, &keys, 0, usize::MAX);
+        for k in &keys {
+            gate.note_answered_present(k, now);
         }
         // Some key answered at `now` was forgotten: every key is kept.
         assert!(gate.answered_present_lately(&key(0xEE), now));
         assert!(!gate.answered_present_lately(&key(0xEE), now + FETCH_WINDOW));
+    }
+
+    /// Answers for keys not being erased, however many, aren't remembered:
+    /// they can't fill the record and fold every key into one time, so a
+    /// selected key not answered stays free to erase.
+    #[test]
+    fn answers_for_keys_not_being_erased_are_not_remembered() {
+        let gate = ErasureGate::default();
+        let now = Instant::now();
+        let _ = gate.select(ClockKind::Records, &[key(0xEE)], 0, 8);
+        let _ = gate.select(ClockKind::Pointers, &[key(0xEF)], 0, 8);
+        for n in 0..=MAX_ANSWERED_PRESENT {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            k[31] = 1;
+            gate.note_answered_present(&k, now);
+        }
+        assert!(gate.answered.lock().at.is_empty());
+        assert!(!gate.answered_present_lately(&key(0xEE), now));
+        // A selected record or pointer answered is remembered.
+        gate.note_answered_present(&key(0xEE), now);
+        gate.note_answered_present(&key(0xEF), now);
+        assert!(gate.answered_present_lately(&key(0xEE), now));
+        assert!(gate.answered_present_lately(&key(0xEF), now));
     }
 
     #[test]

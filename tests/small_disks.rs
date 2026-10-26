@@ -211,8 +211,14 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
             // At the line, passes that erased or selected something leave the
             // node as it is: it still has copies to give up.
             for node in &nodes {
-                assert_eq!(full::after_passes(&node.store, &node.retention, 1, 0), None);
-                assert_eq!(full::after_passes(&node.store, &node.retention, 0, 3), None);
+                assert_eq!(
+                    full::after_passes(&node.store, &node.retention, 1, 0, 0),
+                    None
+                );
+                assert_eq!(
+                    full::after_passes(&node.store, &node.retention, 0, 3, 0),
+                    None
+                );
                 assert!(!node.store.is_full(), "{what}");
             }
             // A key found ready but deferred for lack of audit budget, hinted
@@ -226,7 +232,7 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
             assert!(!gate.is_being_erased(&deferred));
             for node in &nodes {
                 assert_eq!(
-                    full::after_passes(&node.store, &node.retention, 0, gate.not_yet_erased()),
+                    full::after_passes(&node.store, &node.retention, 0, gate.not_yet_erased(), 0),
                     None,
                     "{what}"
                 );
@@ -235,17 +241,31 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
             // Once it is no longer eligible, nothing is owed.
             gate.select(ClockKind::Records, &[], 4, 1024);
             assert_eq!(gate.not_yet_erased(), 0);
+            // Candidates the passes deferred because bootstrap hasn't
+            // drained (after a restart): the node may erase them once it
+            // has, so it isn't full yet.
+            for node in &nodes {
+                assert_eq!(
+                    full::after_passes(&node.store, &node.retention, 0, 0, 2),
+                    None,
+                    "{what}"
+                );
+                assert!(!node.store.is_full(), "{what}");
+            }
             // Passes at the last step that found nothing: full.
             for node in &nodes {
                 assert_eq!(
-                    full::after_passes(&node.store, &node.retention, 0, gate.not_yet_erased()),
+                    full::after_passes(&node.store, &node.retention, 0, gate.not_yet_erased(), 0),
                     Some(true),
                     "{what}"
                 );
                 let state = node.store.full_state().expect("full");
                 assert_eq!(state.trigger, FullTrigger::Bytes);
                 // Entering again changes nothing.
-                assert_eq!(full::after_passes(&node.store, &node.retention, 0, 0), None);
+                assert_eq!(
+                    full::after_passes(&node.store, &node.retention, 0, 0, 0),
+                    None
+                );
             }
             // A full node refuses every new record, even with room for it,
             // and keeps what it holds.
@@ -298,7 +318,7 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
     let refused = node.put_new(seed).await.expect_err("out of inodes");
     assert!(refused.contains("inodes"), "{refused}");
     assert_eq!(
-        full::after_passes(&node.store, &node.retention, 0, 0),
+        full::after_passes(&node.store, &node.retention, 0, 0, 0),
         Some(true)
     );
     assert_eq!(

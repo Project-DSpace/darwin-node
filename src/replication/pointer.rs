@@ -234,6 +234,10 @@ pub struct PointerPruneResult {
     pub disk_pressure: bool,
     /// Candidates strictly beyond the erase floor.
     pub beyond_floor: usize,
+    /// Candidates beyond the erase floor, under disk pressure and held by no
+    /// commitment, not asked about because bootstrap hasn't drained: the
+    /// node may erase them once it has, so it isn't "full" meanwhile.
+    pub bootstrap_deferred: usize,
     /// Records erased this pass.
     pub pruned: usize,
 }
@@ -2182,6 +2186,14 @@ impl PointerReplication {
         // follow: under disk pressure, beyond the floor, once bootstrap allows
         // asking anyone.
         let may_ask = allow_remote && !*self.is_bootstrapping.read().await;
+        if !may_ask && result.disk_pressure {
+            result.bootstrap_deferred = candidates
+                .iter()
+                .filter(|state| {
+                    retention::is_beyond_floor(&self_xor, &state.address, floor.as_ref())
+                })
+                .count();
+        }
         let failures = disk_retention.failed_pointer_checks();
         let ordered = pointer_erase_candidates(
             may_ask && result.disk_pressure,
@@ -3172,6 +3184,7 @@ mod tests {
             held_by_commitment: 6,
             disk_pressure: true,
             beyond_floor: 7,
+            bootstrap_deferred: 9,
             pruned: 8,
         };
         assert_eq!(

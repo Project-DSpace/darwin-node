@@ -3150,7 +3150,7 @@ async fn possession_check_charges(
 }
 
 /// The possession check after a write, driven through its own code with a
-/// peer that lacks the record (stand-ins beyond the 9 nearest are not
+/// peer that lacks the record (stand-ins beyond the 7 nearest are not
 /// possession-checked at all, see `fresh::possession_checked`):
 ///
 /// - a peer not marked full is charged for answering it lacks the record;

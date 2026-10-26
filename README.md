@@ -1805,7 +1805,9 @@ mark when erasing may start and when it stops, `Disk pressure: the erase
 floor moves to step` each step down, and `Free space on the record store's
 partition could not be measured` that it stopped because the disk could not
 be read. `Node full: since <unix seconds>` and `Node full: no longer` mark a
-node entering and leaving "full" ([ADR-0024](docs/adr/ADR-0024-full-not-faulty-and-the-falling-floor.md)).
+node entering and leaving "full" ([ADR-0024](docs/adr/ADR-0024-full-not-faulty-and-the-falling-floor.md));
+they are logged under `ant_node::replication::full_state`, which the log
+writer keeps at the full line, where other INFO lines are dropped.
 
 ---
 

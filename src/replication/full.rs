@@ -226,6 +226,37 @@ impl FullMarks {
         self.readers.lock().contains_key(peer)
     }
 
+    /// Stop counting `peer` as a reader: its user agent now names a release
+    /// that doesn't read the notice (it rolled back). Its mark, if any, stays.
+    pub fn forget_reader(&self, peer: &PeerId) {
+        self.readers.lock().remove(peer);
+    }
+
+    /// Whether to send `peer` the notice, from its user agent read now, if
+    /// any. An agent read now decides: one that reads the notice makes the
+    /// peer a remembered reader, one that doesn't (a rollback to an older
+    /// release among them) removes it from the readers. Only when no agent
+    /// can be read (the peer is disconnected) does the remembered set decide.
+    pub fn tells(
+        &self,
+        peer: PeerId,
+        agent: Option<&str>,
+        from_release: u64,
+        now: Instant,
+    ) -> bool {
+        match agent {
+            Some(agent) if agent_reads_full_notice(agent, from_release) => {
+                self.note_reader(peer, now);
+                true
+            }
+            Some(_) => {
+                self.forget_reader(&peer);
+                false
+            }
+            None => self.sent_a_notice(&peer),
+        }
+    }
+
     /// Forget `peer`: it left the routing table.
     pub fn forget(&self, peer: &PeerId) {
         self.marks.lock().remove(peer);
@@ -654,12 +685,41 @@ impl SeenHolders {
     /// Save the record under `root_dir` when it changed since the last save:
     /// written to a temporary file, then renamed over the saved one. A write
     /// that fails is logged and tried again after the next pass.
-    pub async fn save(&self, root_dir: &Path) {
+    ///
+    /// The temporary file is charged to `storage`'s capacity guard while it
+    /// exists, as a replacing write (it takes the old file's place): the
+    /// node's own writes and its free-space estimate, which the log writer
+    /// reads, count it, and it isn't written when the disk lacks the room
+    /// for it, full line or not.
+    pub async fn save(&self, root_dir: &Path, storage: &crate::storage::ChunkStore) {
+        self.save_with(root_dir, |bytes| storage.reserve_replacement(bytes))
+            .await;
+    }
+
+    /// [`Self::save`], with `reserve` charging the temporary file's bytes
+    /// for as long as what it returns is held. A refused charge is logged,
+    /// and the save tried again after the next pass.
+    async fn save_with<R>(
+        &self,
+        root_dir: &Path,
+        reserve: impl FnOnce(u64) -> crate::error::Result<R>,
+    ) {
         let Some(bytes) = self.encode_if_changed() else {
             return;
         };
+        let reservation = match reserve(bytes.len() as u64) {
+            Ok(reservation) => reservation,
+            Err(e) => {
+                self.changed.store(true, Ordering::Relaxed);
+                crate::logging::warn!(
+                    "Not saving the record of keys peers were seen proving now: {e}"
+                );
+                return;
+            }
+        };
         let path = root_dir.join(SEEN_FILE);
         let written = tokio::task::spawn_blocking(move || write_atomically(&path, &bytes)).await;
+        drop(reservation);
         let failed = match written {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e.to_string()),
@@ -1035,13 +1095,18 @@ pub const FULL_NOTICE_PEERS: usize = 2 * crate::replication::config::K_BUCKET_SI
 /// retried after a failed possession check is tried again later, so neither
 /// keeps a node from being full. It leaves only with
 /// [`LEAVE_FULL_MARGIN`](crate::replication::retention::LEAVE_FULL_MARGIN) of
-/// room above the line. Returns the new state when it changed; the caller
+/// room above the line. Nor does it enter "full" while the passes deferred
+/// candidates because bootstrap hasn't drained (`bootstrap_deferred`: the
+/// record pass's deferred candidates and the pointer pass's beyond the
+/// floor): it may erase those as soon as it has, so the deferral is not
+/// "nothing it may erase". Returns the new state when it changed; the caller
 /// tells the node's peers.
 pub fn after_passes(
     storage: &crate::storage::ChunkStore,
     retention: &crate::replication::retention::DiskRetention,
     erased: usize,
     not_yet_erased: usize,
+    bootstrap_deferred: usize,
 ) -> Option<bool> {
     if storage.is_full() {
         return leave_if_room(storage, retention);
@@ -1050,6 +1115,7 @@ pub fn after_passes(
     if retention.step() != Some(crate::replication::retention::LAST_FLOOR_STEP)
         || erased > 0
         || not_yet_erased > 0
+        || bootstrap_deferred > 0
     {
         return None;
     }
@@ -1059,7 +1125,10 @@ pub fn after_passes(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let free = retention.last_space().map_or(0, |space| space.available);
+    // Kept first at the full line (crate::log_files::KEEP_FIRST_TARGETS),
+    // where a node enters "full": `nodes status` reads this line.
     crate::logging::info!(
+        target: "ant_node::replication::full_state",
         full = 1,
         since,
         trigger = state.trigger.as_str(),
@@ -1093,7 +1162,9 @@ pub fn leave_if_room(
     }
     let state = storage.leave_full()?;
     let full_for = state.since.elapsed().map_or(0, |d| d.as_secs());
+    // Kept first at the full line (crate::log_files::KEEP_FIRST_TARGETS).
     crate::logging::info!(
+        target: "ant_node::replication::full_state",
         full = 0,
         full_for_secs = full_for,
         free_bytes = space.available,
@@ -1119,7 +1190,9 @@ pub fn at_start(retention: &crate::replication::retention::DiskRetention) -> boo
         return false;
     };
     if let Some(trigger) = retention.at_the_line() {
+        // Kept first at the full line (crate::log_files::KEEP_FIRST_TARGETS).
         crate::logging::info!(
+            target: "ant_node::replication::full_state",
             free_bytes = space.available,
             line_bytes = retention.line(),
             "At the full line by {} at start: the node takes no new data, and enters \"full\" \
@@ -1128,7 +1201,9 @@ pub fn at_start(retention: &crate::replication::retention::DiskRetention) -> boo
         );
         return true;
     }
+    // Kept first at the full line (crate::log_files::KEEP_FIRST_TARGETS).
     crate::logging::info!(
+        target: "ant_node::replication::full_state",
         full = 0,
         free_bytes = space.available,
         line_bytes = retention.line(),
@@ -1142,11 +1217,13 @@ pub fn at_start(retention: &crate::replication::retention::DiskRetention) -> boo
 /// Tell this node's nearest peers that read it whether it is full.
 ///
 /// Its [`FULL_NOTICE_PEERS`] nearest, each only if its user agent names a
-/// release that reads the notice, or it is already known to read it (it sent
-/// one, or its user agent did so before). A peer found to read it is
-/// remembered, so a renewal still reaches it while it is disconnected and its
-/// user agent can't be read (sending dials it). One-way. Returns how many
-/// were told.
+/// release that reads the notice or, when no user agent can be read, it is
+/// already known to read it (it sent one, or its user agent did so before).
+/// A peer found to read it is remembered, so a renewal still reaches it while
+/// it is disconnected and its user agent can't be read (sending dials it); a
+/// peer whose user agent now names an older release (it rolled back) isn't
+/// told, and is no longer remembered ([`FullMarks::tells`]). One-way.
+/// Returns how many were told.
 pub async fn send_full_notice(p2p_node: &saorsa_core::P2PNode, full: bool) -> usize {
     use crate::replication::config::REPLICATION_PROTOCOL_ID;
     use crate::replication::protocol::{ReplicationMessage, ReplicationMessageBody};
@@ -1168,16 +1245,13 @@ pub async fn send_full_notice(p2p_node: &saorsa_core::P2PNode, full: bool) -> us
     let mut told = 0usize;
     for node in peers {
         let peer = node.peer_id;
-        let reads = view.marks.sent_a_notice(&peer)
-            || p2p_node
-                .transport()
-                .peer_user_agent(&peer)
-                .await
-                .is_some_and(|agent| agent_reads_full_notice(&agent, from_release));
-        if !reads {
+        let agent = p2p_node.transport().peer_user_agent(&peer).await;
+        if !view
+            .marks
+            .tells(peer, agent.as_deref(), from_release, Instant::now())
+        {
             continue;
         }
-        view.marks.note_reader(peer, Instant::now());
         if p2p_node
             .send_message(&peer, REPLICATION_PROTOCOL_ID, bytes.clone(), &[])
             .await
@@ -1322,6 +1396,33 @@ mod tests {
         );
         marks.forget(&peer(1));
         assert!(!marks.sent_a_notice(&peer(1)));
+    }
+
+    /// A reader whose user agent later names a release that doesn't read the
+    /// notice (it rolled back to node release 1a, ds.16) isn't told, and is
+    /// no longer a reader; its mark stays. With no user agent to read, the
+    /// remembered readers are told; a peer never seen to read it isn't.
+    #[test]
+    fn a_reader_that_rolled_back_is_not_told() {
+        let marks = FullMarks::default();
+        let now = Instant::now();
+        assert!(marks.tells(peer(1), Some("node/0.23.0+ds.17"), 17, now));
+        assert!(marks.sent_a_notice(&peer(1)));
+        // Disconnected: remembered.
+        assert!(marks.tells(peer(1), None, 17, now));
+        marks.mark_for_test(peer(1), now);
+        // Rolled back while staying in the routing table.
+        assert!(!marks.tells(peer(1), Some("node/0.23.0+ds.16.image.abc123"), 17, now));
+        assert!(!marks.sent_a_notice(&peer(1)));
+        assert!(marks.is_marked(&peer(1), now), "its mark stays");
+        // Then disconnected: no longer remembered as a reader.
+        assert!(!marks.tells(peer(1), None, 17, now));
+        // Never seen to read it.
+        assert!(!marks.tells(peer(2), None, 17, now));
+        // A reader by its own notice, then seen with an older agent.
+        marks.note_notice(peer(3), false, now);
+        assert!(!marks.tells(peer(3), Some("node/0.23.0+ds.16"), 17, now));
+        assert!(!marks.sent_a_notice(&peer(3)));
     }
 
     /// A peer that left the routing table loses its mark and its place among
@@ -1508,8 +1609,33 @@ mod tests {
         let fresh = SeenHolders::load(dir.path());
         assert!(!fresh.may_have_seen(&peer(1), &key), "no file: empty");
         fresh.record(&peer(1), &key);
-        fresh.save(dir.path()).await;
+        // The disk can't take the temporary file: nothing written, and the
+        // save tried again after the next pass.
+        let mut charged = None;
+        fresh
+            .save_with(dir.path(), |bytes| {
+                charged = Some(bytes);
+                Err::<(), _>(crate::error::Error::Storage("no room".to_string()))
+            })
+            .await;
+        assert!(charged.is_some_and(|bytes| bytes > 0));
+        assert!(!dir.path().join(SEEN_FILE).exists());
+        assert!(!dir.path().join("seen_holders.bin.tmp").exists());
+        let mut charged = None;
+        fresh
+            .save_with(dir.path(), |bytes| {
+                charged = Some(bytes);
+                Ok(())
+            })
+            .await;
         assert!(dir.path().join(SEEN_FILE).exists());
+        assert_eq!(
+            charged,
+            std::fs::metadata(dir.path().join(SEEN_FILE))
+                .ok()
+                .map(|meta| meta.len()),
+            "the charge is the file's size"
+        );
         assert!(!dir.path().join("seen_holders.bin.tmp").exists());
         let loaded = SeenHolders::load(dir.path());
         assert!(

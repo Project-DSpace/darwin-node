@@ -112,9 +112,12 @@ before.
 
 A node is **full** when it is at the full line and its last prune passes, at the floor's
 last step, erased nothing and left nothing selected for erasure and not yet erased
-(in its wait, deferred by a pass, or kept after an answer of "present"): a record retried
-after a failed possession check is tried again later, and doesn't keep a node from being
-full. Then it:
+(in its wait, deferred by a pass, or kept after an answer of "present"), and deferred no
+candidate because bootstrap hasn't drained (after a restart it erases those once it has):
+a record retried after a failed possession check is tried again later, and doesn't keep a
+node from being full. A key is kept after an answer of "present" only if it was being
+erased when answered: one not selected then can't be erased within the fetch window
+anyway, and remembering only those keeps that record bounded. Then it:
 
 - prices no new data: a quote for data it doesn't hold is refused with the existing
   `QuoteFailed`. A chunk it holds is still answered as already stored, so nobody pays for
@@ -134,8 +137,12 @@ full. Then it:
   sent only to peers whose user agent names the release that reads it, or that sent one
   themselves, renewed every 10 minutes while it stays full; a peer once found to read it
   is remembered (at most 4,096) until it leaves the routing table, so a renewal still
-  reaches it while it is disconnected;
-- logs one line on entering ("Node full: since <unix seconds>") and one on leaving;
+  reaches it while it is disconnected; a user agent read at the time decides, so a peer
+  that rolled back to a release that can't read it is not told, and no longer remembered;
+- logs one line on entering ("Node full: since <unix seconds>") and one on leaving,
+  under a target the log writer keeps first at the full line
+  (`ant_node::replication::full_state`), as it does warnings, since a node enters "full"
+  only at the line, where other INFO lines are dropped;
   the state isn't kept across a restart, so at start a node with room above the line
   logs "Node full: not at start", which `nodes status` reads as no longer full, and one
   that starts at the line tells its peers once, at its first renewal, if no prune pass
@@ -163,10 +170,11 @@ full. Then it:
   holds fewer than 7 not marked full, and 6 proofs are still needed from the 20: peers
   announcing themselves full never lower the bar. Only a routing table that knows fewer
   peers than the close group (a tiny network) lowers it, as before.
-- The possession check after a write probes only the 9 nearest, as before: stand-ins
-  beyond them are offered the record, and take it, older nodes included, since a chunk
+- The possession check after a write probes only the 7 nearest (the unwidened close
+  group, the writing node itself counted), as node release 1a does: stand-ins beyond
+  them are offered the record, and take it, older nodes included, since a chunk
   receiver admits a fresh offer anywhere among the key's 20 nearest. They aren't
-  possession-checked because no peer past the 9 nearest was before this release.
+  possession-checked because no peer past the close group was before this release.
   Nothing is waived for them, and a stand-in that takes the record is, by intent, not
   recorded as seen holding it. A pointer's check after a write probes its 7 nearest, as
   before, and its stand-ins likewise aren't checked.

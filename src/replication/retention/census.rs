@@ -1937,7 +1937,9 @@ fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
     // The lanes of `full::Lane` by name, not `Lane::*`: the payment reads'
     // own `Lane` (`Lane::Put`, `Lane::Background`, node-1a's settlement
     // reads) shares the type's last name, and isn't a lane of this penalty.
-    // The list is checked against `full::Lane::ALL` below.
+    // The list is checked against the variants `full::Lane` declares, read
+    // from its source, and against `full::Lane::ALL`, so a new variant fails
+    // here until it is listed (the wildcard `Lane::*` did that before).
     const LANES: &[(Option<&str>, &str)] = &[
         (Some("Lane"), "Fetch"),
         (Some("Lane"), "ResponsibleAudit"),
@@ -1955,6 +1957,15 @@ fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
     assert_eq!(
         listed, every_lane,
         "the census names every lane of full::Lane, and only those"
+    );
+    let full_rs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/replication/full.rs"),
+    )
+    .expect("read src/replication/full.rs");
+    assert_eq!(
+        listed,
+        enum_variants(&full_rs, "Lane"),
+        "full::Lane declares a lane the census and full::Lane::ALL don't list"
     );
     const NAMED: &[Reviewed] = &[
         (
