@@ -10,8 +10,8 @@
 //! `tests/record_weight.rs`: `record_weight`; `weighted_amount`; a node's
 //! weight total, which is never above its committed key count and equals it
 //! when every record is a full chunk; and the weighted amount for a pointer,
-//! at its 5,303 bytes, which `tests/pointer_convergence.rs` pins too. No quote
-//! or payment path uses those functions yet.
+//! at its 5,303 bytes, which `tests/pointer_convergence.rs` pins too. Every
+//! store check requires the weighted amount; no quote uses the weights yet.
 
 use ant_protocol::evm::Amount;
 use ant_protocol::payment::calculate_price;

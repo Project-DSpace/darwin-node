@@ -1,8 +1,9 @@
 //! Pricing by record size: the functions in the vendored ant-protocol
 //! (`vendor/ant-protocol/src/payment/pricing.rs`) that weigh a record by its
 //! size class, the amount a client pays for it, and a node's weight total.
-//! No quote or payment path uses them yet; nodes and clients must compute the
-//! same values once one does, so these tests fail if a function or one of its
+//! Every store check requires `weighted_amount` for the class of the bytes it
+//! holds (`src/payment/verifier.rs`, `Held`); nodes and clients must compute
+//! the same values, so these tests fail if a function or one of its
 //! parameters changes.
 //!
 //! A record's weight is `φ + (1 − φ) × (class top ÷ 4 MiB)`, with φ = 1/4 and

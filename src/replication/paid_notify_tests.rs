@@ -95,6 +95,7 @@ async fn a_notify_after_a_put_whose_store_failed_records_the_key() {
         verifier
             .verify_payment(
                 &bundle.address,
+                crate::payment::Held::Bytes(ant_protocol::chunk::MAX_CHUNK_SIZE),
                 Some(&bundle.proof(&[])),
                 VerificationContext::ClientPut
             )

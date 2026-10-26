@@ -18,7 +18,12 @@ use crate::payment::settlement::{
 use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::storage::ChunkStore;
+use ant_protocol::chunk::DATA_TYPE_CHUNK;
+use ant_protocol::payment::pricing::{
+    record_weight, weighted_amount, RecordWeight, WEIGHT_DENOMINATOR,
+};
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
+use ant_protocol::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
 use evmlib::common::Amount;
 #[cfg(any(test, feature = "test-utils"))]
 use evmlib::common::QuoteHash;
@@ -657,6 +662,43 @@ impl VerificationContext {
     }
 }
 
+/// What this node holds of the chunk whose payment it checks.
+///
+/// It sets the share of a full chunk's price the payment must cover: the
+/// weight of the chunk's size class ([`record_weight`]). Every chunk payment
+/// check takes it, so a store path can't leave it out.
+///
+/// The requirement is `weighted_amount(median, weight)`, 3 × the median quote
+/// × the weight, rounded up: a full chunk's is 3 × the median, as before, and
+/// a smaller chunk's less. It enters only the "at least" check on the settled
+/// amount, so paying for a larger class, or the full amount, always clears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held {
+    /// The chunk's bytes, this many of them: the payment must cover the size
+    /// class they are in.
+    Bytes(usize),
+    /// No bytes: a payment notice, which names a key and carries its proof
+    /// only. The payment must cover the smallest class.
+    Notice,
+}
+
+impl Held {
+    /// The weight the payment must cover.
+    #[must_use]
+    pub fn weight(self) -> RecordWeight {
+        match self {
+            Self::Bytes(len) => record_weight(DATA_TYPE_CHUNK, len),
+            Self::Notice => record_weight(DATA_TYPE_CHUNK, 0),
+        }
+    }
+}
+
+/// The weight a pointer's payment must cover: every pointer weighs as one of
+/// [`POINTER_WIRE_LEN`] bytes, whatever its request says.
+fn pointer_weight() -> RecordWeight {
+    record_weight(DATA_TYPE_POINTER, POINTER_WIRE_LEN)
+}
+
 /// Status returned by payment verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentStatus {
@@ -1292,6 +1334,9 @@ impl PaymentVerifier {
     /// # Arguments
     ///
     /// * `xorname` - The content-addressed name of the data
+    /// * `held` - What this node holds of the chunk: its bytes' length, or
+    ///   nothing for a payment notice. The payment must cover its size class
+    ///   (see [`Held`]).
     /// * `payment_proof` - Optional payment proof (required if not in cache)
     /// * `context` - Which fresh admission path is verifying the proof — see
     ///   [`VerificationContext`] for cache-strength semantics
@@ -1307,6 +1352,7 @@ impl PaymentVerifier {
     pub async fn verify_payment(
         &self,
         xorname: &XorName,
+        held: Held,
         payment_proof: Option<&[u8]>,
         context: VerificationContext,
     ) -> Result<PaymentStatus> {
@@ -1314,7 +1360,12 @@ impl PaymentVerifier {
         let proof_type = payment_proof_type_label(payment_proof);
         let proof_bytes = payment_proof.map_or(0, <[u8]>::len);
         let result = self
-            .verify_payment_inner(&PaymentTarget::same(*xorname), payment_proof, context)
+            .verify_payment_inner(
+                &PaymentTarget::same(*xorname),
+                held.weight(),
+                payment_proof,
+                context,
+            )
             .await;
         let elapsed_ms = started.elapsed().as_millis();
 
@@ -1351,6 +1402,7 @@ impl PaymentVerifier {
     async fn verify_payment_inner(
         &self,
         target: &PaymentTarget,
+        weight: RecordWeight,
         payment_proof: Option<&[u8]>,
         context: VerificationContext,
     ) -> Result<PaymentStatus> {
@@ -1411,6 +1463,7 @@ impl PaymentVerifier {
 
                             self.verify_evm_payment(
                                 target,
+                                weight,
                                 &parsed.proof_of_payment,
                                 &tx_hashes,
                                 &parsed.commitment_sidecars,
@@ -1507,7 +1560,7 @@ impl PaymentVerifier {
     ) -> Result<()> {
         let target = PaymentTarget::split(*routing_address, *paid_content);
         match self
-            .verify_payment_inner(&target, Some(payment_proof), context)
+            .verify_payment_inner(&target, pointer_weight(), Some(payment_proof), context)
             .await?
         {
             PaymentStatus::CachedAsVerified | PaymentStatus::PaymentVerified => Ok(()),
@@ -1580,14 +1633,15 @@ impl PaymentVerifier {
     ///    valid ML-DSA-65 signature
     /// 4. Each candidate must also come from a local K-close peer
     /// 5. A candidate is accepted only if `completedPayments(quoteHash)` is at
-    ///    least 3x the median price
+    ///    least 3x the median price times `weight`, the share of a full
+    ///    chunk's price the record's size class pays (rounded up to the wei)
     ///
     /// Non-median quotes are parsed only to locate the median. Their content,
     /// peer bindings, and signatures are deliberately ignored: the paid
     /// quote's content hash, quote hash, signature, issuer
     /// K-closeness check, and on-chain settlement are the authority. A
     /// one-quote proof is valid when that single quote passes these checks and
-    /// was paid 3x.
+    /// was paid 3x times `weight`.
     ///
     /// The settlement comes from the vault's record for the quote's hash. The
     /// receipts of `tx_hashes`, the transactions the proof names, may hold it
@@ -1598,6 +1652,7 @@ impl PaymentVerifier {
     async fn verify_evm_payment(
         &self,
         target: &PaymentTarget,
+        weight: RecordWeight,
         payment: &ProofOfPayment,
         tx_hashes: &[[u8; 32]],
         commitment_sidecars: &[Vec<u8>],
@@ -1628,7 +1683,7 @@ impl PaymentVerifier {
         // legitimately differs from the on-disk count, so the old gate would
         // FALSE-REJECT healthy ADR quotes. The binding gate supersedes it.
         Self::validate_quote_arithmetic(payment)?;
-        let candidates = Self::legacy_median_candidates(payment)?;
+        let candidates = Self::legacy_median_candidates(payment, weight)?;
         let mut failures = Vec::with_capacity(candidates.len());
         // The paid (median) price and settled on-chain amount of the winning
         // candidate, kept for the receiver-side price-floor policy below.
@@ -1747,8 +1802,14 @@ impl PaymentVerifier {
         // group that is RESPONSIBLE for the data, so it takes the routing
         // address. For a chunk that is the same value; for a pointer the paid
         // content is its state, which names no close group at all.
-        self.enforce_price_floor(target.routing(), paid_price, settled_amount, context)
-            .await?;
+        self.enforce_price_floor(
+            target.routing(),
+            weight,
+            paid_price,
+            settled_amount,
+            context,
+        )
+        .await?;
 
         // ADR-0004 observe-only telemetry: log off-curve quotes only AFTER the
         // paid (median) quote's ML-DSA-65 signature has verified above, so
@@ -1774,8 +1835,12 @@ impl PaymentVerifier {
         Ok(())
     }
 
+    /// The median-priced quotes of `payment`, each needing
+    /// `weighted_amount(median, weight)`: 3 × the median price × the weight
+    /// of the record's size class, rounded up.
     fn legacy_median_candidates(
         payment: &ProofOfPayment,
+        weight: RecordWeight,
     ) -> Result<Vec<LegacyMedianCandidate<'_>>> {
         let mut sorted_quotes: Vec<(&evmlib::EncodedPeerId, &PaymentQuote)> = payment
             .peer_quotes
@@ -1792,13 +1857,11 @@ impl PaymentVerifier {
             })?
             .1
             .price;
-        let expected_amount = median_price
-            .checked_mul(Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER))
-            .ok_or_else(|| {
-                Error::Payment(format!(
-                    "Median quote payment amount overflow for price {median_price}"
-                ))
-            })?;
+        let expected_amount = weighted_amount(median_price, weight).ok_or_else(|| {
+            Error::Payment(format!(
+                "Median quote payment amount overflow for price {median_price}"
+            ))
+        })?;
 
         if expected_amount == Amount::ZERO || median_price == Amount::ZERO {
             return Err(Error::Payment(format!(
@@ -2248,9 +2311,11 @@ impl PaymentVerifier {
     ///
     /// Requires the settled on-chain amount to also clear
     /// `PAID_QUOTE_PAYMENT_MULTIPLIER × tolerance% ×` the close group's median
-    /// commitment-bound price (see [`Self::group_reference_price`]). Together
-    /// with the per-quote check above, the effective rule is
-    /// `settled >= 3 × max(paid_price, tolerated_floor)`.
+    /// commitment-bound price (see [`Self::group_reference_price`]) × `weight`,
+    /// the record's size class, rounded up as the per-quote requirement is.
+    /// Together with the per-quote check above, the effective rule is
+    /// `settled >= 3 × max(paid_price, tolerated_floor) × weight`, so the
+    /// floor never asks a small record for a full chunk's amount.
     ///
     /// When the group reference cannot be built — too few fresh commitments, no
     /// P2P handle, no gossip cache — the floor SKIPS the admission rather than
@@ -2268,6 +2333,7 @@ impl PaymentVerifier {
     async fn enforce_price_floor(
         &self,
         xorname: &XorName,
+        weight: RecordWeight,
         paid_price: Amount,
         settled_amount: Amount,
         context: VerificationContext,
@@ -2303,11 +2369,11 @@ impl PaymentVerifier {
 
         // Amount is a U256: reference_price is bounded by the saturating pricing
         // curve and the multipliers are <= 300, so this arithmetic cannot
-        // overflow; saturating keeps that a proof instead of an assumption.
+        // overflow; saturating keeps that a proof instead of an assumption,
+        // and a weighted amount that overflowed would require the most there is.
         let tolerated_price =
             reference_price.saturating_mul(Amount::from(tolerance_percent)) / Amount::from(100u64);
-        let required_amount =
-            tolerated_price.saturating_mul(Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER));
+        let required_amount = weighted_amount(tolerated_price, weight).unwrap_or(Amount::MAX);
         let below_floor = settled_amount < required_amount;
 
         info!(
@@ -2316,19 +2382,22 @@ impl PaymentVerifier {
              settled={settled_amount}, neighbours={}, group_sample={}, \
              reference_price={reference_price}, tolerance_percent={tolerance_percent}, \
              required={required_amount}, below_floor={below_floor}, skipped=false, \
-             skip_reason=none, enforce={}",
+             skip_reason=none, enforce={}, weight={}/{WEIGHT_DENOMINATOR}",
             hex::encode(xorname),
             group_sample.neighbours,
             group_sample.total,
             floor.enforce,
+            weight.numerator(),
         );
 
         if below_floor && floor.enforce {
             return Err(Error::Payment(format!(
                 "Settled payment {settled_amount} is below the close-group price floor \
                  {required_amount} ({PAID_QUOTE_PAYMENT_MULTIPLIER}x {tolerance_percent}% of \
-                 the group median price {reference_price}, taken over {} peers)",
-                group_sample.total
+                 the group median price {reference_price}, taken over {} peers, times the \
+                 record's weight {}/{WEIGHT_DENOMINATOR})",
+                group_sample.total,
+                weight.numerator()
             )));
         }
 
@@ -4216,6 +4285,10 @@ mod tests {
     use saorsa_pqc::pqc::MlDsaOperations;
     use std::time::SystemTime;
 
+    /// A whole chunk's bytes: its payment must cover the full amount, 3 ×
+    /// the median, as every payment did before sizes were priced.
+    const FULL_CHUNK: Held = Held::Bytes(ant_protocol::chunk::MAX_CHUNK_SIZE);
+
     impl PaymentVerifier {
         /// `verify_payment` as upstream has it, merkle proofs included.
         ///
@@ -4233,7 +4306,9 @@ mod tests {
             let Some(proof) =
                 payment_proof.filter(|proof| detect_proof_type(proof) == Some(ProofType::Merkle))
             else {
-                return self.verify_payment(xorname, payment_proof, context).await;
+                return self
+                    .verify_payment(xorname, FULL_CHUNK, payment_proof, context)
+                    .await;
             };
             if self.check_payment_required_keyed(target, context) == PaymentStatus::CachedAsVerified
             {
@@ -4271,7 +4346,7 @@ mod tests {
             VerificationContext::PaidListAdmission,
         ] {
             let err = verifier
-                .verify_payment(&xorname, Some(&tagged), context)
+                .verify_payment(&xorname, FULL_CHUNK, Some(&tagged), context)
                 .await
                 .expect_err("a merkle proof must be refused");
             assert!(
@@ -4784,7 +4859,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
         assert_eq!(
             result.expect("the second read finds the payment"),
@@ -4833,7 +4913,12 @@ mod tests {
         let started = Instant::now();
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
         assert_eq!(
             result.expect("the paid candidate verifies"),
@@ -4867,7 +4952,12 @@ mod tests {
         let started = Instant::now();
         let proof_bytes = serialize_proof(peer_quotes);
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("a store nobody paid for is refused");
         let took = started.elapsed();
@@ -5249,7 +5339,7 @@ mod tests {
 
         // No proof provided => should return an error (EVM is always on)
         let result = verifier
-            .verify_payment(&xorname, None, VerificationContext::ClientPut)
+            .verify_payment(&xorname, FULL_CHUNK, None, VerificationContext::ClientPut)
             .await;
         assert!(
             result.is_err(),
@@ -5267,7 +5357,7 @@ mod tests {
 
         // Should succeed without payment (cached)
         let result = verifier
-            .verify_payment(&xorname, None, VerificationContext::ClientPut)
+            .verify_payment(&xorname, FULL_CHUNK, None, VerificationContext::ClientPut)
             .await;
         assert!(result.is_ok());
         assert_eq!(result.expect("cached"), PaymentStatus::CachedAsVerified);
@@ -5291,7 +5381,7 @@ mod tests {
         );
 
         let err = verifier
-            .verify_payment(&xorname, None, VerificationContext::ClientPut)
+            .verify_payment(&xorname, FULL_CHUNK, None, VerificationContext::ClientPut)
             .await
             .expect_err("proof-less client PUT must not ride the paid-list entry");
         assert!(
@@ -5343,7 +5433,12 @@ mod tests {
         // Proof smaller than MIN_PAYMENT_PROOF_SIZE_BYTES
         let small_proof = vec![0u8; MIN_PAYMENT_PROOF_SIZE_BYTES - 1];
         let result = verifier
-            .verify_payment(&xorname, Some(&small_proof), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&small_proof),
+                VerificationContext::ClientPut,
+            )
             .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -5361,7 +5456,12 @@ mod tests {
         // Proof larger than MAX_PAYMENT_PROOF_SIZE_BYTES
         let large_proof = vec![0u8; MAX_PAYMENT_PROOF_SIZE_BYTES + 1];
         let result = verifier
-            .verify_payment(&xorname, Some(&large_proof), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&large_proof),
+                VerificationContext::ClientPut,
+            )
             .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -5381,6 +5481,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&boundary_proof),
                 VerificationContext::ClientPut,
             )
@@ -5403,6 +5504,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&boundary_proof),
                 VerificationContext::ClientPut,
             )
@@ -5431,6 +5533,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&legacy_sized_proof),
                 VerificationContext::ClientPut,
             )
@@ -5453,7 +5556,12 @@ mod tests {
         let mut garbage = vec![crate::ant_protocol::PROOF_TAG_SINGLE_NODE];
         garbage.extend_from_slice(&[0xAB; 63]);
         let result = verifier
-            .verify_payment(&xorname, Some(&garbage), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&garbage),
+                VerificationContext::ClientPut,
+            )
             .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -5479,7 +5587,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -5515,7 +5628,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         let err = result.expect_err("redirected settlement must be rejected");
@@ -5536,7 +5654,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -5815,7 +5938,12 @@ mod tests {
         );
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -5852,7 +5980,12 @@ mod tests {
         );
 
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("settling only the cheapest group quote must not clear the floor");
 
@@ -5892,7 +6025,12 @@ mod tests {
         let proof_bytes = serialize_proof(peer_quotes);
 
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("a bundle padded with cheap quotes must not lower this node's floor");
 
@@ -5938,7 +6076,12 @@ mod tests {
         let proof_bytes = group_floor_proof(&verifier, xorname, 0, settled, &neighbours);
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -5970,7 +6113,12 @@ mod tests {
         );
 
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("exactly at the minimum sample the floor must evaluate and reject");
         assert!(format!("{err}").contains("below the close-group price floor"));
@@ -6002,7 +6150,12 @@ mod tests {
         );
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6064,7 +6217,12 @@ mod tests {
         );
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6101,7 +6259,12 @@ mod tests {
         );
 
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err(
                 "KNOWN LIMIT: four overstated neighbours reject an honest at-median payment. \
@@ -6136,7 +6299,12 @@ mod tests {
         );
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6193,7 +6361,12 @@ mod tests {
         );
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6225,7 +6398,12 @@ mod tests {
         );
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6335,7 +6513,12 @@ mod tests {
         );
 
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("a minority of understated commitments must not disarm the floor");
 
@@ -6359,7 +6542,12 @@ mod tests {
         let proof_bytes = group_floor_proof(&verifier, xorname, 0, settled, &neighbours);
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6378,7 +6566,12 @@ mod tests {
         let proof_bytes = group_floor_proof(&verifier, xorname, 0, settled, &neighbours);
 
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("a 3x-baseline settlement must not clear the group-median floor");
 
@@ -6406,7 +6599,12 @@ mod tests {
         );
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6430,6 +6628,7 @@ mod tests {
         let err = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&proof_bytes),
                 VerificationContext::FreshReplication,
             )
@@ -6454,6 +6653,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&proof_bytes),
                 VerificationContext::PaidListAdmission,
             )
@@ -6489,7 +6689,12 @@ mod tests {
         let proof_bytes = cheap_single_quote_proof(&verifier, xorname, settled);
 
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6545,7 +6750,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("single quote paid less than 3x should be rejected");
 
@@ -6564,7 +6774,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("proof with more than close-group quotes should be rejected");
 
@@ -6601,7 +6816,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6626,7 +6846,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("out-of-K paid issuer should be rejected");
 
@@ -6665,7 +6890,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("zero median must be rejected");
 
@@ -6688,7 +6918,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("paid quote content mismatch should be rejected");
 
@@ -6715,7 +6950,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6742,7 +6982,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await
             .expect_err("paid bad signature should be rejected");
 
@@ -6769,7 +7014,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6795,7 +7045,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6821,7 +7076,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert_eq!(
@@ -6848,6 +7108,7 @@ mod tests {
         let err = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&proof_bytes),
                 VerificationContext::PaidListAdmission,
             )
@@ -6906,7 +7167,7 @@ mod tests {
             let v = verifier.clone();
             handles.push(tokio::spawn(async move {
                 let xorname = [i; 32];
-                v.verify_payment(&xorname, None, VerificationContext::ClientPut)
+                v.verify_payment(&xorname, FULL_CHUNK, None, VerificationContext::ClientPut)
                     .await
             }));
         }
@@ -7029,6 +7290,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &target_xorname,
+                FULL_CHUNK,
                 Some(&proof_bytes),
                 VerificationContext::ClientPut,
             )
@@ -7128,7 +7390,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
@@ -7158,7 +7425,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
@@ -7188,7 +7460,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         // Should NOT fail at timestamp check (will fail later at pub_key binding)
@@ -7219,7 +7496,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
@@ -7249,7 +7531,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         // Should NOT fail at timestamp check (will fail later at pub_key binding)
@@ -7294,7 +7581,12 @@ mod tests {
 
         let proof_bytes = serialize_proof(peer_quotes);
         let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert!(result.is_err(), "Should reject wrong peer binding");
@@ -7334,7 +7626,7 @@ mod tests {
             VerificationContext::PaidListAdmission,
         ] {
             let err = verifier
-                .verify_payment(&stored_xorname, Some(&proof_bytes), context)
+                .verify_payment(&stored_xorname, FULL_CHUNK, Some(&proof_bytes), context)
                 .await
                 .expect_err("content binding must hold in every context");
             assert!(
@@ -7458,6 +7750,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&tagged_bytes),
                 VerificationContext::ClientPut,
             )
@@ -8686,6 +8979,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
             )
@@ -8721,6 +9015,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
             )
@@ -8756,6 +9051,7 @@ mod tests {
         let result = verifier
             .verify_payment(
                 &xorname,
+                FULL_CHUNK,
                 Some(&tagged_proof),
                 VerificationContext::ClientPut,
             )
@@ -9722,6 +10018,238 @@ mod tests {
         // hard error.
         let map2 = PaymentVerifier::index_valid_sidecars(&[vec![0xFF; 8]]);
         assert!(map2.is_empty(), "an unparseable sidecar must be skipped");
+    }
+
+    /// A signed median bundle for `content`, its median quote settled with
+    /// what `settled` makes of the median price.
+    fn weighted_test_proof(
+        verifier: &PaymentVerifier,
+        content: XorName,
+        settled: impl FnOnce(Amount) -> Amount,
+    ) -> Vec<u8> {
+        let peer_quotes = make_signed_legacy_bundle(content, unique_test_prices());
+        mark_k_closest_paid_candidates(verifier, &peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(verifier, &paid_quote, settled(paid_quote.price));
+        serialize_proof(peer_quotes)
+    }
+
+    fn weighted(median: Amount, weight: RecordWeight) -> Amount {
+        weighted_amount(median, weight).expect("no overflow")
+    }
+
+    /// Lengths across the size classes: the edges of the smallest class, a
+    /// chunk inside a middle one, and a full chunk.
+    const HELD_TEST_LENGTHS: [usize; 6] = [
+        1,
+        16 * 1024,
+        16 * 1024 + 1,
+        100_000,
+        1024 * 1024,
+        ant_protocol::chunk::MAX_CHUNK_SIZE,
+    ];
+
+    /// A store check requires `weighted_amount` of the median for the size
+    /// class of the bytes this node holds: that amount clears, one wei less
+    /// does not, in both store contexts. Below a full chunk it is less than 3
+    /// × the median; a full chunk's is exactly that.
+    #[tokio::test]
+    async fn a_store_check_requires_the_weighted_amount_of_the_held_size_class() {
+        for (case, len) in HELD_TEST_LENGTHS.into_iter().enumerate() {
+            let weight = record_weight(DATA_TYPE_CHUNK, len);
+            if len < ant_protocol::chunk::MAX_CHUNK_SIZE {
+                assert!(weight < RecordWeight::FULL, "{len}");
+            } else {
+                assert_eq!(weight, RecordWeight::FULL);
+            }
+            for context in [
+                VerificationContext::ClientPut,
+                VerificationContext::FreshReplication,
+            ] {
+                let xorname = [0x60 + u8::try_from(case).expect("small"); 32];
+
+                let short = create_test_verifier();
+                let proof = weighted_test_proof(&short, xorname, |median| {
+                    weighted(median, weight) - Amount::from(1u64)
+                });
+                let err = short
+                    .verify_payment(&xorname, Held::Bytes(len), Some(&proof), context)
+                    .await
+                    .expect_err("one wei under the weighted amount is refused");
+                assert!(
+                    err.to_string().contains("not paid enough"),
+                    "{len} {context:?}: {err}"
+                );
+
+                let exact = create_test_verifier();
+                let proof = weighted_test_proof(&exact, xorname, |median| {
+                    let amount = weighted(median, weight);
+                    if weight == RecordWeight::FULL {
+                        assert_eq!(amount, three_times(median));
+                    } else {
+                        assert!(amount < three_times(median), "{len}");
+                    }
+                    amount
+                });
+                assert_eq!(
+                    exact
+                        .verify_payment(&xorname, Held::Bytes(len), Some(&proof), context)
+                        .await
+                        .unwrap_or_else(|e| panic!("{len} {context:?}: {e}")),
+                    PaymentStatus::PaymentVerified
+                );
+            }
+        }
+    }
+
+    /// The class comes from the bytes held, not from what was paid for: a
+    /// payment for a smaller class than the held bytes' is refused, and the
+    /// full amount, what every payment carries today, clears every class.
+    #[tokio::test]
+    async fn a_full_payment_clears_every_class_and_a_smaller_class_never_does() {
+        let xorname = [0x6Au8; 32];
+        let smallest = Held::Notice.weight();
+        assert_eq!(smallest, Held::Bytes(1).weight());
+
+        let verifier = create_test_verifier();
+        let proof = weighted_test_proof(&verifier, xorname, |median| weighted(median, smallest));
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                Held::Bytes(16 * 1024 + 1),
+                Some(&proof),
+                VerificationContext::ClientPut,
+            )
+            .await
+            .expect_err("the smallest class's amount does not pay for the next");
+        assert!(err.to_string().contains("not paid enough"), "{err}");
+
+        for (case, len) in HELD_TEST_LENGTHS.into_iter().enumerate() {
+            let xorname = [0x70 + u8::try_from(case).expect("small"); 32];
+            let verifier = create_test_verifier();
+            let proof = weighted_test_proof(&verifier, xorname, three_times);
+            assert_eq!(
+                verifier
+                    .verify_payment(
+                        &xorname,
+                        Held::Bytes(len),
+                        Some(&proof),
+                        VerificationContext::ClientPut,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{len}: {e}")),
+                PaymentStatus::PaymentVerified
+            );
+        }
+    }
+
+    /// A payment notice carries no bytes, so it is admitted at the smallest
+    /// class's amount, and refused below it.
+    #[tokio::test]
+    async fn a_payment_notice_is_admitted_at_the_smallest_class() {
+        let xorname = [0x6Bu8; 32];
+        let smallest = Held::Notice.weight();
+        assert_eq!(smallest, record_weight(DATA_TYPE_CHUNK, 0));
+
+        let short = create_test_verifier();
+        let proof = weighted_test_proof(&short, xorname, |median| {
+            weighted(median, smallest) - Amount::from(1u64)
+        });
+        let err = short
+            .verify_payment(
+                &xorname,
+                Held::Notice,
+                Some(&proof),
+                VerificationContext::PaidListAdmission,
+            )
+            .await
+            .expect_err("below the smallest class is refused");
+        assert!(err.to_string().contains("not paid enough"), "{err}");
+
+        let exact = create_test_verifier();
+        let proof = weighted_test_proof(&exact, xorname, |median| weighted(median, smallest));
+        assert_eq!(
+            exact
+                .verify_payment(
+                    &xorname,
+                    Held::Notice,
+                    Some(&proof),
+                    VerificationContext::PaidListAdmission,
+                )
+                .await
+                .expect("the smallest class's amount admits a notice"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    /// A pointer's payment must cover a pointer's weight, which its data
+    /// type sets: that amount clears, one wei less does not.
+    #[tokio::test]
+    async fn a_pointer_payment_requires_the_pointer_weight() {
+        let routing: XorName = [0x6Cu8; 32];
+        let state_id: XorName = [0x6Du8; 32];
+        let weight = pointer_weight();
+        assert!(weight < RecordWeight::FULL);
+        assert_eq!(weight, record_weight(DATA_TYPE_POINTER, 0));
+
+        let short = create_test_verifier();
+        let proof = weighted_test_proof(&short, state_id, |median| {
+            weighted(median, weight) - Amount::from(1u64)
+        });
+        let err = short
+            .verify_pointer_payment(&routing, &state_id, &proof)
+            .await
+            .expect_err("one wei under the pointer's amount is refused");
+        assert!(err.to_string().contains("not paid enough"), "{err}");
+
+        let exact = create_test_verifier();
+        let proof = weighted_test_proof(&exact, state_id, |median| weighted(median, weight));
+        exact
+            .verify_pointer_payment(&routing, &state_id, &proof)
+            .await
+            .expect("the pointer's weighted amount pays for it");
+    }
+
+    /// An enforced floor never refuses a correct weighted payment: the floor
+    /// weighs its requirement by the held bytes' class, as the per-quote check
+    /// does. The same payment is below the floor a full chunk needs.
+    #[tokio::test]
+    async fn an_enforced_floor_never_refuses_a_correct_weighted_payment() {
+        let verifier = floor_test_verifier(true);
+        let xorname = [0x6Eu8; 32];
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
+        let held = Held::Bytes(1);
+        let median_price = price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize);
+        let settled = weighted(median_price, held.weight());
+        assert!(
+            settled < group_floor_required_amount(),
+            "only meaningful when the unweighted floor would refuse it"
+        );
+        let proof_bytes = group_floor_proof(
+            &verifier,
+            xorname,
+            GROUP_TEST_MEDIAN_KEY_COUNT as usize,
+            settled,
+            &neighbours,
+        );
+
+        assert_eq!(
+            verifier
+                .verify_payment(
+                    &xorname,
+                    held,
+                    Some(&proof_bytes),
+                    VerificationContext::ClientPut
+                )
+                .await
+                .expect("a correct weighted payment clears the enforced floor"),
+            PaymentStatus::PaymentVerified
+        );
     }
 }
 

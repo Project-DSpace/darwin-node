@@ -41,7 +41,7 @@ use crate::listings::ListingService;
 use crate::logging::{debug, info, warn};
 use crate::payment::settlement::Lane;
 use crate::payment::{
-    PaymentVerifier, QuoteGenerator, VerificationContext, BATCH_PAYMENTS_REFUSED,
+    Held, PaymentVerifier, QuoteGenerator, VerificationContext, BATCH_PAYMENTS_REFUSED,
     PUT_PAYMENT_DEADLINE,
 };
 use crate::pointer::PointerService;
@@ -955,6 +955,7 @@ impl AntProtocol {
             .payment_verifier
             .verify_payment(
                 address,
+                Held::Bytes(request.content.len()),
                 request.payment_proof.as_deref(),
                 VerificationContext::ClientPut,
             )

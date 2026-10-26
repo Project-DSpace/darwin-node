@@ -295,6 +295,55 @@ fn nothing_withholds_the_unheld_chunk_penalty() {
     }
 }
 
+/// Every chunk payment check requires the weighted amount for the size class
+/// of the bytes the node holds: what it holds is a required argument of the
+/// check (`Held`), so a path can't leave it out. This pins what each path
+/// passes: a PUT and a fresh offer the length of the bytes they store, and
+/// only a payment notice, which carries no bytes, the smallest class. A new
+/// path fails here until it is reviewed and listed.
+#[test]
+fn every_chunk_payment_check_weighs_the_bytes_it_holds() {
+    let root = repo_path("");
+    let verifier = repo_path("src/payment/verifier.rs");
+    let mut sources = Vec::new();
+    rust_files(&repo_path("src"), &mut sources);
+    let mut found = Vec::new();
+    for path in sources {
+        let tests = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("_tests.rs"));
+        if path == verifier || tests {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let file = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        // The payment check's two variants: the listings service has a
+        // `Held` of its own, with other variants.
+        for variant in ["Held::Bytes(", "Held::Notice"] {
+            for (at, _) in text.match_indices(variant) {
+                let rest = &text[at..];
+                let end = rest.find([',', '\n']).unwrap_or(rest.len());
+                found.push((file.clone(), rest[..end].trim().to_string()));
+            }
+        }
+    }
+    found.sort();
+    let expected = [
+        ("src/replication/mod.rs", "Held::Bytes(data.len())"),
+        ("src/replication/mod.rs", "Held::Notice"),
+        (
+            "src/storage/handler.rs",
+            "Held::Bytes(request.content.len())",
+        ),
+    ]
+    .map(|(file, held)| (file.to_string(), held.to_string()));
+    assert_eq!(found, expected);
+}
+
 /// How the payment check reads the chain, through the path a node takes
 /// (`PaymentVerifier::verify_payment`) to a JSON-RPC provider on 127.0.0.1
 /// that answers as the vault's `completedPayments` does: no test override
@@ -312,17 +361,26 @@ fn nothing_withholds_the_unheld_chunk_penalty() {
 mod payment_reads {
     use ant_node::ant_protocol::PROOF_TAG_MERKLE;
     use ant_node::payment::{
-        calculate_price, serialize_single_node_proof, EvmVerifierConfig, PaymentProof,
+        calculate_price, serialize_single_node_proof, EvmVerifierConfig, Held, PaymentProof,
         PaymentStatus, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig,
         VerificationContext, BATCH_PAYMENTS_REFUSED, MIN_PAYMENT_PROOF_SIZE_BYTES,
     };
     use ant_node::CLOSE_GROUP_SIZE;
+    use ant_protocol::chunk::MAX_CHUNK_SIZE;
+    use ant_protocol::payment::pricing::{weighted_amount, RecordWeight};
     use evmlib::common::Amount;
     use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
     use saorsa_pqc::api::sig::ml_dsa_65;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A whole chunk's bytes: its payment must cover 3 × the median quote.
+    const FULL_CHUNK: Held = Held::Bytes(MAX_CHUNK_SIZE);
+
+    /// The bytes of a chunk in the smallest size class, whose payment must
+    /// cover the least.
+    const SMALL_CHUNK: Held = Held::Bytes(1);
 
     /// A payment read that fails is made again in a second round, half a
     /// second later (`PAYMENT_READ_ROUNDS`, `PAYMENT_READ_BACKOFF` in
@@ -538,6 +596,12 @@ mod payment_reads {
             prefix
         }
 
+        /// The amount due from a node holding `held` of the chunk: 3 × the
+        /// median price × the weight of `held`'s size class, rounded up.
+        fn due(&self, held: Held) -> u128 {
+            u128::try_from(weighted_amount(self.median.price, held.weight()).unwrap()).unwrap()
+        }
+
         /// The paid quote's rewards address.
         fn median_payee(&self) -> [u8; 20] {
             self.median.rewards_address.as_slice().try_into().unwrap()
@@ -645,7 +709,7 @@ mod payment_reads {
         let verifier = verifier(&provider, &bundle);
         let started = Instant::now();
         let outcome = verifier
-            .verify_payment(&bundle.xorname, Some(&bundle.proof), context)
+            .verify_payment(&bundle.xorname, FULL_CHUNK, Some(&bundle.proof), context)
             .await
             .map_err(|e| e.to_string());
         let took = started.elapsed();
@@ -839,7 +903,7 @@ mod payment_reads {
             let mut proof = vec![0u8; MIN_PAYMENT_PROOF_SIZE_BYTES.max(64)];
             proof[0] = PROOF_TAG_MERKLE;
             let err = verifier
-                .verify_payment(&bundle.xorname, Some(&proof), context)
+                .verify_payment(&bundle.xorname, FULL_CHUNK, Some(&proof), context)
                 .await
                 .expect_err("a merkle proof is refused");
             assert!(
@@ -938,7 +1002,7 @@ mod payment_reads {
         ]);
         let started = Instant::now();
         let outcome = verifier
-            .verify_payment(&bundle.xorname, Some(&bundle.proof), context)
+            .verify_payment(&bundle.xorname, FULL_CHUNK, Some(&bundle.proof), context)
             .await
             .map_err(|e| e.to_string());
         let took = started.elapsed();
@@ -1264,6 +1328,20 @@ mod payment_reads {
         receipt: fn(&Bundle) -> Receipt,
         record: fn(&Bundle) -> Answer,
     ) -> (Result<PaymentStatus, String>, usize, usize) {
+        check_held(seed, context, FULL_CHUNK, &[[0x77; 32]], receipt, record).await
+    }
+
+    /// [`check_naming`] for a node holding `held` of the chunk, with a proof
+    /// naming `tx_hashes`: none, or the one transaction whose receipt is
+    /// `receipt`.
+    async fn check_held(
+        seed: u8,
+        context: VerificationContext,
+        held: Held,
+        tx_hashes: &[[u8; 32]],
+        receipt: impl Fn(&Bundle) -> Receipt,
+        record: impl Fn(&Bundle) -> Answer,
+    ) -> (Result<PaymentStatus, String>, usize, usize) {
         let bundle = bundle(seed);
         let (url, receipts, records) =
             chain_provider(receipt_json(&bundle, &receipt(&bundle)), record(&bundle)).await;
@@ -1278,7 +1356,8 @@ mod payment_reads {
         let outcome = verifier
             .verify_payment(
                 &bundle.xorname,
-                Some(&bundle.proof_naming(&[[0x77; 32]])),
+                held,
+                Some(&bundle.proof_naming(tx_hashes)),
                 context,
             )
             .await
@@ -1401,6 +1480,128 @@ mod payment_reads {
                 }
                 assert_eq!(receipt_reads, 1, "{case}");
                 assert_eq!(record_reads, reads, "{case}: the record read decides");
+            }
+        }
+    }
+
+    /// A case of the weighted requirement through the read path: what the
+    /// node holds, whether the proof names the transaction, its receipt,
+    /// the vault's record, whether the payment verifies, and the receipt and
+    /// record reads it takes.
+    type WeightedCase = (
+        &'static str,
+        Held,
+        bool,
+        fn(&Bundle) -> Receipt,
+        fn(&Bundle) -> Answer,
+        bool,
+        (usize, usize),
+    );
+
+    /// The weighted requirement reads the paid amount through the same path
+    /// as the full one: the payment cache's facts from the proof's receipts,
+    /// then the vault's record. A miss, no fact or one paying less than the
+    /// held class's amount, goes to the record read, and is never taken as
+    /// "zero paid": a small chunk paid at its class's amount verifies from
+    /// either, a wei less is refused only by the record, and a fact paying a
+    /// small class leaves a full chunk's check to the record.
+    #[tokio::test]
+    async fn the_weighted_requirement_reads_the_paid_amount_and_a_miss_is_never_zero_paid() {
+        fn no_receipt(_: &Bundle) -> Receipt {
+            Receipt {
+                success: true,
+                logs: Vec::new(),
+            }
+        }
+        fn receipt_paying(bundle: &Bundle, amount: u128) -> Receipt {
+            Receipt {
+                success: true,
+                logs: vec![(vault_address(), bundle.median_payee(), amount)],
+            }
+        }
+        assert!(SMALL_CHUNK.weight() < RecordWeight::FULL);
+        let cases: [WeightedCase; 7] = [
+            (
+                "no fact, the record pays the small class",
+                SMALL_CHUNK,
+                false,
+                no_receipt,
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(SMALL_CHUNK)),
+                true,
+                (0, 1),
+            ),
+            (
+                "no fact, the record a wei short of the small class",
+                SMALL_CHUNK,
+                false,
+                no_receipt,
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(SMALL_CHUNK) - 1),
+                false,
+                (0, 1),
+            ),
+            (
+                "no fact, the record empty",
+                SMALL_CHUNK,
+                false,
+                no_receipt,
+                |_| Answer::Record([0u8; 16], 0),
+                false,
+                (0, 2),
+            ),
+            (
+                "a receipt paying the small class",
+                SMALL_CHUNK,
+                true,
+                |bundle| receipt_paying(bundle, bundle.due(SMALL_CHUNK)),
+                // Read, the record would refuse: nothing is read.
+                |_| Answer::Record([0u8; 16], 0),
+                true,
+                (1, 0),
+            ),
+            (
+                "a receipt a wei short of the small class, the record paying it",
+                SMALL_CHUNK,
+                true,
+                |bundle| receipt_paying(bundle, bundle.due(SMALL_CHUNK) - 1),
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(SMALL_CHUNK)),
+                true,
+                (1, 1),
+            ),
+            (
+                "a full chunk, a receipt paying the small class, the record a full chunk",
+                FULL_CHUNK,
+                true,
+                |bundle| receipt_paying(bundle, bundle.due(SMALL_CHUNK)),
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(FULL_CHUNK)),
+                true,
+                (1, 1),
+            ),
+            (
+                "a full chunk, a receipt and the record paying the small class",
+                FULL_CHUNK,
+                true,
+                |bundle| receipt_paying(bundle, bundle.due(SMALL_CHUNK)),
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(SMALL_CHUNK)),
+                false,
+                (1, 1),
+            ),
+        ];
+        for (name, held, names_tx, receipt, record, verified, reads) in cases {
+            let tx_hashes: &[[u8; 32]] = if names_tx { &[[0x77; 32]] } else { &[] };
+            for context in CONTEXTS {
+                let (outcome, receipt_reads, record_reads) =
+                    check_held(0xE0, context, held, tx_hashes, receipt, record).await;
+                let case = format!("{context:?}, {name}");
+                if verified {
+                    assert_eq!(outcome, Ok(PaymentStatus::PaymentVerified), "{case}");
+                } else {
+                    let err = outcome.expect_err(&case);
+                    assert!(
+                        err.contains("not paid enough") || err.contains("read again"),
+                        "{case}: {err}"
+                    );
+                }
+                assert_eq!((receipt_reads, record_reads), reads, "{case}");
             }
         }
     }

@@ -69,7 +69,7 @@ use tokio_util::task::TaskTracker;
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::payment::{
-    PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
+    Held, PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
     MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
 use crate::pointer::store::PointerStore;
@@ -5954,13 +5954,14 @@ async fn handle_replication_message(
 async fn verify_payment_until_shutdown(
     payment_verifier: &Arc<PaymentVerifier>,
     key: &XorName,
+    held: Held,
     proof_of_payment: &[u8],
     context: VerificationContext,
     shutdown: &CancellationToken,
 ) -> Option<Result<crate::payment::PaymentStatus>> {
     tokio::select! {
         () = shutdown.cancelled() => None,
-        result = payment_verifier.verify_payment(key, Some(proof_of_payment), context) => {
+        result = payment_verifier.verify_payment(key, held, Some(proof_of_payment), context) => {
             Some(result)
         }
     }
@@ -6591,6 +6592,7 @@ async fn handle_fresh_offer(
     let Some(verification) = verify_payment_until_shutdown(
         &ctx.payment_verifier,
         key,
+        Held::Bytes(data.len()),
         &attempt.proof_of_payment,
         fresh_offer_payment_context(),
         &ctx.shutdown,
@@ -6961,6 +6963,7 @@ async fn record_paid_notify(
     let Some(verification) = verify_payment_until_shutdown(
         payment_verifier,
         &notify.key,
+        Held::Notice,
         &notify.proof_of_payment,
         paid_notify_payment_context(),
         shutdown,
