@@ -920,6 +920,20 @@ fn add_fault(faults_file: &Path, word: &str, value: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
+/// Takes a line out of the faults file, once the fault it names has done
+/// its part, so it reaches no other node.
+fn remove_fault(faults_file: &Path, word: &str, value: &[u8; 32]) -> Result<()> {
+    let line = format!("{word} {}", hex::encode(value));
+    let text = std::fs::read_to_string(faults_file)
+        .wrap_err_with(|| format!("reading {}", faults_file.display()))?;
+    let kept: String = text
+        .lines()
+        .filter(|found| *found != line)
+        .map(|found| format!("{found}\n"))
+        .collect();
+    std::fs::write(faults_file, kept).wrap_err_with(|| format!("writing {}", faults_file.display()))
+}
+
 /// The fault cases, after the uploads: repeated PUTs of every stored chunk,
 /// and, at nodes of this tree, holding notices lost on the way to one
 /// storer, a failed paid-list write, and retries answered from the payment
@@ -1075,6 +1089,8 @@ async fn faults(
         )
         .await?;
         let first = put(client, storer, address, &content, proof.clone()).await;
+        // The store failed at the storer: no other node fails it.
+        remove_fault(faults_file, "fail-store", &address)?;
         let retry = put(client, storer, address, &content, bad).await;
         let others = futures::future::join_all(
             quoted
