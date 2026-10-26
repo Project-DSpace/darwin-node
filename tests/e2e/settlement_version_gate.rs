@@ -20,6 +20,11 @@
 //! - **Above this node's current** — must come back `StorerUpdateRequired`.
 //!   A lagging node never reports a client fault.
 //!
+//! This testnet's nodes know no root vault, so the highest version they honour
+//! is the one before root proofs: the "current" case declares that version,
+//! a version-3 request is refused as `StorerUpdateRequired` naming it, and so
+//! is a version above this build's.
+//!
 //! Both refusals are unreachable in production today (`MIN` and `CURRENT` are
 //! both the first declarable version), so they are driven here by crafting the
 //! versions directly, which is what a future settlement bump will make real.
@@ -38,7 +43,7 @@ use ant_node::ant_protocol::{
     ProtocolError, CURRENT_SETTLEMENT_VERSION, MIN_SUPPORTED_SETTLEMENT_VERSION,
 };
 use ant_node::client::send_and_await_chunk_response;
-use ant_node::payment::BATCH_PAYMENTS_REFUSED;
+use ant_node::payment::{BATCH_PAYMENTS_REFUSED, ROOT_SETTLEMENT_VERSION};
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use serial_test::serial;
@@ -135,6 +140,12 @@ fn above_current_version() -> u32 {
     CURRENT_SETTLEMENT_VERSION.saturating_add(1)
 }
 
+/// The highest version a node with no root vault honours, as every node of
+/// this testnet is: the one before root proofs.
+fn honoured_version() -> u32 {
+    ROOT_SETTLEMENT_VERSION.saturating_sub(1)
+}
+
 #[tokio::test]
 #[serial]
 async fn settlement_version_gate_observed_on_live_network() {
@@ -187,23 +198,35 @@ async fn settlement_version_gate_observed_on_live_network() {
     )
     .await;
 
-    // -- New client, upgraded node. The case the whole fleet lands on.
+    // -- New client, upgraded node, settling under the highest version the
+    //    node honours. The case the whole fleet lands on.
+    let mut honoured = ChunkQuoteRequestV2::new(address, QUOTE_DATA_SIZE);
+    honoured.settlement_version = honoured_version();
     let current = single_node_quote(
         &client,
         &storer_peer,
         next_request_id(),
-        ChunkMessageBody::QuoteRequestV2(ChunkQuoteRequestV2::new(address, QUOTE_DATA_SIZE)),
+        ChunkMessageBody::QuoteRequestV2(honoured),
     )
     .await;
+    let mut honoured_merkle =
+        MerkleCandidateQuoteRequestV2::new(merkle_address, QUOTE_DATA_SIZE, timestamp);
+    honoured_merkle.settlement_version = honoured_version();
     let current_merkle = merkle_quote(
         &client,
         &storer_peer,
         next_request_id(),
-        ChunkMessageBody::MerkleCandidateQuoteRequestV2(MerkleCandidateQuoteRequestV2::new(
-            merkle_address,
-            QUOTE_DATA_SIZE,
-            timestamp,
-        )),
+        ChunkMessageBody::MerkleCandidateQuoteRequestV2(honoured_merkle),
+    )
+    .await;
+
+    // -- A client that may pay through the root vault, at a node that knows
+    //    none. Refused with a verdict about the node, before any payment.
+    let rootless = single_node_quote(
+        &client,
+        &storer_peer,
+        next_request_id(),
+        ChunkMessageBody::QuoteRequestV2(ChunkQuoteRequestV2::new(address, QUOTE_DATA_SIZE)),
     )
     .await;
 
@@ -303,13 +326,23 @@ async fn settlement_version_gate_observed_on_live_network() {
         }
         other => panic!("a stale merkle client was not refused as its own fault: {other:?}"),
     }
+    match rootless {
+        ChunkQuoteResponse::Error(ProtocolError::StorerUpdateRequired {
+            client_settlement_version,
+            node_settlement_version,
+        }) => {
+            assert_eq!(client_settlement_version, CURRENT_SETTLEMENT_VERSION);
+            assert_eq!(node_settlement_version, honoured_version());
+        }
+        other => panic!("a node with no root vault quoted a root-paying client: {other:?}"),
+    }
     match node_behind {
         ChunkQuoteResponse::Error(ProtocolError::StorerUpdateRequired {
             client_settlement_version,
             node_settlement_version,
         }) => {
             assert_eq!(client_settlement_version, above_current_version());
-            assert_eq!(node_settlement_version, CURRENT_SETTLEMENT_VERSION);
+            assert_eq!(node_settlement_version, honoured_version());
         }
         other => panic!("a lagging node blamed the client instead of itself: {other:?}"),
     }
@@ -319,7 +352,7 @@ async fn settlement_version_gate_observed_on_live_network() {
             node_settlement_version,
         }) => {
             assert_eq!(client_settlement_version, above_current_version());
-            assert_eq!(node_settlement_version, CURRENT_SETTLEMENT_VERSION);
+            assert_eq!(node_settlement_version, honoured_version());
         }
         other => panic!("a lagging node blamed the merkle client instead of itself: {other:?}"),
     }

@@ -1011,6 +1011,14 @@ impl PaymentVerifier {
         self.reads.root_vault()
     }
 
+    /// Whether this node can check a root proof: it knows a root vault. With
+    /// none, every root proof is refused, so the node must not quote a client
+    /// settling under [`ROOT_SETTLEMENT_VERSION`](crate::payment::ROOT_SETTLEMENT_VERSION).
+    #[must_use]
+    pub fn accepts_root_proofs(&self) -> bool {
+        self.reads.root_vault().is_some()
+    }
+
     /// Create a new payment verifier.
     #[must_use]
     pub fn new(config: PaymentVerifierConfig) -> Self {
@@ -1951,14 +1959,8 @@ impl PaymentVerifier {
             .await?;
 
         let paid_price = candidate.quote.price;
-        self.enforce_price_floor(
-            target.routing(),
-            weight,
-            paid_price,
-            proof.amount,
-            context,
-        )
-        .await?;
+        self.enforce_price_floor(target.routing(), weight, paid_price, proof.amount, context)
+            .await?;
         Self::log_off_curve_single_node(payment);
         if context.is_store_admission() {
             self.cross_check_quotes(

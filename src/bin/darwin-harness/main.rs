@@ -347,7 +347,10 @@ async fn quote(
     address: [u8; 32],
     size: usize,
 ) -> (PeerId, std::result::Result<Quoted, String>) {
-    let request = ChunkQuoteRequestV2::new(address, u64::try_from(size).unwrap_or(u64::MAX));
+    // The harness pays with single-node proofs, so it declares the version
+    // they settle under: a node with no root vault is quoted too.
+    let mut request = ChunkQuoteRequestV2::new(address, u64::try_from(size).unwrap_or(u64::MAX));
+    request.settlement_version = ant_node::payment::SIZE_PRICED_SETTLEMENT_VERSION;
     let answer = ask(
         client,
         &peer,

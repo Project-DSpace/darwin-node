@@ -50,6 +50,13 @@ pub struct QuoteBinding {
 /// declaring it, or a later one, is quoted at the node's weight total.
 pub const SIZE_PRICED_SETTLEMENT_VERSION: u32 = 2;
 
+/// The first settlement version whose clients may pay through the root vault
+/// (proof tag `0x03`). A node that knows no root vault refuses every root
+/// proof, so it answers a request declaring this version, or a later one, as
+/// a node one version older does: `StorerUpdateRequired`, naming
+/// `ROOT_SETTLEMENT_VERSION - 1` as the highest it can honour.
+pub const ROOT_SETTLEMENT_VERSION: u32 = 3;
+
 /// Which count a quote is priced at.
 ///
 /// Both carry the committed key count K and the pin; only the price differs,

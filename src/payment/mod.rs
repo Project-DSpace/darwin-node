@@ -58,7 +58,8 @@ pub use proof::{
     ProofType, RootPaymentProof,
 };
 pub use quote::{
-    wire_ml_dsa_signer, QuoteGenerator, QuotePricing, XorName, SIZE_PRICED_SETTLEMENT_VERSION,
+    wire_ml_dsa_signer, QuoteGenerator, QuotePricing, XorName, ROOT_SETTLEMENT_VERSION,
+    SIZE_PRICED_SETTLEMENT_VERSION,
 };
 pub use settlement::{CLIENT_STORE_WAIT, PUT_PAYMENT_DEADLINE};
 // Wire-side signature verification lives in ant-protocol. Re-exported here

@@ -42,7 +42,7 @@ use crate::logging::{debug, info, warn};
 use crate::payment::settlement::Lane;
 use crate::payment::{
     Held, PaymentVerifier, QuoteGenerator, QuotePricing, VerificationContext,
-    BATCH_PAYMENTS_REFUSED, PUT_PAYMENT_DEADLINE,
+    BATCH_PAYMENTS_REFUSED, PUT_PAYMENT_DEADLINE, ROOT_SETTLEMENT_VERSION,
 };
 use crate::pointer::PointerService;
 use crate::replication::admission;
@@ -296,8 +296,34 @@ static UNVERSIONED_QUOTE_REQUESTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU6
 /// time, once the client has settled on-chain. The client is told to use a
 /// different storer rather than to upgrade, because it is this node that is
 /// behind.
-fn settlement_gate(client_settlement_version: u32, path: &str) -> Option<ProtocolError> {
+///
+/// `node_settlement_version` is the highest version this node can honour
+/// ([`AntProtocol::node_settlement_version`]): [`CURRENT_SETTLEMENT_VERSION`],
+/// or the version before [`ROOT_SETTLEMENT_VERSION`] when the node knows no
+/// root vault and so refuses every root proof. A version this build knows but
+/// the node can't honour is refused the same way as one it doesn't know, so
+/// the client settles with single-node proofs instead.
+fn settlement_gate(
+    client_settlement_version: u32,
+    node_settlement_version: u32,
+    path: &str,
+) -> Option<ProtocolError> {
     match settlement_compatibility(client_settlement_version) {
+        SettlementCompatibility::Compatible
+            if client_settlement_version > node_settlement_version =>
+        {
+            warn!(
+                target: "ant_node::quote::settlement",
+                "Refusing {path} quote: client settles under version \
+                 {client_settlement_version}, and this node knows no root vault, so it \
+                 honours version {node_settlement_version} at most. The client has not \
+                 been charged.",
+            );
+            Some(ProtocolError::StorerUpdateRequired {
+                client_settlement_version,
+                node_settlement_version,
+            })
+        }
         SettlementCompatibility::Compatible => None,
         SettlementCompatibility::ClientTooOld => {
             warn!(
@@ -325,7 +351,7 @@ fn settlement_gate(client_settlement_version: u32, path: &str) -> Option<Protoco
             );
             Some(ProtocolError::StorerUpdateRequired {
                 client_settlement_version,
-                node_settlement_version: CURRENT_SETTLEMENT_VERSION,
+                node_settlement_version,
             })
         }
     }
@@ -1165,6 +1191,18 @@ impl AntProtocol {
         }
     }
 
+    /// The highest settlement version this node can honour:
+    /// [`CURRENT_SETTLEMENT_VERSION`] when it knows a root vault, else the
+    /// version before [`ROOT_SETTLEMENT_VERSION`], since with no root vault
+    /// every root proof is refused.
+    fn node_settlement_version(&self) -> u32 {
+        if self.payment_verifier.accepts_root_proofs() {
+            CURRENT_SETTLEMENT_VERSION
+        } else {
+            ROOT_SETTLEMENT_VERSION.saturating_sub(1)
+        }
+    }
+
     /// Handle a version-declaring storage quote request.
     ///
     /// Refuse first, then fall through to the handler unversioned requests
@@ -1175,7 +1213,11 @@ impl AntProtocol {
     /// today's price.
     fn handle_quote_v2(&self, request: &ChunkQuoteRequestV2) -> ChunkQuoteResponse {
         traffic::record_quote_version(request.settlement_version);
-        if let Some(refusal) = settlement_gate(request.settlement_version, "single_node") {
+        if let Some(refusal) = settlement_gate(
+            request.settlement_version,
+            self.node_settlement_version(),
+            "single_node",
+        ) {
             return ChunkQuoteResponse::Error(refusal);
         }
         self.handle_priced_quote(
@@ -1197,7 +1239,11 @@ impl AntProtocol {
         &self,
         request: &MerkleCandidateQuoteRequestV2,
     ) -> MerkleCandidateQuoteResponse {
-        if let Some(refusal) = settlement_gate(request.settlement_version, "merkle") {
+        if let Some(refusal) = settlement_gate(
+            request.settlement_version,
+            self.node_settlement_version(),
+            "merkle",
+        ) {
             return MerkleCandidateQuoteResponse::Error(refusal);
         }
         self.handle_merkle_candidate_quote(&MerkleCandidateQuoteRequest {
@@ -1393,6 +1439,26 @@ mod tests {
     /// always true, so the disk-space pre-check in `handle_put_inner` fails —
     /// used to exercise the V2-411 early-return path.
     async fn create_test_protocol_with_reserve(disk_reserve: u64) -> (AntProtocol, TempDir) {
+        create_test_protocol_with(disk_reserve, None).await
+    }
+
+    /// A test protocol whose payment verifier knows `root_vault`, as a node
+    /// on a network with one does.
+    async fn create_test_protocol_with_root_vault() -> (AntProtocol, TempDir) {
+        create_test_protocol_with(
+            0,
+            Some(ant_listings::RootVault {
+                address: [0x6a; 20],
+                token: [0x7b; 20],
+            }),
+        )
+        .await
+    }
+
+    async fn create_test_protocol_with(
+        disk_reserve: u64,
+        root_vault: Option<ant_listings::RootVault>,
+    ) -> (AntProtocol, TempDir) {
         let temp_dir = TempDir::new().expect("create temp dir");
 
         let storage_config = ChunkStoreConfig {
@@ -1408,7 +1474,10 @@ mod tests {
 
         let rewards_address = RewardsAddress::new([1u8; 20]);
         let payment_config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig::default(),
+            evm: EvmVerifierConfig {
+                root_vault,
+                ..EvmVerifierConfig::default()
+            },
             cache_capacity: 100_000,
             close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
@@ -2007,7 +2076,7 @@ mod tests {
     /// acceptable.
     #[tokio::test]
     async fn v2_merkle_quote_is_refused_at_the_current_settlement_version() {
-        let (protocol, _temp) = create_test_protocol().await;
+        let (protocol, _temp) = create_test_protocol_with_root_vault().await;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
@@ -2200,19 +2269,12 @@ mod tests {
         }
 
         // A settlement-2 request, which a client paying by size sends, is
-        // quoted at the weight total: release 2 settles at version 2, so the
+        // quoted at the weight total, by a node with no root vault too: the
         // gate admits it rather than answering StorerUpdateRequired.
-        assert_eq!(CURRENT_SETTLEMENT_VERSION, SIZE_PRICED_SETTLEMENT_VERSION);
         let mut v2 = ChunkQuoteRequestV2::new([0xC4; 32], 1);
-        v2.settlement_version = 2;
+        v2.settlement_version = SIZE_PRICED_SETTLEMENT_VERSION;
         assert_eq!(
             quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v2)).await,
-            calculate_price(253)
-        );
-        let current = ChunkQuoteRequestV2::new([0xC5; 32], 1);
-        assert_eq!(current.settlement_version, 2);
-        assert_eq!(
-            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(current)).await,
             calculate_price(253)
         );
     }
@@ -2228,7 +2290,7 @@ mod tests {
     /// wrong for most of the fleet at once.
     #[tokio::test]
     async fn a_newer_settlement_version_is_refused_as_this_nodes_fault() {
-        let (protocol, _temp) = create_test_protocol().await;
+        let (protocol, _temp) = create_test_protocol_with_root_vault().await;
 
         let mut request = ChunkQuoteRequestV2::new([0xBB; 32], 4096);
         request.settlement_version = CURRENT_SETTLEMENT_VERSION.saturating_add(1);
@@ -2262,46 +2324,105 @@ mod tests {
     }
 
     /// Settlement version 3 means root proofs are accepted, and its quote is
-    /// a version-2 quote: every version from the minimum, 1, to 3 is quoted,
-    /// at one price, and each request is counted by its version.
+    /// a version-2 quote: at a node that knows a root vault, every version
+    /// from the minimum, 1, to 3 is quoted, versions 2 and 3 at the weight
+    /// total and version 1 at today's price, and each request is counted by
+    /// its version.
     #[tokio::test]
     async fn settlement_versions_one_to_three_are_quoted_alike() {
-        assert_eq!(CURRENT_SETTLEMENT_VERSION, 3);
-        assert_eq!(MIN_SUPPORTED_SETTLEMENT_VERSION, 1);
-        let (protocol, _temp) = create_test_protocol().await;
+        use crate::payment::pricing::calculate_price;
 
-        let mut prices = Vec::new();
-        for version in 1..=3u32 {
+        assert_eq!(CURRENT_SETTLEMENT_VERSION, 3);
+        assert_eq!(ROOT_SETTLEMENT_VERSION, CURRENT_SETTLEMENT_VERSION);
+        assert_eq!(MIN_SUPPORTED_SETTLEMENT_VERSION, 1);
+        let (protocol, _temp) = create_test_protocol_with_root_vault().await;
+        assert!(protocol.payment_verifier.accepts_root_proofs());
+        // 1,000 records in the smallest class: m = ceil(1,000 × 259 / 1,024).
+        attach_weighed_commitment(&protocol, 1_000, 253);
+
+        for (version, price) in [
+            (1u32, calculate_price(1_000)),
+            (2, calculate_price(253)),
+            (3, calculate_price(253)),
+        ] {
             let counted = crate::storage::traffic::quote_versions(version);
-            let mut request = ChunkQuoteRequestV2::new([0xBC; 32], 4096);
+            let mut request = ChunkQuoteRequestV2::new([0xBC; 32], 1);
             request.settlement_version = version;
-            let msg = ChunkMessage {
-                request_id: 710 + u64::from(version),
-                body: ChunkMessageBody::QuoteRequestV2(request),
-            };
-            let response_bytes = protocol
-                .try_handle_request(&msg.encode().expect("encode request"))
-                .await
-                .expect("handle v2 quote")
-                .expect("expected response");
-            let response = ChunkMessage::decode(&response_bytes).expect("decode response");
-            match response.body {
-                ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote, .. }) => {
-                    let quote: evmlib::PaymentQuote =
-                        rmp_serde::from_slice(&quote).expect("decode quote");
-                    prices.push(quote.price);
-                }
-                other => panic!("version {version} must be quoted, got: {other:?}"),
-            }
+            assert_eq!(
+                quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(request)).await,
+                price,
+                "version {version}"
+            );
             assert!(
                 crate::storage::traffic::quote_versions(version) > counted,
                 "version {version} is counted"
             );
         }
-        assert!(
-            prices.windows(2).all(|pair| pair[0] == pair[1]),
-            "one price for every version: {prices:?}"
+    }
+
+    /// A node that knows no root vault refuses every root proof, so it must
+    /// not quote a version-3 request: it answers as a version-2 node does,
+    /// `StorerUpdateRequired` naming 2, on the single-node and merkle paths
+    /// alike, and the client settles with single-node proofs instead.
+    /// Versions 1 and 2 are still quoted.
+    #[tokio::test]
+    async fn a_node_without_a_root_vault_does_not_quote_version_three() {
+        let (protocol, _temp) = create_test_protocol().await;
+        assert!(!protocol.payment_verifier.accepts_root_proofs());
+        assert_eq!(
+            protocol.node_settlement_version(),
+            ROOT_SETTLEMENT_VERSION - 1
         );
+
+        for version in ROOT_SETTLEMENT_VERSION..=CURRENT_SETTLEMENT_VERSION {
+            let mut request = ChunkQuoteRequestV2::new([0xBD; 32], 4096);
+            request.settlement_version = version;
+            match protocol.handle_quote_v2(&request) {
+                ChunkQuoteResponse::Error(ProtocolError::StorerUpdateRequired {
+                    client_settlement_version,
+                    node_settlement_version,
+                }) => {
+                    assert_eq!(client_settlement_version, version);
+                    assert_eq!(node_settlement_version, ROOT_SETTLEMENT_VERSION - 1);
+                }
+                other => panic!("version {version} must not be quoted, got: {other:?}"),
+            }
+            let mut merkle = MerkleCandidateQuoteRequestV2::new([0xBE; 32], 4096, 1_700_000_000);
+            merkle.settlement_version = version;
+            assert!(
+                matches!(
+                    protocol.handle_merkle_candidate_quote_v2(&merkle),
+                    MerkleCandidateQuoteResponse::Error(ProtocolError::StorerUpdateRequired {
+                        node_settlement_version: 2,
+                        ..
+                    })
+                ),
+                "merkle version {version}"
+            );
+        }
+        for version in 1..ROOT_SETTLEMENT_VERSION {
+            let mut request = ChunkQuoteRequestV2::new([0xBF; 32], 4096);
+            request.settlement_version = version;
+            assert!(
+                matches!(
+                    protocol.handle_quote_v2(&request),
+                    ChunkQuoteResponse::Success { .. }
+                ),
+                "version {version} is quoted"
+            );
+        }
+
+        // A version newer than this build knows names the version this node
+        // can honour too, not the build's.
+        let mut newer = ChunkQuoteRequestV2::new([0xBF; 32], 4096);
+        newer.settlement_version = CURRENT_SETTLEMENT_VERSION + 1;
+        assert!(matches!(
+            protocol.handle_quote_v2(&newer),
+            ChunkQuoteResponse::Error(ProtocolError::StorerUpdateRequired {
+                node_settlement_version: 2,
+                ..
+            })
+        ));
     }
 
     /// Legacy requests keep working. A node cannot tell a client that settles

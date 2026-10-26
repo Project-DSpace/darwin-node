@@ -578,6 +578,12 @@ impl NodeBuilder {
             .root_vault()
             .map_err(Error::Startup)?;
         info!("{}", root_vault_line(root_vault_setting));
+        if let Some(line) = root_vault_override_line(
+            config.payment.evm_network.is_production(),
+            root_vault_setting,
+        ) {
+            warn!("{line}");
+        }
         let root_vault = root_vault_setting.vault();
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
@@ -705,6 +711,27 @@ fn root_vault_line(setting: RootVaultSetting) -> String {
             "No root vault is known for this network: root proofs are refused".to_string()
         }
     }
+}
+
+/// What a node on the production network warns once at start when its root
+/// vault setting gives a vault other than the one built in: the setting wins,
+/// so the node reads that vault, finds no record of any root payment made
+/// through the built-in one, and refuses those proofs. `None` for a setting
+/// that gives the built-in vault, for no setting, and off the production
+/// network.
+fn root_vault_override_line(production: bool, setting: RootVaultSetting) -> Option<String> {
+    let RootVaultSetting::Given(vault) = setting else {
+        return None;
+    };
+    let given = format!("0x{}", hex::encode(vault.address));
+    if !production || given.eq_ignore_ascii_case(crate::config::PRODUCTION_ROOT_VAULT) {
+        return None;
+    }
+    Some(format!(
+        "The root vault setting gives {given}, not the production network's {}: this node \
+         reads only the vault given, and refuses root proofs paid through the built-in one",
+        crate::config::PRODUCTION_ROOT_VAULT
+    ))
 }
 
 /// A running Ant node.
@@ -1975,6 +2002,46 @@ mod tests {
         assert_eq!(
             root_vault_line(RootVaultSetting::None),
             "No root vault is known for this network: root proofs are refused"
+        );
+    }
+
+    /// A production-network node whose setting gives a root vault other than
+    /// the built-in one is warned at start; the built-in vault given, no
+    /// setting, and another network are not.
+    #[test]
+    fn a_production_node_is_warned_when_its_setting_overrides_the_built_in_root_vault() {
+        let other = ant_listings::RootVault {
+            address: [0x9f; 20],
+            token: [0x51; 20],
+        };
+        let line = root_vault_override_line(true, RootVaultSetting::Given(other))
+            .expect("an override on the production network is warned");
+        assert!(
+            line.contains(&format!("0x{}", hex::encode(other.address))),
+            "{line}"
+        );
+        assert!(
+            line.contains(crate::config::PRODUCTION_ROOT_VAULT),
+            "{line}"
+        );
+
+        let mut built_in = other;
+        built_in.address.copy_from_slice(
+            &hex::decode(crate::config::PRODUCTION_ROOT_VAULT.trim_start_matches("0x"))
+                .expect("hex"),
+        );
+        assert_eq!(
+            root_vault_override_line(true, RootVaultSetting::Given(built_in)),
+            None
+        );
+        assert_eq!(
+            root_vault_override_line(true, RootVaultSetting::BuiltIn(built_in)),
+            None
+        );
+        assert_eq!(root_vault_override_line(true, RootVaultSetting::None), None);
+        assert_eq!(
+            root_vault_override_line(false, RootVaultSetting::Given(other)),
+            None
         );
     }
 

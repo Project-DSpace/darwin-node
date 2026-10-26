@@ -114,9 +114,12 @@ async fn blocked_put_lifecycle(probe_multiplex: bool) -> Result<(), Box<dyn Erro
         // closed its channel even though both operations fit the source budget.
         let mut other = BrowserRpcClient::connect(&endpoint).await?;
         other.rpc(json!({"version":BROWSER_PROTOCOL_VERSION,"request_id":1,"type":"hello"}), &[]).await?;
-        let quote = other.chunk_rpc(2, ant_protocol::ChunkMessageBody::QuoteRequestV2(
-            ant_protocol::ChunkQuoteRequestV2::new([9; 32], 1024),
-        )).await?;
+        // The devnet's nodes know no root vault, so they honour the version
+        // before root proofs at most.
+        let honoured = ant_node::payment::ROOT_SETTLEMENT_VERSION - 1;
+        let mut request = ant_protocol::ChunkQuoteRequestV2::new([9; 32], 1024);
+        request.settlement_version = honoured;
+        let quote = other.chunk_rpc(2, ant_protocol::ChunkMessageBody::QuoteRequestV2(request)).await?;
         assert!(matches!(quote, ant_protocol::ChunkMessageBody::QuoteResponse(ant_protocol::ChunkQuoteResponse::Success { .. })));
 
         // Check the actual adapter and shared version gate, not only the
@@ -129,7 +132,7 @@ async fn blocked_put_lifecycle(probe_multiplex: bool) -> Result<(), Box<dyn Erro
             let expected = if version == 0 {
                 ant_protocol::ProtocolError::ClientUpdateRequired { client_settlement_version: 0, min_settlement_version: 1 }
             } else {
-                ant_protocol::ProtocolError::StorerUpdateRequired { client_settlement_version: newer, node_settlement_version: ant_protocol::CURRENT_SETTLEMENT_VERSION }
+                ant_protocol::ProtocolError::StorerUpdateRequired { client_settlement_version: newer, node_settlement_version: honoured }
             };
             assert!(matches!(response, ant_protocol::ChunkMessageBody::QuoteResponse(ant_protocol::ChunkQuoteResponse::Error(ref error)) if *error == expected));
         }
