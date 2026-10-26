@@ -39,13 +39,16 @@ group, and still held at the end by a majority of the nodes that stored it
 (a node that joins later gets a record only by repair, which waits for the
 record to age, so the nodes nearest it now are counted but not required; a
 record PUT to one storer counts its close group at upload as its storers);
-every member of a chunk's paid group at upload, the devnet's nodes left out,
-listing the key in its paid list at the end; every repeated PUT answered
-"already stored"; and every standalone node received neighbour sync.
+every repeated PUT answered "already stored"; and every standalone node
+received neighbour sync. A record's one storer is never one of the devnet's
+nodes, which run no replication.
 
 Each mixed run must also show no proof refused by a node of the previous
 release in a notice, an offer or a pointer offer (each kind counted for each
-role) where no all-old run had one.
+role) where no all-old run had one; and, for each role, no more keys missing
+from the paid lists of the members of their paid group at upload (the
+devnet's nodes left out), read at the end, than the all-old runs' highest
+count plus --penalty-slack: each release lists what the previous one does.
 
 Each mixed run must also show no penalty heavier than the all-old runs': the
 penalties (saorsa-core's trust events that lower a peer's score) that the
@@ -552,9 +555,12 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         log(f"{name}: {len(incumbents)} incumbents up; settling {args.settle_seconds} s")
         time.sleep(args.settle_seconds)
 
+        # The devnet's nodes run no replication: never a record's one storer.
+        devnet_ids = sorted(path.name for path in (devnet_data / "nodes").iterdir()
+                            if path.is_dir())
         uploads = []
         uploads.append(upload(harness, manifest_path, folder / "uploads-before.json",
-                              args.records_before))
+                              args.records_before, devnet_ids))
         timeline["joiners"] = utc_now().isoformat()
         joiners = [start("joiner", index, joiner_release, index < full_count)
                    for index in range(args.joiners)]
@@ -563,7 +569,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
             f"{args.join_seconds} s")
         time.sleep(args.join_seconds)
         uploads.append(upload(harness, manifest_path, folder / "uploads-after.json",
-                              args.records_after))
+                              args.records_after, devnet_ids))
         new_peers = [node.peer_id for node in nodes if node.release.faults]
         faults = run_faults(harness, manifest_path, uploads[-1], faults_file, new_peers,
                             folder / "faults.json")
@@ -653,13 +659,14 @@ def client(harness, arguments, out):
     return out
 
 
-def upload(harness, manifest, out, records):
+def upload(harness, manifest, out, records, not_storers):
     sizes = ",".join(str(RECORD_SIZES[index % len(RECORD_SIZES)]) for index in range(records))
     log(f"uploading {records} records ({records // 2} to one storer) and "
         f"{POINTERS_PER_UPLOAD} pointers")
     return client(harness, ["upload", "--manifest", str(manifest), "--sizes", sizes,
                             "--one-storer", str(records // 2),
-                            "--pointers", str(POINTERS_PER_UPLOAD)], out)
+                            "--pointers", str(POINTERS_PER_UPLOAD),
+                            "--not-storers", ",".join(not_storers)], out)
 
 
 def run_faults(harness, manifest, uploads, faults_file, new_peers, out):
@@ -943,6 +950,12 @@ def comparisons(result, baselines, args):
     return entries
 
 
+def unlisted_count(result, role):
+    """How many keys the nodes of `role` miss from their paid lists, each
+    counted once for each member of the key's paid group at upload."""
+    return sum(1 for _, found, _, _ in result.get("unlisted", []) if found == role)
+
+
 def old_proof_refusals(result, baselines):
     """The proofs nodes of the previous release refused in a run, by role
     and kind, where no all-old run had one of that role and kind: as (role,
@@ -985,9 +998,6 @@ def verdicts(results, args):
                 failures.append(f"{name}: record {record['address']} is held at the end by "
                                 f"{record['held_by_storers']} of the "
                                 f"{len(record['storers'])} nodes that stored it")
-        for address, role, release, outcome in result.get("unlisted", []):
-            failures.append(f"{name}: a {role} of the {release} release, in record "
-                            f"{address}'s paid group at upload, doesn't list it: {outcome}")
         for case in result.get("faults", []):
             if case["case"] == "repeated PUT" and any(
                     answer["outcome"] != "already_stored" for answer in case["answers"]):
@@ -1008,6 +1018,12 @@ def verdicts(results, args):
                     failures.append(f"{name}: the {role}s received no {family}")
         if not is_measured(name, baselines):
             continue
+        for role in ("incumbent", "joiner"):
+            bases = [unlisted_count(baseline, role) for baseline in baselines]
+            count = unlisted_count(result, role)
+            if count > limit(bases, args):
+                failures.append(f"{name}: the {role}s in a paid group at upload miss {count} "
+                                f"keys from their paid lists, against {against(bases)}")
         for role, kind, count in old_proof_refusals(result, baselines):
             failures.append(f"{name}: the {role}s of the previous release refused {count} "
                             f"proofs in a {kind}, which no all-old run did")
@@ -1075,7 +1091,12 @@ def report(results, args):
         refused = ", ".join(f"{role} ({release}) {kind} {count}" for (role, release, kind), count
                             in sorted(result.get("proof_refusals", {}).items()))
         lines.append(f"proofs refused (role, release, kind): {refused or 'none'}")
-        lines.append(f"paid-group members not listing a key: {len(result.get('unlisted', []))}")
+        missing = {}
+        for _, role, release, _ in result.get("unlisted", []):
+            missing[(role, release)] = missing.get((role, release), 0) + 1
+        shown = ", ".join(f"{role}s ({release}) {count}"
+                          for (role, release), count in sorted(missing.items()))
+        lines.append(f"keys missing from paid-group members' paid lists: {shown or 'none'}")
         for case in result.get("faults", []):
             answers = ", ".join(answer["outcome"][:60] for answer in case["answers"])
             lines.append(f"fault case: {case['case']} at {case['address'][:16]}: "

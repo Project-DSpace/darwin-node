@@ -99,6 +99,10 @@ enum Command {
         /// state and sent to one storer only.
         #[arg(long, default_value_t = 0)]
         pointers: usize,
+        /// Peer ids, in hex, never chosen as a record's one storer: the
+        /// devnet's in-process nodes, which run no replication.
+        #[arg(long, value_delimiter = ',')]
+        not_storers: Vec<String>,
         /// Where to write what happened, as JSON.
         #[arg(long)]
         out: PathBuf,
@@ -289,11 +293,21 @@ async fn main() -> Result<()> {
             sizes,
             one_storer,
             pointers,
+            not_storers,
             out,
         } => {
             let manifest = read_manifest(&manifest)?;
+            let not_storers = peers_of(&not_storers)?;
             let client = join(&manifest).await?;
-            let result = upload(&client, &manifest, &sizes, one_storer, pointers).await;
+            let result = upload(
+                &client,
+                &manifest,
+                &sizes,
+                one_storer,
+                pointers,
+                &not_storers,
+            )
+            .await;
             client.shutdown().await.ok();
             write_json(&out, &result?)
         }
@@ -309,11 +323,7 @@ async fn main() -> Result<()> {
                 &std::fs::read(&uploads)
                     .wrap_err_with(|| format!("reading {}", uploads.display()))?,
             )?;
-            let new_peers = new_peers
-                .iter()
-                .filter(|peer| !peer.is_empty())
-                .map(|peer| bytes32(peer).map(PeerId::from_bytes))
-                .collect::<Result<Vec<_>>>()?;
+            let new_peers = peers_of(&new_peers)?;
             let client = join(&manifest).await?;
             let result = faults(&client, &manifest, &uploads, &faults_file, &new_peers).await;
             client.shutdown().await.ok();
@@ -350,6 +360,15 @@ async fn main() -> Result<()> {
             out,
         } => browser::load(&ready, sessions, get_seconds, max_rate, &out).await,
     }
+}
+
+/// Peer ids from hex, empty entries left out.
+fn peers_of(hex_ids: &[String]) -> Result<Vec<PeerId>> {
+    hex_ids
+        .iter()
+        .filter(|peer| !peer.is_empty())
+        .map(|peer| bytes32(peer).map(PeerId::from_bytes))
+        .collect()
 }
 
 fn read_manifest(path: &Path) -> Result<DevnetManifest> {
@@ -620,6 +639,7 @@ async fn upload(
     sizes: &[usize],
     one_storer: usize,
     pointers: usize,
+    not_storers: &[PeerId],
 ) -> Result<Uploads> {
     let wallet = wallet_of(manifest)?;
     let mut records = Vec::with_capacity(sizes.len() + pointers);
@@ -633,7 +653,17 @@ async fn upload(
         } else {
             Storers::AllQuoted
         };
-        if let Err(e) = store(client, &wallet, address, &content, to, &mut record).await {
+        if let Err(e) = store(
+            client,
+            &wallet,
+            address,
+            &content,
+            to,
+            not_storers,
+            &mut record,
+        )
+        .await
+        {
             record.error = Some(format!("{e:#}"));
         }
         print_record(index, &record);
@@ -641,7 +671,7 @@ async fn upload(
     }
     for index in 0..pointers {
         let mut record = new_record([0; 32], POINTER_WIRE_LEN, "pointer", true);
-        if let Err(e) = store_pointer(client, &wallet, &mut record).await {
+        if let Err(e) = store_pointer(client, &wallet, not_storers, &mut record).await {
             record.error = Some(format!("{e:#}"));
         }
         print_record(index, &record);
@@ -764,6 +794,7 @@ async fn store(
     address: [u8; 32],
     content: &[u8],
     to: Storers,
+    not_storers: &[PeerId],
     record: &mut Upload,
 ) -> Result<()> {
     let group = groups(client, &address, record).await?;
@@ -777,9 +808,9 @@ async fn store(
         record,
     )
     .await?;
-    let targets: &[PeerId] = match to {
-        Storers::AllQuoted => &quoted,
-        Storers::Nearest => &quoted[..1],
+    let targets: Vec<PeerId> = match to {
+        Storers::AllQuoted => quoted,
+        Storers::Nearest => vec![one_storer(&quoted, not_storers)?],
     };
     record.puts = futures::future::join_all(
         targets
@@ -788,6 +819,15 @@ async fn store(
     )
     .await;
     judge_puts(record)
+}
+
+/// The nearest node that quoted and may be a record's one storer.
+fn one_storer(quoted: &[PeerId], not_storers: &[PeerId]) -> Result<PeerId> {
+    quoted
+        .iter()
+        .find(|peer| !not_storers.contains(peer))
+        .copied()
+        .ok_or_else(|| eyre!("every node that quoted is one the devnet runs"))
 }
 
 /// Whether the record's PUTs stored it: by a majority of the close group, or
@@ -812,7 +852,12 @@ fn judge_puts(record: &mut Upload) -> Result<()> {
 
 /// Signs, pays for and stores a new pointer at one storer, noting each step
 /// in `record`: quoted and paid at its state, as a client pays for one.
-async fn store_pointer(client: &P2PNode, wallet: &Wallet, record: &mut Upload) -> Result<()> {
+async fn store_pointer(
+    client: &P2PNode,
+    wallet: &Wallet,
+    not_storers: &[PeerId],
+    record: &mut Upload,
+) -> Result<()> {
     let (pk, sk) = ml_dsa_65()
         .generate_keypair()
         .map_err(|e| eyre!("a pointer key: {e:?}"))?;
@@ -839,7 +884,8 @@ async fn store_pointer(client: &P2PNode, wallet: &Wallet, record: &mut Upload) -
         record,
     )
     .await?;
-    record.puts = vec![put_pointer(client, quoted[0], &pointer, proof).await];
+    let storer = one_storer(&quoted, not_storers)?;
+    record.puts = vec![put_pointer(client, storer, &pointer, proof).await];
     judge_puts(record)
 }
 

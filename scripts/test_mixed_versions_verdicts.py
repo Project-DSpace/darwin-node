@@ -3,8 +3,8 @@
 on made-up results: what a mixed run's penalties, refused PUTs and message
 families are measured against, with one all-old run and with several, and
 what counts as a new failure reason; proofs the previous release's nodes
-refused, paid-group members that don't list a key, and repeated PUTs not
-answered "already stored"; and that the report and summary.json
+refused, keys missing from paid-group members' paid lists, and repeated
+PUTs not answered "already stored"; and that the report and summary.json
 list every count measured, with its excess and limit, within the limit or
 not. The Test workflow runs it; run it by hand with
 `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
@@ -248,9 +248,19 @@ def main():
     expect("proofs this tree's nodes refused are not counted against the previous release",
            {**two, "old-hosts-new": result(proof_refusals={("joiner", "new", "offer"): 2})},
            options(), [])
-    expect("a paid-group member that doesn't list a key fails, in every run",
-           {"all-old": result(unlisted=[("ab" * 32, "incumbent", "old", "not_listed")])},
-           options(), ["doesn't list it: not_listed"])
+    def missing(role, count):
+        return [("ab" * 32, role, "old", "not_listed")] * count
+    expect("keys missing from paid lists as often as in the all-old runs pass",
+           {"all-old": result(unlisted=missing("incumbent", 3)),
+            "all-old-2": result(unlisted=missing("incumbent", 1)),
+            "new-hosts-old": result(unlisted=missing("incumbent", 3 + harness.PENALTY_SLACK))},
+           options(), [])
+    expect("more keys missing from paid lists than the all-old runs, past the slack, fails",
+           {"all-old": result(unlisted=missing("joiner", 2)),
+            "all-old-2": result(),
+            "old-hosts-new": result(unlisted=missing("joiner", 3 + harness.PENALTY_SLACK))},
+           options(),
+           [f"the joiners in a paid group at upload miss {3 + harness.PENALTY_SLACK} keys"])
     repeated = {"case": "repeated PUT", "address": "cd" * 32, "peer": None, "note": "",
                 "answers": [{"peer": "01", "outcome": "already_stored"},
                             {"peer": "02", "outcome": "stored"}]}
