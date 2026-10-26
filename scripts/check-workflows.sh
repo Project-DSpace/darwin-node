@@ -24,6 +24,10 @@
 #   every pin;
 # - its publish job runs in the release environment and needs build and
 #   checks;
+# - its build job hands the tagged commit's release-notes/<tag>.md, when it
+#   has one, to the publish job as release-notes.md, and the publish job
+#   writes the release's fixed text first and then that file's text into the
+#   notes it publishes;
 # - its latest job needs checks and publish, and moves :latest forward only:
 #   before it moves it, it reads :latest and refuses unless :latest's node
 #   is older than the release's, ordered as latest.yml orders them, or
@@ -441,6 +445,29 @@ else
             problem "release.yml's publish job must need ${need}"
         fi
     done
+
+    # A release's own notes: the build job, on the tagged commit, hands
+    # release-notes/<tag>.md on as release-notes.md (empty when there is
+    # none), and the publish job writes the fixed text, then that file's
+    # text, then publishes.
+    holds "$(step Package "${build}")" "release.yml's build job must hand the tagged commit's release-notes/<tag>.md to the publish job as release-notes.md" \
+        'touch release-notes.md' \
+        'if [[ -f "release-notes/$GITHUB_REF_NAME.md" ]]; then' \
+        'cp "release-notes/$GITHUB_REF_NAME.md" release-notes.md'
+    if ! grep -qx '            release-notes.md' <<<"${build}"; then
+        problem "release.yml's build job must upload release-notes.md with the archive"
+    fi
+    notes=$(step Publish "$(job publish)" | sed 's/^[[:space:]]*//')
+    holds "${notes}" "release.yml's publish job must add release-notes.md to the notes when it has any text" \
+        'if [[ -s release-notes.md ]]; then' \
+        '--title "Storage node $TAG" --notes-file notes.md'
+    fixed=$(grep -nxF -- '> notes.md' <<<"${notes}" | cut -d: -f1 | tr '\n' ' ' || true)
+    added=$(grep -nxF -- 'cat release-notes.md >> notes.md' <<<"${notes}" | cut -d: -f1 | tr '\n' ' ' || true)
+    created=$(grep -nF -- 'gh release create "$TAG"' <<<"${notes}" | cut -d: -f1 | tr '\n' ' ' || true)
+    if [[ ! "${fixed}" =~ ^[0-9]+\ $ || ! "${added}" =~ ^[0-9]+\ $ || ! "${created}" =~ ^[0-9]+\ $ ]] \
+        || ((fixed > added || added > created)); then
+        problem "release.yml's publish job must write the fixed text to notes.md once, then add release-notes.md once (cat release-notes.md >> notes.md), then create the release"
+    fi
 
     # :latest moves only after the publish, to the image of the checked
     # Build run.
@@ -1181,4 +1208,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, and moves :latest forward only; latest.yml runs only by hand with no default permissions, names each run for its digest, checks its own commit with this script, and moves :latest in the latest environment, once it asks for its one reviewer's approval, only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested (for a withdrawal, also recorded, or listed in ${RELEASE_IMAGES_FILE}), from a commit whose Test run succeeded, with a published release's node whose code changes since its tag node_code names, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, to an image without a marker from one with a marker only in a withdrawal with allow_unmarked, to an older node only once the withdrawn release is gone and no other published release is newer, to the same node only one image back, with its release checked again after the approval, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, each with one registry write, and build.yml's image job alone pushes other tags; only release.yml's publish job runs in the release environment, and latest.yml's latest job in the latest environment; ${RELEASE_IMAGES_FILE} lists the images releases put on :latest before attestation; ${TOOLCHAIN_FILE} pins an exact Rust release that every workflow builds with."
+echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, with the tagged commit's release notes after the fixed text,its Test run from the push to main or by hand without the listings cross-test, and moves :latest forward only; latest.yml runs only by hand with no default permissions, names each run for its digest, checks its own commit with this script, and moves :latest in the latest environment, once it asks for its one reviewer's approval, only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested (for a withdrawal, also recorded, or listed in ${RELEASE_IMAGES_FILE}), from a commit whose Test run succeeded, with a published release's node whose code changes since its tag node_code names, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, to an image without a marker from one with a marker only in a withdrawal with allow_unmarked, to an older node only once the withdrawn release is gone and no other published release is newer, to the same node only one image back, with its release checked again after the approval, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, each with one registry write, and build.yml's image job alone pushes other tags; only release.yml's publish job runs in the release environment, and latest.yml's latest job in the latest environment; ${RELEASE_IMAGES_FILE} lists the images releases put on :latest before attestation; ${TOOLCHAIN_FILE} pins an exact Rust release that every workflow builds with."

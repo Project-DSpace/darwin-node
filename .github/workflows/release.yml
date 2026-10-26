@@ -8,6 +8,8 @@
 # 0.21.0 < 0.21.0+ds.1 < 0.21.0+ds.2 < 0.21.1 < 0.21.1+ds.1. Bump Cargo.toml
 # (and Cargo.lock's ant-node entry) with every node code change, then tag it:
 # a running node only takes a release whose version is higher than its own.
+# A release's notes are a fixed text, then release-notes/<tag>.md (for
+# example release-notes/v0.21.0+ds.2.md) when the tagged commit has one.
 #
 # The tag has to come from a person: GitHub won't let GITHUB_TOKEN create a tag
 # on a commit that changes .github/workflows, so this only publishes an
@@ -160,9 +162,15 @@ jobs:
       # Autonomi's archives, it also carries the project's licence files, the
       # third-party notices and the Rust standard library's notices from the
       # toolchain that built the binary; whatever installs a release extracts
-      # only ant-node, so the extra files do not affect upgrades.
+      # only ant-node, so the extra files do not affect upgrades. The tagged
+      # commit's release-notes/<tag>.md, if it has one, goes to the publish
+      # job as release-notes.md, which is empty otherwise.
       - name: Package
         run: |
+          touch release-notes.md
+          if [[ -f "release-notes/$GITHUB_REF_NAME.md" ]]; then
+            cp "release-notes/$GITHUB_REF_NAME.md" release-notes.md
+          fi
           mkdir dist
           cp target/release/ant-node config/bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt dist/
           cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" dist/RUST-STD-COPYRIGHT.html
@@ -176,6 +184,7 @@ jobs:
           path: |
             ant-node-cli-linux-x64.tar.gz
             release-signing-key.pub
+            release-notes.md
           if-no-files-found: error
           retention-days: 1
 
@@ -276,7 +285,8 @@ jobs:
           sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt
 
       # Nodes fail to read the whole release list if any release has no title
-      # or no notes, so both are always set.
+      # or no notes, so both are always set. The release's own notes, from
+      # release-notes/<tag>.md in the tagged commit, follow the fixed text.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -291,6 +301,10 @@ jobs:
             "" \
             "The archive also contains LICENSE-MIT and LICENSE-APACHE, plus THIRD-PARTY-NOTICES.txt and RUST-STD-COPYRIGHT.html with the licences and copyright notices of the third-party code in the binary and of the tools used to build it." \
             > notes.md
+          if [[ -s release-notes.md ]]; then
+            echo >> notes.md
+            cat release-notes.md >> notes.md
+          fi
           gh release create "$TAG" --verify-tag --latest \
             --title "Storage node $TAG" --notes-file notes.md \
             ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig \

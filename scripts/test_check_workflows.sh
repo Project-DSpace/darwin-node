@@ -231,6 +231,33 @@ fresh
 edit "${RELEASE}" '    needs: [build, checks]' '    needs: build'
 expect "publish without the checks" "publish job must need checks"
 
+# A release's own notes reach its notes, after the fixed text.
+fresh
+edit "${RELEASE}" 'cp "release-notes/$GITHUB_REF_NAME.md" release-notes.md' 'cp "release-notes/latest.md" release-notes.md'
+expect "another file's notes taken" "build job must hand the tagged commit's release-notes/<tag>.md to the publish job"
+
+fresh
+edit "${RELEASE}" $'            release-notes.md\n' ''
+expect "the notes not uploaded" "build job must upload release-notes.md with the archive"
+
+fresh
+edit "${RELEASE}" 'if [[ -s release-notes.md ]]; then' 'if [[ -s notes.md ]]; then'
+expect "the notes added whatever they hold" "publish job must add release-notes.md to the notes when it has any text"
+
+fresh
+edit "${RELEASE}" 'cat release-notes.md >> notes.md' 'cat release-notes.md'
+expect "the notes left out" "publish job must write the fixed text to notes.md once, then add release-notes.md once"
+
+fresh
+edit "${RELEASE}" $'            cat release-notes.md >> notes.md\n' ''
+edit "${RELEASE}" $'          printf \'%s\\n\' \\\n            "Storage node $TAG for Linux' \
+    $'          cat release-notes.md >> notes.md\n          printf \'%s\\n\' \\\n            "Storage node $TAG for Linux'
+expect "the notes overwritten by the fixed text" "publish job must write the fixed text to notes.md once, then add release-notes.md once"
+
+fresh
+edit "${RELEASE}" $'            > notes.md\n' $'            >> notes.md\n'
+expect "the fixed text not written first" "publish job must write the fixed text to notes.md once, then add release-notes.md once"
+
 fresh
 edit "${RELEASE}" '    needs: [build, checks, publish]' '    needs: [build, checks]'
 expect "latest before the publish" "latest job must need publish"
