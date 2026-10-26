@@ -298,10 +298,9 @@ fn nothing_withholds_the_unheld_chunk_penalty() {
 }
 
 /// Every file under `tests/`, reviewed on 2026-10-25 when the suite was cut
-/// back to what protects something (Dan: "keep what's needed"). A file that
-/// isn't here, from an upstream merge or a new branch, fails the census
-/// below until it is reviewed: kept and listed, or left out and listed in
-/// `REMOVED_TEST_FILES`.
+/// back to the tests that protect something. A file that isn't here, from an
+/// upstream merge or a new branch, fails the census below until it is
+/// reviewed: kept and listed, or left out and listed in `REMOVED_TEST_FILES`.
 const TEST_FILES: &[&str] = &[
     "tests/chunk_store_crash_safety.rs",
     "tests/darwin_image.rs",

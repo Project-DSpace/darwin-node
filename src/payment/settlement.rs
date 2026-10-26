@@ -101,13 +101,12 @@ pub const PUT_CALL_TIMEOUT: Duration = Duration::from_millis(2_500);
 /// goes to the next RPC as well. The first good answer counts.
 pub const PUT_SECOND_RPC_AFTER: Duration = Duration::from_secs(2);
 
-/// On a store's path, how long the receipts of a proof's transactions are
-/// read alone before the per-quote read of a quote they haven't settled
-/// starts beside them. Claude's proposal: a receipt from an RPC that answers
-/// in a round trip settles its quotes within it, saving their reads, and
-/// with every RPC slow (about 2.3 s a call) the per-quote read, read empty,
-/// the pause and the read again (about 6.1 s) still end inside
-/// [`PUT_PAYMENT_DEADLINE`].
+/// On a store's path, how long the receipts of a proof's transactions are read
+/// alone before the per-quote read of a quote they haven't settled starts
+/// beside them. A receipt from an RPC that answers in a round trip settles its
+/// quotes within it, saving their reads, and with every RPC slow (about 2.3 s
+/// a call) the per-quote read, read empty, the pause and the read again (about
+/// 6.1 s) still end inside [`PUT_PAYMENT_DEADLINE`].
 pub const PUT_RECEIPTS_HEAD_START: Duration = Duration::from_millis(500);
 
 /// How long one call nobody is waiting on may take: reads for fresh
@@ -155,9 +154,9 @@ const BLOCKS_CAPACITY: usize = 1_024;
 const MAX_BATCH: usize = 32;
 
 /// The reads of a batch no RPC answered in time are made one at a time, at
-/// most this many at once. Claude's proposal: an RPC that stalled is sent a
-/// few calls, not a whole batch's worth at once; a batch of `MAX_BATCH`
-/// answered in about a second a call is read in about 8 seconds.
+/// most this many at once, so an RPC that stalled is sent a few calls, not a
+/// whole batch's worth at once; a batch of `MAX_BATCH` answered in about a
+/// second a call is read in about 8 seconds.
 const SINGLES_AFTER_TIMED_OUT_BATCH: usize = 4;
 
 /// `completedPayments(bytes32)`'s selector: the first four bytes of the
