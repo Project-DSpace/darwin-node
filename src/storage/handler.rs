@@ -345,9 +345,10 @@ fn settlement_gate(
             warn!(
                 target: "ant_node::quote::settlement",
                 "Refusing {path} quote: client settles under version \
-                 {client_settlement_version}, newer than this node's \
-                 {CURRENT_SETTLEMENT_VERSION}. This node needs upgrading; the client \
-                 has not been charged.",
+                 {client_settlement_version}, newer than this build's \
+                 {CURRENT_SETTLEMENT_VERSION}, and this node honours version \
+                 {node_settlement_version} at most. This node needs upgrading; the \
+                 client has not been charged.",
             );
             Some(ProtocolError::StorerUpdateRequired {
                 client_settlement_version,

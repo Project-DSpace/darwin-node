@@ -76,25 +76,32 @@ pub(crate) struct FreshOfferContext {
 /// possession check, by the offer's request id, each with the peers excused
 /// for refusing it.
 ///
-/// A client pays through the root vault only when every node it was quoted
-/// by accepts root proofs: a node quotes a settlement-version-3 request only
-/// when it knows a root vault, and an older node or one with none answers it
-/// `StorerUpdateRequired`. This node, though, offers the record to its own
-/// view of the close group, which can hold a peer the client never asked,
-/// and that peer may be one that can't check the proof. It refuses the offer
-/// with a `FreshReplicationResponse::Rejected` carrying the offer's request
-/// id, and is dropped from that key's possession check, so an honest refusal
-/// is never charged as a missing chunk; neighbour sync places the record
-/// with it later.
+/// An up-to-date client pays through the root vault only when every node it
+/// was quoted by accepts root proofs: a node quotes a settlement-version-3
+/// request only when it knows a root vault, and an older node or one with
+/// none answers it `StorerUpdateRequired`. This node, though, offers the
+/// record to its own view of the close group, which can hold a peer the
+/// client never asked, and that peer may be one that can't check the proof.
+/// It refuses the offer with a `FreshReplicationResponse::Rejected` carrying
+/// the offer's request id, and is dropped from that key's possession check,
+/// so an honest refusal is never charged as a missing chunk; neighbour sync
+/// places the record with it later.
 ///
-/// Only a peer the proof holds no quote from is excused. A peer the proof
-/// holds a quote from answered the client's version-3 request, so it said it
-/// can check a root proof; its refusal, whatever reason it gives, leaves it
-/// in the possession check, charged as a missing chunk as every refusal of a
-/// single-node offer is. The reason a peer gives is its own text and decides
-/// nothing. The quotes are not signature-checked here: a client that lists a
-/// peer it never asked only takes that peer's excuse away, leaving it where
-/// a single-node offer leaves every peer.
+/// A quote doesn't record the settlement version it was asked at: a
+/// version-3 quote is byte for byte a version-2 one, and signs no version. So
+/// a quote in a root proof doesn't show that its peer can check a root proof;
+/// an older node or one with no root vault may have given it at version 2,
+/// to a client that mixes quotes of both versions or during a mixed-version
+/// rollout. Such a peer refuses the offer at payment verification. A refusal
+/// whose reason is a payment-verification refusal
+/// ([`is_payment_refusal`]) is therefore excused from every peer, quoted or
+/// not, as payment outcomes are never charged on the receiving side either.
+/// A peer the proof holds no quote from is excused whatever its reason. A
+/// quoted peer that refuses for any other reason (out of range, out of
+/// space, a failed write) stays in the possession check, charged as a
+/// missing chunk as every refusal of a single-node offer is. The quotes are
+/// not signature-checked here: a client that lists a peer it never asked only
+/// narrows that peer's excuse to payment refusals.
 ///
 /// Single-node offers are not tracked, and a peer that accepts a root-paid
 /// offer, or doesn't answer, is checked as before.
@@ -122,11 +129,12 @@ pub(crate) enum Refusal {
     /// Not a refusal of a tracked root-paid offer, by a peer it was sent to,
     /// naming its key: nothing changes.
     Untracked,
-    /// The proof holds no quote from the peer, which may be one that can't
-    /// check a root proof: it is left out of the possession check.
+    /// The proof holds no quote from the peer, or the peer refused at
+    /// payment verification, so it may be one that can't check a root proof:
+    /// it is left out of the possession check.
     Excused,
-    /// The peer quoted the key for its root payment, so it said it can check
-    /// a root proof: it stays in the possession check.
+    /// The peer quoted the key for its root payment and refused for a reason
+    /// other than payment verification: it stays in the possession check.
     Charged,
 }
 
@@ -153,10 +161,17 @@ impl RootOfferRefusals {
         );
     }
 
-    /// Note that `source` refused the offer `request_id` of `key`. Only a
-    /// peer the offer was sent to, naming the offer's key, counts, and only
-    /// one the proof holds no quote from is excused.
-    pub(crate) fn note_refusal(&self, request_id: u64, source: &PeerId, key: &XorName) -> Refusal {
+    /// Note that `source` refused the offer `request_id` of `key`, giving
+    /// `reason`. Only a peer the offer was sent to, naming the offer's key,
+    /// counts; it is excused when the proof holds no quote from it or when
+    /// `reason` is a payment-verification refusal.
+    pub(crate) fn note_refusal(
+        &self,
+        request_id: u64,
+        source: &PeerId,
+        key: &XorName,
+        reason: &str,
+    ) -> Refusal {
         let mut offers = self.offers.lock();
         let Some(offer) = offers.get_mut(&request_id) else {
             return Refusal::Untracked;
@@ -164,7 +179,7 @@ impl RootOfferRefusals {
         if offer.key != *key || !offer.targets.contains(source) {
             return Refusal::Untracked;
         }
-        if offer.quoted.contains(source) {
+        if offer.quoted.contains(source) && !is_payment_refusal(reason) {
             return Refusal::Charged;
         }
         offer.refused.insert(*source);
@@ -188,6 +203,22 @@ impl RootOfferRefusals {
     pub(crate) fn pending(&self) -> usize {
         self.offers.lock().len()
     }
+}
+
+/// How a fresh-offer receiver's refusal reason starts when the payment
+/// verifier found no payment for the proof.
+pub(crate) const PAYMENT_VERIFICATION_FAILED: &str = "Payment verification failed";
+
+/// How a fresh-offer receiver's refusal reason starts when the payment
+/// verifier returned an error, as it does for a root proof at a node with no
+/// root vault.
+pub(crate) const PAYMENT_VERIFICATION_ERROR: &str = "Payment verification error";
+
+/// Whether a fresh-offer refusal `reason` is a payment-verification refusal.
+/// Every released node words these two refusals so.
+fn is_payment_refusal(reason: &str) -> bool {
+    reason.starts_with(PAYMENT_VERIFICATION_FAILED)
+        || reason.starts_with(PAYMENT_VERIFICATION_ERROR)
 }
 
 /// For a proof that pays through the root vault, the peers it holds a quote
@@ -508,6 +539,10 @@ mod tests {
         assert_eq!(root_quoted_peers(&[PROOF_TAG_ROOT, 0x90]), None);
     }
 
+    /// A refusal reason that is not about payment, as a peer out of range
+    /// for the key gives.
+    const OUT_OF_RANGE: &str = "Not in storage-admission range for this key";
+
     /// A peer that refuses a root-paid offer is left out of that key's
     /// possession check; one that accepted or never answered stays in it. A
     /// refusal from a peer the offer was not sent to, naming another key, or
@@ -520,19 +555,22 @@ mod tests {
         offers.open(7, key, &targets, &HashSet::new());
         assert_eq!(offers.pending(), 1);
 
-        assert_eq!(offers.note_refusal(7, &peer(2), &key), Refusal::Excused);
         assert_eq!(
-            offers.note_refusal(7, &peer(9), &key),
+            offers.note_refusal(7, &peer(2), &key, OUT_OF_RANGE),
+            Refusal::Excused
+        );
+        assert_eq!(
+            offers.note_refusal(7, &peer(9), &key, OUT_OF_RANGE),
             Refusal::Untracked,
             "not a target"
         );
         assert_eq!(
-            offers.note_refusal(7, &peer(3), &[0x43; 32]),
+            offers.note_refusal(7, &peer(3), &[0x43; 32], OUT_OF_RANGE),
             Refusal::Untracked,
             "another key"
         );
         assert_eq!(
-            offers.note_refusal(8, &peer(1), &key),
+            offers.note_refusal(8, &peer(1), &key, OUT_OF_RANGE),
             Refusal::Untracked,
             "another offer"
         );
@@ -540,17 +578,20 @@ mod tests {
         assert_eq!(offers.close(7, targets.clone()), vec![peer(1), peer(3)]);
         assert_eq!(offers.pending(), 0);
         // Closed: a late refusal is ignored, and the id no longer filters.
-        assert_eq!(offers.note_refusal(7, &peer(1), &key), Refusal::Untracked);
+        assert_eq!(
+            offers.note_refusal(7, &peer(1), &key, OUT_OF_RANGE),
+            Refusal::Untracked
+        );
         assert_eq!(offers.close(7, targets.clone()), targets);
     }
 
-    /// A peer the root proof holds a quote from answered the client's
-    /// settlement-version-3 request, so it said it can check a root proof. If
-    /// it refuses the offer anyway, whatever its reason, it stays in the
-    /// key's possession check, as a refuser of a single-node offer does; an
-    /// unquoted peer that refuses beside it is still left out.
+    /// A peer the root proof holds a quote from that refuses the offer for a
+    /// reason other than payment verification stays in the key's possession
+    /// check, as a refuser of a single-node offer does; an unquoted peer that
+    /// refuses beside it is still left out.
     #[test]
-    fn a_peer_quoted_at_version_3_that_refuses_a_root_paid_offer_stays_in_its_possession_check() {
+    fn a_quoted_peer_that_refuses_a_root_paid_offer_for_another_reason_stays_in_its_possession_check(
+    ) {
         let offers = RootOfferRefusals::default();
         let key = [0x42; 32];
         let targets = vec![peer(1), peer(2), peer(3)];
@@ -558,11 +599,67 @@ mod tests {
         let quoted = root_quoted_peers(&proof).expect("a root proof");
         offers.open(7, key, &targets, &quoted);
 
-        assert_eq!(offers.note_refusal(7, &peer(1), &key), Refusal::Charged);
-        assert_eq!(offers.note_refusal(7, &peer(3), &key), Refusal::Excused);
+        assert_eq!(
+            offers.note_refusal(7, &peer(1), &key, OUT_OF_RANGE),
+            Refusal::Charged
+        );
+        assert_eq!(
+            offers.note_refusal(7, &peer(3), &key, OUT_OF_RANGE),
+            Refusal::Excused
+        );
         // A quoted peer the offer was not sent to counts for nothing.
-        assert_eq!(offers.note_refusal(7, &peer(8), &key), Refusal::Untracked);
+        assert_eq!(
+            offers.note_refusal(7, &peer(8), &key, OUT_OF_RANGE),
+            Refusal::Untracked
+        );
 
         assert_eq!(offers.close(7, targets), vec![peer(1), peer(2)]);
+    }
+
+    /// A quote doesn't record its settlement version, so a quote an older
+    /// node or one with no root vault gave at version 2 (or unversioned) can
+    /// sit in a root proof: its bytes are the same as a version-3 quote's.
+    /// That peer can't check the proof and refuses the offer at payment
+    /// verification, so it is excused like an unquoted peer, whichever of
+    /// the two payment-verification refusals it gives, and it is left out of
+    /// the key's possession check.
+    #[test]
+    fn a_peer_quoted_at_version_2_in_a_root_proof_that_refuses_at_payment_verification_is_excused()
+    {
+        let offers = RootOfferRefusals::default();
+        let key = [0x42; 32];
+        let targets = vec![peer(1), peer(2), peer(3)];
+        // Peers 1 and 2 quoted at version 2; the proof can't tell.
+        let proof = root_proof(&[peer(1), peer(2), peer(3)]);
+        let quoted = root_quoted_peers(&proof).expect("a root proof");
+        offers.open(7, key, &targets, &quoted);
+
+        // The two reasons a fresh-offer receiver gives at payment
+        // verification, worded as `handle_fresh_offer` words them.
+        let error = format!("{PAYMENT_VERIFICATION_ERROR}: no root vault configured");
+        let failed = format!("{PAYMENT_VERIFICATION_FAILED}: payment required");
+        assert_eq!(
+            offers.note_refusal(7, &peer(1), &key, &error),
+            Refusal::Excused
+        );
+        assert_eq!(
+            offers.note_refusal(7, &peer(2), &key, &failed),
+            Refusal::Excused
+        );
+
+        assert_eq!(offers.close(7, targets), vec![peer(3)]);
+    }
+
+    /// Only the two payment-verification refusals count as one.
+    #[test]
+    fn only_payment_verification_reasons_are_payment_refusals() {
+        assert!(is_payment_refusal(
+            "Payment verification failed: payment required"
+        ));
+        assert!(is_payment_refusal("Payment verification error: rpc down"));
+        assert!(!is_payment_refusal(OUT_OF_RANGE));
+        assert!(!is_payment_refusal("Missing proof of payment"));
+        assert!(!is_payment_refusal("payment verification error"));
+        assert!(!is_payment_refusal(""));
     }
 }
