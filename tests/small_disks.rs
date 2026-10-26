@@ -27,7 +27,7 @@
 use ant_node::replication::erasure::{ClockKind, ErasureGate};
 use ant_node::replication::full;
 use ant_node::replication::retention::{
-    step_clamp, DiskRetention, FLOOR_STEPS, LAST_FLOOR_STEP, LEAVE_FULL_INODE_MARGIN,
+    leave_full_inode_margin, step_clamp, DiskRetention, FLOOR_STEPS, LAST_FLOOR_STEP,
     LEAVE_FULL_MARGIN,
 };
 use ant_node::storage::{
@@ -305,12 +305,13 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
         node.store.full_state().map(|state| state.trigger),
         Some(FullTrigger::Inodes)
     );
-    // Leaving needs the inode margin too.
+    // Leaving needs the inode margin too: here a fortieth of the inodes,
+    // fewer than LEAVE_FULL_INODE_MARGIN.
     let at_the_line = inodes * 25 / 1000;
     seam.with_inodes(
         total / 2,
         total,
-        at_the_line + LEAVE_FULL_INODE_MARGIN - 1,
+        at_the_line + leave_full_inode_margin(inodes) - 1,
         inodes,
     );
     assert_eq!(full::leave_if_room(&node.store, &node.retention), None);
@@ -318,7 +319,7 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
     seam.with_inodes(
         total / 2,
         total,
-        more * 25 / 1000 + LEAVE_FULL_INODE_MARGIN,
+        more * 25 / 1000 + leave_full_inode_margin(more),
         more,
     );
     assert_eq!(

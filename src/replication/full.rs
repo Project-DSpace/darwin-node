@@ -791,6 +791,78 @@ pub struct FullView {
     /// Keys whose verification found fewer than 4 holders present, since the
     /// last prune pass took the count.
     few_holders: AtomicU64,
+    /// What this process told its peers about its own "full" state, and the
+    /// order it tells them in.
+    pub announcer: FullAnnouncer,
+}
+
+/// What this process told its peers about its own "full" state.
+///
+/// Every notice this node sends goes through [`Self::announce`], which reads
+/// the state and sends it under one lock: a renewal that read "full" can't
+/// send it after the erasure task has told the peers the node left "full".
+///
+/// A node at the line at start says so once, before its first prune pass
+/// (see [`Self::renewal_when_not_full`]). If that pass then doesn't put it in
+/// "full", the next renewal takes the notice back, so its peers don't keep
+/// widening and waiving for it until the notice goes stale.
+#[derive(Debug, Default)]
+pub struct FullAnnouncer {
+    /// Held across reading the state and sending it.
+    send: tokio::sync::Mutex<()>,
+    /// Set once the erasure task's first prune pass has finished.
+    first_pass_done: AtomicBool,
+    /// Set when the at-start "full" was sent and not yet taken back or
+    /// confirmed by a pass that put the node in "full".
+    announced_at_start: AtomicBool,
+}
+
+impl FullAnnouncer {
+    /// Under the lock, read what to send (`None`: nothing) and send it.
+    /// Returns what `send` returned, or `None` when nothing was sent.
+    pub async fn announce<R, S, F>(&self, read: R, send: S) -> Option<usize>
+    where
+        R: FnOnce(&Self) -> Option<bool>,
+        S: FnOnce(bool) -> F,
+        F: std::future::Future<Output = usize>,
+    {
+        let _send = self.send.lock().await;
+        let full = read(self)?;
+        Some(send(full).await)
+    }
+
+    /// The erasure task's prune pass finished.
+    pub fn note_pass_done(&self) {
+        self.first_pass_done.store(true, Ordering::Release);
+    }
+
+    /// A renewal while the node is in "full": its own notice says so, and
+    /// confirms any at-start one.
+    pub fn renewal_when_full(&self) {
+        self.announced_at_start.store(false, Ordering::Release);
+    }
+
+    /// What a renewal sends while the node isn't in "full", if anything:
+    /// "full" once at start when it is at the line (`at_the_line_at_start`)
+    /// and no pass has run yet; "not full" once, after its first pass, if it
+    /// sent that and no pass has put it in "full" since; else nothing.
+    pub fn renewal_when_not_full(&self, at_the_line_at_start: bool) -> Option<bool> {
+        let pass_done = self.first_pass_done.load(Ordering::Acquire);
+        if at_the_line_at_start && !pass_done {
+            self.announced_at_start.store(true, Ordering::Release);
+            return Some(true);
+        }
+        if pass_done && self.announced_at_start.swap(false, Ordering::AcqRel) {
+            return Some(false);
+        }
+        None
+    }
+
+    /// A prune pass put the node in "full", or took it out: its own notice
+    /// says so, and settles any at-start one.
+    pub fn state_sent(&self) {
+        self.announced_at_start.store(false, Ordering::Release);
+    }
 }
 
 impl FullView {
@@ -1001,20 +1073,22 @@ pub fn after_passes(
     Some(true)
 }
 
-/// Leave "full" if the node has the room to: [`LEAVE_FULL_MARGIN`] above the
-/// line, measured again now. Returns `Some(false)` when it left.
+/// Leave "full" if the node has the room to. Returns `Some(false)` when it left.
+///
+/// The room is [`LEAVE_FULL_MARGIN`] above the line, measured again now, and
+/// inodes off the line, with their own margin when inodes put the node in
+/// "full" (see [`may_leave_full`]).
 ///
 /// [`LEAVE_FULL_MARGIN`]: crate::replication::retention::LEAVE_FULL_MARGIN
+/// [`may_leave_full`]: crate::replication::retention::may_leave_full
 pub fn leave_if_room(
     storage: &crate::storage::ChunkStore,
     retention: &crate::replication::retention::DiskRetention,
 ) -> Option<bool> {
-    if !storage.is_full() {
-        return None;
-    }
+    let trigger = storage.full_state()?.trigger;
     retention.refresh();
     let space = retention.last_space()?;
-    if !crate::replication::retention::may_leave_full(space, retention.line()) {
+    if !crate::replication::retention::may_leave_full(space, retention.line(), trigger) {
         return None;
     }
     let state = storage.leave_full()?;
@@ -1492,5 +1566,101 @@ mod tests {
         assert_eq!(own_quote(&peer(3), Some(&paid)), OwnQuote::NotPaid);
         assert_eq!(own_quote(&peer(3), None), OwnQuote::PaidOrUnknown);
         assert_eq!(paid_quote_issuers(b"not a proof"), None);
+    }
+
+    /// A node at the line at start says "full" before its first pass; when
+    /// that pass erases and leaves it above the line, not in "full", the next
+    /// renewal takes the notice back, once.
+    #[test]
+    fn an_at_start_full_notice_is_taken_back_when_the_first_pass_does_not_make_the_node_full() {
+        let announcer = FullAnnouncer::default();
+        assert_eq!(announcer.renewal_when_not_full(true), Some(true));
+        // The pass erased and left the node above the line: no state change.
+        announcer.note_pass_done();
+        assert_eq!(announcer.renewal_when_not_full(false), Some(false));
+        assert_eq!(announcer.renewal_when_not_full(false), None, "once");
+
+        // A pass that puts the node in "full" settles it: nothing to take back.
+        let confirmed = FullAnnouncer::default();
+        assert_eq!(confirmed.renewal_when_not_full(true), Some(true));
+        confirmed.note_pass_done();
+        confirmed.state_sent();
+        assert_eq!(confirmed.renewal_when_not_full(false), None);
+
+        // As does a renewal while full.
+        let renewed = FullAnnouncer::default();
+        assert_eq!(renewed.renewal_when_not_full(true), Some(true));
+        renewed.renewal_when_full();
+        renewed.note_pass_done();
+        assert_eq!(renewed.renewal_when_not_full(false), None);
+
+        // After the first pass, a node not in "full" never says "full" at start.
+        let late = FullAnnouncer::default();
+        late.note_pass_done();
+        assert_eq!(late.renewal_when_not_full(true), None);
+    }
+
+    /// A renewal that read "full" and is still sending it holds the lock: the
+    /// erasure task's "not full" waits for it, reads the state again and goes
+    /// out last, so a stale "full" can't follow it.
+    #[tokio::test]
+    async fn a_stale_full_renewal_cannot_follow_a_not_full_notice() {
+        let announcer = Arc::new(FullAnnouncer::default());
+        let state = Arc::new(AtomicBool::new(true));
+        let sent = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let (reading_done, read) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+
+        let renewal = {
+            let (announcer, state, sent) = (
+                Arc::clone(&announcer),
+                Arc::clone(&state),
+                Arc::clone(&sent),
+            );
+            tokio::spawn(async move {
+                announcer
+                    .announce(
+                        |_| Some(state.load(Ordering::Acquire)),
+                        |full| async move {
+                            let _ = reading_done.send(());
+                            let _ = released.await;
+                            sent.lock().push(full);
+                            1
+                        },
+                    )
+                    .await
+            })
+        };
+        read.await.expect("the renewal read the state");
+        // The erasure task leaves "full" and tells the peers.
+        state.store(false, Ordering::Release);
+        let leaving = {
+            let (announcer, state, sent) = (
+                Arc::clone(&announcer),
+                Arc::clone(&state),
+                Arc::clone(&sent),
+            );
+            tokio::spawn(async move {
+                announcer
+                    .announce(
+                        |_| Some(state.load(Ordering::Acquire)),
+                        |full| async move {
+                            sent.lock().push(full);
+                            1
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(sent.lock().is_empty(), "the notice waits for the renewal");
+        let _ = release.send(());
+        renewal.await.expect("renewal");
+        leaving.await.expect("leaving");
+        assert_eq!(
+            *sent.lock(),
+            vec![true, false],
+            "\"not full\" goes out last"
+        );
     }
 }

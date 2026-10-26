@@ -269,8 +269,27 @@ pub enum ReplicationMessageBody {
 // encode/decode call sites are free functions scattered across the replication
 // modules that do not carry any shared engine handle.
 
+/// The last body index a ds.15 node reads: `PointerStateResponse`. Every
+/// index past it is unreadable on a ds.15 node.
+pub const DS15_LAST_INDEX: usize = 22;
+
+/// The last body index before the "full" notice: ds.15's last, and, once
+/// node-1b-sync's page messages are merged (they keep 23 and 24), theirs.
+///
+/// The merge order is fixed (build plan, ADR-0024): node-1b-sync keeps 23
+/// and 24, and the notice takes the next index after it, 25, whenever this
+/// branch merges second. That merge changes this one constant to 24; the
+/// notice's index, the variant count, the family table, the traffic summary,
+/// the notice's byte test and the check of its pins in
+/// `tests/wire_format.rs` follow from it.
+pub const BEFORE_FULL_NOTICE_LAST_INDEX: usize = DS15_LAST_INDEX;
+
+/// The "full" notice's body index: the first after
+/// [`BEFORE_FULL_NOTICE_LAST_INDEX`].
+pub const FULL_NOTICE_INDEX: usize = BEFORE_FULL_NOTICE_LAST_INDEX + 1;
+
 /// Number of [`ReplicationMessageBody`] variants (the counter-table width).
-pub(crate) const N_REPLICATION_VARIANTS: usize = 24;
+pub(crate) const N_REPLICATION_VARIANTS: usize = FULL_NOTICE_INDEX + 1;
 
 static REPL_TX_BYTES: [AtomicU64; N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
@@ -311,7 +330,7 @@ impl ReplicationMessageBody {
             Self::PointerFetchResponse(_) => 20,
             Self::PointerStateRequest(_) => 21,
             Self::PointerStateResponse(_) => 22,
-            Self::FullNotice(_) => 23,
+            Self::FullNotice(_) => FULL_NOTICE_INDEX,
         }
     }
 
@@ -378,7 +397,7 @@ impl BodyFamily {
 pub(crate) fn family_of_variant(index: usize) -> Option<BodyFamily> {
     match index {
         11..=14 => Some(BodyFamily::SubtreeAudit),
-        0..=10 | 15..=23 => Some(BodyFamily::Core),
+        0..=10 | 15..N_REPLICATION_VARIANTS => Some(BodyFamily::Core),
         _ => None,
     }
 }
@@ -674,8 +693,10 @@ pub(crate) fn log_traffic_summary() {
     crate::logging::info!(
         target: "ant_node::replication::traffic",
         group = 5,
-        full_notice_tx_bytes = tb(23), full_notice_tx_count = tc(23),
-        full_notice_rx_bytes = rb(23), full_notice_rx_count = rc(23),
+        full_notice_tx_bytes = tb(FULL_NOTICE_INDEX),
+        full_notice_tx_count = tc(FULL_NOTICE_INDEX),
+        full_notice_rx_bytes = rb(FULL_NOTICE_INDEX),
+        full_notice_rx_count = rc(FULL_NOTICE_INDEX),
         "replication traffic summary (cumulative)"
     );
 }
@@ -2021,7 +2042,7 @@ mod tests {
             declared, N_REPLICATION_VARIANTS,
             "update this test's bounds when a variant is added or removed"
         );
-        assert_eq!(declared, 24);
+        assert_eq!(declared, FULL_NOTICE_INDEX + 1);
         for index in [declared, declared + 1, 99, usize::MAX] {
             assert_eq!(
                 family_of_variant(index),
@@ -3005,9 +3026,8 @@ mod tests {
 
     // === Full, not faulty ===
 
-    /// `ReplicationMessageBody` as a node of the release before the "full"
-    /// notice declares it, 23 variants, in a message as such a node decodes
-    /// one. Unit variants stand in for their contents, which postcard reads
+    /// `ReplicationMessageBody` as a ds.15 node declares it, indexes 0 to
+    /// [`DS15_LAST_INDEX`], in a message as such a node decodes one. Unit variants stand in for their contents, which postcard reads
     /// only after the index, and leaves unread here.
     mod before_full_notice {
         use serde::Deserialize;
@@ -3062,7 +3082,7 @@ mod tests {
             .encode()
             .expect("encode");
             let old = postcard::from_bytes::<before_full_notice::Message>(&encoded);
-            if index < 23 {
+            if index <= DS15_LAST_INDEX {
                 assert!(old.is_ok(), "index {index} must still decode: {old:?}");
             } else {
                 assert!(old.is_err(), "the notice must not decode as anything old");
@@ -3091,7 +3111,7 @@ mod tests {
         );
         for body in all_bodies() {
             let index = body.variant_index();
-            if index <= 22 {
+            if index <= DS15_LAST_INDEX {
                 continue;
             }
             let encoded = ReplicationMessage {
@@ -3107,7 +3127,8 @@ mod tests {
         }
     }
 
-    /// The notice's bytes: the request id, the body's index 23, the flag.
+    /// The notice's bytes: the request id, the body's index
+    /// ([`FULL_NOTICE_INDEX`]), the flag.
     #[test]
     fn a_full_notice_keeps_its_bytes() {
         for (full, flag) in [(true, 1u8), (false, 0u8)] {
@@ -3116,7 +3137,8 @@ mod tests {
                 body: ReplicationMessageBody::FullNotice(FullNotice { full }),
             };
             let encoded = msg.encode().expect("encode");
-            assert_eq!(encoded, vec![7, 23, flag]);
+            let index = u8::try_from(FULL_NOTICE_INDEX).expect("one byte");
+            assert_eq!(encoded, vec![7, index, flag]);
             let decoded = ReplicationMessage::decode(&encoded).expect("decode");
             assert!(matches!(
                 decoded.body,

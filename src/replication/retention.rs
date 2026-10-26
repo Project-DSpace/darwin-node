@@ -146,9 +146,22 @@ pub const STEP_CLAMP_ABOVE_LINE: u64 = MAX_CHUNK_SIZE as u64;
 pub const LEAVE_FULL_MARGIN: u64 = 64 * STEP_CLAMP_ABOVE_LINE;
 
 /// How many inodes above the last step's share a full node needs to leave
-/// "full" when inodes put it there: the margin in records of the smallest
-/// allocation, 4 KiB, one inode each.
+/// "full" when inodes put it there.
+///
+/// The margin in records of the smallest allocation, 4 KiB, one inode each. Bounded by the filesystem's own size
+/// (see [`leave_full_inode_margin`]), so a filesystem with few inodes can
+/// always reach it.
 pub const LEAVE_FULL_INODE_MARGIN: u64 = LEAVE_FULL_MARGIN / (4 * 1024);
+
+/// The inode margin for leaving "full" on a filesystem of `total` inodes.
+///
+/// [`LEAVE_FULL_INODE_MARGIN`], or a fortieth of the inodes (2.5%, the line's
+/// own share) where that is smaller. The line's share plus this is at most
+/// 5% of the inodes, so a node whose inodes are freed can always leave.
+#[must_use]
+pub fn leave_full_inode_margin(total: u64) -> u64 {
+    LEAVE_FULL_INODE_MARGIN.min(total / 40)
+}
 
 const _: () = assert!(
     LEAVE_FULL_MARGIN == 256 * MIB,
@@ -263,18 +276,25 @@ pub fn at_the_line(space: DiskSpace, line: u64) -> Option<FullTrigger> {
     }
 }
 
-/// Whether a full node with `space` has the room to leave "full".
+/// Whether a full node with `space`, put at the line by `trigger`, has the
+/// room to leave "full".
 ///
 /// That is free bytes at least [`LEAVE_FULL_MARGIN`] above the line, and,
-/// where inodes are counted, [`LEAVE_FULL_INODE_MARGIN`] inodes above the last
-/// step's share.
+/// where inodes are counted, inodes not at the line. When inodes put the node
+/// in "full", they also need [`leave_full_inode_margin`] above the last
+/// step's share, so the state doesn't flap; when bytes did, the inodes need
+/// no margin of their own.
 #[must_use]
-pub fn may_leave_full(space: DiskSpace, line: u64) -> bool {
+pub fn may_leave_full(space: DiskSpace, line: u64, trigger: FullTrigger) -> bool {
     let bytes = space.available >= line.saturating_add(LEAVE_FULL_MARGIN);
-    let inodes = space.inodes.is_none_or(|inodes| {
-        let at_the_line =
-            u128::from(inodes.total) * u128::from(INODES_AT_THE_LINE_PER_MILLE) / 1000;
-        u128::from(inodes.free) >= at_the_line + u128::from(LEAVE_FULL_INODE_MARGIN)
+    let inodes = space.inodes.is_none_or(|inodes| match trigger {
+        FullTrigger::Bytes => !inodes.at_the_line(),
+        FullTrigger::Inodes => {
+            let at_the_line =
+                u128::from(inodes.total) * u128::from(INODES_AT_THE_LINE_PER_MILLE) / 1000;
+            u128::from(inodes.free)
+                >= at_the_line + u128::from(leave_full_inode_margin(inodes.total))
+        }
     });
     bytes && inodes
 }
@@ -1552,7 +1572,8 @@ mod tests {
         let no_count = DiskSpace::bytes(total / 2, total);
         assert_eq!(at_the_line(no_count, line), None);
         assert_eq!(deepest_step(no_count, line), None);
-        assert!(may_leave_full(no_count, line));
+        assert!(may_leave_full(no_count, line, FullTrigger::Bytes));
+        assert!(may_leave_full(no_count, line, FullTrigger::Inodes));
         assert!(!crate::storage::Inodes { free: 0, total: 0 }.at_the_line());
     }
 
@@ -1560,24 +1581,97 @@ mod tests {
     fn leaving_full_needs_the_margin_above_the_line() {
         let total = 20 * GB;
         let line = DEFAULT_DISK_RESERVE;
-        assert!(!may_leave_full(at(line, total), line));
-        assert!(!may_leave_full(at(step_clamp(line) + 1, total), line));
-        assert!(!may_leave_full(
-            at(line + LEAVE_FULL_MARGIN - 1, total),
-            line
-        ));
-        assert!(may_leave_full(at(line + LEAVE_FULL_MARGIN, total), line));
-        // Inodes, where counted, need their own margin.
+        for trigger in [FullTrigger::Bytes, FullTrigger::Inodes] {
+            assert!(!may_leave_full(at(line, total), line, trigger));
+            assert!(!may_leave_full(
+                at(step_clamp(line) + 1, total),
+                line,
+                trigger
+            ));
+            assert!(!may_leave_full(
+                at(line + LEAVE_FULL_MARGIN - 1, total),
+                line,
+                trigger
+            ));
+            assert!(may_leave_full(
+                at(line + LEAVE_FULL_MARGIN, total),
+                line,
+                trigger
+            ));
+        }
+        // Inodes that put the node in "full" need their own margin.
         let inodes = 10_000_000;
         let share = inodes * 25 / 1000;
         let roomy = line + 10 * GIB;
+        assert_eq!(leave_full_inode_margin(inodes), LEAVE_FULL_INODE_MARGIN);
         assert!(!may_leave_full(
             with_inodes(roomy, total, share + LEAVE_FULL_INODE_MARGIN - 1, inodes),
-            line
+            line,
+            FullTrigger::Inodes
         ));
         assert!(may_leave_full(
             with_inodes(roomy, total, share + LEAVE_FULL_INODE_MARGIN, inodes),
-            line
+            line,
+            FullTrigger::Inodes
+        ));
+    }
+
+    /// Bytes put the node in "full": inodes need only be off the line, with no
+    /// margin, however few the filesystem has.
+    #[test]
+    fn a_node_full_by_bytes_leaves_on_a_filesystem_with_few_inodes() {
+        let total = 20 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        let roomy = line + LEAVE_FULL_MARGIN;
+        // ext4 made with -T largefile4 on a 20 GB partition: about 5,000 inodes.
+        let inodes = 5_000;
+        let share = inodes * 25 / 1000;
+        assert!(may_leave_full(
+            with_inodes(roomy, total, inodes / 2, inodes),
+            line,
+            FullTrigger::Bytes
+        ));
+        assert!(may_leave_full(
+            with_inodes(roomy, total, share, inodes),
+            line,
+            FullTrigger::Bytes
+        ));
+        // Not straight back to the line by inodes.
+        assert!(!may_leave_full(
+            with_inodes(roomy, total, share - 1, inodes),
+            line,
+            FullTrigger::Bytes
+        ));
+        // A larger filesystem whose free inodes sit between the share and the
+        // share plus the fixed margin: inodes never put it at the line.
+        let more = 10_000_000;
+        assert!(may_leave_full(
+            with_inodes(roomy, total, more * 25 / 1000 + 1, more),
+            line,
+            FullTrigger::Bytes
+        ));
+    }
+
+    /// Inodes put a node on a tiny filesystem in "full": it leaves once free
+    /// inodes reach the share plus a fortieth of the inodes.
+    #[test]
+    fn a_node_full_by_inodes_on_a_tiny_filesystem_can_leave() {
+        let total = 20 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        let roomy = line + LEAVE_FULL_MARGIN;
+        let inodes = 20_000;
+        let share = inodes * 25 / 1000;
+        let margin = leave_full_inode_margin(inodes);
+        assert_eq!(margin, inodes / 40);
+        assert!(!may_leave_full(
+            with_inodes(roomy, total, share + margin - 1, inodes),
+            line,
+            FullTrigger::Inodes
+        ));
+        assert!(may_leave_full(
+            with_inodes(roomy, total, share + margin, inodes),
+            line,
+            FullTrigger::Inodes
         ));
     }
 }

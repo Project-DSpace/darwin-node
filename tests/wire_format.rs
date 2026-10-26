@@ -539,9 +539,33 @@ const PINNED: &[(&str, &str)] = &[
     // Appended since ds.15, whose message enum ends at index 22, and sent only
     // to peers known to read them; ds.15 drops the notice (`a_node_before_the_full_notice_reads_every_earlier_body_and_drops_the_notice`
     // in src/replication/protocol.rs).
+    // Its index byte is FULL_NOTICE_INDEX (checked below): 23 now, 25 once
+    // node-1b-sync's page messages (23, 24) are merged before it.
     ("FullNotice, full", "b4241701"),
     ("FullNotice, no longer full", "b4241700"),
 ];
+
+/// The notice's pinned bytes carry the index the protocol gives it, so the
+/// merge that moves it past node-1b-sync's messages re-pins them here.
+#[test]
+fn the_full_notice_pins_carry_its_index() {
+    use ant_node::replication::protocol::FULL_NOTICE_INDEX;
+    for (name, flag) in [
+        ("FullNotice, full", "01"),
+        ("FullNotice, no longer full", "00"),
+    ] {
+        let pinned = PINNED
+            .iter()
+            .find(|(pinned, _)| *pinned == name)
+            .map(|(_, bytes)| *bytes)
+            .unwrap();
+        assert_eq!(
+            pinned,
+            format!("b424{FULL_NOTICE_INDEX:02x}{flag}"),
+            "{name}"
+        );
+    }
+}
 
 fn encode(body: ReplicationMessageBody) -> Vec<u8> {
     ReplicationMessage {

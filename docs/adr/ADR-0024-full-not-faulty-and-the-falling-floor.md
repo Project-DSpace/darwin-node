@@ -121,11 +121,16 @@ full. Then it:
   it again, and an update of a pointer it holds is still quoted;
 - refuses every new record, fresh offers with the existing `Rejected`, but takes the
   repair of a chunk it held and removed because its bytes were wrong, which replaces the
-  space the removal freed (at most 1,024 such chunks remembered);
+  space the removal freed: full or at the line, it needs room only for its temporary
+  file, and only up to the bytes that removal freed (at most 1,024 such chunks
+  remembered, each with its freed size); above the line it is admitted as any record;
 - takes updates and repairs of pointers it holds, which use no new space;
 - keeps serving and proving what it holds: its audit and possession replies keep their
   format, real digests for held keys and the absent digest for others;
-- tells its peers with a one-way `FullNotice`, appended to the replication messages and
+- tells its peers with a one-way `FullNotice`, appended to the replication messages (body
+  index 23 on this branch; node-1b-sync's two page messages keep 23 and 24, so the notice
+  takes 25 whenever it merges after them: one constant, `BEFORE_FULL_NOTICE_LAST_INDEX`,
+  moves to 24) and
   sent only to peers whose user agent names the release that reads it, or that sent one
   themselves, renewed every 10 minutes while it stays full; a peer once found to read it
   is remembered (at most 4,096) until it leaves the routing table, so a renewal still
@@ -134,9 +139,13 @@ full. Then it:
   the state isn't kept across a restart, so at start a node with room above the line
   logs "Node full: not at start", which `nodes status` reads as no longer full, and one
   that starts at the line tells its peers once, at its first renewal, if no prune pass
-  has made it full again by then, so their marks don't lapse in between;
-- leaves "full" only with 256 MiB of free bytes above the line (and, where inodes are
-  counted, 65,536 inodes above their line), so the state doesn't flap.
+  has run by then, so their marks don't lapse in between; if that pass then doesn't make
+  it full, the next renewal takes the notice back. Every notice is read and sent under
+  one lock, so a renewal can't send "full" after the node has said it left;
+- leaves "full" only with 256 MiB of free bytes above the line, and inodes, where
+  counted, off their line; when inodes put it in "full", it also needs 65,536 inodes
+  above their line, or a fortieth of the filesystem's inodes where that is fewer, so a
+  filesystem with few inodes can always be left. The state doesn't flap.
 
 ### How other nodes treat a full node
 
@@ -155,9 +164,10 @@ full. Then it:
   announcing themselves full never lower the bar. Only a routing table that knows fewer
   peers than the close group (a tiny network) lowers it, as before.
 - The possession check after a write probes only the 9 nearest, as before: stand-ins
-  beyond them are offered the record but not possession-checked, since a receiver that
-  doesn't widen (an older node, or one without the same marks) rightly refuses the offer.
-  Nothing is waived for them, and a stand-in that does take the record is, by intent, not
+  beyond them are offered the record, and take it, older nodes included, since a chunk
+  receiver admits a fresh offer anywhere among the key's 20 nearest. They aren't
+  possession-checked because no peer past the 9 nearest was before this release.
+  Nothing is waived for them, and a stand-in that takes the record is, by intent, not
   recorded as seen holding it. A pointer's check after a write probes its 7 nearest, as
   before, and its stand-ins likewise aren't checked.
 

@@ -1751,7 +1751,9 @@ fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
 /// every lane that finds it out, as in upstream v0.23.0: the responsible-chunk
 /// audit, the possession check after a fresh write, the prune audit, a
 /// sole-source replica hint its sender then denies, and a fetch a verified
-/// source can't serve. Nothing can withhold it but one bounded waiver for
+/// source can't serve; and a peer that doesn't hold a pointer it was offered,
+/// on the pointer possession check after a write (charged through
+/// `PointerReplication::penalise`). Nothing can withhold it but one bounded waiver for
 /// a full peer (the next test): the release switch, its environment override
 /// and the helper the lanes went through while nodes moved off the LMDB chunk
 /// store are gone, and stay gone. Each lane charges the peer's trust itself,
@@ -1825,12 +1827,25 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
             1,
         ),
     ];
-    let found = census_counting(
+    // The pointer possession check after a write charges through the pointer
+    // service's own `penalise`, which calls report_trust_event once.
+    const POINTER_CHARGE: &[(Option<&str>, &str)] = &[(None, "penalise")];
+    const POINTER_LANES: &[Reviewed] = &[(
+        "src/replication/pointer.rs",
+        "PointerReplication::check_possession",
+        "penalise",
+        1,
+    )];
+    let mut found = census_counting(
         Path::new(env!("CARGO_MANIFEST_DIR")),
         Counting::Calls(CHARGE),
     );
+    found.extend(census_counting(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Counting::Calls(POINTER_CHARGE),
+    ));
     let mut lanes = String::new();
-    for (file, site, call, count) in LANES {
+    for (file, site, call, count) in LANES.iter().chain(POINTER_LANES) {
         let key = (
             (*file).to_string(),
             (*site).to_string(),
@@ -1851,8 +1866,8 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
         lanes.is_empty(),
         "\nThe lanes that penalise a peer for an unheld close-group chunk no longer charge \
          its trust as reviewed.\n\n{lanes}\n\
-         Each of these functions charges the peer itself with report_trust_event. If a \
-         charge moved, follow it and list where it went; if one is gone, find out why \
+         Each of these functions charges the peer itself with report_trust_event, or for \
+         the pointer lane with PointerReplication::penalise. If a charge moved, follow it and list where it went; if one is gone, find out why \
          before changing the count.\n"
     );
 }

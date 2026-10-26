@@ -3913,15 +3913,25 @@ impl ReplicationEngine {
                 };
                 let not_yet_erased = erasure_gate.not_yet_erased();
                 // The notice dials peers in turn: a shutdown stops it, and
-                // the clocks are still saved before the task leaves.
+                // the clocks are still saved before the task leaves. The
+                // state changes and is sent under the announcer's lock, so a
+                // renewal can't send an older state after it.
                 let mut stopping = false;
-                if let Some(full) =
-                    full::after_passes(&storage, &disk_retention, erased, not_yet_erased)
-                {
-                    tokio::select! {
-                        () = shutdown.cancelled() => stopping = true,
-                        _ = full::send_full_notice(&p2p, full) => {}
-                    }
+                let notice = full_view.announcer.announce(
+                    |announcer| {
+                        let changed =
+                            full::after_passes(&storage, &disk_retention, erased, not_yet_erased);
+                        announcer.note_pass_done();
+                        changed.map(|_| {
+                            announcer.state_sent();
+                            storage.is_full()
+                        })
+                    },
+                    |full| full::send_full_notice(&p2p, full),
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => stopping = true,
+                    _ = notice => {}
                 }
                 if let Some(clocks) = &clocks {
                     save_out_of_range_clocks(clocks, &paid_list, pointers.as_ref()).await;
@@ -3944,12 +3954,14 @@ impl ReplicationEngine {
     /// The "full" state isn't kept across a restart: at start the node logs
     /// where it stands ([`full::at_start`]), and a node that starts at the
     /// line tells its peers once, at the first renewal, if no prune pass has
-    /// put it back in "full" by then, so their marks from before the restart
-    /// don't lapse while it waits for that pass.
+    /// run by then, so their marks from before the restart don't lapse while
+    /// it waits for that pass. If the pass then doesn't put it in "full", the
+    /// next renewal takes that back ([`full::FullAnnouncer`]).
     fn start_full_notice_loop(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
         let disk_retention = Arc::clone(&self.disk_retention);
+        let full_view = Arc::clone(&self.full_view);
         let shutdown = self.shutdown.clone();
         let handle = tokio::spawn(async move {
             let mut at_the_line_at_start = full::at_start(&disk_retention);
@@ -3958,22 +3970,25 @@ impl ReplicationEngine {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(full::full_notice_renewal()) => {}
                 }
-                if !storage.is_full() {
-                    if std::mem::take(&mut at_the_line_at_start)
-                        && disk_retention.at_the_line().is_some()
-                    {
-                        tokio::select! {
-                            () = shutdown.cancelled() => break,
-                            _ = full::send_full_notice(&p2p, true) => {}
+                // Read and sent under the announcer's lock, after any state
+                // change the erasure task sent.
+                let notice = full_view.announcer.announce(
+                    |announcer| {
+                        if storage.is_full() {
+                            at_the_line_at_start = false;
+                            announcer.renewal_when_full();
+                            Some(full::leave_if_room(&storage, &disk_retention) != Some(false))
+                        } else {
+                            let at_start = std::mem::take(&mut at_the_line_at_start)
+                                && disk_retention.at_the_line().is_some();
+                            announcer.renewal_when_not_full(at_start)
                         }
-                    }
-                    continue;
-                }
-                at_the_line_at_start = false;
-                let full = full::leave_if_room(&storage, &disk_retention) != Some(false);
+                    },
+                    |full| full::send_full_notice(&p2p, full),
+                );
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    _ = full::send_full_notice(&p2p, full) => {}
+                    _ = notice => {}
                 }
             }
             debug!("Full notice loop shut down");

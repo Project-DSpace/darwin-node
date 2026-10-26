@@ -132,12 +132,12 @@ pub(crate) async fn send_fresh_offers(
     )
     .await;
     // The stand-ins: past the unwidened storage admission width (9 nearest,
-    // the node itself counted), where a receiver that doesn't widen (an
-    // older node, or one without the same marks) rightly refuses the offer.
-    // They are offered the record but not possession-checked, as no peer
-    // past the 9 nearest was before: nothing is waived for them, and one
-    // that does take the record is, by intent, not recorded as seen holding
-    // it.
+    // the node itself counted). They take the offer, older nodes included,
+    // since a chunk receiver admits a fresh offer anywhere among the key's 20
+    // nearest (`paid_list_close_group_size`). They are left unchecked because
+    // no peer past the 9 nearest was possession-checked before ds.17: nothing
+    // is waived for them, and one that takes the record is, by intent, not
+    // recorded as seen holding it.
     let checked_peers = possession_checked(&widened, &self_id, ctx.config.close_group_size);
     let target_peers: Vec<PeerId> = widened
         .into_iter()
