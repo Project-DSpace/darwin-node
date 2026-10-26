@@ -50,9 +50,10 @@ never ran.
   storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a
   second apart. The public RPCs built in are PublicNode and Robinhood Chain's
-  own. A node on `rpc.ordofi.network`, an earlier default, reads through it
-  first and then falls back to both of these (no node falls back to it), and
-  the image points out an `RPC_URL` or `RPC_URLS` that still names it; a
+  own. A node on `https://rpc.ordofi.network`, an earlier default, reads
+  through it first and then falls back to both of these (no node falls back to
+  it), while any other form of it (`http://`, a path or a query) is read alone,
+  and the image points out an `RPC_URL` or `RPC_URLS` that still names it; a
   node on any other RPC reads through it alone. Only a failed call moves on: any answer, even that nothing
   was paid, settles the check. Upstream reads once, through one RPC, so a
   provider answering `-32005 the network is busy` made nodes refuse paid
