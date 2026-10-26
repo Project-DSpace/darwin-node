@@ -47,11 +47,12 @@
 #   set it, take the inputs and what the checks found only from their job's
 #   env (no step sets its own but 'Check the digest', which takes the Build
 #   run the step before it found, the withdrawal's check, which takes
-#   the record 'Check the digest' took, and the step reading the images
+#   the record 'Check the digest' took and that Build run, and the step reading the images
 #   :latest held, which takes the node version), and change no later step's
 #   environment;
 # - its checks job can write nothing, and hands the latest job the Build run
-#   the node version and the images :latest held with it alone, each from
+#   the node version, the images :latest held with it and whether the
+#   digest is tied to the image a Release run of the commit took alone, each from
 #   the step that checked or read it, which
 #   writes it once; refuses a run from any ref but main, inputs other than a
 #   full commit, a sha256 digest and an empty or 64-digit node_code, and a
@@ -75,7 +76,10 @@
 #   by its title, or that the commit is a v*+ds.* tag's whose Release run
 #   succeeded, and hands on the images :latest held with the image's node
 #   since its newest successful Release run, read from the Latest runs
-#   started after it, from the step that read them;
+#   started after it whose image runs that node, from the step that read
+#   them, and whether the digest is the image the commit's Release run
+#   took (the Build run's record or docker/release-images, or the
+#   attestation of the one attempt of that run that pushed an image);
 # - its latest job needs the checks job, runs in the latest environment, can
 #   read attestations and contents and write packages and nothing else,
 #   refuses an image whose node is newer than :latest's, and, unless the
@@ -86,7 +90,9 @@
 #   withdrawal and allow_unmarked is set, refuses a withdrawal to an older
 #   node until the withdrawn release is deleted, a draft or a pre-release,
 #   and while a published release other than the withdrawn one is newer
-#   than the image's, refuses a withdrawal to the same node to any image
+#   than the image's, or to any image but the last one :latest had with
+#   that node (a release's own image only as tied to its Release run),
+#   refuses a withdrawal to the same node to any image
 #   but the one :latest held before its image, checks again that the image's
 #   node is a published release, orders versions as nodes do, makes every
 #   check before it moves :latest, writes :latest's digest and the new one
@@ -698,6 +704,7 @@ else
     holds "$(step "Check a withdrawal goes back to an image latest had" "${checks}")" \
         "latest.yml's checks job must check that a withdrawal goes back to an image :latest held before" \
         'RECORD: ${{ steps.digest.outputs.record }}' \
+        'RUN: ${{ steps.build_run.outputs.run }}' \
         'if [[ "$WITHDRAW" == true ]]; then' \
         'tags=$(git tag --points-at "$COMMIT" --list '\''v*+ds.*'\'')' \
         'releases=$(gh api -X GET "repos/$GH_REPO/actions/workflows/release.yml/runs" \' \
@@ -709,13 +716,34 @@ else
         'held=${by_latest:-$by_release}' \
         'refuse: if [[ -z "$held" ]]; then' \
         'if [[ -z "$by_latest" && "$RECORD" == attestation ]]; then'
+    # It hands on whether the digest is the image a Release run of the
+    # commit took (tied), for a withdrawal back to a release's own image:
+    # by Build run RUN's record or docker/release-images, or, once those
+    # have expired, by an attestation from the one attempt of Build run RUN
+    # whose image job succeeded, never by another attempt's image.
+    holds "$(step "Check a withdrawal goes back to an image latest had" "${checks}")" \
+        "latest.yml's checks job must tie a withdrawal's image to the one the commit's Release run took only by its record, or by the attestation of the one attempt of the Build run that pushed an image" \
+        'tied=false' \
+        'if [[ "$RECORD" == artifact || "$RECORD" == listed ]]; then' \
+        'attempts=$(gh api "repos/$GH_REPO/actions/runs/$RUN" --jq .run_attempt)' \
+        'for ((k = 1; k <= attempts; k++)); do' \
+        'images=$(gh api "repos/$GH_REPO/actions/runs/$RUN/attempts/$k/jobs?per_page=100" \' \
+        '--jq '\''[.jobs[] | select(.name == "image" and .conclusion == "success")] | length'\'')' \
+        'attested_in=$({ gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GH_REPO" \' \
+        '--signer-workflow "$GH_REPO/.github/workflows/build.yml" \' \
+        '--source-digest "$COMMIT" --source-ref refs/heads/main --format json || true; } \' \
+        '| jq -r --arg from "https://github.com/$GH_REPO/actions/runs/$RUN/attempts/" '\''[.[]?.verificationResult.signature.certificate | select(.buildTrigger == "push") | .runInvocationURI | select(startswith($from)) | ltrimstr($from)] | unique | join(" ")'\'' || true)' \
+        'if ((${#pushed[@]} == 1)) && [[ "$attested_in" == "${pushed[0]}" ]]; then' \
+        'tied=true'
 
     # For a withdrawal, the images :latest held with the image's node since
     # that node's newest successful Release run (its own image first, as
     # release:<its tag's commit>), from the successful Latest runs from main
     # started after it, in the order they started: a run without withdraw
     # adds its image, a withdrawal goes back to its image, dropping those
-    # after it, or, for an image not among them, starts again from it.
+    # after it, or, for an image not among them, starts again from it; a
+    # run whose image runs another node is left out, so the newest image
+    # read is the last one :latest had with the node.
     holds "$(step "Read the images latest held with the image's node" "${checks}")" \
         "latest.yml's checks job must read, for a withdrawal, the images :latest held with the image's node since its release, in order" \
         'VERSION: ${{ steps.version.outputs.version }}' \
@@ -731,6 +759,9 @@ else
         '--jq '\''.workflow_runs[] | "\(.run_started_at) \(.display_title)"'\'' | sort)' \
         'while read -r started kind _ _ digest _; do' \
         'if [[ ! "$started" > "$since" || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then' \
+        'declare -A nodes=()' \
+        'if ! nodes[$digest]=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$digest" --version </dev/null); then' \
+        'if [[ "${nodes[$digest]}" != "$VERSION" ]]; then' \
         'if [[ "$kind" == Point && "${stack[${#stack[@]}-1]}" != "$digest" ]]; then' \
         'stack+=("$digest")' \
         'elif [[ "$kind" == Withdraw ]]; then' \
@@ -739,21 +770,23 @@ else
         'held="${stack[*]}"'
 
     # The checks job hands the latest job the Build run it found, the node
-    # version it read and the images :latest held with it, and nothing
-    # else, each written once by the step that checked or read it; 'Check
-    # the digest' hands the withdrawal's check the record it took the same
-    # way.
+    # version it read, the images :latest held with it and whether the
+    # digest is tied to a Release run's image, and nothing else, each
+    # written once by the step that checked or read it; 'Check the digest'
+    # hands the withdrawal's check the record it took the same way.
     expected_outputs=$(printf '%s\n' \
         'run: ${{ steps.build_run.outputs.run }}' \
         'version: ${{ steps.version.outputs.version }}' \
-        'held: ${{ steps.held.outputs.held }}')
+        'held: ${{ steps.held.outputs.held }}' \
+        'tied: ${{ steps.withdrawal.outputs.tied }}')
     if [[ "$(job_key checks "${LATEST}" outputs)" != "${expected_outputs}" ]]; then
-        problem "latest.yml's checks job must hand on exactly the Build run, the node version and the images :latest held its steps checked or read ($(tr '\n' ' ' <<<"${expected_outputs}")); it has: $(job_key checks "${LATEST}" outputs | tr '\n' ' ')"
+        problem "latest.yml's checks job must hand on exactly the Build run, the node version, the images :latest held and whether the image is tied to a Release run's, as its steps checked or read ($(tr '\n' ' ' <<<"${expected_outputs}")); it has: $(job_key checks "${LATEST}" outputs | tr '\n' ' ')"
     fi
     hands_on "${build_run_step}" "Check the commit's Build run" build_run 'echo "run=$run" >> "$GITHUB_OUTPUT"'
     hands_on "${version_step}" "Read the image's node version" version 'echo "version=$version" >> "$GITHUB_OUTPUT"'
     hands_on "${digest_step}" "Check the digest" digest 'echo "record=$record" >> "$GITHUB_OUTPUT"'
     hands_on "$(step "Read the images latest held with the image's node" "${checks}")" "Read the images latest held with the image's node" held 'echo "held=$held" >> "$GITHUB_OUTPUT"'
+    hands_on "$(step "Check a withdrawal goes back to an image latest had" "${checks}")" "Check a withdrawal goes back to an image latest had" withdrawal 'echo "tied=$tied" >> "$GITHUB_OUTPUT"'
 
     # The latest job: approved in the latest environment, after the checks
     # job, and able to read attestations and contents and write packages
@@ -822,6 +855,16 @@ else
         '| select(("ant-node " + ltrimstr("v") | node_version) > $t)] | join(" ")'\'' <<<"$published_releases"); then' \
         'refuse: if [[ -n "$newer" ]]; then' \
         'echo "- With $withdrawn gone, $release is the newest published release:'
+    # And it goes back to the last image :latest had with that node, never
+    # another: the newest of the images the checks job read it held with
+    # it, or, for the release's own image, the image of its tag's commit
+    # tied to its Release run.
+    holds "${latest}" "latest.yml's latest job must refuse a withdrawal to an older node to any image but the last one :latest had with that node" \
+        'TIED: ${{ needs.checks.outputs.tied }}' \
+        'read -ra node_images <<<"$HELD"' \
+        'last=${node_images[n-1]}' \
+        'refuse: if [[ "$last" != "$DIGEST" ]] && ! [[ "$last" == "release:$COMMIT" && "$TIED" == true ]]; then' \
+        'echo "- A withdrawal to an older node, to the last image the latest tag had with $VERSION'
     if [[ "$(newer_releases_order "${latest}")" != "${NODE_VERSION_DEF}" ]]; then
         problem "latest.yml's latest job must order the published releases as nodes order versions (the def node_version after --arg withdrawn \"\$withdrawn\" must be scripts/check-workflows.sh's NODE_VERSION_ORDER's)"
     fi
@@ -835,7 +878,7 @@ else
         'read -ra held <<<"$HELD"' \
         'if ((n >= 2)) && [[ "${held[n-1]}" == "$current" ]]; then' \
         'before=${held[n-2]}' \
-        'refuse: if [[ "$before" != "$DIGEST" && "$before" != "release:$COMMIT" ]]; then' \
+        'refuse: if [[ "$before" != "$DIGEST" ]] && ! [[ "$before" == "release:$COMMIT" && "$TIED" == true ]]; then' \
         'echo "- A withdrawal to the same node, back one image:'
     # And, unless the run is a withdrawal, an image built from the commit
     # :latest's image was built from, or a later one: the commit its image
@@ -905,9 +948,10 @@ else
         case "${where}"$'\t'"${entry}" in
             $'checks: Check the digest\tRUN: ${{ steps.build_run.outputs.run }}') ;;
             $'checks: Check a withdrawal goes back to an image latest had\tRECORD: ${{ steps.digest.outputs.record }}') ;;
+            $'checks: Check a withdrawal goes back to an image latest had\tRUN: ${{ steps.build_run.outputs.run }}') ;;
             $'checks: Read the images latest held with the image\'s node\tVERSION: ${{ steps.version.outputs.version }}') ;;
             *)
-                problem "latest.yml's steps must take their environment from their job's env alone (only the checks job's 'Check the digest' sets RUN: \${{ steps.build_run.outputs.run }}, its withdrawal's check RECORD: \${{ steps.digest.outputs.record }}, and its step reading the images :latest held VERSION: \${{ steps.version.outputs.version }}): ${where}: ${entry}"
+                problem "latest.yml's steps must take their environment from their job's env alone (only the checks job's 'Check the digest' sets RUN: \${{ steps.build_run.outputs.run }}, its withdrawal's check RECORD: \${{ steps.digest.outputs.record }} and RUN: \${{ steps.build_run.outputs.run }}, and its step reading the images :latest held VERSION: \${{ steps.version.outputs.version }}): ${where}: ${entry}"
                 ;;
         esac
     done < <(awk '
@@ -1181,4 +1225,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, and moves :latest forward only; latest.yml runs only by hand with no default permissions, names each run for its digest, checks its own commit with this script, and moves :latest in the latest environment, once it asks for its one reviewer's approval, only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested (for a withdrawal, also recorded, or listed in ${RELEASE_IMAGES_FILE}), from a commit whose Test run succeeded, with a published release's node whose code changes since its tag node_code names, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, to an image without a marker from one with a marker only in a withdrawal with allow_unmarked, to an older node only once the withdrawn release is gone and no other published release is newer, to the same node only one image back, with its release checked again after the approval, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, each with one registry write, and build.yml's image job alone pushes other tags; only release.yml's publish job runs in the release environment, and latest.yml's latest job in the latest environment; ${RELEASE_IMAGES_FILE} lists the images releases put on :latest before attestation; ${TOOLCHAIN_FILE} pins an exact Rust release that every workflow builds with."
+echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, and moves :latest forward only; latest.yml runs only by hand with no default permissions, names each run for its digest, checks its own commit with this script, and moves :latest in the latest environment, once it asks for its one reviewer's approval, only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested (for a withdrawal, also recorded, or listed in ${RELEASE_IMAGES_FILE}), from a commit whose Test run succeeded, with a published release's node whose code changes since its tag node_code names, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, to an image without a marker from one with a marker only in a withdrawal with allow_unmarked, to an older node only once the withdrawn release is gone and no other published release is newer and only to the last image :latest had with that node, to the same node only one image back, with its release checked again after the approval, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, each with one registry write, and build.yml's image job alone pushes other tags; only release.yml's publish job runs in the release environment, and latest.yml's latest job in the latest environment; ${RELEASE_IMAGES_FILE} lists the images releases put on :latest before attestation; ${TOOLCHAIN_FILE} pins an exact Rust release that every workflow builds with."

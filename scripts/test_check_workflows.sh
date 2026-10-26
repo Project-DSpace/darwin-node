@@ -710,10 +710,11 @@ edit "${LATEST}" 'fingerprint=$({ node_code "$released"; node_code "$COMMIT"; } 
     'fingerprint=$(node_code "$COMMIT" | sha256sum | cut -d'"' '"' -f1)'
 expect "a fingerprint of the commit's code alone, not of the change" "${CHANGES}"
 
-# The checks job hands on the Build run and the node version alone, each
+# The checks job hands on the Build run, the node version, the images
+# :latest held and whether the image is tied to a Release run's alone, each
 # written once by the step that checked it, and 'Check the digest' the
 # record it took.
-HANDS_ON="latest.yml's checks job must hand on exactly the Build run, the node version and the images :latest held its steps checked or read"
+HANDS_ON="latest.yml's checks job must hand on exactly the Build run, the node version, the images :latest held and whether the image is tied to a Release run's"
 fresh
 edit "${LATEST}" '      version: ${{ steps.version.outputs.version }}' '      version: ant-node 0.23.0+ds.15'
 expect "a node version handed on as a literal" "${HANDS_ON}"
@@ -801,6 +802,36 @@ expect "a withdrawal taking any attested image of a release's commit unsaid" "${
 fresh
 edit "${LATEST}" $'          RECORD: ${{ steps.digest.outputs.record }}\n' ''
 expect "the record taken never reaching the withdrawal's check" "${WITHDRAWAL}"
+
+fresh
+edit "${LATEST}" $'          RUN: ${{ steps.build_run.outputs.run }}\n        run: |\n          tied=false\n' \
+    $'        run: |\n          tied=false\n'
+expect "the Build run never reaching the withdrawal's check" "${WITHDRAWAL}"
+
+# A withdrawal's image is tied to the one the commit's Release run took
+# only by its record, or by the attestation of the one attempt of the Build
+# run that pushed an image, never by another attempt's.
+TIED="latest.yml's checks job must tie a withdrawal's image to the one the commit's Release run took only by its record, or by the attestation of the one attempt of the Build run that pushed an image"
+fresh
+edit "${LATEST}" 'if ((${#pushed[@]} == 1)) && [[ "$attested_in" == "${pushed[0]}" ]]; then' 'if [[ -n "$attested_in" ]]; then'
+expect "any attested image of the commit tied to its Release run" "${TIED}"
+
+fresh
+edit "${LATEST}" 'if [[ "$RECORD" == artifact || "$RECORD" == listed ]]; then' 'if true; then'
+expect "every image tied to its Release run" "${TIED}"
+
+fresh
+edit "${LATEST}" '[.jobs[] | select(.name == "image" and .conclusion == "success")] | length' '[.jobs[] | select(.name == "image")] | length'
+expect "a failed attempt's image counted as pushed" "${TIED}"
+
+FROM_WITHDRAWAL="latest.yml's checks job must hand on what 'Check a withdrawal goes back to an image latest had' checked"
+fresh
+edit "${LATEST}" 'echo "tied=$tied" >> "$GITHUB_OUTPUT"' 'echo "tied=true" >> "$GITHUB_OUTPUT"'
+expect "a literal tie written for the latest job" "${FROM_WITHDRAWAL}"
+
+fresh
+edit "${LATEST}" $'        id: withdrawal\n' ''
+expect "the withdrawal's check with no id" "${FROM_WITHDRAWAL}"
 
 fresh
 edit "${LATEST}" $'    environment: latest\n' ''
@@ -1006,8 +1037,13 @@ expect "the newest release left out of the summary" "${NEWEST}"
 # before its image, as the checks job read them.
 ONE_BACK="latest.yml's latest job must refuse a withdrawal to the same node to any image but the one :latest held before its image"
 fresh
-edit "${LATEST}" 'if [[ "$before" != "$DIGEST" && "$before" != "release:$COMMIT" ]]; then' 'if false; then'
+edit "${LATEST}" 'if [[ "$before" != "$DIGEST" ]] && ! [[ "$before" == "release:$COMMIT" && "$TIED" == true ]]; then' 'if false; then'
 expect "a withdrawal to any earlier image of the node" "${ONE_BACK}"
+
+fresh
+edit "${LATEST}" 'if [[ "$before" != "$DIGEST" ]] && ! [[ "$before" == "release:$COMMIT" && "$TIED" == true ]]; then' \
+    'if [[ "$before" != "$DIGEST" && "$before" != "release:$COMMIT" ]]; then'
+expect "a withdrawal to the same node taking any image of the release's commit" "${ONE_BACK}"
 
 fresh
 edit "${LATEST}" 'if [[ "$order" == "the same as" && "$WITHDRAW" == true ]]; then' 'if false; then'
@@ -1025,7 +1061,36 @@ fresh
 edit "${LATEST}" $'      HELD: ${{ needs.checks.outputs.held }}\n' ''
 expect "the images held never reaching the latest job" "${ONE_BACK}"
 
+# A withdrawal to an older node goes back to the last image :latest had
+# with that node: the newest of the images read, or, for the release's own
+# image, the one tied to its Release run.
+OLDER_LAST="latest.yml's latest job must refuse a withdrawal to an older node to any image but the last one :latest had with that node"
+fresh
+edit "${LATEST}" 'if [[ "$last" != "$DIGEST" ]] && ! [[ "$last" == "release:$COMMIT" && "$TIED" == true ]]; then' 'if false; then'
+expect "a withdrawal to an older node taking any image it ever had" "${OLDER_LAST}"
+
+fresh
+edit "${LATEST}" 'if [[ "$last" != "$DIGEST" ]] && ! [[ "$last" == "release:$COMMIT" && "$TIED" == true ]]; then' \
+    'if [[ "$last" != "$DIGEST" && "$last" != "release:$COMMIT" ]]; then'
+expect "a withdrawal to an older node taking any image of the release's commit" "${OLDER_LAST}"
+
+fresh
+edit "${LATEST}" 'last=${node_images[n-1]}' 'last=$DIGEST'
+expect "the last image taken as the one asked for" "${OLDER_LAST}"
+
+fresh
+edit "${LATEST}" $'      TIED: ${{ needs.checks.outputs.tied }}\n' ''
+expect "the tie never reaching the latest job" "${OLDER_LAST}"
+
 HELD_READ="latest.yml's checks job must read, for a withdrawal, the images :latest held with the image's node since its release, in order"
+fresh
+edit "${LATEST}" 'if [[ "${nodes[$digest]}" != "$VERSION" ]]; then' 'if [[ -z "${nodes[$digest]}" ]]; then'
+expect "another node's images read as this node's" "${HELD_READ}"
+
+fresh
+edit "${LATEST}" 'if ! nodes[$digest]=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$digest" --version </dev/null); then' \
+    'if ! nodes[$digest]=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$digest" --version </dev/null || true); then'
+expect "an image whose node can't be read let through" "${HELD_READ}"
 fresh
 edit "${LATEST}" 'stack=("${stack[@]:0:at+1}")' 'stack+=("$digest")'
 expect "a withdrawal read as a new image, keeping the withdrawn ones" "${HELD_READ}"
@@ -1189,8 +1254,8 @@ edit "${LATEST}" $'      - name: Point latest at it\n' \
 expect "latest moved to a digest a step sets" "${OWN_ENV}"
 
 fresh
-edit "${LATEST}" $'          RUN: ${{ steps.build_run.outputs.run }}\n' \
-    $'          RUN: ${{ steps.build_run.outputs.run }}\n          COMMIT: ${{ github.sha }}\n'
+edit "${LATEST}" $'        env:\n          RUN: ${{ steps.build_run.outputs.run }}\n' \
+    $'        env:\n          RUN: ${{ steps.build_run.outputs.run }}\n          COMMIT: ${{ github.sha }}\n'
 expect "the digest checked against another commit" "${OWN_ENV}"
 
 fresh
@@ -1481,7 +1546,9 @@ newer_than "no published release listed" "" v0.23.0+ds.15 v0.23.0+ds.16 ""
 # from its "Read the images latest held with the image's node" step: the
 # loop from "while read -r started" to its done, run on sample lists of
 # Latest runs (started time, then title), as the step runs them after the
-# node's Release run started at SINCE.
+# node's Release run started at SINCE, for the node VERSION, with docker
+# reading each image's node from NODES ("digest node" lines) in place of
+# the registry.
 held_lines=$(awk '
     { line = $0; sub(/^[ \t]+/, "", line) }
     index(line, "while read -r started kind") == 1 { inside = 1 }
@@ -1501,6 +1568,14 @@ held_reads() {
         since=$3
         released=$4
         runs=$5
+        IMAGE=ghcr.io/project-dspace/storage-node
+        VERSION="ant-node 0.23.0+ds.15"
+        NODES="${6:-}"
+        docker() {
+            local image=${@: -2:1}
+            awk -v digest="${image#*@}" '$1 == digest { $1 = ""; sub(/^ /, ""); print "ant-node " $0; found = 1 } END { exit !found }' <<<"${NODES}"
+        }
+        declare -A nodes=()
         stack=("release:${released}")
         eval "${held_lines}"
         echo "${stack[*]}"
@@ -1519,19 +1594,38 @@ c=cbd133ba3665b38b81890a6932ae1657d7a32712
 a=sha256:$(printf 'a%.0s' {1..64})
 b=sha256:$(printf 'b%.0s' {1..64})
 e=sha256:$(printf 'e%.0s' {1..64})
-held_reads "the release's image alone" "release:${c}" 2026-10-20T00:00:00Z "${c}" ""
+# Images of a newer node, ds.16: its release's own (r16) and image
+# releases of it (p and q).
+r16=sha256:$(printf '1%.0s' {1..64})
+p=sha256:$(printf 'c%.0s' {1..64})
+q=sha256:$(printf 'd%.0s' {1..64})
+ds15="${a} 0.23.0+ds.15"$'\n'"${b} 0.23.0+ds.15"$'\n'"${e} 0.23.0+ds.15"
+ds16="${r16} 0.23.0+ds.16"$'\n'"${p} 0.23.0+ds.16"$'\n'"${q} 0.23.0+ds.16"
+held_reads "the release's image alone" "release:${c}" 2026-10-20T00:00:00Z "${c}" "" "${ds15}"
 held_reads "two image releases" "release:${c} ${a} ${b}" 2026-10-20T00:00:00Z "${c}" \
-    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y" "${ds15}"
 held_reads "a run before the release left out" "release:${c} ${b}" 2026-10-20T00:00:00Z "${c}" \
-    "2026-10-19T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"
+    "2026-10-19T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y" "${ds15}"
 held_reads "a withdrawal drops the images after its own" "release:${c} ${a}" 2026-10-20T00:00:00Z "${c}" \
-    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"$'\n'"2026-10-23T00:00:00Z Withdraw latest to ${a} from x"
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"$'\n'"2026-10-23T00:00:00Z Withdraw latest to ${a} from x" "${ds15}"
 held_reads "a withdrawn image never comes back as the one before" "release:${c} ${a} ${e}" 2026-10-20T00:00:00Z "${c}" \
-    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"$'\n'"2026-10-23T00:00:00Z Withdraw latest to ${a} from x"$'\n'"2026-10-24T00:00:00Z Point latest at ${e} from z"
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"$'\n'"2026-10-23T00:00:00Z Withdraw latest to ${a} from x"$'\n'"2026-10-24T00:00:00Z Point latest at ${e} from z" "${ds15}"
 held_reads "a run moving latest to the image it has adds nothing" "release:${c} ${a}" 2026-10-20T00:00:00Z "${c}" \
-    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${a} from x"
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${a} from x" "${ds15}"
 held_reads "a withdrawal to an image not among them starts again from it" "${e}" 2026-10-20T00:00:00Z "${c}" \
-    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Withdraw latest to ${e} from z"
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Withdraw latest to ${e} from z" "${ds15}"
+# A newer node released after ds.15's image releases (its Release run is
+# not read), with image releases of its own and one of them withdrawn:
+# the newest image read is still ds.15's last, the one a withdrawal of
+# ds.16 goes back to, not an earlier one, and not a ds.16 image.
+held_reads "a newer node's image releases and withdrawals left out" "release:${c} ${a} ${b}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-22T00:00:00Z Point latest at ${b} from y"$'\n'"2026-10-25T00:00:00Z Point latest at ${p} from z"$'\n'"2026-10-26T00:00:00Z Point latest at ${q} from z"$'\n'"2026-10-27T00:00:00Z Withdraw latest to ${p} from z" "${ds15}"$'\n'"${ds16}"
+held_reads "a newer node's withdrawal to its release's own image left out" "release:${c} ${a}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-25T00:00:00Z Point latest at ${p} from z"$'\n'"2026-10-26T00:00:00Z Withdraw latest to ${r16} from z" "${ds15}"$'\n'"${ds16}"
+# ds.16 withdrawn once already, back to ds.15's last image, then ds.15
+# image-released again before a later release: the newest is that one.
+held_reads "a withdrawal back to the node, then an image release of it" "release:${c} ${a} ${e}" 2026-10-20T00:00:00Z "${c}" \
+    "2026-10-21T00:00:00Z Point latest at ${a} from x"$'\n'"2026-10-25T00:00:00Z Point latest at ${p} from z"$'\n'"2026-10-26T00:00:00Z Withdraw latest to ${a} from x"$'\n'"2026-10-27T00:00:00Z Point latest at ${e} from y" "${ds15}"$'\n'"${ds16}"
 
 # The lines latest.yml's checks job reads the node's code with, from its
 # "Read the image's node version" step: from paths=( to the end of

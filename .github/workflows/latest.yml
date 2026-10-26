@@ -63,8 +63,10 @@
 # held the image before: an earlier Latest run moved :latest to that
 # digest, or it is the image of a v*+ds.* tag on the commit whose Release
 # run succeeded. It also reads, from those runs, the images :latest held
-# with the image's node since that node's release, in order, for the latest
-# job's check that a withdrawal to the same node goes back one image.
+# with the image's node since that node's release, in order, leaving out
+# runs whose image runs another node, for the latest job's check that a
+# withdrawal goes back one step, and whether the digest is the image the
+# commit's Release run took, for a withdrawal to a release's own image.
 #
 # The latest job then runs in the latest environment, after its approval,
 # given in GitHub's interface by a required reviewer. It refuses an image
@@ -78,8 +80,9 @@
 # and allow_unmarked is set: only withdrawing the first image release
 # needs that. A withdrawal goes back one step, never further: to an older
 # node only once the withdrawn release is gone and the image's release is
-# then the newest published one, and to the same node only to the image
-# :latest had before the one it has. It checks again
+# then the newest published one, and only to the last image :latest had
+# with that node, and to the same node only to the image :latest had
+# before the one it has. It checks again
 # that the image's node is a published release. It writes
 # the digest :latest had and the new one to the run's summary, with the
 # command that moves it back when the image it had has a record that
@@ -146,6 +149,7 @@ jobs:
       run: ${{ steps.build_run.outputs.run }}
       version: ${{ steps.version.outputs.version }}
       held: ${{ steps.held.outputs.held }}
+      tied: ${{ steps.withdrawal.outputs.tied }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -429,11 +433,24 @@ jobs:
       # has expired, for an image docker/release-images doesn't list, any
       # image attested as built by the push of the commit to main is taken,
       # the images a run without withdraw would take, and the summary says
-      # so. Without withdraw, the latest job refuses any move back.
+      # so. Without withdraw, the latest job refuses any move back. It
+      # also hands the latest job whether the digest is tied to the image a
+      # Release run of the commit took, for a withdrawal back to a
+      # release's own image (release: in the images :latest held below):
+      # the Build run recorded it, or docker/release-images lists it, or,
+      # once the record has expired, its attestation is by Build run RUN,
+      # the run release.yml takes too, from the one attempt of that run
+      # whose image job succeeded, as each attempt pushes an image of its
+      # own and only one of them can be told apart then. Any other image
+      # of the commit is not tied: a re-run attempt's image may never have
+      # been on :latest.
       - name: Check a withdrawal goes back to an image latest had
+        id: withdrawal
         env:
           RECORD: ${{ steps.digest.outputs.record }}
+          RUN: ${{ steps.build_run.outputs.run }}
         run: |
+          tied=false
           if [[ "$WITHDRAW" == true ]]; then
             tags=$(git tag --points-at "$COMMIT" --list 'v*+ds.*')
             releases=$(gh api -X GET "repos/$GH_REPO/actions/workflows/release.yml/runs" \
@@ -467,7 +484,31 @@ jobs:
                 echo "- The Build run's record of the digest that Release run moved the latest tag to has expired, and docker/release-images doesn't list it: any image attested as built by the push of $COMMIT to main is taken, by any Build run of that push, not tied to Build run $RUN."
               fi
             } >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$RECORD" == artifact || "$RECORD" == listed ]]; then
+              tied=true
+              tied_by="Build run $RUN's record of it ($RECORD)"
+            else
+              attempts=$(gh api "repos/$GH_REPO/actions/runs/$RUN" --jq .run_attempt)
+              pushed=()
+              for ((k = 1; k <= attempts; k++)); do
+                images=$(gh api "repos/$GH_REPO/actions/runs/$RUN/attempts/$k/jobs?per_page=100" \
+                  --jq '[.jobs[] | select(.name == "image" and .conclusion == "success")] | length')
+                if [[ "$images" != 0 ]]; then
+                  pushed+=("$k")
+                fi
+              done
+              attested_in=$({ gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GH_REPO" \
+                --signer-workflow "$GH_REPO/.github/workflows/build.yml" \
+                --source-digest "$COMMIT" --source-ref refs/heads/main --format json || true; } \
+                | jq -r --arg from "https://github.com/$GH_REPO/actions/runs/$RUN/attempts/" '[.[]?.verificationResult.signature.certificate | select(.buildTrigger == "push") | .runInvocationURI | select(startswith($from)) | ltrimstr($from)] | unique | join(" ")' || true)
+              tied_by="its attestation, by attempt ${attested_in:-none} of Build run $RUN, whose attempts that pushed an image are ${pushed[*]:-none}"
+              if ((${#pushed[@]} == 1)) && [[ "$attested_in" == "${pushed[0]}" ]]; then
+                tied=true
+              fi
+            fi
+            echo "- Tied to the image a Release run of $COMMIT took: $tied, by $tied_by." >> "$GITHUB_STEP_SUMMARY"
           fi
+          echo "tied=$tied" >> "$GITHUB_OUTPUT"
 
       # For a withdrawal, the images :latest held with the image's node
       # since that node's release, oldest first, for the latest job's check
@@ -482,8 +523,13 @@ jobs:
       # among them, leaves it alone, with nothing known before it. A
       # release's Release run moving :latest to a newer node in between is
       # not read: a withdrawal back to this node drops what came after.
-      # With no successful Release run of the node, nothing is known, and
-      # the latest job refuses a withdrawal to the same node.
+      # Only runs whose image runs the node are read, by the version the
+      # image's node reports (read once for each digest): a newer node's
+      # image releases and withdrawals never enter, so the newest image
+      # read is the last one :latest had with this node, the one a
+      # withdrawal to an older node goes back to. An image whose node can't
+      # be read stops the step. With no successful Release run of the node,
+      # nothing is known, and the latest job refuses a withdrawal to it.
       - name: Read the images latest held with the image's node
         id: held
         env:
@@ -498,11 +544,21 @@ jobs:
               --jq '.workflow_runs[] | "\(.head_branch) \(.run_started_at)"' | awk -v tag="$tag" '$1 == tag { print $2 }' | sort | tail -n 1)
             if [[ -n "$since" ]]; then
               stack=("release:$released")
+              declare -A nodes=()
               runs=$(gh api --paginate -X GET "repos/$GH_REPO/actions/workflows/latest.yml/runs" \
                 -f event=workflow_dispatch -f branch=main -f status=success -f per_page=100 \
                 --jq '.workflow_runs[] | "\(.run_started_at) \(.display_title)"' | sort)
               while read -r started kind _ _ digest _; do
                 if [[ ! "$started" > "$since" || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  continue
+                fi
+                if [[ -z "${nodes[$digest]:-}" ]]; then
+                  if ! nodes[$digest]=$(docker run --rm --entrypoint /opt/ant/ant-node "$IMAGE@$digest" --version </dev/null); then
+                    echo "::error::the node of $IMAGE@$digest, which a Latest run moved the latest tag to, can't be read"
+                    exit 1
+                  fi
+                fi
+                if [[ "${nodes[$digest]}" != "$VERSION" ]]; then
                   continue
                 fi
                 if [[ "$kind" == Point && "${stack[${#stack[@]}-1]}" != "$digest" ]]; then
@@ -547,6 +603,7 @@ jobs:
       RUN: ${{ needs.checks.outputs.run }}
       VERSION: ${{ needs.checks.outputs.version }}
       HELD: ${{ needs.checks.outputs.held }}
+      TIED: ${{ needs.checks.outputs.tied }}
       ALLOW_UNMARKED: ${{ inputs.allow_unmarked }}
     steps:
       - name: Log in to the registry
@@ -574,11 +631,16 @@ jobs:
       # refuses it. It goes back to the release before, never further: once
       # the withdrawn release is left out, no published release (not a
       # draft or a pre-release) may be newer than the image's, ordered as
-      # nodes order them. A withdrawal to the same node (an image release
-      # going back) keeps that release published, and goes back one image:
-      # :latest's image must be the newest of the images the checks job
-      # read it held with that node, and the new one the image before it, or,
-      # when that is the release's own image, an image of its tag's commit.
+      # nodes order them, and the image must be the last one :latest had
+      # with that node: the newest of the images the checks job read it
+      # held with it, or, when that is the release's own image, the image
+      # of its tag's commit the checks job tied to its Release run (TIED).
+      # A withdrawal to the same node (an image release going back) keeps
+      # that release published, and goes back one image: :latest's image
+      # must be the newest of the images the checks job read it held with
+      # that node, and the new one the image before it, or, when that is
+      # the release's own image, the image of its tag's commit tied to its
+      # Release run.
       # A floor from the root switch on (no withdrawal below the root
       # release) is to be its own check once that release exists. The image's node
       # must still be a published release: the checks job checked it before
@@ -671,6 +733,16 @@ jobs:
               echo "::error::a withdrawal goes back to the release before the withdrawn one, never further: with $withdrawn gone, $newer is still published and newer than $release, which $IMAGE@$DIGEST runs. Withdraw to the newest published release's image instead"
               exit 1
             fi
+            read -ra node_images <<<"$HELD"
+            n=${#node_images[@]}
+            last=""
+            if ((n >= 1)); then
+              last=${node_images[n-1]}
+            fi
+            if [[ "$last" != "$DIGEST" ]] && ! [[ "$last" == "release:$COMMIT" && "$TIED" == true ]]; then
+              echo "::error::a withdrawal to an older node goes back to the last image the latest tag had with that node, never another: ${last:-not known}, and $DIGEST from $COMMIT is not it (release: names the release's own image, by its tag's commit, which needs the image its Release run took; tied: $TIED). The images it held with $VERSION since its release, oldest first: ${HELD:-not known}"
+              exit 1
+            fi
           fi
           if [[ "$order" == "the same as" && "$WITHDRAW" == true ]]; then
             read -ra held <<<"$HELD"
@@ -679,8 +751,8 @@ jobs:
             if ((n >= 2)) && [[ "${held[n-1]}" == "$current" ]]; then
               before=${held[n-2]}
             fi
-            if [[ "$before" != "$DIGEST" && "$before" != "release:$COMMIT" ]]; then
-              echo "::error::a withdrawal to the same node goes back one image, never further: to the image the latest tag had before $current, which is ${before:-not known}, and $DIGEST from $COMMIT is not it. The images it held with $VERSION since its release, oldest first (release: names the release's own image, by its tag's commit): ${HELD:-not known}"
+            if [[ "$before" != "$DIGEST" ]] && ! [[ "$before" == "release:$COMMIT" && "$TIED" == true ]]; then
+              echo "::error::a withdrawal to the same node goes back one image, never further: to the image the latest tag had before $current, which is ${before:-not known}, and $DIGEST from $COMMIT is not it (release: needs the image its Release run took; tied: $TIED). The images it held with $VERSION since its release, oldest first (release: names the release's own image, by its tag's commit): ${HELD:-not known}"
               exit 1
             fi
           fi
@@ -716,6 +788,7 @@ jobs:
             echo "- $VERSION is still the published release $release."
             if [[ "$order" == "older than" ]]; then
               echo "- With $withdrawn gone, $release is the newest published release: the withdrawal goes back to the release before, no further."
+              echo "- A withdrawal to an older node, to the last image the latest tag had with $VERSION (${last})."
             fi
             if [[ "$WITHDRAW" == true && "$order" == "the same as" ]]; then
               echo "- A withdrawal to the same node, back one image: from $current, the newest image the latest tag held with $VERSION, to the one before it (${before})."
