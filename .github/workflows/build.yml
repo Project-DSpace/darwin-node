@@ -7,8 +7,11 @@
 #
 # It never publishes :latest, which home operators run: release.yml points
 # :latest at the image a push run here made from a release's commit, once that
-# release is approved and published. Each run records the digest it pushed
-# (the storage-node-digest artifact) for that.
+# release is approved and published, and latest.yml, run by hand and approved
+# the same way, at the image a push run here made from a commit on main. Each
+# run records the digest it pushed for them: in the storage-node-digest
+# artifact, kept 30 days, and in a build provenance attestation of the image,
+# which doesn't expire.
 #
 # Replaces upstream's workflows, which run Autonomi's test matrix, PR checks
 # and multi-platform releases.
@@ -52,10 +55,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # The workflow files keep what releases rely on: only these three
-      # workflows, every action pinned to a commit, and release.yml's tags,
-      # permissions, key check and the checks its publish waits for (see the
-      # script).
+      # The workflow files keep what releases rely on: only these four
+      # workflows, every action pinned to a commit, release.yml's tags,
+      # permissions, key check and the checks its publish waits for, and
+      # latest.yml's trigger, approval and checks (see the script).
       - name: Check the workflows
         shell: bash
         run: bash scripts/check-workflows.sh
@@ -324,7 +327,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       actions: read
+      attestations: write
       contents: read
+      id-token: write
       packages: write
     env:
       IMAGE: ghcr.io/project-dspace/storage-node
@@ -394,15 +399,21 @@ jobs:
         run: docker push "$IMAGE:${{ github.sha }}"
 
       # The digest this run pushed, read back from the registry. release.yml
-      # copies exactly this image to :latest, so a later run that pushes the
-      # same commit tag again (a reuse_build run, say) can't change what
-      # :latest gets.
+      # copies exactly this image to :latest, and latest.yml copies only an
+      # image this record or the attestation below names (or, for a
+      # withdrawal to an image a release put on :latest before this
+      # workflow attested its images, docker/release-images, copied from
+      # these records), never what the commit's tag names, so a later run
+      # that pushes the same commit tag again (a reuse_build run, say) can't
+      # change what :latest gets.
       - name: Record the image digest
+        id: digest
         run: |
           docker buildx imagetools inspect "$IMAGE:${{ github.sha }}" --format '{{json .Manifest}}' \
             | jq -r .digest > storage-node-digest.txt
           digest=$(cat storage-node-digest.txt)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected digest: $digest"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "$IMAGE:${{ github.sha }} is $digest"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -411,3 +422,18 @@ jobs:
           path: storage-node-digest.txt
           if-no-files-found: error
           retention-days: 30
+
+      # The same record, kept for good: a build provenance attestation of the
+      # image, signed with a short-lived certificate issued for this run's
+      # GitHub token, which names build.yml, the ref, the commit and the event
+      # that started the run. As for any public repository, Sigstore's public
+      # instance signs it; it is kept in GitHub's attestations API, not pushed
+      # to the registry. latest.yml takes an image only from a run a push to
+      # main started, by this record or the artifact above (or
+      # docker/release-images, for a withdrawal, as above).
+      - name: Attest the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/project-dspace/storage-node
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: false

@@ -19,7 +19,9 @@
 //! released client waits for its answer. And the bytes of
 //! the payment proofs nodes pass each other in fresh offers and paid notices,
 //! and of the quotes inside them, with each quote's hash
-//! (`payment_encodings` below).
+//! (`payment_encodings` below). And the census of test files, so a merge
+//! can't bring back a test this fork removed, or add one, unreviewed
+//! (`every_test_file_is_reviewed`).
 //!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes. The payment reads need the
@@ -293,6 +295,112 @@ fn nothing_withholds_the_unheld_chunk_penalty() {
             );
         }
     }
+}
+
+/// Every file under `tests/`, reviewed on 2026-10-25 when the suite was cut
+/// back to what protects something (Dan: "keep what's needed"). A file that
+/// isn't here, from an upstream merge or a new branch, fails the census
+/// below until it is reviewed: kept and listed, or left out and listed in
+/// `REMOVED_TEST_FILES`.
+const TEST_FILES: &[&str] = &[
+    "tests/chunk_store_crash_safety.rs",
+    "tests/darwin_image.rs",
+    "tests/darwin_network.rs",
+    "tests/e2e/anvil.rs",
+    "tests/e2e/data_types/chunk.rs",
+    "tests/e2e/data_types/mod.rs",
+    "tests/e2e/fetch_local_write_guard.rs",
+    "tests/e2e/fetch_responsibility_recheck.rs",
+    "tests/e2e/fresh_offer_capacity.rs",
+    "tests/e2e/harness.rs",
+    "tests/e2e/integration_tests.rs",
+    "tests/e2e/listings.rs",
+    "tests/e2e/mod.rs",
+    "tests/e2e/pointer_replication.rs",
+    "tests/e2e/replication.rs",
+    "tests/e2e/settlement_version_gate.rs",
+    "tests/e2e/subtree_audit_testnet.rs",
+    "tests/e2e/testnet.rs",
+    "tests/e2e/verify_storage_gate.rs",
+    "tests/fork_pins.rs",
+    "tests/full_line.rs",
+    "tests/poc_audit_handler_live.rs",
+    "tests/poc_bootstrap_stall.rs",
+    "tests/poc_commitment_audit_attacks.rs",
+    "tests/poc_d1_bounded_queues.rs",
+    "tests/poc_price_floor_live.rs",
+    "tests/pointer_convergence.rs",
+    "tests/price_multiplier.rs",
+    "tests/record_weight.rs",
+    "tests/storage_scale.rs",
+    "tests/test_seams.rs",
+    "tests/webrtc_direct_devnet.rs",
+    "tests/webrtc_dtls_cleanup.rs",
+    "tests/wire_format.rs",
+];
+
+/// Upstream's test files this fork removed, and where what they checked is
+/// checked now. An upstream merge that brings one back fails the census.
+const REMOVED_TEST_FILES: &[(&str, &str)] = &[
+    (
+        "tests/e2e/payment_flow.rs",
+        "tested only its own helper; paid stores on live nodes: e2e listings, \
+         poc_price_floor_live",
+    ),
+    ("tests/e2e/complete_payment_e2e.rs", "had no tests"),
+    (
+        "tests/e2e/live_testnet.rs",
+        "ignored, disabled since saorsa-core 0.16",
+    ),
+    (
+        "tests/e2e/first_audit_ab.rs",
+        "an A/B load driver behind FIRST_AUDIT_AB=1, never run in CI",
+    ),
+    (
+        "tests/e2e/security_attacks.rs",
+        "the refusal table, e2e data_types::chunk::test_chunk_rejected_without_payment",
+    ),
+    (
+        "tests/e2e/merkle_payment.rs",
+        "merkle refusal: payment_reads::a_merkle_proof_is_refused_before_any_read here, \
+         the verifier's merkle_proofs_are_refused_in_every_context and _for_pointers, \
+         and the refusal table",
+    ),
+];
+
+/// The census of test files: every file under `tests/` is one reviewed
+/// (`TEST_FILES`), and none of the removed ones is back.
+#[test]
+fn every_test_file_is_reviewed() {
+    let root = repo_path("");
+    let mut found = Vec::new();
+    rust_files(&repo_path("tests"), &mut found);
+    let mut found: Vec<String> = found
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    found.sort();
+    let mut listed: Vec<String> = TEST_FILES.iter().map(|s| (*s).to_string()).collect();
+    listed.sort();
+    for (path, now) in REMOVED_TEST_FILES {
+        assert!(
+            !repo_path(path).exists(),
+            "{path} is back: it was removed (its checks: {now}); review it, then \
+             list it in TEST_FILES or delete it"
+        );
+    }
+    let unreviewed: Vec<_> = found.iter().filter(|f| !listed.contains(f)).collect();
+    let missing: Vec<_> = listed.iter().filter(|f| !found.contains(f)).collect();
+    assert!(
+        unreviewed.is_empty() && missing.is_empty(),
+        "test files not in TEST_FILES (review each, then list it): {unreviewed:?}; \
+         listed but gone (take them off the list): {missing:?}"
+    );
 }
 
 /// How the payment check reads the chain, through the path a node takes
