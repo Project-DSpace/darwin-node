@@ -36,6 +36,7 @@ pub mod scheduling;
 pub mod slice;
 pub mod storage_commitment_audit;
 pub mod subtree;
+pub mod sync_pages;
 pub mod types;
 
 /// The line every commitment tick logs (`commitment_tick_tests.rs`).
@@ -95,13 +96,16 @@ use crate::replication::config::{
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
-    FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
-    VerificationResponse,
+    FreshReplicationResponse, NeighborSyncPageResponse, NeighborSyncResponse, ReplicationMessage,
+    ReplicationMessageBody, VerificationResponse,
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
 use crate::replication::storage_commitment_audit::PointerBindings;
+use crate::replication::sync_pages::{
+    HeldProofs, ServedHintSets, ServedHints, SyncPeers, SyncRole,
+};
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
@@ -1172,7 +1176,32 @@ const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING: usize = NEIGHBOR_SYNC_RESPONDER_W
 ///
 /// Sync history must be updated before repair proofs for the same peer. A
 /// single slot preserves that ordering while independent peers remain parallel.
+/// A paged exchange keeps to it: its requester sends each page only once the
+/// last is answered, and the responder lets the slot go before it answers.
 const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 1;
+
+/// Neighbour-sync requests admitted at once across peers:
+/// [`NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING`], or, in a `test-utils` build,
+/// the limit a test set ([`crate::test_seams::SYNC_ADMISSION_LIMIT`]), so that
+/// a run can push requesters past a responder's limit with a few nodes.
+fn neighbor_sync_admission_limit() -> usize {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(limit) = crate::test_seams::sync_admission_limit() {
+        return limit;
+    }
+    NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING
+}
+
+/// Busy answers to sync page requests in flight at once: as many as requests
+/// admitted. A request refused when this many are already being sent, or
+/// while one to the same peer is, gets no answer, as every refused request
+/// did before busy answers. An honest requester has one page outstanding at
+/// a time, so only a peer sending more than that goes unanswered, and it
+/// can't keep the busy answers from other peers.
+const NEIGHBOR_SYNC_BUSY_REPLIES: usize = NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING;
+
+/// Busy answers in flight to one peer at once.
+const NEIGHBOR_SYNC_BUSY_REPLIES_PER_PEER: u32 = 1;
 
 /// Match an inbound topic against the replication protocol ids, in both the bare
 /// gossip form and the `/rr/<id>` request-response form.
@@ -1816,6 +1845,17 @@ pub struct ReplicationEngine {
     neighbor_sync_responder_admission_semaphore: Arc<Semaphore>,
     /// Per-source sync responder counts; capped at one to preserve ordering.
     neighbor_sync_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Busy answers to sync page requests that may be in flight at once.
+    neighbor_sync_busy_replies: Arc<Semaphore>,
+    /// Per-peer busy answers in flight, for flood-fair busy answers.
+    neighbor_sync_busy_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// What this node keeps of its sync exchanges with each peer: those in
+    /// progress, as requester, the peers whose next exchange is a single
+    /// message, where the next window of the hints it sends each starts, and
+    /// what it holds of their answers.
+    sync_peers: Arc<SyncPeers>,
+    /// The hints this node holds, as responder, for paged exchanges in progress.
+    served_hint_sets: Arc<ServedHintSets>,
     /// Bounded worker permits for expensive fresh-offer handling.
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     /// Admission permits bounding offers running on a worker or queued for one.
@@ -1974,9 +2014,13 @@ impl ReplicationEngine {
                 NEIGHBOR_SYNC_RESPONDER_WORKER_LIMIT,
             )),
             neighbor_sync_responder_admission_semaphore: Arc::new(Semaphore::new(
-                NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+                neighbor_sync_admission_limit(),
             )),
             neighbor_sync_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            neighbor_sync_busy_replies: Arc::new(Semaphore::new(NEIGHBOR_SYNC_BUSY_REPLIES)),
+            neighbor_sync_busy_inflight: Arc::new(RwLock::new(HashMap::new())),
+            sync_peers: Arc::new(SyncPeers::default()),
+            served_hint_sets: Arc::new(ServedHintSets::default()),
             fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
             fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
             fresh_offer_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
@@ -2066,6 +2110,140 @@ impl ReplicationEngine {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Test-only: run one neighbour-sync exchange with `peer` now, paged or
+    /// as a single message, whatever the peer is known to read, and take its
+    /// answer as a sync round does.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn sync_with_peer_now(
+        &self,
+        peer: &PeerId,
+        paged: bool,
+    ) -> neighbor_sync::ExchangeReport {
+        // Its turn, after any exchange of the sync rounds with the peer.
+        let _turn = loop {
+            if let Some(turn) = self.sync_peers.try_start(*peer) {
+                break turn;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let hints = neighbor_sync::build_sync_hints_for_peer(
+            peer,
+            &self.storage,
+            &self.paid_list,
+            &self.p2p_node,
+            self.config.close_group_size,
+            self.config.paid_list_close_group_size,
+        )
+        .await;
+        let form = if paged {
+            neighbor_sync::SyncForm::Paged
+        } else {
+            neighbor_sync::SyncForm::Single
+        };
+        let bootstrapping = *self.is_bootstrapping.read().await;
+        let commitment = self
+            .commitment_state
+            .current_for_gossip()
+            .map(|built| built.commitment().clone());
+        let exchange = neighbor_sync::exchange(
+            peer,
+            &self.p2p_node,
+            &self.config,
+            bootstrapping,
+            hints,
+            commitment,
+            form,
+            &self.sync_peers,
+        )
+        .await;
+        let report = neighbor_sync::ExchangeReport::of(&exchange, form);
+        if exchange.answer.is_some() {
+            let gossip_audit = GossipAuditTrigger {
+                p2p_node: Arc::clone(&self.p2p_node),
+                config: Arc::clone(&self.config),
+                recent_provers: Arc::clone(&self.recent_provers),
+                sync_state: Arc::clone(&self.sync_state),
+                cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+                detached_task_tracker: self.detached_task_tracker.clone(),
+                lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
+            };
+            handle_sync_response(
+                self.p2p_node.peer_id(),
+                peer,
+                &exchange,
+                &self.p2p_node,
+                &self.config,
+                bootstrapping,
+                &self.bootstrap_state,
+                &self.storage,
+                &self.paid_list,
+                &self.queues,
+                &self.sync_state,
+                &self.sync_history,
+                &self.sync_cycle_epoch,
+                &self.repair_proofs,
+                &self.last_commitment_by_peer,
+                &self.ever_capable_peers,
+                &self.sig_verify_attempts,
+                &gossip_audit,
+            )
+            .await;
+        }
+        report
+    }
+
+    /// Test-only: whether this node would page its next exchange with `peer`.
+    /// Like an exchange, it spends a "single message next" mark.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn pages_to_for_test(&self, peer: &PeerId) -> bool {
+        neighbor_sync::sync_form_for(peer, &self.p2p_node, &self.sync_peers).await
+            == neighbor_sync::SyncForm::Paged
+    }
+
+    /// Test-only: whether this node holds a repair proof that it hinted `key`
+    /// to `peer`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn has_repair_proof_for_test(&self, peer: &PeerId, key: &XorName) -> bool {
+        self.repair_proofs.read().await.has_proof(peer, key)
+    }
+
+    /// Test-only: take every neighbour-sync admission permit, so that sync
+    /// requests are refused at admission until the permits are dropped.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn hold_neighbor_sync_admission(&self) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut held = Vec::new();
+        while let Ok(permit) =
+            Arc::clone(&self.neighbor_sync_responder_admission_semaphore).try_acquire_owned()
+        {
+            held.push(permit);
+        }
+        held
+    }
+
+    /// Test-only: take every neighbour-sync responder worker, so that admitted
+    /// sync requests wait for a worker until the permits are dropped.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn hold_neighbor_sync_workers(&self) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut held = Vec::new();
+        while let Ok(permit) =
+            Arc::clone(&self.neighbor_sync_responder_worker_semaphore).try_acquire_owned()
+        {
+            held.push(permit);
+        }
+        held
+    }
+
+    /// Test-only: the hint sets this node holds as responder, their bytes of
+    /// keys, and how many it has built.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn served_hint_sets_for_test(&self) -> (usize, usize, u64) {
+        let (sets, bytes) = self.served_hint_sets.held();
+        (sets, bytes, self.served_hint_sets.built())
     }
 
     /// Test-only: directly seed this node's cached commitment for `peer`,
@@ -3113,6 +3291,10 @@ impl ReplicationEngine {
         let neighbor_sync_responder_admission_semaphore =
             Arc::clone(&self.neighbor_sync_responder_admission_semaphore);
         let neighbor_sync_responder_inflight = Arc::clone(&self.neighbor_sync_responder_inflight);
+        let neighbor_sync_busy_replies = Arc::clone(&self.neighbor_sync_busy_replies);
+        let neighbor_sync_busy_inflight = Arc::clone(&self.neighbor_sync_busy_inflight);
+        let sync_peers = Arc::clone(&self.sync_peers);
+        let served_hint_sets = Arc::clone(&self.served_hint_sets);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
         let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
         let fresh_offer_responder_inflight = Arc::clone(&self.fresh_offer_responder_inflight);
@@ -3166,6 +3348,10 @@ impl ReplicationEngine {
             neighbor_sync_responder_worker_semaphore,
             neighbor_sync_responder_admission_semaphore,
             neighbor_sync_responder_inflight,
+            neighbor_sync_busy_replies,
+            neighbor_sync_busy_inflight,
+            sync_peers,
+            served_hint_sets,
             fresh_offer_worker_semaphore,
             fresh_offer_admission_semaphore,
             fresh_offer_responder_inflight,
@@ -3410,6 +3596,8 @@ impl ReplicationEngine {
                                 if let Some(pointers) = &handler_context.pointers {
                                     pointers.forget_peer(&peer_id);
                                 }
+                                handler_context.sync_peers.forget(&peer_id);
+                                handler_context.served_hint_sets.forget(&peer_id);
                                 update_bootstrap_after_peer_removed(
                                     &peer_id,
                                     &handler_context.bootstrap_state,
@@ -3470,6 +3658,7 @@ impl ReplicationEngine {
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let detached_task_tracker = self.detached_task_tracker.clone();
+        let sync_peers = Arc::clone(&self.sync_peers);
         // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
         // (we initiated, they piggybacked theirs). Carry a gossip-audit trigger
         // here too so a peer that only ever answers — never initiates sync —
@@ -3529,6 +3718,7 @@ impl ReplicationEngine {
                         &gossip_audit,
                         pointers.as_ref(),
                         &disk_retention,
+                        &sync_peers,
                     ) => {}
                 }
             }
@@ -4174,6 +4364,7 @@ impl ReplicationEngine {
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
+        let sync_peers = Arc::clone(&self.sync_peers);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -4228,35 +4419,99 @@ impl ReplicationEngine {
                 bootstrap::increment_pending_requests(&bootstrap_state, batch.len()).await;
                 let bootstrapping = *is_bootstrapping.read().await;
 
-                let sync_futures = batch.iter().map(|peer| {
-                    let peer = *peer;
-                    let hints = hints_by_peer.remove(&peer).unwrap_or_default();
-                    // Atomically snapshot + mark-gossiped for each emitted
-                    // bootstrap request so we remain answerable for it.
-                    let commitment = my_commitment_state
-                        .current_for_gossip()
-                        .map(|binding| binding.commitment().clone());
-                    let p2p = &p2p;
-                    let config = &config;
-                    async move {
-                        let outcome = neighbor_sync::sync_with_peer_with_hints(
-                            &peer,
-                            p2p,
-                            config,
-                            bootstrapping,
-                            hints,
-                            commitment,
-                        )
-                        .await;
-                        (peer, outcome)
+                // One try of the exchanges with `peers`, all at once. A peer
+                // an exchange is in progress with already (the sync rounds')
+                // is skipped, and tried again with the peers that answered
+                // busy before any page ([`exchange_until_heard`]).
+                let (p2p_ref, config_ref, storage_ref, paid_list_ref) =
+                    (&p2p, &config, &storage, &paid_list);
+                let (sync_peers_ref, commitment_ref) = (&sync_peers, &my_commitment_state);
+                let hints_left = &mut hints_by_peer;
+                let try_exchanges = move |peers: Vec<PeerId>| {
+                    let mut planned = Vec::with_capacity(peers.len());
+                    let mut skipped = Vec::new();
+                    for peer in peers {
+                        if let Some(turn) = sync_peers_ref.try_start(peer) {
+                            planned.push((peer, hints_left.remove(&peer), turn));
+                        } else {
+                            debug!(
+                                "Bootstrap sync with {peer}: an exchange with it is in progress already; trying again shortly"
+                            );
+                            skipped.push(peer);
+                        }
                     }
-                });
-                let completed = join_all(sync_futures).await;
+                    async move {
+                        let sync_futures =
+                            planned.into_iter().map(|(peer, hints, turn)| async move {
+                                let hints = match hints {
+                                    Some(hints) => hints,
+                                    None => {
+                                        neighbor_sync::build_sync_hints_for_peer(
+                                            &peer,
+                                            storage_ref,
+                                            paid_list_ref,
+                                            p2p_ref,
+                                            config_ref.close_group_size,
+                                            config_ref.paid_list_close_group_size,
+                                        )
+                                        .await
+                                    }
+                                };
+                                let form =
+                                    neighbor_sync::sync_form_for(&peer, p2p_ref, sync_peers_ref)
+                                        .await;
+                                // Atomically snapshot + mark-gossiped for each
+                                // emitted bootstrap request so we remain
+                                // answerable for it.
+                                let commitment = commitment_ref
+                                    .current_for_gossip()
+                                    .map(|binding| binding.commitment().clone());
+                                let exchange = neighbor_sync::exchange(
+                                    &peer,
+                                    p2p_ref,
+                                    config_ref,
+                                    bootstrapping,
+                                    hints,
+                                    commitment,
+                                    form,
+                                    sync_peers_ref,
+                                )
+                                .await;
+                                drop(turn);
+                                (peer, Some(exchange))
+                            });
+                        let mut tried = join_all(sync_futures).await;
+                        tried.extend(skipped.into_iter().map(|peer| (peer, None)));
+                        tried
+                    }
+                };
+                let (completed, unheard, owing) = exchange_until_heard(
+                    batch.to_vec(),
+                    &BOOTSTRAP_UNHEARD_RETRY_WAITS,
+                    &shutdown,
+                    neighbor_sync::SyncExchange::unheard,
+                    try_exchanges,
+                )
+                .await;
+                for peer in &unheard {
+                    if owing.contains(peer) {
+                        debug!(
+                            "Bootstrap sync with {peer}: still busy after {} tries; it owes its \
+                             hints until a later exchange delivers them or the record expires",
+                            BOOTSTRAP_UNHEARD_RETRY_WAITS.len() + 1
+                        );
+                    } else {
+                        debug!(
+                            "Bootstrap sync with {peer}: held by another exchange at its last \
+                             try; that exchange accounts for it"
+                        );
+                    }
+                }
 
                 // Process response metadata before exposing any of this batch's
                 // hints to verification.
-                for (peer, outcome) in &completed {
-                    if let Some(outcome) = outcome {
+                for (peer, exchange) in &completed {
+                    if let Some(answer) = &exchange.answer {
                         // Ingest the peer's piggybacked commitment from the
                         // response (same verification as the request path).
                         // Bootstrap is the FIRST gossip we receive from most
@@ -4273,7 +4528,7 @@ impl ReplicationEngine {
                         // coverage gap (ADR-0002).
                         ingest_peer_commitment(
                             peer,
-                            outcome.response.commitment.as_ref(),
+                            answer.commitment.as_ref(),
                             &p2p,
                             &last_commitment_by_peer,
                             &ever_capable_peers,
@@ -4281,10 +4536,11 @@ impl ReplicationEngine {
                         )
                         .await; // sig_verify_attempts in scope from line ~1080
 
-                        if !outcome.response.bootstrapping {
+                        if !answer.bootstrapping {
                             record_sent_replica_hints(
                                 peer,
-                                &outcome.sent_replica_hints,
+                                &exchange.hints,
+                                &exchange.answered_replica_hints(),
                                 &repair_proofs,
                                 &sync_cycle_epoch,
                             )
@@ -4297,12 +4553,14 @@ impl ReplicationEngine {
                     let q = queues.read().await;
                     q.pending_keys().into_iter().collect()
                 };
-                let admission_futures = completed.iter().map(async |(_, outcome)| match outcome {
-                    Some(outcome) if !outcome.response.bootstrapping => Some(
+                let admission_futures = completed.iter().map(async |(_, exchange)| match &exchange
+                    .answer
+                {
+                    Some(answer) if !answer.bootstrapping => Some(
                         admission::admit_hints(
                             &self_id,
-                            &outcome.response.replica_hints,
-                            &outcome.response.paid_hints,
+                            &answer.replica_hints,
+                            &answer.paid_hints,
                             &p2p,
                             &config,
                             &storage,
@@ -4319,18 +4577,28 @@ impl ReplicationEngine {
                 // released, source-count ordering sees the complete batch.
                 let (batch_outcomes, batch_discovered) = {
                     let mut q = queues.write().await;
-                    let outcomes = completed
+                    let mut outcomes = completed
                         .iter()
                         .zip(admitted)
-                        .filter_map(|((peer, _), admitted)| {
+                        .filter_map(|((peer, exchange), admitted)| {
                             admitted.map(|admitted| {
-                                (
-                                    *peer,
-                                    queue_admitted_hints(peer, admitted, &storage, &mut q),
-                                )
+                                let mut outcome =
+                                    queue_admitted_hints(peer, admitted, &storage, &mut q);
+                                // A source counts as drained only after its
+                                // marked last page.
+                                outcome.owes_more = !exchange.received_last_page();
+                                (*peer, outcome)
                             })
                         })
                         .collect::<Vec<_>>();
+                    // A source still busy after its tries owes every hint;
+                    // one held by another exchange is that exchange's to
+                    // account for.
+                    outcomes.extend(
+                        owing
+                            .iter()
+                            .map(|peer| (*peer, AdmissionOutcome::owing_all())),
+                    );
                     let live_discovered = outcomes
                         .iter()
                         .flat_map(|(_, outcome)| outcome.discovered.iter().copied())
@@ -4646,6 +4914,10 @@ struct ReplicationMessageHandlerContext {
     neighbor_sync_responder_worker_semaphore: Arc<Semaphore>,
     neighbor_sync_responder_admission_semaphore: Arc<Semaphore>,
     neighbor_sync_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    neighbor_sync_busy_replies: Arc<Semaphore>,
+    neighbor_sync_busy_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    sync_peers: Arc<SyncPeers>,
+    served_hint_sets: Arc<ServedHintSets>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_admission_semaphore: Arc<Semaphore>,
     fresh_offer_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
@@ -4753,6 +5025,8 @@ const fn replication_message_class(body: &ReplicationMessageBody) -> &'static st
         ReplicationMessageBody::PointerFetchResponse(_) => "pointer_fetch_response",
         ReplicationMessageBody::PointerStateRequest(_) => "pointer_state_request",
         ReplicationMessageBody::PointerStateResponse(_) => "pointer_state_response",
+        ReplicationMessageBody::NeighborSyncPageRequest(_) => "neighbor_sync_page_request",
+        ReplicationMessageBody::NeighborSyncPageResponse(_) => "neighbor_sync_page_response",
     }
 }
 
@@ -5918,9 +6192,21 @@ async fn handle_replication_message(
             }
             Ok(())
         }
+        ReplicationMessageBody::NeighborSyncPageRequest(request) => {
+            dispatch_neighbor_sync_page(
+                *source,
+                request,
+                ctx,
+                msg.request_id,
+                received_at,
+                rr_message_id,
+            )
+            .await
+        }
         // Response messages are handled by their respective request initiators.
         ReplicationMessageBody::FreshReplicationResponse(_)
         | ReplicationMessageBody::NeighborSyncResponse(_)
+        | ReplicationMessageBody::NeighborSyncPageResponse(_)
         | ReplicationMessageBody::VerificationResponse(_)
         | ReplicationMessageBody::FetchResponse(_)
         | ReplicationMessageBody::AuditResponse(_)
@@ -7004,7 +7290,31 @@ async fn record_paid_notify(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Whether `peer`'s connection names a release that reads paged sync, and so
+/// reads a busy answer ([`NeighborSyncPageResponse::Busy`]) to a single
+/// request too.
+async fn peer_reads_sync_pages(p2p_node: &Arc<P2PNode>, peer: &PeerId) -> bool {
+    p2p_node
+        .transport()
+        .peer_user_agent(peer)
+        .await
+        .is_some_and(|agent| {
+            sync_pages::agent_reads_pages(&agent, sync_pages::pages_from_release())
+        })
+}
+
+/// The cycle and page a busy answer to a single request names: a single
+/// request has neither, and its requester reads any busy answer as busy.
+const SINGLE_REQUEST_BUSY: (u64, u32) = (0, 0);
+
+/// Take a single neighbour-sync request.
+///
+/// A request refused at admission, or shed as stale, is answered busy when
+/// its requester reads pages ([`peer_reads_sync_pages`]), as a page is, so a
+/// requester that falls back to a single message after an unanswered page
+/// isn't left to time out and charge this node for the silence. A requester
+/// of an older release gets no answer, as before busy answers.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn dispatch_neighbor_sync_request(
     source: PeerId,
     request: protocol::NeighborSyncRequest,
@@ -7019,7 +7329,7 @@ async fn dispatch_neighbor_sync_request(
         &ctx.neighbor_sync_responder_admission_semaphore,
         &ctx.neighbor_sync_responder_inflight,
         &source,
-        NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+        neighbor_sync_admission_limit(),
         NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
     )
     .await
@@ -7030,11 +7340,21 @@ async fn dispatch_neighbor_sync_request(
                 ReplicationResponderClass::NeighborSync,
                 failure.reason.into(),
             );
-            warn!(
-                responder_class = "neighbor_sync",
-                source = %source,
-                "Neighbor-sync response dropped at admission: {failure}"
-            );
+            if peer_reads_sync_pages(&ctx.p2p_node, &source).await {
+                warn!(
+                    responder_class = "neighbor_sync",
+                    source = %source,
+                    "Neighbor-sync request answered busy at admission: {failure}"
+                );
+                let (cycle, page) = SINGLE_REQUEST_BUSY;
+                answer_sync_page_busy(ctx, source, cycle, page, request_id, rr_message_id).await;
+            } else {
+                warn!(
+                    responder_class = "neighbor_sync",
+                    source = %source,
+                    "Neighbor-sync response dropped at admission: {failure}"
+                );
+            }
             return Ok(());
         }
     };
@@ -7049,11 +7369,13 @@ async fn dispatch_neighbor_sync_request(
     let sync_history = Arc::clone(&ctx.sync_history);
     let sync_cycle_epoch = Arc::clone(&ctx.sync_cycle_epoch);
     let repair_proofs = Arc::clone(&ctx.repair_proofs);
+    let sync_peers = Arc::clone(&ctx.sync_peers);
     let request_timeout = ctx.config.verification_request_timeout;
+    let single_stale_after = ctx.config.neighbor_sync_single_stale_after();
     let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    let busy_ctx = ctx.clone();
     ctx.detached_task_tracker.spawn(async move {
-        let _guard = guard;
-        let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
+        let Ok(worker_permit) = worker_semaphore.acquire_owned().await else {
             debug!(
                 responder_class = "neighbor_sync",
                 source = %source,
@@ -7061,16 +7383,50 @@ async fn dispatch_neighbor_sync_request(
             );
             return;
         };
-        if request_is_stale(received_at, request_timeout) {
+        // A requester that reads pages is answered busy once its request has
+        // waited half its wait, so the answer reaches it while it still
+        // waits. An older requester can't read a busy answer: its request is
+        // dropped only once the whole wait has passed, and served before.
+        let stale = if request_is_stale(received_at, single_stale_after) {
+            let reads_pages = peer_reads_sync_pages(&p2p_node, &source).await;
+            (reads_pages || request_is_stale(received_at, request_timeout)).then_some(reads_pages)
+        } else {
+            None
+        };
+        if let Some(reads_pages) = stale {
             audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::NeighborSync);
-            debug!(
-                responder_class = "neighbor_sync",
-                source = %source,
-                request_age_ms = received_at.elapsed().as_millis(),
-                "Stale neighbor-sync request shed at dequeue"
-            );
+            drop(worker_permit);
+            drop(guard);
+            if reads_pages {
+                debug!(
+                    responder_class = "neighbor_sync",
+                    source = %source,
+                    request_age_ms = received_at.elapsed().as_millis(),
+                    "Stale neighbor-sync request answered busy at dequeue"
+                );
+                let (cycle, page) = SINGLE_REQUEST_BUSY;
+                answer_sync_page_busy(
+                    &busy_ctx,
+                    source,
+                    cycle,
+                    page,
+                    request_id,
+                    rr_message_id.as_deref(),
+                )
+                .await;
+            } else {
+                debug!(
+                    responder_class = "neighbor_sync",
+                    source = %source,
+                    request_age_ms = received_at.elapsed().as_millis(),
+                    "Stale neighbor-sync request shed at dequeue"
+                );
+            }
             return;
         }
+        // The admission slot and the worker are held until the answer is
+        // handled.
+        let _held = (guard, worker_permit);
         // A peer whose sync request is admitted and fresh gets our pointer
         // hints as well, including a node that is bootstrapping, which is how
         // it learns the pointers it should hold. Only such a request: each
@@ -7092,6 +7448,7 @@ async fn dispatch_neighbor_sync_request(
             &sync_history,
             &sync_cycle_epoch,
             &repair_proofs,
+            &sync_peers,
             my_commitment,
             request_id,
             rr_message_id.as_deref(),
@@ -7119,6 +7476,7 @@ async fn handle_neighbor_sync_request(
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
+    sync_peers: &SyncPeers,
     my_commitment: Option<StorageCommitment>,
     request_id: u64,
     rr_message_id: Option<&str>,
@@ -7131,19 +7489,39 @@ async fn handle_neighbor_sync_request(
     // enter the verification queue. A per-request limit here would break
     // bootstrap replication for newly-joined nodes with 0 stored chunks.
 
-    // Build response (outbound hints).
-    let (response, sent_replica_hints, sender_in_rt) =
-        neighbor_sync::handle_sync_request_with_proofs(
-            source,
-            request,
-            p2p_node,
-            storage,
-            paid_list,
-            config,
-            is_bootstrapping,
-            my_commitment.clone(),
-        )
-        .await;
+    // Rule 4-6: hints are always sent, even to a peer outside LocalRT, but
+    // its own are taken only from a peer in it.
+    let sender_in_rt = p2p_node.dht_manager().is_in_routing_table(source).await;
+
+    // Build response (outbound hints): one scan, and a single message, which
+    // is what a requester that sends one reads: the next window of the hints,
+    // when they come to more than it carries.
+    let hints = neighbor_sync::build_sync_hints_for_peer(
+        source,
+        storage,
+        paid_list,
+        p2p_node,
+        config.close_group_size,
+        config.paid_list_close_group_size,
+    )
+    .await;
+    let (hints, cut) = sync_peers.window(
+        source,
+        SyncRole::Responder,
+        hints,
+        neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Single),
+    );
+    // As it goes out: a record being erased is named in no hint, and proofs
+    // are recorded for this same list.
+    let sent = hints.all().to_send(&neighbor_sync::erasing(&self_id));
+    let sent_replica_hints = sent.replica;
+    let response = NeighborSyncResponse {
+        replica_hints: sent_replica_hints.clone(),
+        paid_hints: sent.paid,
+        bootstrapping: is_bootstrapping,
+        rejected_keys: Vec::new(),
+        commitment: my_commitment.clone(),
+    };
 
     // Send response.
     let response_sent = send_replication_response_checked(
@@ -7155,6 +7533,15 @@ async fn handle_neighbor_sync_request(
         None,
     )
     .await;
+    // The window moves on only once the response went: otherwise the next
+    // exchange with the requester takes the same keys.
+    if let Some(cut) = cut {
+        if response_sent {
+            cut.commit(hints.replica.len(), hints.paid.len());
+        } else {
+            cut.commit(0, 0);
+        }
+    }
 
     // Process inbound hints only if sender is in LocalRT (Rule 4-6).
     if !sender_in_rt {
@@ -7174,8 +7561,14 @@ async fn handle_neighbor_sync_request(
     }
 
     if response_sent && !request.bootstrapping {
-        record_sent_replica_hints(source, &sent_replica_hints, repair_proofs, sync_cycle_epoch)
-            .await;
+        record_sent_replica_hints(
+            source,
+            &hints,
+            &sent_replica_hints,
+            repair_proofs,
+            sync_cycle_epoch,
+        )
+        .await;
     }
 
     // Admit inbound hints and queue for verification.
@@ -7203,6 +7596,467 @@ async fn handle_neighbor_sync_request(
     }
 
     Ok(())
+}
+
+/// Take one page of a paged neighbour-sync exchange.
+///
+/// Admitted under the same limits as a single sync request, 1 per peer and
+/// [`NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING`] in all: a requester sends a
+/// page only once its last is answered. A request refused at admission is
+/// answered busy, so its requester ends the exchange at once and syncs again
+/// in a later cycle, instead of waiting out its deadline and charging this
+/// node for the silence. Only a peer that sent a page gets these answers, so
+/// every one is a message it reads.
+///
+/// A request after an exchange's first shows that the page before it arrived,
+/// since its requester asks for a page only once the last is answered: the
+/// repair proofs held back for that page are recorded first, whatever this
+/// request is then answered, and the pages that arrived are what the
+/// requester's window moves on by once the exchange's set is dropped.
+async fn dispatch_neighbor_sync_page(
+    source: PeerId,
+    request: protocol::NeighborSyncPageRequest,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    if request.page > 0 {
+        ctx.served_hint_sets
+            .note_arrived(&source, request.cycle, request.page);
+        if let Some(held) = ctx.served_hint_sets.take_proofs(
+            &source,
+            request.cycle,
+            Instant::now(),
+            ctx.config.neighbor_sync_page_timeout,
+        ) {
+            record_held_proofs(source, held, ctx);
+        }
+    }
+    if request.page == 0 {
+        // As for a single request: the requester's commitment, on the first
+        // page only, verified before it is stored.
+        if let Some(target) = ingest_peer_commitment(
+            &source,
+            request.commitment.as_ref(),
+            &ctx.p2p_node,
+            &ctx.last_commitment_by_peer,
+            &ctx.ever_capable_peers,
+            &ctx.sig_verify_attempts,
+        )
+        .await
+        {
+            maybe_trigger_gossip_audit(&ctx.gossip_audit, &source, target).await;
+        }
+    }
+
+    let guard = match admit_bounded_responder(
+        &ctx.neighbor_sync_responder_admission_semaphore,
+        &ctx.neighbor_sync_responder_inflight,
+        &source,
+        neighbor_sync_admission_limit(),
+        NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::NeighborSync,
+                failure.reason.into(),
+            );
+            warn!(
+                responder_class = "neighbor_sync",
+                source = %source,
+                "Neighbor-sync page answered busy at admission: {failure}"
+            );
+            answer_sync_page_busy(
+                ctx,
+                source,
+                request.cycle,
+                request.page,
+                request_id,
+                rr_message_id,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let page_ctx = ctx.clone();
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        serve_neighbor_sync_page(
+            source,
+            request,
+            page_ctx,
+            guard,
+            request_id,
+            received_at,
+            rr_message_id,
+        )
+        .await;
+    });
+    Ok(())
+}
+
+/// Record, in the background, the repair proofs held back for a page that
+/// arrived: the replica hints on it.
+fn record_held_proofs(source: PeerId, held: HeldProofs, ctx: &ReplicationMessageHandlerContext) {
+    let repair_proofs = Arc::clone(&ctx.repair_proofs);
+    let sync_cycle_epoch = Arc::clone(&ctx.sync_cycle_epoch);
+    ctx.detached_task_tracker.spawn(async move {
+        // The page's replica hints as it was sent, less those being erased
+        // then: what the requester was named is what is proved.
+        record_sent_replica_hints(
+            &source,
+            &held.hints,
+            &held.keys,
+            &repair_proofs,
+            &sync_cycle_epoch,
+        )
+        .await;
+    });
+}
+
+/// Answer a page request busy in the background, within
+/// [`NEIGHBOR_SYNC_BUSY_REPLIES`] in all and
+/// [`NEIGHBOR_SYNC_BUSY_REPLIES_PER_PEER`] to one peer; past them it goes
+/// unanswered, as every refused request did before busy answers.
+async fn answer_sync_page_busy(
+    ctx: &ReplicationMessageHandlerContext,
+    source: PeerId,
+    cycle: u64,
+    page: u32,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+) {
+    let guard = match admit_bounded_responder(
+        &ctx.neighbor_sync_busy_replies,
+        &ctx.neighbor_sync_busy_inflight,
+        &source,
+        NEIGHBOR_SYNC_BUSY_REPLIES,
+        NEIGHBOR_SYNC_BUSY_REPLIES_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            debug!(
+                source = %source,
+                "Neighbor-sync page left unanswered, its busy answer refused: {failure}"
+            );
+            return;
+        }
+    };
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _guard = guard;
+        send_sync_page_busy(
+            &source,
+            &p2p_node,
+            cycle,
+            page,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await;
+    });
+}
+
+async fn send_sync_page_busy(
+    source: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    cycle: u64,
+    page: u32,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+) {
+    send_replication_response(
+        source,
+        p2p_node,
+        request_id,
+        ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy {
+            cycle,
+            page,
+        }),
+        rr_message_id,
+    )
+    .await;
+}
+
+/// Serve one admitted page: take the requester's hints on it, then answer
+/// with this node's page of the same number, from the hints built at the
+/// exchange's first page, with no scan of its own.
+///
+/// The worker and the admission slot are let go before the answer is sent,
+/// so the requester's next page, sent once this answer arrives, finds the
+/// requester's slot free. The repair proofs of the replica hints on the page
+/// are held back until the requester's next request of the exchange shows the
+/// page arrived ([`dispatch_neighbor_sync_page`]): proofs are kept only for
+/// acknowledged delivery. The last page's keys, in a one-page exchange every
+/// key served, get none from the exchange, since nothing follows it; they get
+/// proofs only where this node hints them as the requester of its own
+/// exchanges with the peer, which neighbour selection doesn't promise. That
+/// costs audits of the pair, never a penalty for keys not known to have
+/// arrived (the README's "Messages between nodes").
+#[allow(clippy::too_many_lines)]
+async fn serve_neighbor_sync_page(
+    source: PeerId,
+    request: protocol::NeighborSyncPageRequest,
+    ctx: ReplicationMessageHandlerContext,
+    guard: ResponderGuard,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<String>,
+) {
+    let Ok(worker) = Arc::clone(&ctx.neighbor_sync_responder_worker_semaphore)
+        .acquire_owned()
+        .await
+    else {
+        debug!(
+            responder_class = "neighbor_sync",
+            source = %source,
+            "Neighbor-sync responder worker pool closed before dequeue"
+        );
+        return;
+    };
+    let cycle = request.cycle;
+    let page = request.page;
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let rr_message_id = rr_message_id.as_deref();
+
+    // Waited so long the requester may give up before an answer could reach
+    // it: answer busy at once, while it still waits.
+    if request_is_stale(received_at, ctx.config.neighbor_sync_page_stale_after()) {
+        audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::NeighborSync);
+        drop(worker);
+        drop(guard);
+        debug!(
+            responder_class = "neighbor_sync",
+            source = %source,
+            request_age_ms = received_at.elapsed().as_millis(),
+            "Neighbor-sync page answered busy: it waited too long for a worker"
+        );
+        send_sync_page_busy(&source, &p2p_node, cycle, page, request_id, rr_message_id).await;
+        return;
+    }
+    if page >= config::MAX_NEIGHBOR_SYNC_PAGES {
+        ctx.served_hint_sets.finish(&source, cycle);
+        drop(worker);
+        drop(guard);
+        debug!(
+            source = %source,
+            page,
+            "Neighbor-sync page answered busy: past the most pages an exchange takes"
+        );
+        send_sync_page_busy(&source, &p2p_node, cycle, page, request_id, rr_message_id).await;
+        return;
+    }
+
+    // This node's hints for the requester, built once for the exchange.
+    let now = Instant::now();
+    let idle = ctx.config.neighbor_sync_page_timeout;
+    let served = match ctx.served_hint_sets.get(&source, cycle, now, idle) {
+        Some(served) => Some(served),
+        None if page == 0 && ctx.served_hint_sets.may_build(now, idle) => {
+            Some(build_served_hints(&source, cycle, &ctx).await)
+        }
+        None => None,
+    };
+    let Some(served) = served else {
+        drop(worker);
+        drop(guard);
+        let (held_sets, held_bytes) = ctx.served_hint_sets.held();
+        debug!(
+            source = %source,
+            cycle,
+            page,
+            held_sets,
+            held_bytes,
+            "Neighbor-sync page answered busy: the exchange's hints aren't held, and \
+             can't be built now"
+        );
+        send_sync_page_busy(&source, &p2p_node, cycle, page, request_id, rr_message_id).await;
+        return;
+    };
+
+    if page == 0 {
+        // As for a single request, a served exchange gets this node's pointer
+        // hints too, once.
+        if let Some(pointers) = &ctx.pointers {
+            pointers.answer_sync_with_hints(source);
+        }
+    }
+
+    let is_bootstrapping = *ctx.is_bootstrapping.read().await;
+    // Rule 4-6: hints are served to any peer, but taken only from one in
+    // LocalRT.
+    let sender_in_rt = p2p_node.dht_manager().is_in_routing_table(&source).await;
+    if sender_in_rt {
+        // Sync history before this page's proofs, as for a single request.
+        {
+            let mut history = ctx.sync_history.write().await;
+            let record = history.entry(source).or_insert(PeerSyncRecord {
+                last_sync: None,
+                cycles_since_sync: 0,
+            });
+            record.last_sync = Some(Instant::now());
+            record.cycles_since_sync = 0;
+        }
+        let mut outcome = admit_and_queue_hints(
+            p2p_node.peer_id(),
+            &source,
+            &request.replica_hints,
+            &request.paid_hints,
+            &p2p_node,
+            &ctx.config,
+            &ctx.storage,
+            &ctx.paid_list,
+            &ctx.queues,
+        )
+        .await;
+        let rejected_in_exchange =
+            ctx.served_hint_sets
+                .note_inbound(&source, cycle, outcome.capacity_rejected_count > 0);
+        if is_bootstrapping {
+            // The requester counts as drained only at its marked last page,
+            // and only if no page of the exchange had hints turned away.
+            let last_page = page.saturating_add(1) >= request.pages;
+            outcome.owes_more = !last_page || rejected_in_exchange;
+            let live_discovered = outcome.discovered.clone();
+            let outcomes = [(source, outcome)];
+            publish_bootstrap_admission_outcomes(&ctx.bootstrap_state, &outcomes, &live_discovered)
+                .await;
+        }
+    }
+
+    // The page as it goes out, filtered now, since the set was built at the
+    // exchange's first page and a key may have been selected for erasure
+    // since: one list for the page and for its held proofs.
+    let ours = served
+        .hints
+        .page(page, served.page_keys)
+        .to_send(&neighbor_sync::erasing(p2p_node.peer_id()));
+    let replica_withheld = ours.withheld.len();
+    let replica_sent = ours.replica;
+    let paid_sent = ours.paid;
+    let commitment = if page == 0 {
+        // Emitted on the first page, so this node stays answerable for it
+        // (ADR-0002).
+        ctx.my_commitment_state
+            .current_for_gossip()
+            .map(|built| built.commitment().clone())
+    } else {
+        None
+    };
+    let rounds = sync_pages::exchange_rounds(served.announced, request.pages);
+    let waits = sync_pages::proofs_wait_for_next_page(page, rounds);
+    if !waits {
+        ctx.served_hint_sets.finish(&source, cycle);
+    }
+    // Held before the answer goes, so the requester's next request, sent once
+    // the answer arrives, finds them.
+    let holds_proofs = waits && sender_in_rt && !request.bootstrapping && !replica_sent.is_empty();
+    if holds_proofs {
+        ctx.served_hint_sets
+            .hold_proofs(&source, cycle, page, replica_sent.clone());
+    }
+    debug!(
+        target: "ant_node::replication::neighbor_sync",
+        source = %source,
+        cycle,
+        page,
+        pages = served.pages,
+        pages_announced = served.announced,
+        requester_pages = request.pages,
+        replica_hints = replica_sent.len(),
+        paid_hints = paid_sent.len(),
+        replica_hints_withheld = replica_withheld,
+        "Neighbor-sync page served"
+    );
+    let body = ReplicationMessageBody::NeighborSyncPageResponse(NeighborSyncPageResponse::Page {
+        cycle,
+        page,
+        pages: served.announced,
+        replica_hints: replica_sent,
+        paid_hints: paid_sent,
+        bootstrapping: is_bootstrapping,
+        commitment,
+    });
+
+    drop(worker);
+    drop(guard);
+    let sent = send_replication_response_checked(
+        &source,
+        &p2p_node,
+        request_id,
+        body,
+        rr_message_id,
+        None,
+    )
+    .await;
+    if !sent && holds_proofs {
+        ctx.served_hint_sets.drop_proofs(&source, cycle, page);
+    }
+}
+
+/// Build this node's hints for `source`'s exchange `cycle`, once, at its
+/// first page, and hold them for its other pages: only the window of them
+/// this exchange serves, at most 256 pages, with no spare capacity. Its pages
+/// announce the pages of all of them
+/// ([`neighbor_sync::announced_pages`]). The window moves on by the pages the
+/// requester showed arrived, when the set is dropped.
+async fn build_served_hints(
+    source: &PeerId,
+    cycle: u64,
+    ctx: &ReplicationMessageHandlerContext,
+) -> ServedHints {
+    let started = Instant::now();
+    let hints = neighbor_sync::build_sync_hints_for_peer(
+        source,
+        &ctx.storage,
+        &ctx.paid_list,
+        &ctx.p2p_node,
+        ctx.config.close_group_size,
+        ctx.config.paid_list_close_group_size,
+    )
+    .await;
+    let page_keys = neighbor_sync::page_keys();
+    let all_keys = hints.key_count();
+    let (mut hints, cut) = ctx.sync_peers.window(
+        source,
+        SyncRole::Responder,
+        hints,
+        neighbor_sync::max_exchange_keys(neighbor_sync::SyncForm::Paged),
+    );
+    hints.shrink_to_fit();
+    let pages = hints.page_count(page_keys);
+    let served = ServedHints {
+        cycle,
+        pages,
+        announced: neighbor_sync::announced_pages(all_keys, page_keys).max(pages),
+        page_keys,
+        hints: Arc::new(hints),
+    };
+    ctx.served_hint_sets
+        .insert(*source, served.clone(), cut, Instant::now());
+    let (held_sets, held_bytes) = ctx.served_hint_sets.held();
+    debug!(
+        target: "ant_node::replication::neighbor_sync",
+        source = %source,
+        cycle,
+        pages = served.pages,
+        pages_announced = served.announced,
+        replica_hints = served.hints.replica.len(),
+        paid_hints = served.hints.paid.len(),
+        held_sets,
+        held_bytes,
+        received_held_bytes = ctx.sync_peers.received().held(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "Neighbor-sync hint set built"
+    );
+    served
 }
 
 /// Test-only record of who *sent* a verification request covering a watched key.
@@ -7859,7 +8713,9 @@ async fn send_replication_response_checked(
     // few-KB verified slice (V2-685), not a full-chunk transfer, so it is light.
     if matches!(
         msg.body,
-        ReplicationMessageBody::FetchResponse(_) | ReplicationMessageBody::NeighborSyncResponse(_)
+        ReplicationMessageBody::FetchResponse(_)
+            | ReplicationMessageBody::NeighborSyncResponse(_)
+            | ReplicationMessageBody::NeighborSyncPageResponse(_)
     ) {
         protocol::record_served(peer, encoded.len());
     }
@@ -7878,23 +8734,37 @@ async fn send_replication_response_checked(
     true
 }
 
+/// Record that `peer` was sent the replica hints `sent`, out of `hints`, on
+/// pages it answered: each with the close group it was hinted in, computed
+/// again from the routing snapshot the hints were chosen from, off the async
+/// workers.
 async fn record_sent_replica_hints(
     peer: &PeerId,
-    hints: &[neighbor_sync::SentReplicaHint],
+    hints: &neighbor_sync::PeerSyncHints,
+    sent: &[XorName],
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
 ) {
-    if hints.is_empty() {
+    if sent.is_empty() {
         return;
     }
 
+    let groups_of = hints.groups_for(sent);
+    let grouped = match tokio::task::spawn_blocking(move || groups_of.close_groups()).await {
+        Ok(grouped) => grouped,
+        Err(e) => {
+            warn!("Repair hint proofs for {peer} not recorded: {e}");
+            return;
+        }
+    };
+
     let hinted_at_epoch = *sync_cycle_epoch.read().await;
     let mut proofs = repair_proofs.write().await;
-    for hint in hints {
-        if proofs.record_replica_hint_sent(*peer, hint.key, &hint.close_peers, hinted_at_epoch) {
+    for (key, close_peers) in &grouped {
+        if proofs.record_replica_hint_sent(*peer, *key, close_peers, hinted_at_epoch) {
             debug!(
                 "Recorded repair hint proof for peer {peer} and key {}",
-                hex::encode(hint.key)
+                hex::encode(key)
             );
         }
     }
@@ -7926,6 +8796,7 @@ async fn run_neighbor_sync_round(
     gossip_audit: &GossipAuditTrigger,
     pointers: Option<&Arc<pointer::PointerReplication>>,
     disk_retention: &retention::DiskRetention,
+    sync_peers: &Arc<SyncPeers>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -7988,8 +8859,9 @@ async fn run_neighbor_sync_round(
         let mut state = sync_state.write().await;
         if state.is_cycle_complete() {
             // Preserve cooldown and bootstrap-claim tracking across cycles.
-            // Claims have a 24h lifecycle vs 10-20 min cycles — dropping them
-            // would reset the abuse detection timer every cycle.
+            // Claims have a 24h lifecycle vs cycles of up to five rounds of
+            // 10-20 min each — dropping them would reset the abuse detection
+            // timer every cycle.
             let old_sync_times = std::mem::take(&mut state.last_sync_times);
             let old_bootstrap_claims = std::mem::take(&mut state.bootstrap_claims);
             let old_bootstrap_claim_history = std::mem::take(&mut state.bootstrap_claim_history);
@@ -8038,25 +8910,47 @@ async fn run_neighbor_sync_round(
     )
     .await;
 
-    // Sync with each peer in the batch.
+    // Sync with each peer in the batch, in the form each reads.
     for peer in &batch {
-        let hints = hints_by_peer.remove(peer).unwrap_or_default();
-        let outcome = neighbor_sync::sync_with_peer_with_hints(
+        // One exchange at a time with a peer: one in progress already (the
+        // bootstrap sync's) leaves this one to a later cycle.
+        let Some(_turn) = sync_peers.try_start(*peer) else {
+            debug!("Neighbor sync with {peer}: an exchange with it is in progress already");
+            sync_state.write().await.remove_peer(peer);
+            continue;
+        };
+        let hints = match hints_by_peer.remove(peer) {
+            Some(hints) => hints,
+            None => {
+                neighbor_sync::build_sync_hints_for_peer(
+                    peer,
+                    storage,
+                    paid_list,
+                    p2p_node,
+                    config.close_group_size,
+                    config.paid_list_close_group_size,
+                )
+                .await
+            }
+        };
+        let form = neighbor_sync::sync_form_for(peer, p2p_node, sync_peers).await;
+        let exchange = neighbor_sync::exchange(
             peer,
             p2p_node,
             config,
             bootstrapping,
             hints,
             my_commitment.clone(),
+            form,
+            sync_peers,
         )
         .await;
 
-        if let Some(outcome) = outcome {
+        if exchange.answer.is_some() {
             handle_sync_response(
                 &self_id,
                 peer,
-                &outcome.response,
-                &outcome.sent_replica_hints,
+                &exchange,
                 p2p_node,
                 config,
                 bootstrapping,
@@ -8075,16 +8969,21 @@ async fn run_neighbor_sync_round(
             )
             .await;
         } else {
-            // Sync failed -- remove peer and try to fill slot.
+            // Sync failed, or the peer answered its first page busy: no page
+            // was taken, so it is tried again in a later cycle. Remove the peer
+            // and try to fill the slot.
+            note_unheard_bootstrap_source(bootstrapping, bootstrap_state, peer, &exchange).await;
             let replacement = {
                 let mut state = sync_state.write().await;
                 neighbor_sync::handle_sync_failure(&mut state, peer, config.neighbor_sync_cooldown)
             };
 
             // Attempt sync with the replacement peer (if one was found).
-            if let Some(replacement_peer) = replacement {
-                let mut replacement_hints = neighbor_sync::build_sync_hints_for_peers(
-                    std::slice::from_ref(&replacement_peer),
+            let replacement =
+                replacement.and_then(|peer| sync_peers.try_start(peer).map(|turn| (peer, turn)));
+            if let Some((replacement_peer, _replacement_turn)) = replacement {
+                let hints = neighbor_sync::build_sync_hints_for_peer(
+                    &replacement_peer,
                     storage,
                     paid_list,
                     p2p_node,
@@ -8092,25 +8991,25 @@ async fn run_neighbor_sync_round(
                     config.paid_list_close_group_size,
                 )
                 .await;
-                let hints = replacement_hints
-                    .remove(&replacement_peer)
-                    .unwrap_or_default();
-                let replacement_outcome = neighbor_sync::sync_with_peer_with_hints(
+                let form =
+                    neighbor_sync::sync_form_for(&replacement_peer, p2p_node, sync_peers).await;
+                let replacement_exchange = neighbor_sync::exchange(
                     &replacement_peer,
                     p2p_node,
                     config,
                     bootstrapping,
                     hints,
                     my_commitment.clone(),
+                    form,
+                    sync_peers,
                 )
                 .await;
 
-                if let Some(outcome) = replacement_outcome {
+                if replacement_exchange.answer.is_some() {
                     handle_sync_response(
                         &self_id,
                         &replacement_peer,
-                        &outcome.response,
-                        &outcome.sent_replica_hints,
+                        &replacement_exchange,
                         p2p_node,
                         config,
                         bootstrapping,
@@ -8128,20 +9027,51 @@ async fn run_neighbor_sync_round(
                         gossip_audit,
                     )
                     .await;
+                } else {
+                    note_unheard_bootstrap_source(
+                        bootstrapping,
+                        bootstrap_state,
+                        &replacement_peer,
+                        &replacement_exchange,
+                    )
+                    .await;
                 }
             }
         }
     }
 }
 
-/// Process a successful neighbor sync response: record the sync, check for
-/// bootstrap claim abuse, and admit inbound hints.
+/// While bootstrapping, keep a source that answered busy before any page
+/// outstanding ([`AdmissionOutcome::owing_all`]): it is there and owes its
+/// hints. One whose exchange failed or timed out isn't known to be there, and
+/// is left as before.
+async fn note_unheard_bootstrap_source(
+    bootstrapping: bool,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    peer: &PeerId,
+    exchange: &neighbor_sync::SyncExchange,
+) {
+    if bootstrapping && exchange.unheard() {
+        publish_bootstrap_admission_outcomes(
+            bootstrap_state,
+            &[(*peer, AdmissionOutcome::owing_all())],
+            &HashSet::new(),
+        )
+        .await;
+    }
+}
+
+/// Process an exchange the peer answered: record the sync, check for
+/// bootstrap claim abuse, and admit inbound hints, from every page the peer
+/// answered. Only the replica hints this node sent on those pages get repair
+/// proofs. Only a complete exchange puts the peer on the sync cooldown
+/// ([`neighbor_sync::exchange_earns_cooldown`]): one that ended part way
+/// leaves the peer to its next cycle, as a first page answered busy does.
 #[allow(clippy::too_many_arguments)]
 async fn handle_sync_response(
     self_id: &PeerId,
     peer: &PeerId,
-    resp: &NeighborSyncResponse,
-    sent_replica_hints: &[neighbor_sync::SentReplicaHint],
+    exchange: &neighbor_sync::SyncExchange,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     bootstrapping: bool,
@@ -8158,6 +9088,9 @@ async fn handle_sync_response(
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
     gossip_audit: &GossipAuditTrigger,
 ) {
+    let Some(resp) = exchange.answer.as_ref() else {
+        return;
+    };
     // Ingest the peer's commitment if they piggybacked one on the response.
     // Same verification as the request path (peer-id binding + signature);
     // forged commitments are dropped at the edge. A *changed* commitment here
@@ -8176,11 +9109,13 @@ async fn handle_sync_response(
         maybe_trigger_gossip_audit(gossip_audit, peer, target).await;
     }
 
-    // Record successful sync.
+    // The cooldown, for a complete exchange only.
     {
         let mut state = sync_state.write().await;
-        neighbor_sync::record_successful_sync(&mut state, peer);
+        neighbor_sync::record_exchange(&mut state, peer, exchange);
     }
+    // Sync history, for a partial exchange too: the peer received the
+    // hints of the pages it answered, and its repair proofs mature with it.
     {
         let mut history = sync_history.write().await;
         let record = history.entry(*peer).or_insert(PeerSyncRecord {
@@ -8235,8 +9170,15 @@ async fn handle_sync_response(
             let mut state = sync_state.write().await;
             state.clear_active_bootstrap_claim(peer);
         }
-        record_sent_replica_hints(peer, sent_replica_hints, repair_proofs, sync_cycle_epoch).await;
-        let outcome = admit_and_queue_hints(
+        record_sent_replica_hints(
+            peer,
+            &exchange.hints,
+            &exchange.answered_replica_hints(),
+            repair_proofs,
+            sync_cycle_epoch,
+        )
+        .await;
+        let mut outcome = admit_and_queue_hints(
             self_id,
             peer,
             &resp.replica_hints,
@@ -8252,8 +9194,11 @@ async fn handle_sync_response(
         // Track discovered keys for bootstrap drain detection so that hints
         // admitted via regular neighbor sync are not missed. Capacity-
         // rejected hints keep this source on the "not yet drained" list
-        // until its next sync replays them; a clean cycle clears it.
+        // until its next sync replays them; a clean cycle clears it. A
+        // source whose pages stopped before its marked last page owes the
+        // rest, and is kept on the list too.
         if bootstrapping {
+            outcome.owes_more = !exchange.received_last_page();
             let live_discovered = outcome.discovered.clone();
             let outcomes = [(*peer, outcome)];
             publish_bootstrap_admission_outcomes(bootstrap_state, &outcomes, &live_discovered)
@@ -8278,11 +9223,103 @@ struct AdmissionOutcome {
     discovered: HashSet<XorName>,
     capacity_rejected_count: usize,
     displaced: Vec<CapacityDisplacement>,
+    /// The source still owes hints: its paged exchange ended before its
+    /// marked last page, or an earlier page of it had hints turned away. It
+    /// is kept outstanding as a capacity-rejected source is.
+    owes_more: bool,
+}
+
+impl AdmissionOutcome {
+    /// A source that is alive but wasn't heard: it answered busy before any
+    /// page, or every try found an exchange with it in progress. It owes all
+    /// its hints, and is kept outstanding until a later exchange delivers
+    /// them or its record expires.
+    fn owing_all() -> Self {
+        Self {
+            discovered: HashSet::new(),
+            capacity_rejected_count: 0,
+            displaced: Vec::new(),
+            owes_more: true,
+        }
+    }
+}
+
+/// How long the bootstrap sync waits before each further try of the peers of
+/// a batch it hasn't heard from ([`exchange_until_heard`]): 3 more tries,
+/// 35 seconds of waiting in all, well inside the 110 seconds a source's
+/// outstanding record lasts (which starts only once the tries are over).
+const BOOTSTRAP_UNHEARD_RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+];
+
+/// Run `try_exchanges` with `peers`, then again, after each of `waits`, with
+/// the peers not heard from: those it skipped (`None`: an exchange with the
+/// peer was in progress already) and those whose exchange `is_unheard` (a
+/// first page answered busy). A peer that failed or timed out is heard, and
+/// not tried again: it isn't known to be there, so it owes nothing. Returns
+/// the exchanges of the peers heard; the peers still not heard after the
+/// last try, or when `shutdown` cut the waiting short; and those of them
+/// whose own exchange, at their last try, answered busy, which owe their
+/// hints. One skipped at its last try owes nothing here: the exchange that
+/// held it (a sync round's) publishes what it delivered, or that it answered
+/// busy, itself, and may already have found it drained.
+async fn exchange_until_heard<T, F, Fut>(
+    peers: Vec<PeerId>,
+    waits: &[Duration],
+    shutdown: &CancellationToken,
+    is_unheard: impl Fn(&T) -> bool,
+    mut try_exchanges: F,
+) -> (Vec<(PeerId, T)>, Vec<PeerId>, Vec<PeerId>)
+where
+    F: FnMut(Vec<PeerId>) -> Fut,
+    Fut: Future<Output = Vec<(PeerId, Option<T>)>>,
+{
+    let mut heard = Vec::with_capacity(peers.len());
+    let mut unheard = peers;
+    // The unheard peers whose last try was their own busy answer.
+    let mut answered_busy = HashSet::new();
+    for attempt in 0..=waits.len() {
+        if attempt > 0 {
+            if unheard.is_empty() {
+                break;
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(waits[attempt - 1]) => {}
+            }
+        }
+        for (peer, tried) in try_exchanges(std::mem::take(&mut unheard)).await {
+            match tried {
+                Some(exchange) if !is_unheard(&exchange) => {
+                    answered_busy.remove(&peer);
+                    heard.push((peer, exchange));
+                }
+                Some(_) => {
+                    answered_busy.insert(peer);
+                    unheard.push(peer);
+                }
+                None => {
+                    answered_busy.remove(&peer);
+                    unheard.push(peer);
+                }
+            }
+        }
+    }
+    let owing = unheard
+        .iter()
+        .filter(|peer| answered_busy.contains(*peer))
+        .copied()
+        .collect();
+    (heard, unheard, owing)
 }
 
 /// Publish one atomic admission unit into bootstrap drain accounting.
 ///
-/// Only sources that were themselves capacity-rejected are kept outstanding.
+/// Only sources that were themselves capacity-rejected, or that still owe
+/// hints from pages that stopped before their marked last page, are kept
+/// outstanding.
 /// A fairness displacement forfeits the displaced *key* but never stamps its
 /// former owner: reclaiming a borrowed slot is this node's own fairness
 /// decision, so charging it to the victim would let a sustained flooder wedge
@@ -8300,7 +9337,7 @@ async fn publish_bootstrap_admission_outcomes(
     let mut displaced_keys = HashSet::new();
 
     for (source, outcome) in outcomes {
-        if outcome.capacity_rejected_count > 0 {
+        if outcome.capacity_rejected_count > 0 || outcome.owes_more {
             rejected_sources.insert(*source);
         } else {
             clean_sources.insert(*source);
@@ -8449,6 +9486,7 @@ fn queue_admitted_hints(
         discovered,
         capacity_rejected_count,
         displaced,
+        owes_more: false,
     }
 }
 
@@ -10535,6 +11573,11 @@ impl CommitmentTick {
 /// commitment for this peer" by falling back to the legacy plain-digest
 /// audit path. Returns what the node advertises after this tick, for the
 /// line every tick logs.
+///
+/// Everything after reading the keys, the responsibility filter over every
+/// key, the tree and the signature, runs off the async workers, from one
+/// snapshot of the routing table, so the hourly rebuild of a large store
+/// holds up no message handling.
 async fn rebuild_and_rotate_commitment(
     storage: &Arc<ChunkStore>,
     pointers: Option<&PointerStore>,
@@ -10553,7 +11596,37 @@ async fn rebuild_and_rotate_commitment(
         .all_keys()
         .await
         .map_err(|e| Error::Storage(format!("commitment build: read keys: {e}")))?;
+    let routing = neighbor_sync::RoutingSnapshot::take(p2p).await;
+    let pointers = pointers.cloned();
+    let identity = Arc::clone(identity);
+    let state = Arc::clone(state);
+    let close_group_size = config.close_group_size;
+    tokio::task::spawn_blocking(move || {
+        rotate_commitment_from(
+            stored_keys,
+            pointers.as_ref(),
+            &identity,
+            &state,
+            &routing,
+            close_group_size,
+        )
+    })
+    .await
+    .map_err(|e| Error::Replication(format!("commitment build: {e}")))?
+}
 
+/// The part of [`rebuild_and_rotate_commitment`] that runs off the async
+/// workers: every key weighed against `routing`, the tree built, signed and
+/// rotated in.
+#[allow(clippy::too_many_lines)]
+fn rotate_commitment_from(
+    stored_keys: Vec<XorName>,
+    pointers: Option<&PointerStore>,
+    identity: &NodeIdentity,
+    state: &ResponderCommitmentState,
+    routing: &neighbor_sync::RoutingSnapshot,
+    close_group_size: usize,
+) -> Result<CommitmentTick> {
     // Commit only to keys we are still RESPONSIBLE for ("want-to-hold"), not
     // everything currently on disk ("hold"). This is the half of the retention
     // contract that lets out-of-range chunks age out: a key that has left our
@@ -10565,10 +11638,10 @@ async fn rebuild_and_rotate_commitment(
     // keep re-committing stale keys forever (the rebuild reads all_keys, so a
     // retained-on-disk key would be re-committed and re-gossiped every
     // rotation — a permanent pin).
-    let self_id = *p2p.peer_id();
+    let self_id = *routing.self_id();
     let mut keys = Vec::with_capacity(stored_keys.len());
     for k in stored_keys {
-        if admission::is_responsible(&self_id, &k, p2p, config.close_group_size).await {
+        if routing.is_within(&self_id, &k, close_group_size) {
             keys.push(k);
         }
     }
@@ -10577,7 +11650,7 @@ async fn rebuild_and_rotate_commitment(
     // retained slot holds it.
     let mut pointer_keys = Vec::new();
     for state in pointers.map(PointerStore::held_states).unwrap_or_default() {
-        if admission::is_responsible(&self_id, &state.address, p2p, config.close_group_size).await {
+        if routing.is_within(&self_id, &state.address, close_group_size) {
             pointer_keys.push(state.address);
         }
     }
@@ -10710,7 +11783,7 @@ async fn rebuild_and_rotate_commitment(
     let sk = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)
         .map_err(|e| Error::Crypto(format!("commitment build: load sk: {e}")))?;
     let pk_bytes = identity.public_key().as_bytes().to_vec();
-    let peer_id_bytes = *p2p.peer_id().as_bytes();
+    let peer_id_bytes = *self_id.as_bytes();
 
     let built = commitment_state::BuiltCommitment::build_from_tree(
         candidate_tree,
@@ -12028,6 +13101,7 @@ mod tests {
                     key: displaced_key,
                     owner: displaced_owner,
                 }],
+                owes_more: false,
             },
         )];
 
@@ -12052,6 +13126,195 @@ mod tests {
             .contains_key(&incoming_source));
     }
 
+    /// A source counts as drained only after its marked last page: a source
+    /// whose pages stopped before it stays outstanding, as a capacity-rejected
+    /// one does, until a later exchange with it delivers every page cleanly
+    /// (or the record expires).
+    #[tokio::test]
+    async fn a_source_whose_pages_stopped_early_stays_outstanding() {
+        let source = test_peer(0xB5);
+        let key = test_key(0xB5);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        let outcome = |owes_more| AdmissionOutcome {
+            discovered: HashSet::from([key]),
+            capacity_rejected_count: 0,
+            displaced: Vec::new(),
+            owes_more,
+        };
+
+        publish_bootstrap_admission_outcomes(
+            &bootstrap_state,
+            &[(source, outcome(true))],
+            &HashSet::from([key]),
+        )
+        .await;
+        {
+            let state = bootstrap_state.read().await;
+            assert!(state.pending_keys.contains(&key), "its keys are tracked");
+            assert!(
+                state.capacity_rejected_sources.contains_key(&source),
+                "a source short of its last page is not drained"
+            );
+        }
+
+        publish_bootstrap_admission_outcomes(
+            &bootstrap_state,
+            &[(source, outcome(false))],
+            &HashSet::new(),
+        )
+        .await;
+        assert!(
+            !bootstrap_state
+                .read()
+                .await
+                .capacity_rejected_sources
+                .contains_key(&source),
+            "every page delivered cleanly clears it"
+        );
+    }
+
+    /// The bootstrap sync tries again the peers it hasn't heard from: one that
+    /// answered busy before any page, or that another exchange held, until it
+    /// is heard or the tries run out. One that failed is heard, and not tried
+    /// again.
+    #[tokio::test]
+    async fn bootstrap_tries_again_the_peers_it_has_not_heard() {
+        let (late, held, failed, busy) = (
+            test_peer(0xC1),
+            test_peer(0xC2),
+            test_peer(0xC3),
+            test_peer(0xC4),
+        );
+        // Each peer's tries in turn: `None` is skipped, as an exchange with
+        // the peer is in progress already.
+        let mut script: HashMap<PeerId, VecDeque<Option<&'static str>>> = HashMap::from([
+            (late, VecDeque::from([Some("busy"), Some("complete")])),
+            (held, VecDeque::from([None, Some("complete")])),
+            (failed, VecDeque::from([Some("failed")])),
+            (busy, VecDeque::new()),
+        ]);
+        let mut attempts: HashMap<PeerId, usize> = HashMap::new();
+        let try_exchanges = |peers: Vec<PeerId>| {
+            let tried = peers
+                .into_iter()
+                .map(|peer| {
+                    *attempts.entry(peer).or_default() += 1;
+                    let next = script
+                        .get_mut(&peer)
+                        .and_then(VecDeque::pop_front)
+                        .unwrap_or(Some("busy"));
+                    (peer, next)
+                })
+                .collect::<Vec<_>>();
+            std::future::ready(tried)
+        };
+        let (heard, unheard, owing) = exchange_until_heard(
+            vec![late, held, failed, busy],
+            &[Duration::ZERO; 3],
+            &CancellationToken::new(),
+            |end: &&str| *end == "busy",
+            try_exchanges,
+        )
+        .await;
+
+        assert_eq!(
+            heard,
+            vec![(failed, "failed"), (late, "complete"), (held, "complete")]
+        );
+        assert_eq!(unheard, vec![busy]);
+        assert_eq!(owing, vec![busy], "it answered busy itself");
+        assert_eq!(attempts[&failed], 1, "a failed peer isn't tried again");
+        assert_eq!(attempts[&late], 2);
+        assert_eq!(attempts[&held], 2);
+        assert_eq!(attempts[&busy], 4, "the first try and 3 more");
+    }
+
+    /// A peer another exchange held at its last try is not marked as owing
+    /// its hints: that exchange (a sync round's) accounts for it, and may
+    /// already have found it drained. Only one whose own last answer was busy
+    /// gets a record.
+    #[tokio::test]
+    async fn a_peer_held_by_another_exchange_gets_no_owing_record() {
+        let (always_held, busy_then_held, busy) =
+            (test_peer(0xC6), test_peer(0xC7), test_peer(0xC8));
+        let mut script: HashMap<PeerId, VecDeque<Option<&'static str>>> = HashMap::from([
+            (always_held, VecDeque::from([None, None, None, None])),
+            (
+                busy_then_held,
+                VecDeque::from([Some("busy"), None, None, None]),
+            ),
+            (busy, VecDeque::new()),
+        ]);
+        let try_exchanges = |peers: Vec<PeerId>| {
+            let tried = peers
+                .into_iter()
+                .map(|peer| {
+                    let next = script
+                        .get_mut(&peer)
+                        .and_then(VecDeque::pop_front)
+                        .unwrap_or(Some("busy"));
+                    (peer, next)
+                })
+                .collect::<Vec<_>>();
+            std::future::ready(tried)
+        };
+        let (heard, unheard, owing) = exchange_until_heard(
+            vec![always_held, busy_then_held, busy],
+            &[Duration::ZERO; 3],
+            &CancellationToken::new(),
+            |end: &&str| *end == "busy",
+            try_exchanges,
+        )
+        .await;
+        assert!(heard.is_empty());
+        assert_eq!(unheard, vec![always_held, busy_then_held, busy]);
+        assert_eq!(owing, vec![busy]);
+
+        // As the bootstrap sync publishes them: a record for the busy peer
+        // only.
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        let outcomes = owing
+            .iter()
+            .map(|peer| (*peer, AdmissionOutcome::owing_all()))
+            .collect::<Vec<_>>();
+        publish_bootstrap_admission_outcomes(&bootstrap_state, &outcomes, &HashSet::new()).await;
+        let state = bootstrap_state.read().await;
+        assert!(state.capacity_rejected_sources.contains_key(&busy));
+        assert!(!state.capacity_rejected_sources.contains_key(&always_held));
+        assert!(!state
+            .capacity_rejected_sources
+            .contains_key(&busy_then_held));
+    }
+
+    /// A source that answered its first page busy keeps bootstrap from
+    /// draining: it owes all its hints until a later exchange delivers them,
+    /// or its record expires.
+    #[tokio::test]
+    async fn a_source_that_answered_busy_keeps_bootstrap_undrained() {
+        let source = test_peer(0xC5);
+        let queues = ReplicationQueues::new();
+        let owing = [(source, AdmissionOutcome::owing_all())];
+
+        // Until the record expires.
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        publish_bootstrap_admission_outcomes(&bootstrap_state, &owing, &HashSet::new()).await;
+        assert!(!bootstrap::check_bootstrap_drained(&bootstrap_state, &queues).await);
+        bootstrap::expire_capacity_rejected(&bootstrap_state, Duration::ZERO).await;
+        assert!(bootstrap::check_bootstrap_drained(&bootstrap_state, &queues).await);
+
+        // Until a later exchange delivers every page cleanly.
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        publish_bootstrap_admission_outcomes(&bootstrap_state, &owing, &HashSet::new()).await;
+        assert!(!bootstrap::check_bootstrap_drained(&bootstrap_state, &queues).await);
+        let clean = AdmissionOutcome {
+            owes_more: false,
+            ..AdmissionOutcome::owing_all()
+        };
+        publish_bootstrap_admission_outcomes(&bootstrap_state, &[(source, clean)], &HashSet::new())
+            .await;
+        assert!(bootstrap::check_bootstrap_drained(&bootstrap_state, &queues).await);
+    }
+
     /// A source that keeps overflowing us must not keep its own record fresh.
     ///
     /// This is the wedge the first-seen stamp closes: with refresh-on-every-
@@ -12072,6 +13335,7 @@ mod tests {
                     discovered: HashSet::new(),
                     capacity_rejected_count: 1,
                     displaced: Vec::new(),
+                    owes_more: false,
                 },
             )];
             publish_bootstrap_admission_outcomes(&bootstrap_state, &outcomes, &HashSet::new())
@@ -12092,6 +13356,7 @@ mod tests {
                     discovered: HashSet::from([key]),
                     capacity_rejected_count: 1,
                     displaced: Vec::new(),
+                    owes_more: false,
                 },
             )];
             publish_bootstrap_admission_outcomes(

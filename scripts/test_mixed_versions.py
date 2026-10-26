@@ -22,6 +22,23 @@ The runs (`--runs`):
   all-new        this tree throughout (not run unless asked for)
   full           this tree throughout, with --full joiners whose disk reads as
                  full through the free-space seam (run when --full is given)
+  paged          this tree throughout, its incumbents admitting --busy-limit
+                 sync requests at once through the admission seam, so that
+                 joiners syncing with them together are answered busy (run
+                 when --paged is given)
+  rollback       this tree throughout, but one joiner, started again part way
+                 on the previous release's binary with its data folder, then
+                 on this tree's again (run when --rollback is given)
+
+In the runs that page (every run but the all-old and full ones), this tree's
+nodes cut their neighbour-sync hints into pages of --page-bytes of keys,
+through the page-size seam, so that the few records of a run take more than
+one page. And until the release that reads pages is cut, they announce that
+release (NEIGHBOR_SYNC_PAGES_FROM_RELEASE, read from src/replication/config.rs)
+through the announced-release seam: nodes built between releases announce
+the last release's version, the version the previous release's nodes
+announce too, so without it they would page to no one, and no lower paging
+release could tell them from the previous release's nodes.
 
 Every run must show, over the time from the joiners' start to the last read:
 no message that failed to decode, in any node's log; no audit failed for a
@@ -29,9 +46,17 @@ reply that didn't decode; every record stored by a majority of its close
 group, and still held at the end by a majority of the nodes that stored it
 (a node that joins later gets a record only by repair, which waits for the
 record to age, so the nodes nearest it now are counted but not required);
-and every standalone node received neighbour sync.
+and every standalone node received neighbour sync, in single messages or
+in pages. And of neighbour sync, as the requesters' logs show it, with the
+releases the two nodes ran when each exchange started: no node paged its
+hints to a node of the previous release, which can't read pages; in a run
+that pages, this tree's nodes paged to each other; with nodes of the
+previous release beside them, they sent those nodes single messages (pages,
+if that release reads them); and no requester charged its responder anything
+during an exchange the responder answered busy.
 
-Each mixed run must also show no penalty heavier than the all-old runs': the
+Each mixed run, and the rollback run, must also show no penalty heavier than
+the all-old runs': the
 penalties (saorsa-core's trust events that lower a peer's score) that the
 devnet's nodes, the incumbents and the joiners charge the incumbents and the
 joiners, counted for each pair of roles and each reason, may exceed the
@@ -48,11 +73,34 @@ within the limit or not, so a small excess shows before the canary. The
 penalties one release's nodes charge the other's are reported by reason. And
 the message shapes: each role received every message family it received at
 least SHAPE_FLOOR times in every all-old run, and a family that only this
-tree knows (--new-only-family) reached nodes of this tree and no others.
+tree knows (--new-only-family) reached nodes of this tree and no others. The
+paged run is measured for new failure reasons only: its pages of two keys
+send far more messages than any all-old run.
+
+The paged run must show, besides: an exchange in which each node's replica
+hints and paid hints took more than one page, both ways; every exchange's
+pages served from the hints its responder built at the first page, built
+once; each exchange's pages served in order, the next only after the
+last; and pages answered busy, with no penalty for them.
+
+The rollback run must show, besides: the rolled-back node starting on the
+previous release's binary with the data folder this tree's binary wrote, and
+on this tree's again; while it ran the previous release, a single message to
+it from a node of this tree, no page reaching it (no message that failed to
+decode), and from each node at most one page, left unanswered, over the
+connection its earlier process left; and once it came back, a page to it
+from a node of this tree, answered. Each of the run's three phases (before,
+during and after) lasts --rollback-minutes, and the last two go on, up to
+ROLLBACK_WAIT_LIMIT minutes, until they show their exchange: a node syncs with
+a peer at most once an hour. Penalties on the node from each of its stops
+until RESTART_GRACE seconds after it is up again, for requests it couldn't
+answer while it restarted, are reported, not compared.
 
 The test-only seams (src/test_seams.rs) are compiled only into builds with the
 `test-utils` feature, which both releases are built with here. The free-space
-seam makes a node's disk read as full (the `full` run).
+seam makes a node's disk read as full (the `full` run); the page-size,
+announced-release and admission seams are the ones above. The harness
+refuses a run with a binary that lacks the seams it sets.
 
 Usage, from the repository root (needs cargo, git, Python 3.8+, and Foundry's
 `anvil` on PATH):
@@ -60,6 +108,8 @@ Usage, from the repository root (needs cargo, git, Python 3.8+, and Foundry's
   python3 scripts/test_mixed_versions.py
   python3 scripts/test_mixed_versions.py --old-ref v0.23.0+ds.15 --observe-minutes 25
   python3 scripts/test_mixed_versions.py --old-bin path/to/old --new-bin path/to/new
+  python3 scripts/test_mixed_versions.py --runs paged --observe-minutes 10
+  python3 scripts/test_mixed_versions.py --paged --rollback
 
 The previous release is the newest v*+ds.* tag before HEAD, built from an
 export of the tree at that tag under target/mv/ with its own target folder,
@@ -70,7 +120,8 @@ under the work folder (target/mv/runs/<time> unless --work names one); the
 summary is summary.json there. Exits 0 when every run passes.
 
 With the defaults a run takes about 30 minutes, most of it --observe-minutes,
-and the harness makes four: two all-old runs, then the two mixed ones.
+and the harness makes four: two all-old runs, then the two mixed ones. The
+rollback run takes 40 minutes or more, up to about two and a half hours.
 The standalone nodes run in testnet mode, which binds every interface; on a
 desktop whose firewall asks about that, --network-mode development keeps them
 on loopback. A run during which the machine stood still (asleep, say) fails
@@ -151,6 +202,68 @@ CLIENT_TIMEOUT = 1800
 # The seam whose name, found in a binary, shows it was built with test-utils.
 FREE_SPACE_SEAM = "ANT_TEST_SEAM_FREE_SPACE_FILE"
 
+# The seams this tree's nodes are given in the runs that page: the bytes of
+# keys on one neighbour-sync page; the release they announce in their user
+# agent, as its +ds number; and, for the paged run's incumbents, the sync
+# requests a node admits at once.
+PAGE_SEAM = "ANT_TEST_SEAM_SYNC_PAGE_BYTES"
+ANNOUNCED_SEAM = "ANT_TEST_SEAM_ANNOUNCED_RELEASE"
+ADMISSION_SEAM = "ANT_TEST_SEAM_SYNC_ADMISSION_LIMIT"
+
+# The runs in which this tree's nodes page, and those with nodes of the
+# previous release beside them.
+PAGING_RUNS = ("new-hosts-old", "old-hosts-new", "all-new", "paged", "rollback")
+OLD_RUNS = ("new-hosts-old", "old-hosts-new", "rollback")
+
+# The family of a sync page request: a binary that names it reads pages,
+# whatever features it was built with.
+PAGE_REQUEST_FAMILY = "neighbor_sync_page_request"
+
+# Where this tree sets the first release whose nodes read pages.
+PAGING_RELEASE = re.compile(r"pub const NEIGHBOR_SYNC_PAGES_FROM_RELEASE: u64 = (\d+);")
+# A version's release: n of <version>+ds.<n>.
+RELEASE_NUMBER = re.compile(r"\+ds\.(\d+)")
+
+# Bytes of keys on a page in the runs that page: two keys, so that each list
+# of a run's records takes more than one page.
+PAGE_BYTES = 64
+
+# Sync requests the paged run's incumbents admit at once (8 without the
+# seam), so that joiners syncing with them together are answered busy.
+BUSY_LIMIT = 1
+
+# The rollback run: each of its three phases lasts --rollback-minutes, and the
+# last two go on, up to ROLLBACK_WAIT_LIMIT minutes, until they show the
+# exchange they must: a node syncs with a peer at most once an hour, so a
+# phase may wait out that hour for the nodes that synced with the rolled-back
+# node last.
+ROLLBACK_MINUTES = 10
+ROLLBACK_WAIT_LIMIT = 70
+
+# Penalties on the rolled-back node from each of its stops until this many
+# seconds after it is up again, for requests it couldn't answer while it
+# restarted (a request waits 30 seconds at most): reported, not compared, as
+# no all-old run restarts a node.
+RESTART_GRACE = 60
+
+# A penalty a requester charges its responder up to this many seconds after
+# an exchange the responder answered busy is charged for that exchange.
+BUSY_CHARGE_GRACE = 1.0
+
+# The message families of paged neighbour sync, and the single-message family
+# each takes the place of between two nodes that read pages.
+PAGE_FAMILIES = {"neighbor_sync_page_request": "neighbor_sync_request",
+                 "neighbor_sync_page_response": "neighbor_sync_response"}
+
+# The lines a node logs for each exchange it starts, paged or single; for the
+# hints it builds as a responder at an exchange's first page; for each page
+# it serves; and for each page it answers busy.
+PAGED_EXCHANGE_LINE = "Neighbor-sync paged exchange"
+SINGLE_EXCHANGE_LINE = "Neighbor-sync single exchange"
+HINT_SET_LINE = "Neighbor-sync hint set built"
+PAGE_SERVED_LINE = "Neighbor-sync page served"
+BUSY_LINE = "Neighbor-sync page answered busy"
+
 # What each node logs: info, and debug for the code whose debug lines name
 # messages that didn't decode (src/replication, the chunk handler, listings).
 LOG_FILTER = ("info,ant_node::replication=debug,ant_node::storage::handler=debug,"
@@ -184,7 +297,7 @@ UNANSWERED_KIND = {"Sync with": "neighbour sync", "Verification request to": "ve
 # A possession check a peer failed: the peer and the key.
 POSSESSION_FAILED = re.compile(r"Possession check: ([0-9a-f]{64}) failed to prove possession "
                                r"for ([0-9a-f]{64})")
-RUNS = ("all-old", "new-hosts-old", "old-hosts-new", "all-new", "full")
+RUNS = ("all-old", "new-hosts-old", "old-hosts-new", "all-new", "full", "paged", "rollback")
 # The all-old runs: all-old, and all-old-2 on when there are more.
 BASELINE_RUN = re.compile(r"all-old(?:-([2-9]|[1-9][0-9]+))?")
 
@@ -256,6 +369,17 @@ def previous_release():
     return git("describe", "--tags", "--abbrev=0", "--match", "v*+ds.*", "HEAD^")
 
 
+def paging_release():
+    """The first release whose nodes read paged sync, as this tree sets it, or
+    None for a tree without pages."""
+    try:
+        found = PAGING_RELEASE.search(
+            (REPO / "src" / "replication" / "config.rs").read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return int(found.group(1)) if found else None
+
+
 def cargo_build(root, bins, profile, cargo_args, env=None):
     command = ["cargo", "build", "--locked", "--profile", profile, "--features", "test-utils"]
     for name in bins:
@@ -323,7 +447,14 @@ class Release:
                 raise HarnessError(f"{binary} is missing")
         self.version = subprocess.run([str(self.node), "--version"], capture_output=True,
                                       text=True).stdout.strip()
-        self.seams = FREE_SPACE_SEAM.encode() in self.node.read_bytes()
+        binary = self.node.read_bytes()
+        self.seams = FREE_SPACE_SEAM.encode() in binary
+        self.page_seams = PAGE_SEAM.encode() in binary
+        self.announce_seam = ANNOUNCED_SEAM.encode() in binary
+        self.admission_seam = ADMISSION_SEAM.encode() in binary
+        self.reads_pages = PAGE_REQUEST_FAMILY.encode() in binary
+        number = RELEASE_NUMBER.search(self.version)
+        self.number = int(number.group(1)) if number else None
 
     def __str__(self):
         return f"{self.name}: {self.version}, {self.label}"
@@ -423,19 +554,79 @@ def socket_address(multiaddr):
 # --------------------------------------------------------------------------
 
 class Node:
-    def __init__(self, name, role, release, process, root, full):
+    def __init__(self, name, role, release, root, full, rewards):
         self.name = name
         self.role = role
         self.release = release
-        self.process = process
+        self.process = None
         self.root = root
         self.full = full
+        self.rewards = rewards
         self.peer_id = None
 
 
-def run_one(name, network_release, joiner_release, args, harness, folder):
+class ExchangeWatch:
+    """Follows logs for the neighbour-sync exchanges their nodes start with
+    one peer, as they are written."""
+
+    def __init__(self, logs, peer_id):
+        self.offsets = {path: 0 for path in logs}
+        self.peer_id = peer_id
+        self.exchanges = []
+
+    def poll(self):
+        """Reads what the logs gained since the last poll; returns every
+        exchange with the peer seen so far."""
+        for path, offset in self.offsets.items():
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(offset)
+                    data = handle.read()
+            except OSError:
+                continue
+            whole = data.rfind(b"\n") + 1
+            self.offsets[path] = offset + whole
+            for raw in data[:whole].splitlines():
+                text = ANSI.sub("", raw.decode("utf-8", "replace"))
+                exchange = exchange_in(text)
+                if exchange and exchange.get("peer") == self.peer_id:
+                    self.exchanges.append(exchange)
+        return self.exchanges
+
+    def seen(self, form, since, answered=False):
+        """The exchanges in `form` ("paged" or "single") that started at
+        `since` or later, with a page answered if `answered`."""
+        return [exchange for exchange in self.poll()
+                if exchange["form"] == form and exchange["start"] >= since
+                and (not answered or exchange.get("pages_answered", 0) >= 1)]
+
+
+def paging_plan(name, new, old, paging_from, args):
+    """What this tree's nodes are given in run `name` so that they page, and
+    what its neighbour sync must then show. Until the release that reads
+    pages is cut, this tree's nodes announce the last release's version, as
+    the previous release's nodes do: without the announced-release seam they
+    would page to no one, and no lower paging release would tell them from
+    the previous release's nodes."""
+    pages = bool(new.reads_pages and paging_from is not None)
+    native = pages and new.number is not None and new.number >= paging_from
+    announced = paging_from if pages and not native and name in PAGING_RUNS else None
+    return {
+        "announced": announced,
+        "page_bytes": args.page_bytes if pages and name in PAGING_RUNS else None,
+        "busy_limit": args.busy_limit if name == "paged" and args.busy_limit else None,
+        "new_pages": bool(native or announced) and not is_baseline(name),
+        "old_present": name in OLD_RUNS,
+        "old_reads_pages": bool(old is not None and old.reads_pages),
+    }
+
+
+def run_one(name, network_release, joiner_release, args, harness, folder, old=None,
+            paging=None):
     """Runs one scenario under `folder`, and records there (run.json) what the
-    analysis needs."""
+    analysis needs. `old` is the previous release, which the rollback run
+    starts one of this tree's nodes on part way; `paging` is what this tree's
+    nodes are given to page (paging_plan)."""
     folder.mkdir(parents=True)
     env = dict(os.environ, RUST_LOG=LOG_FILTER, NO_COLOR="1",
                XDG_DATA_HOME=str(folder / "xdg"))
@@ -454,6 +645,8 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
     timeline = {"started": utc_now().isoformat()}
     stall = StallWatch()
     full_count = args.full if name == "full" else 0
+    paging = paging or {}
+    rolled = None
     try:
         manifest_path = folder / "manifest.json"
         devnet_data = folder / "devnet"
@@ -470,34 +663,54 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         bootstrap = [socket_address(address) for address in manifest["bootstrap"]]
         log(f"{name}: devnet up ({network_release.name}), bootstrap {', '.join(bootstrap)}")
 
-        def start(role, index, release, full):
-            node_name = f"{role}-{index:02d}"
-            root = folder / "nodes" / node_name
-            root.mkdir(parents=True)
-            node_env = dict(env)
-            if full:
-                seam = folder / "seams" / f"{node_name}.free"
-                seam.parent.mkdir(exist_ok=True)
-                total = shutil.disk_usage(folder).total
-                seam.write_text(f"0 {total}\n")
-                node_env[FREE_SPACE_SEAM] = str(seam)
+        def node_env(node, release):
+            """The environment `node` runs `release`'s binary with."""
+            values = dict(env)
+            if release.name == "new":
+                # Small sync pages, and the release that reads pages
+                # announced until it is cut: see paging_plan.
+                if paging.get("page_bytes"):
+                    values[PAGE_SEAM] = str(paging["page_bytes"])
+                if paging.get("announced"):
+                    values[ANNOUNCED_SEAM] = str(paging["announced"])
+                if paging.get("busy_limit") and node.role == "incumbent":
+                    values[ADMISSION_SEAM] = str(paging["busy_limit"])
+            if node.full:
+                values[FREE_SPACE_SEAM] = str(folder / "seams" / f"{node.name}.free")
+            return values
+
+        def launch(node, release):
+            """Starts `release`'s binary as `node`, on its data folder."""
             command = [
-                str(release.node), "--root-dir", str(root), "--port", "0", "--ipv4-only",
+                str(release.node), "--root-dir", str(node.root), "--port", "0", "--ipv4-only",
                 "--network-mode", args.network_mode, "--metrics-port", "0",
                 "--evm-rpc-url", evm["rpc_url"],
                 "--evm-payment-token", evm["payment_token_address"],
                 "--evm-payment-vault", evm["payment_vault_address"],
-                "--rewards-address", "0x" + "d1" * 18 + f"{len(nodes) + 1:04x}",
+                "--rewards-address", node.rewards,
                 "--config", str(node_config), "--enable-logging", "--log-level", "info",
             ]
             if args.network_mode == "development":
                 command += ["--webrtc-direct-bind", "127.0.0.1:0"]
             for address in bootstrap:
                 command += ["--bootstrap", address]
-            process = Process(node_name, command, folder / f"{node_name}.log", node_env)
-            processes.append(process)
-            node = Node(node_name, role, release, process, root, full)
+            node.process = Process(node.name, command, folder / f"{node.name}.log",
+                                   node_env(node, release))
+            processes.append(node.process)
+
+        def start(role, index, release, full):
+            node_name = f"{role}-{index:02d}"
+            root = folder / "nodes" / node_name
+            root.mkdir(parents=True)
+            if full:
+                seam = folder / "seams" / f"{node_name}.free"
+                seam.parent.mkdir(exist_ok=True)
+                total = shutil.disk_usage(folder).total
+                seam.write_text(f"0 {total}\n")
+            node = Node(node_name, role, release, root, full,
+                        "0x" + "d1" * 18 + f"{len(nodes) + 1:04x}")
             nodes.append(node)
+            launch(node, release)
             return node
 
         def started(group):
@@ -505,6 +718,68 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
                 node.peer_id = wait_for(
                     f"{node.name}'s identity",
                     lambda node=node: peer_id_in(node.process.log_path), 120, node.process)
+
+        def observe(minutes, until=None, most=None):
+            """Lets the nodes run for `minutes`, and then, while `until` finds
+            nothing, on up to `most` minutes in all; fails when a node stops.
+            Returns what `until` found last."""
+            began = time.monotonic()
+            found = None
+            while True:
+                for process in processes:
+                    if not process.alive():
+                        raise HarnessError(f"{process.name} exited; see {process.log_path}")
+                passed = (time.monotonic() - began) / 60
+                if passed >= minutes:
+                    if until is None:
+                        return None
+                    found = until()
+                    if found or passed >= most:
+                        return found
+                time.sleep(5)
+
+        def restart(node, release):
+            """Stops `node` and starts `release`'s binary as it, on its data
+            folder; returns when the new process has logged its identity,
+            with the times the node stopped and came up."""
+            offset = node.process.log_path.stat().st_size
+            stopped = utc_now()
+            node.process.signal()
+            node.process.stop()
+            processes.remove(node.process)
+            launch(node, release)
+            wait_for(f"{node.name}'s identity on {release.name}",
+                     lambda: peer_id_in(node.process.log_path, offset), 120, node.process)
+            return stopped, utc_now()
+
+        def roll_back(node):
+            """The rollback run's three phases: `node` on this tree's binary,
+            then on the previous release's, then on this tree's again, each
+            until the nodes of this tree show what they must of it."""
+            new = node.release
+            watch = ExchangeWatch([folder / f"{other.name}.log" for other in nodes
+                                   if other.release.name == "new" and other is not node],
+                                  node.peer_id)
+            log(f"{name}: observing for {args.rollback_minutes} min before rolling back")
+            observe(args.rollback_minutes)
+            log(f"{name}: {node.name} started again on {old.name} ({old.version}), its data "
+                "folder kept")
+            stopped_old, up_old = restart(node, old)
+            found = observe(args.rollback_minutes, lambda: watch.seen("single", up_old),
+                            ROLLBACK_WAIT_LIMIT)
+            log(f"{name}: {len(found or [])} single exchange(s) to {node.name} from this "
+                "tree's nodes while it ran the previous release")
+            stopped_new, up_new = restart(node, new)
+            log(f"{name}: {node.name} back on this tree's binary")
+            found = observe(args.rollback_minutes,
+                            lambda: watch.seen("paged", up_new, answered=True),
+                            ROLLBACK_WAIT_LIMIT)
+            log(f"{name}: {len(found or [])} paged exchange(s) to {node.name} since it came "
+                "back")
+            return {"node": node.name, "peer_id": node.peer_id,
+                    "old_from": stopped_old.isoformat(), "old_until": stopped_new.isoformat(),
+                    "restarts": [[stopped_old.isoformat(), up_old.isoformat()],
+                                 [stopped_new.isoformat(), up_new.isoformat()]]}
 
         incumbents = [start("incumbent", index, network_release, False)
                       for index in range(args.incumbents)]
@@ -525,13 +800,11 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         uploads.append(upload(harness, manifest_path, folder / "uploads-after.json",
                               args.records_after))
 
-        log(f"{name}: observing for {args.observe_minutes} min")
-        deadline = time.monotonic() + args.observe_minutes * 60
-        while time.monotonic() < deadline:
-            for process in processes:
-                if not process.alive():
-                    raise HarnessError(f"{process.name} exited; see {process.log_path}")
-            time.sleep(5)
+        if name == "rollback":
+            rolled = roll_back(joiners[0] if joiners else incumbents[0])
+        else:
+            log(f"{name}: observing for {args.observe_minutes} min")
+            observe(args.observe_minutes)
         checks = [check(harness, manifest_path, path, folder / f"check-{path.stem}.json")
                   for path in uploads]
         timeline["ended"] = utc_now().isoformat()
@@ -550,10 +823,13 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         "stalled_seconds": stalled,
         "devnet_peers": devnet_peers,
         "nodes": [{"name": node.name, "role": node.role, "release": node.release.name,
-                   "ran": started_as(node.process.log_path), "peer_id": node.peer_id,
-                   "full": node.full, "log": node.process.log_path.name} for node in nodes],
+                   "ran": started_as(folder / f"{node.name}.log"), "peer_id": node.peer_id,
+                   "full": node.full, "log": f"{node.name}.log"} for node in nodes],
         "uploads": [path.name for path in uploads],
         "checks": [path.name for path in checks],
+        "page_bytes": paging.get("page_bytes"),
+        "paging": paging,
+        "rollback": rolled,
     }
     (folder / "run.json").write_text(json.dumps(record, indent=2))
     return folder
@@ -567,6 +843,12 @@ def load_run(folder):
                              for stamp in record["window"])
     record["uploads"] = [json.loads((folder / name).read_text()) for name in record["uploads"]]
     record["checks"] = [json.loads((folder / name).read_text()) for name in record["checks"]]
+    rollback = record.get("rollback")
+    if rollback:
+        for key in ("old_from", "old_until"):
+            rollback[key] = datetime.datetime.fromisoformat(rollback[key])
+        rollback["restarts"] = [[datetime.datetime.fromisoformat(stamp) for stamp in pair]
+                                for pair in rollback["restarts"]]
     return record
 
 
@@ -581,9 +863,11 @@ def started_as(log_path):
     return "unknown"
 
 
-def peer_id_in(log_path):
+def peer_id_in(log_path, offset=0):
+    """The peer id a node's log names, from `offset` on."""
     try:
         with open(log_path, "rb") as handle:
+            handle.seek(offset)
             for raw in handle:
                 match = PEER_ID_LINE.search(ANSI.sub("", raw.decode("utf-8", "replace")))
                 if match:
@@ -672,6 +956,11 @@ def analyze(run):
         releases[node["peer_id"]] = node["release"]
     for uploads in run["uploads"]:
         roles.setdefault(uploads["client"], "client")
+    rollback = run.get("rollback")
+
+    def release_at(peer, when):
+        return release_of(rollback, releases, peer, when)
+
     full_peers = {node["peer_id"] for node in run["nodes"] if node["full"]}
     # A node that refused a record's PUT doesn't hold it, and its close group's
     # possession checks then charge it: those penalties follow the refusal,
@@ -685,22 +974,28 @@ def analyze(run):
         role = roles.get(peer, "other")
         refusals[role] = refusals.get(role, 0) + 1
 
-    sources = [("devnet", "devnet", run["network"], folder / "devnet.log")]
-    sources += [(node["name"], node["role"], node["release"], folder / node["log"])
+    sources = [("devnet", "devnet", None, folder / "devnet.log")]
+    sources += [(node["name"], node["role"], node["peer_id"], folder / node["log"])
                 for node in run["nodes"]]
     decode_failures = []
     unanswered = {}
     penalties = {}
     penalties_on_full = {}
     penalties_on_refusals = {}
+    penalties_on_restart = {}
     between_releases = {}
     traffic = {}
     audits = {}
-    for source, role, release, path in sources:
+    charges = []
+    sync = {"paged": [], "single": [], "builds": {}, "served": {}, "busy": 0}
+    for source, role, source_peer, path in sources:
         traffic_groups = {}
         audit_groups = {}
         possession_failed = None
-        for _, text in read_log(path, window):
+        for stamp, text in read_log(path, window):
+            own_release = (run["network"] if source_peer is None
+                           else release_at(source_peer, stamp))
+            note_sync(sync, source, own_release, stamp, text, release_at)
             failed = POSSESSION_FAILED.search(text)
             if failed:
                 possession_failed = (failed.group(1), failed.group(2))
@@ -726,8 +1021,11 @@ def analyze(run):
                 reason = found.get("reason", "")
                 target = found.get("peer_id", "")
                 weight = float(found.get("weight", "1") or 1)
+                charges.append((source, target, stamp, reason))
                 if target in full_peers:
                     book = penalties_on_full
+                elif restarting(rollback, target, stamp):
+                    book = penalties_on_restart
                 elif (possession_failed and possession_failed[0] == target
                       and possession_failed in refused):
                     book = penalties_on_refusals
@@ -739,14 +1037,16 @@ def analyze(run):
                 book[key] = (count + 1, total + weight)
                 # One release's nodes charging the other's, whatever the
                 # book: what the rule for messages between nodes governs.
+                target_release = release_at(target, stamp)
                 if (roles.get(target) in ("incumbent", "joiner")
-                        and releases.get(target, release) != release):
-                    key = (release, releases[target], reason)
+                        and target_release != own_release):
+                    key = (own_release, target_release, reason)
                     count, total = between_releases.get(key, (0, 0.0))
                     between_releases[key] = (count + 1, total + weight)
         if source != "devnet":
             traffic[source] = merge_counters(traffic_groups)
             audits[source] = merge_counters(audit_groups)
+    sync["busy_charged"] = busy_charges(sync, charges)
 
     records = [record for uploads in run["uploads"] for record in uploads["records"]]
     checks = [record for checks in run["checks"] for record in checks["records"]]
@@ -762,6 +1062,7 @@ def analyze(run):
         "penalties": penalties,
         "penalties_on_full": penalties_on_full,
         "penalties_on_refusals": penalties_on_refusals,
+        "penalties_on_restart": penalties_on_restart,
         "between_releases": between_releases,
         "refusals": refusals,
         "traffic": traffic,
@@ -770,6 +1071,9 @@ def analyze(run):
         "checks": checks,
         "full_evidence": full_evidence,
         "unanswered": unanswered,
+        "sync": sync,
+        "paging": run.get("paging") or {},
+        "rollback": rollback,
         "stalled_seconds": run.get("stalled_seconds", 0),
         "roles": {node["name"]: node["role"] for node in run["nodes"]},
         "ran": {role: sorted({node.get("ran") or started_as(folder / node["log"])
@@ -779,8 +1083,99 @@ def analyze(run):
     }
 
 
+def release_of(rollback, releases, peer, when):
+    """The release `peer` ran at `when`: the one it was started on, but for
+    the rollback run's node from its stop until it came back, when it was
+    the previous release's."""
+    if (rollback and peer == rollback["peer_id"] and when is not None
+            and rollback["old_from"] <= when < rollback["old_until"]):
+        return "old"
+    return releases.get(peer, "other")
+
+
+def restarting(rollback, peer, when):
+    """Whether `when` falls in one of the rollback run's restarts of `peer`:
+    from its stop until RESTART_GRACE seconds after it was up again, when
+    requests sent to it before or during the restart still fail."""
+    if not rollback or peer != rollback["peer_id"]:
+        return False
+    grace = datetime.timedelta(seconds=RESTART_GRACE)
+    return any(stopped <= when <= up + grace for stopped, up in rollback["restarts"])
+
+
+def busy_charges(sync, charges):
+    """The penalties a requester charged its responder during a paged exchange
+    the responder answered busy, up to BUSY_CHARGE_GRACE after it ended."""
+    grace = datetime.timedelta(seconds=BUSY_CHARGE_GRACE)
+    found = []
+    for exchange in sync.get("paged", []):
+        if exchange.get("end") != "Busy" or "start" not in exchange:
+            continue
+        for observer, target, stamp, reason in charges:
+            if (observer == exchange["from"] and target == exchange.get("peer")
+                    and exchange["start"] <= stamp <= exchange["at"] + grace):
+                found.append({"from": observer, "peer": target, "at": stamp,
+                              "reason": reason})
+    return found
+
+
+def exchange_in(text):
+    """The neighbour-sync exchange a log line ends, with the time it started,
+    or None: the requester logs one line for each exchange it starts, paged or
+    single, when it ends, with how long it took."""
+    if PAGED_EXCHANGE_LINE in text:
+        form = "paged"
+    elif SINGLE_EXCHANGE_LINE in text:
+        form = "single"
+    else:
+        return None
+    at = parse_time(text)
+    if at is None:
+        return None
+    exchange = {key: int(value) if value.isdigit() else value
+                for key, value in fields(text).items()}
+    exchange["form"] = form
+    exchange["at"] = at
+    elapsed = exchange.get("elapsed_ms", 0)
+    exchange["start"] = at - datetime.timedelta(
+        milliseconds=elapsed if isinstance(elapsed, int) else 0)
+    return exchange
+
+
+def note_sync(sync, source, release, stamp, text, release_at):
+    """Notes a neighbour-sync line of `source`'s log in `sync`: an exchange it
+    started, paged or single, with the releases of the two nodes when it
+    started; a hint set it built, and a page it served, as a responder, by
+    the requester and the exchange's number; or a page it answered busy."""
+    exchange = exchange_in(text)
+    if exchange is not None:
+        exchange.update({"from": source, "release": release,
+                         "peer_release": release_at(exchange.get("peer", ""),
+                                                    exchange["start"])})
+        sync[exchange["form"]].append(exchange)
+    elif HINT_SET_LINE in text:
+        found = fields(text)
+        key = f"{source} {found.get('source', '?')} {found.get('cycle', '?')}"
+        sync["builds"][key] = sync["builds"].get(key, 0) + 1
+    elif PAGE_SERVED_LINE in text:
+        found = fields(text)
+        key = f"{source} {found.get('source', '?')} {found.get('cycle', '?')}"
+        page = found.get("page", "")
+        sync["served"].setdefault(key, []).append(int(page) if page.isdigit() else -1)
+    elif BUSY_LINE in text:
+        sync["busy"] += 1
+
+
+def multi_page(exchange):
+    """Whether an exchange took more than one page for each list, both ways."""
+    return all(exchange.get(f"{kind}_pages_{way}", 0) >= 2
+               for kind in ("replica", "paid") for way in ("sent", "received"))
+
+
 def received_families(result, role):
-    """The message families the nodes of `role` received, with counts."""
+    """The message families the nodes of `role` received, with counts. A page
+    family counts towards the single-message family it takes the place of
+    too, so a node that read pages from its peers received neighbour sync."""
     families = {}
     for name, counters in result["traffic"].items():
         if result["roles"].get(name) != role:
@@ -789,6 +1184,9 @@ def received_families(result, role):
             if key.endswith("_rx_count"):
                 family = key[:-len("_rx_count")]
                 families[family] = families.get(family, 0) + value
+                if family in PAGE_FAMILIES:
+                    single = PAGE_FAMILIES[family]
+                    families[single] = families.get(single, 0) + value
     return families
 
 
@@ -821,10 +1219,119 @@ def against(bases):
     return f"at most {max(bases)} in the {len(bases)} all-old runs ({', '.join(map(str, bases))})"
 
 
-def is_measured(name, baselines):
-    """Whether a run is measured against the all-old runs: when there is
-    one, every run but those and the full run."""
-    return bool(baselines) and not is_baseline(name) and name != "full"
+def measured(name, baselines):
+    """What of a run is measured against the all-old runs, when there is one:
+    for the mixed runs and the rollback run, everything (the penalties for
+    each pair of roles and reason, new failure reasons, refused PUTs and the
+    message families); for the paged run, new failure reasons only, since its
+    pages of two keys send far more messages than any all-old run; for the
+    all-old runs and the full run, nothing."""
+    if not baselines or is_baseline(name) or name == "full":
+        return set()
+    if name == "paged":
+        return {"new reason"}
+    return {"penalties", "new reason", "refused PUTs", "families"}
+
+
+def sync_failures(name, result):
+    """What fails a run in its neighbour sync.
+
+    In every run: a node paging to a node that can't read pages; this tree's
+    nodes, in a run in which they page, not paging to each other; with the
+    previous release's nodes beside them, no single message to those nodes
+    (or, if they read pages, no page); and a requester charging its responder
+    during an exchange the responder answered busy. In the rollback run: no
+    single message to the rolled-back node while it ran the previous release,
+    more than one page from a node left unanswered over the connection its
+    earlier process left, and no page to it once it came back. In the paged
+    run: no exchange taking more than one page for each list both ways,
+    hints built more than once in an exchange, an exchange's pages served
+    out of order, and, with the incumbents' admission limit lowered, no page
+    answered busy."""
+    failures = []
+    sync = result.get("sync") or {}
+    paging = result.get("paging") or {}
+    rollback = result.get("rollback")
+    rolled = rollback["peer_id"] if rollback else None
+    paged = sync.get("paged", [])
+    single = sync.get("single", [])
+
+    def between(exchanges, release, peer_release):
+        return [exchange for exchange in exchanges if exchange.get("release") == release
+                and exchange.get("peer_release") == peer_release]
+
+    # Pages to nodes that can't read them. Over a connection the rolled-back
+    # node's earlier process left, a page may go out once from each node
+    # before the node's agent shows its release, and is never answered.
+    left_over = {}
+    if not paging.get("old_reads_pages"):
+        for exchange in between(paged, "new", "old"):
+            if (rolled is not None and exchange.get("peer") == rolled
+                    and exchange.get("pages_answered", 0) == 0):
+                left_over[exchange["from"]] = left_over.get(exchange["from"], 0) + 1
+                continue
+            failures.append(f"{name}: {exchange['from']} paged its hints to a node of the "
+                            "previous release, which can't read pages")
+    for requester, count in sorted(left_over.items()):
+        if count > 1:
+            failures.append(f"{name}: {requester} paged {count} times to the rolled-back node "
+                            "while it ran the previous release: a first page left unanswered "
+                            "should make the next exchange a single message")
+
+    if paging.get("new_pages") and not between(paged, "new", "new"):
+        failures.append(f"{name}: no node of this tree paged its hints to another")
+    # The rollback run's previous release is its one node, checked below.
+    if paging.get("old_present") and not rollback:
+        if paging.get("old_reads_pages"):
+            if not between(paged, "new", "old"):
+                failures.append(f"{name}: no node of this tree paged its hints to a node of "
+                                "the previous release, which reads pages")
+        elif not between(single, "new", "old"):
+            failures.append(f"{name}: no node of this tree sent its hints to a node of the "
+                            "previous release in a single message")
+
+    for charged in sync.get("busy_charged", []):
+        failures.append(f"{name}: {charged['from']} charged {charged['peer'][:16]} "
+                        f"({charged['reason']}) during an exchange it answered busy")
+
+    if rollback:
+        if paging.get("old_reads_pages"):
+            if not any(exchange.get("peer") == rolled and exchange.get("pages_answered", 0) >= 1
+                       for exchange in between(paged, "new", "old")):
+                failures.append(f"{name}: no node of this tree paged to the rolled-back node "
+                                "while it ran the previous release: observe for longer")
+        elif not any(exchange.get("peer") == rolled
+                     for exchange in between(single, "new", "old")):
+            failures.append(f"{name}: no node of this tree sent the rolled-back node a single "
+                            "message while it ran the previous release: observe for longer")
+        if not any(exchange.get("peer") == rolled and exchange.get("pages_answered", 0) >= 1
+                   and exchange.get("start", rollback["old_until"]) >= rollback["old_until"]
+                   for exchange in between(paged, "new", "new")):
+            failures.append(f"{name}: no node of this tree paged to the rolled-back node once "
+                            "it came back: observe for longer")
+
+    if name != "paged":
+        return failures
+    if not any(multi_page(exchange) for exchange in paged):
+        failures.append(f"{name}: no exchange took more than one page for each list, both "
+                        "ways: no paging happened at this page size")
+    for key, count in sorted(sync.get("builds", {}).items()):
+        if count > 1:
+            failures.append(f"{name}: {key}: the responder built its hints {count} times in "
+                            "one exchange, not once")
+    served_from_one = 0
+    for key, pages in sorted(sync.get("served", {}).items()):
+        if pages != list(range(len(pages))):
+            failures.append(f"{name}: {key}: pages served out of order: {pages[:20]}")
+        elif len(pages) > 1 and sync.get("builds", {}).get(key) == 1:
+            served_from_one += 1
+    if served_from_one == 0:
+        failures.append(f"{name}: no responder served more than one page from hints built "
+                        "once")
+    if paging.get("busy_limit") and sync.get("busy", 0) == 0:
+        failures.append(f"{name}: no page was answered busy, with the incumbents admitting "
+                        f"{paging['busy_limit']} sync request(s) at once")
+    return failures
 
 
 def comparisons(result, baselines, args):
@@ -908,11 +1415,13 @@ def verdicts(results, args):
             for family in ("neighbor_sync_request", "neighbor_sync_response"):
                 if families.get(family, 0) == 0:
                     failures.append(f"{name}: the {role}s received no {family}")
-        if not is_measured(name, baselines):
+        failures += sync_failures(name, result)
+        kinds = measured(name, baselines)
+        if not kinds:
             continue
         for compared in comparisons(result, baselines, args):
             count, target, reason = compared["count"], compared["target"], compared["reason"]
-            if count <= compared["limit"]:
+            if compared["kind"] not in kinds or count <= compared["limit"]:
                 continue
             if compared["kind"] == "penalties":
                 failures.append(f"{name}: {count} {reason} penalties by "
@@ -924,6 +1433,8 @@ def verdicts(results, args):
             else:
                 failures.append(f"{name}: the {target}s refused {count} paid PUTs, against "
                                 f"{against(compared['all_old'])}")
+        if "families" not in kinds:
+            continue
         for role in ("incumbent", "joiner"):
             befores = [received_families(baseline, role) for baseline in baselines]
             now = received_families(result, role)
@@ -980,10 +1491,13 @@ def report(results, args):
         refusals = ", ".join(f"{role}s {count}" for role, count in
                              sorted(result["refusals"].items()))
         lines.append(f"paid PUTs refused: {refusals or 'none'}")
-        if is_measured(name, baseline_results):
+        kinds = measured(name, baseline_results)
+        if kinds:
             lines.append("measured against the all-old runs (observer -> target, reason: "
                          "count, highest all-old, excess, limit):")
             for compared in comparisons(result, baseline_results, args):
+                if compared["kind"] not in kinds:
+                    continue
                 if compared["kind"] == "penalties":
                     what = (f"{compared['observer']:>9} -> {compared['target']:<9} "
                             f"{compared['reason']:<19}")
@@ -1007,6 +1521,11 @@ def report(results, args):
                     result["between_releases"].items()):
                 lines.append(f"  {observer:>9} -> {target:<9} {reason:<19} {count:>5} "
                              f"{weight:8.2f}")
+        if result.get("penalties_on_restart"):
+            lines.append("penalties on the rolled-back node while it restarted:")
+            for key, (count, weight) in sorted(result["penalties_on_restart"].items()):
+                lines.append(f"  {key[0]:>9} -> {key[1]:<9} {key[2]:<19} {count:>5} "
+                             f"{weight:8.2f}")
         if result["penalties_on_full"]:
             lines.append("penalties on full nodes:")
             for key, (count, weight) in sorted(result["penalties_on_full"].items()):
@@ -1016,6 +1535,7 @@ def report(results, args):
             shown = ", ".join(f"{family} {count}" for family, count in sorted(families.items())
                               if count)
             lines.append(f"{role}s received: {shown}")
+        lines.extend(sync_lines(result))
         kept = [record["held_by_storers"] for record in result["checks"]]
         near = [record["held_by_close_group"] for record in result["checks"]]
         stored = sum(1 for record in result["records"] if record.get("stored"))
@@ -1030,6 +1550,61 @@ def report(results, args):
         counted = ", ".join(f"{key} {value}" for key, value in sorted(audits.items()) if value)
         lines.append(f"audit outcomes: {counted or 'none counted yet'}")
     return "\n".join(lines)
+
+
+def sync_lines(result):
+    """The report's lines on neighbour sync: exchanges paged and single, by the
+    releases of the two nodes, the most pages one took, busy answers, and how
+    many times a responder built its hints in one exchange."""
+    sync = result.get("sync") or {}
+    lines = ["neighbour-sync exchanges (requester's release -> peer's: paged, single):"]
+    pairs = {}
+    for form in ("paged", "single"):
+        for exchange in sync.get(form, []):
+            pair = (exchange["release"], exchange["peer_release"])
+            counts = pairs.setdefault(pair, [0, 0])
+            counts[0 if form == "paged" else 1] += 1
+    for (release, peer_release), (paged, single) in sorted(pairs.items()):
+        lines.append(f"  {release:>9} -> {peer_release:<9} {paged:>5} {single:>5}")
+    paged = sync.get("paged", [])
+    if paged:
+        sent = max(exchange.get("pages_sent", 0) for exchange in paged)
+        received = max(exchange.get("pages_received", 0) for exchange in paged)
+        lines.append(f"  most pages in an exchange: {sent} sent, {received} received; "
+                     f"{sum(1 for exchange in paged if multi_page(exchange))} exchange(s) "
+                     "took more than one page for each list both ways")
+    builds = sync.get("builds", {})
+    busy = sum(1 for exchange in paged if exchange.get("end") == "Busy")
+    lines.append(f"  pages answered busy: {sync.get('busy', 0)}; exchanges ended busy: {busy}, "
+                 f"charged for: {len(sync.get('busy_charged', []))}; hint sets built: "
+                 f"{sum(builds.values())}, at most {max(builds.values(), default=0)} in one "
+                 "exchange")
+    # A responder keeps repair proofs only for pages a later request showed
+    # arrived, so its one-page exchanges give it none: audits per exchange
+    # measure what that costs, run against run.
+    audits = sum(value for counters in (result.get("audits") or {}).values()
+                 for key, value in counters.items()
+                 if key.startswith(("responsible_audit_", "subtree_audit_")))
+    exchanges = len(paged) + len(sync.get("single", []))
+    per_exchange = f"{audits / exchanges:.3f}" if exchanges else "no exchanges"
+    lines.append(f"  audits made: {audits} over {exchanges} exchange(s), per exchange: "
+                 f"{per_exchange}")
+    rollback = result.get("rollback")
+    if rollback:
+        rolled = rollback["peer_id"]
+        to_rolled = [exchange for form in ("paged", "single") for exchange in sync.get(form, [])
+                     if exchange.get("peer") == rolled and exchange.get("release") == "new"]
+        while_old = [exchange for exchange in to_rolled if exchange["peer_release"] == "old"]
+        after = [exchange for exchange in to_rolled
+                 if exchange.get("start", rollback["old_until"]) >= rollback["old_until"]]
+        lines.append(
+            f"  rolled back: {rollback['node']} ran the previous release from "
+            f"{rollback['old_from']:%H:%M:%S} to {rollback['old_until']:%H:%M:%S}; this tree's "
+            f"nodes sent it {sum(1 for e in while_old if e['form'] == 'single')} single and "
+            f"{sum(1 for e in while_old if e['form'] == 'paged')} paged exchange(s) then, and "
+            f"{sum(1 for e in after if e['form'] == 'paged')} paged and "
+            f"{sum(1 for e in after if e['form'] == 'single')} single after it came back")
+    return lines
 
 
 def summary_json(results, failures, releases, args):
@@ -1049,6 +1624,10 @@ def summary_json(results, failures, releases, args):
                                    "weight": w}
                                   for (o, t, r), (c, w) in
                                   sorted(result["penalties_on_full"].items())],
+            "penalties_on_restart": [{"observer": o, "target": t, "reason": r, "count": c,
+                                      "weight": w}
+                                     for (o, t, r), (c, w) in
+                                     sorted(result.get("penalties_on_restart", {}).items())],
             "between_releases": [{"observer_release": o, "target_release": t, "reason": r,
                                   "count": c, "weight": w}
                                  for (o, t, r), (c, w) in
@@ -1060,6 +1639,9 @@ def summary_json(results, failures, releases, args):
                                     for record in result["checks"]],
             "stored": [bool(record.get("stored")) for record in result["records"]],
             "full_evidence": result["full_evidence"],
+            "sync": result.get("sync"),
+            "paging": result.get("paging"),
+            "rollback": result.get("rollback"),
         }
     baselines = [result for name, result in results.items() if is_baseline(name)]
     runs = {}
@@ -1067,8 +1649,11 @@ def summary_json(results, failures, releases, args):
         runs[name] = plain(result)
         # Every count measured against the all-old runs, within its limit or
         # not, so a small excess shows before the canary.
-        if is_measured(name, baselines):
-            runs[name]["comparisons"] = comparisons(result, baselines, args)
+        kinds = measured(name, baselines)
+        if kinds:
+            runs[name]["comparisons"] = [compared for compared in
+                                         comparisons(result, baselines, args)
+                                         if compared["kind"] in kinds]
     return {
         "releases": releases,
         "measured_against": [name for name in results if is_baseline(name)],
@@ -1120,6 +1705,23 @@ def main():
                         "every node's audit and neighbour sync tick once in 10 to 20)")
     parser.add_argument("--full", type=int, default=0,
                         help="joiners of the full run whose disk reads as full (adds the run)")
+    parser.add_argument("--paged", action="store_true",
+                        help="add the paged run, its incumbents admitting --busy-limit sync "
+                        "requests at once")
+    parser.add_argument("--page-bytes", type=int, default=PAGE_BYTES,
+                        help="bytes of keys on a sync page in the runs that page, at least "
+                        f"one key's 32 (default {PAGE_BYTES}: two keys)")
+    parser.add_argument("--busy-limit", type=int, default=BUSY_LIMIT,
+                        help="sync requests the paged run's incumbents admit at once, through "
+                        f"the admission seam; 0 leaves their limit as it is (default "
+                        f"{BUSY_LIMIT})")
+    parser.add_argument("--rollback", action="store_true",
+                        help="add the rollback run: a joiner started again on the previous "
+                        "release's binary, then on this tree's")
+    parser.add_argument("--rollback-minutes", type=float, default=ROLLBACK_MINUTES,
+                        help="the least each phase of the rollback run lasts (default "
+                        f"{ROLLBACK_MINUTES}); the last two go on, up to "
+                        f"{ROLLBACK_WAIT_LIMIT} minutes, until they show their exchange")
     parser.add_argument("--penalty-slack", type=int, default=PENALTY_SLACK,
                         help="penalties a mixed run may count above the highest all-old "
                         f"count, for each pair of roles and reason (default {PENALTY_SLACK})")
@@ -1150,6 +1752,16 @@ def main():
     runs = [run.strip() for run in args.runs.split(",") if run.strip()]
     if args.full and "full" not in runs:
         runs.append("full")
+    if args.paged and "paged" not in runs:
+        runs.append("paged")
+    if args.rollback and "rollback" not in runs:
+        runs.append("rollback")
+    if args.page_bytes < 32:
+        parser.error("--page-bytes must be at least one key's 32 bytes")
+    if args.busy_limit < 0:
+        parser.error("--busy-limit must be 0 or more")
+    if args.rollback_minutes < 5:
+        parser.error("--rollback-minutes must be 5 or more: nodes log their traffic every 5")
     unknown = [run for run in runs if run not in RUNS]
     if unknown:
         parser.error(f"unknown runs: {', '.join(unknown)}")
@@ -1171,7 +1783,7 @@ def main():
     harness = new_folder / f"darwin-harness{EXE}"
     if not harness.exists():
         raise HarnessError(f"{harness} is missing")
-    needs_old = any(run in ("all-old", "new-hosts-old", "old-hosts-new") for run in runs)
+    needs_old = any(run in ("all-old",) + OLD_RUNS for run in runs)
     releases = [new]
     old = None
     if needs_old:
@@ -1183,6 +1795,27 @@ def main():
     if "full" in runs and not new.seams:
         raise HarnessError("this tree's ant-node has no free-space seam: build it with "
                            "--features test-utils")
+    if "paged" in runs and not new.reads_pages:
+        raise HarnessError("this tree's ant-node reads no sync pages: the paged run needs a "
+                           "release that pages")
+    # The rollback run sets no seam on the previous release's binary, so it
+    # needs none: a release before the seams, ds.15 among them, runs as it is.
+    paging_from = paging_release()
+    plans_paging = {name: paging_plan(name, new, old, paging_from, args) for name in runs}
+    for name, paging in plans_paging.items():
+        needed = []
+        if paging["page_bytes"] and not new.page_seams:
+            needed.append(PAGE_SEAM)
+        if paging["announced"] and not new.announce_seam:
+            needed.append(ANNOUNCED_SEAM)
+        if paging["busy_limit"] and not new.admission_seam:
+            needed.append(ADMISSION_SEAM)
+        if needed:
+            raise HarnessError(f"this tree's ant-node lacks the seam(s) the {name} run sets "
+                               f"({', '.join(needed)}): build it with --features test-utils")
+        if paging["announced"]:
+            log(f"{name}: this tree's nodes announce release {paging['announced']}, the first "
+                "that reads pages")
 
     work = Path(args.work) if args.work else (
         cache / "runs" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -1200,15 +1833,22 @@ def main():
         "old-hosts-new": (old, new),
         "all-new": (new, new),
         "full": (new, new),
+        "paged": (new, new),
+        "rollback": (new, new),
     }
     keep_awake()
     for name in runs:
         network_release, joiner_release = plans["all-old" if is_baseline(name) else name]
-        run_one(name, network_release, joiner_release, args, harness, work / name)
+        run_one(name, network_release, joiner_release, args, harness, work / name, old=old,
+                paging=plans_paging[name])
         log(f"{name}: done")
     (work / "releases.json").write_text(json.dumps(
         {release.name: {"version": release.version, "from": release.label,
-                        "seams": release.seams} for release in releases}, indent=2))
+                        "seams": release.seams, "page_seams": release.page_seams,
+                        "announce_seam": release.announce_seam,
+                        "admission_seam": release.admission_seam,
+                        "reads_pages": release.reads_pages}
+         for release in releases}, indent=2))
     # Every run in the work folder: one run again into a folder whose other
     # runs passed is measured against the same all-old runs.
     return conclude(work, runs_in(work), args)
