@@ -26,6 +26,10 @@
 //! can't bring back a test this fork removed, or add one, unreviewed
 //! (`every_test_file_is_reviewed`).
 //!
+//! And the order a node dials a peer's addresses in, a verified direct address
+//! before a relay, which comes from the vendored saorsa-core, the only one this
+//! lock resolves (`direct_first` below).
+//!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes. The payment reads need the
 //! `test-utils` feature, with which CI runs every test.
@@ -299,6 +303,193 @@ fn nothing_but_a_fresh_full_notice_withholds_the_unheld_chunk_penalty() {
                 path.display()
             );
         }
+    }
+}
+
+/// A verified direct address is dialled before a relay (from ds.17). The node
+/// builds saorsa-core from `vendor/saorsa-core`, its 0.29.1 release with
+/// `AddressType::priority` and the dial plan
+/// (`select_dial_candidates_with_context`) putting a verified Direct address
+/// ahead of the relay, so traffic to a reachable peer doesn't pass through
+/// another peer's relay. A peer behind NAT has no verified Direct address, so
+/// its relay is still dialled first. The dial plan is private to saorsa-core:
+/// its own tests pin it there, and test.yml runs them.
+mod direct_first {
+    use super::repo_text;
+    use saorsa_core::{AddressType, DHTNode, MultiAddr, PeerId};
+
+    /// The saorsa-core release the copy is, and upstream's commit for it.
+    const SAORSA_CORE_VERSION: &str = "0.29.1";
+    const SAORSA_CORE_COMMIT: &str = "29bb069691880de59f5157c315a6233b1c57b20f";
+
+    /// The saorsa-transport release the lock holds (node release 1a's bump).
+    const SAORSA_TRANSPORT_VERSION: &str = "0.38.2";
+
+    const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+    /// The vendored crate's tests of the change, by file, each of which must
+    /// stay: the dial plan, the stored order, and the tag rank that keeps
+    /// re-tagging and the lookup's tie-break as upstream's.
+    const DIRECT_FIRST_TESTS: &[(&str, &[&str])] = &[
+        (
+            "vendor/saorsa-core/src/dht_network_manager.rs",
+            &[
+                "direct_first_direct_plus_relay_dials_direct_first",
+                "direct_first_unverified_plus_relay_dials_relay_first",
+                "direct_first_unverified_alone_is_still_dialled",
+                "direct_first_full_order_direct_relay_unverified",
+                "direct_first_same_wan_lan_stays_first",
+                "direct_first_same_wan_relay_still_skipped",
+                "direct_first_home_node_behind_nat_keeps_its_relay_first",
+                "direct_first_lan_is_the_last_fallback",
+                "direct_first_lookup_order_agrees_with_dial_order",
+            ],
+        ),
+        (
+            "vendor/saorsa-core/src/dht/core_engine.rs",
+            &[
+                "address_type_priority_is_direct_relay_unverified_lan",
+                "address_type_tag_rank_is_relay_direct_unverified_lan",
+                "merge_typed_address_keeps_direct_before_relay",
+                "upgrade_only_gossip_cannot_retag_relay_as_direct",
+                "unsequenced_lookup_view_cannot_retag_relay_as_direct",
+            ],
+        ),
+        (
+            "vendor/saorsa-core/src/client_routing.rs",
+            &["direct_first_leaves_the_lookup_tie_break_as_upstream_made_it"],
+        ),
+    ];
+
+    fn toml_file(path: &str) -> toml::Value {
+        toml::from_str(&repo_text(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// Every package Cargo.lock resolves under `name`, as (version, source).
+    fn locked(name: &str) -> Vec<(String, Option<String>)> {
+        let lock = toml_file("Cargo.lock");
+        lock["package"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|package| package["name"].as_str() == Some(name))
+            .map(|package| {
+                (
+                    package["version"].as_str().unwrap().to_string(),
+                    package
+                        .get("source")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_lock_holds_one_saorsa_core_the_vendored_copy() {
+        let manifest = toml_file("Cargo.toml");
+        assert_eq!(
+            manifest["patch"]["crates-io"]["saorsa-core"]["path"].as_str(),
+            Some("vendor/saorsa-core"),
+            "[patch.crates-io] must put vendor/saorsa-core in place of the crates.io release"
+        );
+        assert_eq!(
+            manifest["dependencies"]["saorsa-core"].as_str(),
+            Some(SAORSA_CORE_VERSION)
+        );
+        let vendored = toml_file("vendor/saorsa-core/Cargo.toml");
+        assert_eq!(
+            vendored["package"]["version"].as_str(),
+            Some(SAORSA_CORE_VERSION)
+        );
+        let vcs = repo_text("vendor/saorsa-core/.cargo_vcs_info.json");
+        assert!(
+            vcs.contains(&format!("\"sha1\": \"{SAORSA_CORE_COMMIT}\"")),
+            "vendor/saorsa-core is not saorsa-core {SAORSA_CORE_VERSION}'s release: {vcs}"
+        );
+
+        // One saorsa-core, from the path (a path package has no source).
+        assert_eq!(
+            locked("saorsa-core"),
+            vec![(SAORSA_CORE_VERSION.to_string(), None)]
+        );
+        // One saorsa-transport: 0.38.2 from crates.io (node release 1a's
+        // bump, Cargo.toml's direct requirement), which both this package's
+        // requirement and the vendored saorsa-core's accept.
+        let transport = locked("saorsa-transport");
+        assert_eq!(transport.len(), 1, "one saorsa-transport: {transport:?}");
+        let (version, source) = &transport[0];
+        assert_eq!(source.as_deref(), Some(CRATES_IO));
+        assert_eq!(version, SAORSA_TRANSPORT_VERSION);
+        assert_eq!(
+            manifest["dependencies"]["saorsa-transport"]["version"].as_str(),
+            Some(SAORSA_TRANSPORT_VERSION)
+        );
+        let version = semver::Version::parse(version).unwrap();
+        for (path, requirement) in [
+            (
+                "Cargo.toml",
+                &manifest["dependencies"]["saorsa-transport"]["version"],
+            ),
+            (
+                "vendor/saorsa-core/Cargo.toml",
+                &vendored["dependencies"]["saorsa-transport"]["version"],
+            ),
+        ] {
+            let requirement = semver::VersionReq::parse(requirement.as_str().unwrap()).unwrap();
+            assert!(
+                requirement.matches(&version),
+                "{path} requires saorsa-transport {requirement}; the lock has {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verified_direct_address_is_dialled_before_a_relay() {
+        assert!(AddressType::Direct.priority() < AddressType::Relay.priority());
+        assert!(AddressType::Relay.priority() < AddressType::Unverified.priority());
+        assert!(AddressType::Unverified.priority() < AddressType::Lan.priority());
+
+        // Lookups order a peer's addresses as the dial plan dials them.
+        let entries = [
+            ("/ip4/192.168.1.10/udp/9003/quic", AddressType::Lan),
+            ("/ip6/2001:db8::9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ];
+        let node = DHTNode {
+            peer_id: PeerId::from_bytes([7u8; 32]),
+            addresses: entries
+                .iter()
+                .map(|(address, _)| address.parse::<MultiAddr>().unwrap())
+                .collect(),
+            address_types: entries.iter().map(|(_, kind)| *kind).collect(),
+            distance: None,
+            reliability: 1.0,
+            address_authority: None,
+        };
+        assert_eq!(
+            node.address_type_labels_by_priority(),
+            vec!["direct", "relay", "unverified", "lan"]
+        );
+    }
+
+    #[test]
+    fn the_direct_first_tests_stay_and_run() {
+        for (path, names) in DIRECT_FIRST_TESTS {
+            let source = repo_text(path);
+            for name in *names {
+                assert!(
+                    source.contains(&format!("fn {name}()")),
+                    "{path} lost {name}, a test of direct-first dialling"
+                );
+            }
+        }
+        let test_workflow = repo_text(".github/workflows/test.yml");
+        assert!(
+            test_workflow.contains("run: cargo test --locked -p saorsa-core --lib"),
+            "test.yml no longer runs vendor/saorsa-core's own tests"
+        );
     }
 }
 

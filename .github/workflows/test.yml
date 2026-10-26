@@ -134,6 +134,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml
 
+      # vendor/saorsa-core's own unit tests, under this repository's Cargo.lock
+      # too: the networking code the node is built from, the order it dials a
+      # peer's addresses in among them (a verified direct address before a
+      # relay). Its integration tests start networks of nodes and are left to
+      # the node's own.
+      - name: Vendored saorsa-core
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p saorsa-core --lib
+
       # Run whether or not the library tests passed, as long as the tests
       # built, and one target at a time, so every target reports even if an
       # earlier one fails. The ones upstream ran single-threaded (e2e flakes

@@ -125,6 +125,26 @@ never ran.
   relay. The node can still use other peers' relays. Unset, nodes serve
   relays, as upstream's do. The Docker image passes the variable through to
   every node.
+- **A verified direct address is dialled before a relay** (from ds.17). A
+  node dials a peer's addresses in this order: a LAN address first when the
+  peer is behind the node's own public IP address; then a verified direct
+  address; then the peer's relay, skipped when the relay is behind the
+  node's own public IP address; then an unverified address; and a LAN
+  address only when nothing else is known. Upstream dials the relay first,
+  so traffic to a reachable node passed through another node's relay. A
+  node behind NAT has no verified direct address, so its relay is still
+  dialled first, with no 1.25-second direct attempt before it. Lookups order
+  a peer's addresses the same way (`AddressType::priority`), and the relay
+  switch above is unchanged. Weighing one view of a peer against another
+  keeps upstream's order (`AddressType::tag_rank`): a lookup's hint still
+  can't re-tag a relay address as direct, and a lookup breaks ties between
+  reports as upstream does. The change is a patch to saorsa-core 0.29.1,
+  vendored in `vendor/saorsa-core`. Its own tests pin the order, and the
+  Test workflow runs them (`cargo test --locked -p saorsa-core --lib`);
+  `tests/fork_pins.rs` pins the address priority, that those tests stay and
+  run, and that `Cargo.lock` holds one saorsa-core, the vendored copy, and
+  one saorsa-transport, a crates.io release that `Cargo.toml` and the
+  vendored copy both accept.
 - **Request routing survives falling behind** (from ds.10). The loop that
   hands chunk and listings requests to their handlers reads saorsa-core's
   event broadcast, which keeps 1,000 events. Upstream's loop stopped for good
@@ -447,7 +467,7 @@ never ran.
   publish job runs in the release environment and only latest.yml's
   `latest` job in the `latest` environment, `docker/release-images` keeps
   its lines, test.yml's test job runs every test: the library and
-  binaries, both vendored crates' own tests and every target in `tests/`,
+  binaries, the vendored crates' own tests and every target in `tests/`,
   and build.yml builds the image's node manager with `--locked` from the
   pinned darwin-client commit, once it has checked that the commit is on
   darwin-client's main, checks the binary, gives the image its marker and
@@ -457,22 +477,25 @@ never ran.
   is there. Both build.yml and release.yml build the node with exactly
   `cargo build --release --locked --bin ant-node`, and check it for test
   seams before packaging it.
-- **Three crates are vendored**, each with a `VENDORED.md` saying what it
-  is: `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
+- **Four crates are vendored**, each with a `VENDORED.md` saying what it is:
+  `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
   `VENDORED.md` lists, `PRICE_MULTIPLIER` and the functions that price a
   record by its size, which nothing uses yet; `vendor/webrtc` is webrtc
   0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
-  in progress; and `vendor/ant-listings` is darwin-listings 0.3.1,
-  unchanged: the envelope format, listings, their payment checks, the
-  listings protocol and its change feeds. `[patch.crates-io]` puts the
-  first two in place of the crates.io releases. `vendor/ant-listings` and
-  `vendor/ant-protocol` are workspace members, so their own tests run
-  under this repository's
-  `Cargo.lock` in the Test workflow (`cargo test --locked -p ant-listings`,
-  `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml`),
-  and the Build workflow checks `vendor/ant-listings`' git objects against
-  its `VENDORED.md`. saorsa-core and saorsa-transport are their crates.io
-  releases, as upstream's are.
+  in progress; `vendor/saorsa-core` is saorsa-core 0.29.1, which dials a
+  verified direct address before a relay; and `vendor/ant-listings` is
+  darwin-listings 0.3.1, unchanged: the envelope format, listings, their
+  payment checks, the listings protocol and its change feeds.
+  `[patch.crates-io]` puts the first three in place of the crates.io
+  releases. `vendor/ant-listings`, `vendor/ant-protocol` and
+  `vendor/saorsa-core` are workspace members, so their own tests run under
+  this repository's `Cargo.lock` in the Test workflow (`cargo test --locked
+  -p ant-listings`, `cargo test --locked --manifest-path
+  vendor/ant-protocol/Cargo.toml`, `cargo test --locked -p saorsa-core
+  --lib`), and the Build workflow checks the git objects of
+  `vendor/ant-listings` and `vendor/saorsa-core` against their
+  `VENDORED.md`. saorsa-transport is its crates.io release, as
+  upstream's is.
 - **Release builds link self_encryption** (GPL-3.0 with MaidSafe's linking
   exception), which upstream's don't: `vendor/ant-listings` reads the data
   maps in file envelopes with it. The exception lets the binary be

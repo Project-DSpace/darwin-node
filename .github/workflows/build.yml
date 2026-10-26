@@ -99,6 +99,34 @@ jobs:
             fi
           done
 
+      # vendor/saorsa-core is saorsa-core 0.29.1 from crates.io with only the
+      # dial order changed (vendor/saorsa-core/VENDORED.md): the four patched
+      # files and the rest of the copy are the git objects that file records.
+      - name: Check the vendored saorsa-core
+        shell: bash
+        run: |
+          dir=vendor/saorsa-core
+          patched="src/client_routing.rs src/dht/core_engine.rs src/dht_network_manager.rs src/peer_record.rs"
+          fail=0
+          check() {
+            if [[ -z "$2" || "$3" != "$2" ]]; then
+              echo "::error::$1 is $3; $dir/VENDORED.md records ${2:-none}"
+              fail=1
+            fi
+          }
+          for file in $patched; do
+            recorded=$(sed -n "s|^- $file blob: \([0-9a-f]\{40\}\)\$|\1|p" $dir/VENDORED.md)
+            check "$dir/$file" "$recorded" "$(git rev-parse "HEAD:$dir/$file")"
+          done
+          recorded=$(sed -n "s/^- rest sha256: \([0-9a-f]\{64\}\)\$/\1/p" $dir/VENDORED.md)
+          actual=$(git ls-tree -r HEAD $dir \
+            | awk -F'\t' -v dir="$dir" -v skip="VENDORED.md $patched" '
+                BEGIN { n = split(skip, s, " "); for (i = 1; i <= n; i++) drop[dir "/" s[i]] = 1 }
+                !($2 in drop)' \
+            | sha256sum | cut -d' ' -f1)
+          check "the rest of $dir" "$recorded" "$actual"
+          exit $fail
+
   linux-x64:
     if: ${{ !inputs.reuse_build }}
     # Pinned to the servers' Ubuntu release: a binary built against a newer
