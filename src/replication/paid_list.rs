@@ -11,7 +11,11 @@
 //! ```
 //!
 //! One unnamed database stores set membership: key = 32-byte `XorName`,
-//! value = empty byte slice.
+//! value = the size class a payment notice's settled amount covers, one byte
+//! ([`PaidClass`]), or an empty byte slice, which reads as the full class.
+//! Every path but a payment notice writes the empty value, and a recorded
+//! class is only ever raised. Membership (`contains`, `count`, `all_keys`)
+//! ignores the value, so a node that never reads it opens the same list.
 //!
 //! ## Out-of-range timestamps
 //!
@@ -23,6 +27,7 @@
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::logging::{debug, trace, warn};
+use crate::payment::PaidClass;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions};
 use parking_lot::RwLock;
@@ -136,7 +141,8 @@ impl PaidList {
         Ok(paid_list)
     }
 
-    /// Insert a key into the paid-for set.
+    /// Insert a key into the paid-for set, with the empty value: the full
+    /// class. An entry already present keeps its value.
     ///
     /// Returns `true` if the key was newly added, `false` if it already existed.
     ///
@@ -197,6 +203,104 @@ impl PaidList {
         }
 
         Ok(was_new)
+    }
+
+    /// Record `key` as paid for `class`, as a payment notice does: insert it
+    /// with the class as its value, or raise the class an entry already
+    /// records. A class is never lowered, and an entry with the empty value
+    /// already records the full class.
+    ///
+    /// Returns `true` if the key was newly added.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB transaction fails.
+    pub async fn insert_class(&self, key: &XorName, class: PaidClass) -> Result<bool> {
+        #[cfg(test)]
+        if self
+            .fail_next_insert
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Storage(
+                "Failed to commit paid-list insert: failed for a test".to_string(),
+            ));
+        }
+        // Fast-path: no write transaction when the entry already covers it.
+        if self.class(key)?.is_some_and(|recorded| recorded >= class) {
+            trace!(
+                "Paid-list key {} already present at its class or above",
+                hex::encode(key)
+            );
+            return Ok(false);
+        }
+
+        let key_owned = *key;
+        let env = self.env.clone();
+        let db = self.db;
+
+        let (was_new, raised) = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<(bool, bool)> {
+                let mut wtxn = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+
+                // Authoritative read inside the serialized write txn.
+                let recorded = db
+                    .get(&wtxn, &key_owned)
+                    .map_err(|e| {
+                        Error::Storage(format!("Failed to check paid-list existence: {e}"))
+                    })?
+                    .map(PaidClass::from_value);
+                if recorded.is_some_and(|recorded| recorded >= class) {
+                    return Ok((false, false));
+                }
+
+                db.put(&mut wtxn, &key_owned, &class.to_value())
+                    .map_err(|e| Error::Storage(format!("Failed to insert into paid-list: {e}")))?;
+                wtxn.commit().map_err(|e| {
+                    Error::Storage(format!("Failed to commit paid-list insert: {e}"))
+                })?;
+
+                Ok((recorded.is_none(), recorded.is_some()))
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Paid-list insert task failed: {e}")))??;
+
+        if was_new {
+            debug!(
+                "Added key {} to paid-list, paid up to {} bytes",
+                hex::encode(key),
+                class.top()
+            );
+        } else if raised {
+            debug!(
+                "Raised paid-list key {} to {} bytes",
+                hex::encode(key),
+                class.top()
+            );
+        }
+
+        Ok(was_new)
+    }
+
+    /// The size class `key`'s entry records, or `None` if the key is not in
+    /// the paid-for set. An empty value reads as the full class.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB read transaction fails.
+    pub fn class(&self, key: &XorName) -> Result<Option<PaidClass>> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+        let class = self
+            .db
+            .get(&rtxn, key.as_ref())
+            .map_err(|e| Error::Storage(format!("Failed to check paid-list membership: {e}")))?
+            .map(PaidClass::from_value);
+        Ok(class)
     }
 
     /// Remove a key from the paid-for set.
@@ -540,6 +644,109 @@ mod tests {
         assert!(was_new);
 
         assert!(pl.contains(&key).expect("contains after insert"));
+    }
+
+    #[tokio::test]
+    async fn a_notice_records_its_class_and_only_ever_raises_it() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key: XorName = [0xA1; 32];
+        let middle = PaidClass::of_len(100 * 1024);
+        assert_eq!(pl.class(&key).expect("class"), None);
+
+        assert!(pl.insert_class(&key, middle).await.expect("insert"));
+        assert_eq!(pl.class(&key).expect("class"), Some(middle));
+
+        // Lower: kept as it is.
+        assert!(!pl
+            .insert_class(&key, PaidClass::SMALLEST)
+            .await
+            .expect("insert"));
+        assert_eq!(pl.class(&key).expect("class"), Some(middle));
+
+        // Higher: raised.
+        assert!(!pl
+            .insert_class(&key, PaidClass::FULL)
+            .await
+            .expect("insert"));
+        assert_eq!(pl.class(&key).expect("class"), Some(PaidClass::FULL));
+    }
+
+    /// A key written with the empty value (before notices recorded a class,
+    /// by neighbour sync or the paid-list quorum, or by a node that never
+    /// reads values) reads as the full class, which a notice never lowers.
+    #[tokio::test]
+    async fn an_empty_value_reads_as_the_full_class_and_is_never_lowered() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key: XorName = [0xA2; 32];
+        assert!(pl.insert(&key).await.expect("insert"));
+        assert_eq!(pl.class(&key).expect("class"), Some(PaidClass::FULL));
+        assert!(!pl
+            .insert_class(&key, PaidClass::SMALLEST)
+            .await
+            .expect("insert"));
+        assert_eq!(pl.class(&key).expect("class"), Some(PaidClass::FULL));
+
+        // And a plain insert never changes a recorded class.
+        let noticed: XorName = [0xA3; 32];
+        pl.insert_class(&noticed, PaidClass::SMALLEST)
+            .await
+            .expect("insert");
+        assert!(!pl.insert(&noticed).await.expect("insert"));
+        assert_eq!(
+            pl.class(&noticed).expect("class"),
+            Some(PaidClass::SMALLEST)
+        );
+    }
+
+    /// Membership ignores the values, so a node that never reads them lists
+    /// the same keys from the same database, after a reopen too.
+    #[tokio::test]
+    async fn membership_ignores_the_recorded_classes() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let plain: XorName = [0xA4; 32];
+        let small: XorName = [0xA5; 32];
+        {
+            let pl = PaidList::new(temp_dir.path()).await.expect("open");
+            pl.insert(&plain).await.expect("insert");
+            pl.insert_class(&small, PaidClass::SMALLEST)
+                .await
+                .expect("insert");
+            pl.wait_idle().await;
+        }
+        let pl = PaidList::new(temp_dir.path()).await.expect("reopen");
+        assert!(pl.contains(&plain).expect("contains"));
+        assert!(pl.contains(&small).expect("contains"));
+        assert_eq!(pl.count().expect("count"), 2);
+        let mut keys = pl.all_keys().expect("all keys");
+        keys.sort_unstable();
+        assert_eq!(keys, vec![plain, small]);
+        assert_eq!(pl.class(&small).expect("class"), Some(PaidClass::SMALLEST));
+        assert_eq!(pl.class(&plain).expect("class"), Some(PaidClass::FULL));
+    }
+
+    /// Pruning a key prunes its class: a notice after it records its own.
+    #[tokio::test]
+    async fn pruning_a_key_removes_its_class_with_it() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let one: XorName = [0xA6; 32];
+        let two: XorName = [0xA7; 32];
+        pl.insert_class(&one, PaidClass::FULL)
+            .await
+            .expect("insert");
+        pl.insert_class(&two, PaidClass::FULL)
+            .await
+            .expect("insert");
+
+        assert!(pl.remove(&one).await.expect("remove"));
+        assert_eq!(pl.remove_batch(&[two]).await.expect("remove batch"), 1);
+        assert_eq!(pl.class(&one).expect("class"), None);
+        assert_eq!(pl.class(&two).expect("class"), None);
+
+        assert!(pl
+            .insert_class(&one, PaidClass::SMALLEST)
+            .await
+            .expect("insert"));
+        assert_eq!(pl.class(&one).expect("class"), Some(PaidClass::SMALLEST));
     }
 
     #[tokio::test]

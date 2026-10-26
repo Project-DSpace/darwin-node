@@ -69,7 +69,7 @@ use tokio_util::task::TaskTracker;
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::payment::{
-    Held, PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
+    Held, PaidClass, PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
     MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
 use crate::pointer::store::PointerStore;
@@ -103,7 +103,7 @@ use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
 use crate::replication::storage_commitment_audit::PointerBindings;
 use crate::replication::types::{
-    AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
+    AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence, FetchAuthority,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
     VerificationState,
 };
@@ -3932,6 +3932,7 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let detached_task_tracker = self.detached_task_tracker.clone();
+        let paid_list = Arc::clone(&self.paid_list);
         let concurrency = max_parallel_fetch();
 
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
@@ -3961,6 +3962,8 @@ impl ReplicationEngine {
                             );
                             continue;
                         };
+                        let paid_class_check = (candidate.authority == FetchAuthority::OwnPaidList)
+                            .then(|| Arc::clone(&paid_list));
                         q.start_dequeued_fetch(candidate, source);
 
                         let p2p = Arc::clone(&p2p);
@@ -3981,7 +3984,7 @@ impl ReplicationEngine {
                                         result: FetchResult::SourceFailed,
                                     },
                                     outcome = execute_single_fetch(
-                                        p2p, storage, config, fetch_key, source,
+                                        p2p, storage, config, paid_class_check, fetch_key, source,
                                     ) => outcome,
                                 }
                             });
@@ -4025,6 +4028,9 @@ impl ReplicationEngine {
                                 FetchFollowUp::RequeuedForVerification => false,
                                 FetchFollowUp::RetryFrom(next_peer) => {
                                     // Spawn a new fetch task for the next source.
+                                    let paid_class_check = (q.fetch_authority(&key)
+                                        == FetchAuthority::OwnPaidList)
+                                        .then(|| Arc::clone(&paid_list));
                                     let p2p = Arc::clone(&p2p);
                                     let storage = Arc::clone(&storage);
                                     let config = Arc::clone(&config);
@@ -4041,7 +4047,12 @@ impl ReplicationEngine {
                                                     result: FetchResult::SourceFailed,
                                                 },
                                                 outcome = execute_single_fetch(
-                                                    p2p, storage, config, fetch_key, next_peer,
+                                                    p2p,
+                                                    storage,
+                                                    config,
+                                                    paid_class_check,
+                                                    fetch_key,
+                                                    next_peer,
                                                 ) => outcome,
                                             }
                                         });
@@ -6731,13 +6742,13 @@ async fn dispatch_paid_notify(
     ctx: &ReplicationMessageHandlerContext,
     received_at: Instant,
 ) -> Result<()> {
-    // Already known: nothing to admit, verify or write.
+    // Already known at the full class: nothing to admit, verify or write.
     if paid_notify_key_known(&ctx.paid_list, &notify.key) {
         debug!(
             responder_class = "paid_notify",
             source = %source,
             key = %hex::encode(notify.key),
-            "Paid notify dropped before admission: the key is already in the paid list"
+            "Paid notify dropped before admission: the key is already in the paid list at the full class"
         );
         return Ok(());
     }
@@ -6825,15 +6836,17 @@ async fn dispatch_paid_notify(
     Ok(())
 }
 
-/// Whether a paid notify's key is already known: in this node's paid list,
-/// by one local database read. A failed read counts as not known.
+/// Whether a paid notify's key is already known: in this node's paid list at
+/// the full class, by one local database read. A key recorded at a smaller
+/// class isn't, since a notice may raise it. A failed read counts as not
+/// known.
 ///
 /// Only the paid list decides. The payment check's cache spares a notify's
 /// chain read but is never a reason to drop one, so a key it holds that the
 /// paid list doesn't, because the paid-list write failed or the store that
 /// would have led to it failed, is still recorded by the next notify.
 fn paid_notify_key_known(paid_list: &PaidList, key: &XorName) -> bool {
-    matches!(paid_list.contains(key), Ok(true))
+    matches!(paid_list.class(key), Ok(Some(PaidClass::FULL)))
 }
 
 /// The paid notifies being handled, by key, so a key is handled by one
@@ -6948,8 +6961,8 @@ async fn handle_paid_notify(
 }
 
 /// Verify a paid notify's proof, for a key this node tracks, and record the
-/// key in the paid list. A key the payment check has already verified costs
-/// no chain read.
+/// key in the paid list with the size class its settled amount covers. A key
+/// the payment check has already verified usually costs no chain read.
 async fn record_paid_notify(
     notify: &protocol::PaidNotify,
     paid_list: &Arc<PaidList>,
@@ -6959,17 +6972,19 @@ async fn record_paid_notify(
     // Gap 1: Validate PoP via PaymentVerifier. PaidNotify admits fresh
     // paid-list metadata, so local paid-list close-group membership was checked
     // above before proof work. The verifier then runs the same payment proof
-    // checks as ClientPut while writing a paid-list-strength cache entry.
-    let Some(verification) = verify_payment_until_shutdown(
-        payment_verifier,
-        &notify.key,
-        Held::Notice,
-        &notify.proof_of_payment,
-        paid_notify_payment_context(),
-        shutdown,
-    )
-    .await
-    else {
+    // checks as ClientPut, at the smallest class's amount since a notice
+    // carries no bytes, while writing a paid-list-strength cache entry, and
+    // reports the largest class the settled amount covers.
+    let verification = tokio::select! {
+        () = shutdown.cancelled() => None,
+        result = payment_verifier.verify_paid_class(
+            &notify.key,
+            Held::Notice,
+            &notify.proof_of_payment,
+            paid_notify_payment_context(),
+        ) => Some(result),
+    };
+    let Some(verification) = verification else {
         debug!(
             "Paid notify for {} abandoned: engine shutting down during payment \
              verification",
@@ -6977,19 +6992,14 @@ async fn record_paid_notify(
         );
         return Ok(());
     };
-    match verification {
-        Ok(status) if status.can_store() => {
+    let class = match verification {
+        Ok(class) => {
             debug!(
-                "PoP validated for paid notify key {}",
-                hex::encode(notify.key)
+                "PoP validated for paid notify key {}, paid up to {} bytes",
+                hex::encode(notify.key),
+                class.top()
             );
-        }
-        Ok(_) => {
-            warn!(
-                "Paid notify rejected: payment required for key {}",
-                hex::encode(notify.key)
-            );
-            return Ok(());
+            class
         }
         Err(e) => {
             warn!(
@@ -6998,9 +7008,9 @@ async fn record_paid_notify(
             );
             return Ok(());
         }
-    }
+    };
 
-    if let Err(e) = paid_list.insert(&notify.key).await {
+    if let Err(e) = paid_list.insert_class(&notify.key, class).await {
         warn!("Failed to add paid notify key to PaidForList: {e}");
     }
 
@@ -8661,6 +8671,11 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             if let Some(entry) = q.get_pending(&key) {
                 add_replica_hint_sources(&mut sources, &entry.replica_hint_sources);
             }
+            let authority = evidence
+                .get(&key)
+                .map_or(FetchAuthority::OwnPaidList, |ev| {
+                    local_paid_fetch_authority(&key, ev, &targets, config)
+                });
             if sources.is_empty() {
                 no_holder_deferrals += 1;
                 let outcome = q.defer_unresolved(&key, config.verification_request_timeout);
@@ -8676,7 +8691,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 // Atomic remove+enqueue: if fetch_queue is at capacity, the
                 // pending entry is preserved and retried next cycle (no
                 // silent drop of verified replica-repair work).
-                let _ = q.promote_pending_to_fetch(key, distance, sources);
+                let _ = q.promote_pending_to_fetch_by(key, distance, sources, authority);
             }
         }
     }
@@ -9167,6 +9182,14 @@ enum FetchResult {
     /// the fetch was serving has lapsed, so no alternate source is tried and
     /// no trust event is reported: the source did nothing wrong.
     NoLongerResponsible,
+    /// The fetch's only authority was this node's own paid-list entry, and
+    /// the class that entry records is below the class of the bytes that
+    /// arrived: a payment notice paid for a smaller chunk than this one.
+    /// Terminal for this fetch only: the bytes aren't stored, no other source
+    /// is tried (any would send the same bytes), and no trust event is
+    /// reported. The paid-list entry stays, and nothing already held is
+    /// touched; a later fetch on majority evidence is accepted.
+    PaidClassBelowHeld,
 }
 
 /// Outcome produced by [`execute_single_fetch`] and consumed by the fetch
@@ -9209,7 +9232,10 @@ fn apply_fetch_result(
     verification_retry_after: Duration,
 ) -> FetchFollowUp {
     match result {
-        FetchResult::Stored | FetchResult::NoLongerResponsible | FetchResult::AlreadyHeld => {
+        FetchResult::Stored
+        | FetchResult::NoLongerResponsible
+        | FetchResult::AlreadyHeld
+        | FetchResult::PaidClassBelowHeld => {
             q.complete_fetch(key);
             FetchFollowUp::Terminal
         }
@@ -9242,6 +9268,37 @@ fn apply_fetch_result(
             }
         }
     }
+}
+
+/// What authorises the fetch of a key found in this node's own paid list:
+/// [`FetchAuthority::Majority`] when the presence probe found a quorum of the
+/// close group holding it, otherwise [`FetchAuthority::OwnPaidList`], the
+/// entry alone.
+fn local_paid_fetch_authority(
+    key: &XorName,
+    evidence: &crate::replication::types::KeyVerificationEvidence,
+    targets: &quorum::VerificationTargets,
+    config: &ReplicationConfig,
+) -> FetchAuthority {
+    match quorum::evaluate_key_evidence(key, evidence, targets, config) {
+        KeyVerificationOutcome::QuorumVerified { .. } => FetchAuthority::Majority,
+        _ => FetchAuthority::OwnPaidList,
+    }
+}
+
+/// The class `key`'s paid-list entry records, if it is below the class of a
+/// chunk of `held_len` bytes. `None` when the entry covers it, records no
+/// class (the full class), is gone, or can't be read.
+fn paid_class_below_held(
+    paid_list: &PaidList,
+    key: &XorName,
+    held_len: usize,
+) -> Option<PaidClass> {
+    paid_list
+        .class(key)
+        .ok()
+        .flatten()
+        .filter(|recorded| !recorded.covers(held_len))
 }
 
 /// Whether this node currently sits inside the storage-admission group for
@@ -9284,6 +9341,7 @@ async fn execute_single_fetch(
     p2p_node: Arc<P2PNode>,
     storage: Arc<ChunkStore>,
     config: Arc<ReplicationConfig>,
+    paid_class_check: Option<Arc<PaidList>>,
     key: XorName,
     source: PeerId,
 ) -> FetchOutcome {
@@ -9466,6 +9524,24 @@ async fn execute_single_fetch(
                             key,
                             result: FetchResult::NoLongerResponsible,
                         };
+                    }
+
+                    // The re-check on fetch, read from the paid list now,
+                    // never from the payment check's cache.
+                    if let Some(paid_list) = &paid_class_check {
+                        if let Some(recorded) = paid_class_below_held(paid_list, &key, data.len()) {
+                            info!(
+                                "Fetched {} ({} bytes) on this node's paid-list entry alone, \
+                                 which records payment up to {} bytes; not storing",
+                                hex::encode(key),
+                                data.len(),
+                                recorded.top()
+                            );
+                            return FetchOutcome {
+                                key,
+                                result: FetchResult::PaidClassBelowHeld,
+                            };
+                        }
                     }
 
                     if let Err(e) = storage.put(&resp_key, &data).await {
@@ -14103,6 +14179,153 @@ mod tests {
             assert!(!q.contains_key(&key));
             assert_eq!(q.retry_reserved_slot_count(), 0);
         }
+    }
+
+    /// A fetch refused on the paid class ends that fetch only: no other
+    /// source is tried (each would send the same bytes), and the key is not
+    /// requeued, so no cycle downloads it again until a new hint.
+    #[test]
+    fn a_paid_class_below_the_held_bytes_ends_that_fetch_only() {
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0xC7);
+        drive_key_in_flight(&mut q, key, vec![test_peer(0x07), test_peer(0x08)]);
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::PaidClassBelowHeld, RETRY_AFTER);
+
+        assert_eq!(follow_up, FetchFollowUp::Terminal);
+        assert!(!q.contains_key(&key));
+        assert_eq!(q.pending_count(), 0);
+        assert_eq!(q.retry_reserved_slot_count(), 0);
+    }
+
+    /// What authorised a fetch rides with it from promotion to the in-flight
+    /// entry, through a retry from the next source. A promotion that names
+    /// none is majority evidence.
+    #[test]
+    fn a_fetch_keeps_its_authority_from_promotion_through_every_source() {
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0xC8);
+        let first = test_peer(0x09);
+        let second = test_peer(0x0A);
+        let now = Instant::now();
+        let entry = VerificationEntry {
+            state: VerificationState::PendingVerify,
+            verified_sources: Vec::new(),
+            tried_sources: HashSet::new(),
+            created_at: now,
+            next_verify_at: now,
+            hint_sources: HashSet::from([first]),
+            replica_hint_sources: HashSet::from([first]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
+        };
+        assert!(q.add_pending_verify(key, entry).admitted());
+        assert!(q.promote_pending_to_fetch_by(
+            key,
+            key,
+            vec![first, second],
+            FetchAuthority::OwnPaidList
+        ));
+        let candidate = q.dequeue_fetch().expect("promoted key must dequeue");
+        assert_eq!(candidate.authority, FetchAuthority::OwnPaidList);
+        q.start_dequeued_fetch(candidate, first);
+        assert_eq!(q.fetch_authority(&key), FetchAuthority::OwnPaidList);
+
+        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        assert_eq!(follow_up, FetchFollowUp::RetryFrom(second));
+        assert_eq!(q.fetch_authority(&key), FetchAuthority::OwnPaidList);
+
+        let other = test_key(0xC9);
+        drive_key_in_flight(&mut q, other, vec![test_peer(0x0B)]);
+        assert_eq!(q.fetch_authority(&other), FetchAuthority::Majority);
+    }
+
+    /// A key in this node's paid list is fetched on majority evidence when
+    /// the presence probe finds a quorum of the close group holding it, and
+    /// on the entry alone otherwise.
+    #[test]
+    fn a_local_paid_fetch_is_majority_authorised_only_by_a_presence_quorum() {
+        let config = config::ReplicationConfig::default();
+        let key = test_key(0xCA);
+        let peers: Vec<PeerId> = (0x10..0x17).map(test_peer).collect();
+        let mut targets = quorum::VerificationTargets::default();
+        targets.quorum_targets.insert(key, peers.clone());
+        let needed = config.quorum_needed(peers.len());
+        assert!(needed > 1);
+
+        let evidence = |present: usize| types::KeyVerificationEvidence {
+            presence: peers
+                .iter()
+                .enumerate()
+                .map(|(i, peer)| {
+                    let seen = if i < present {
+                        PresenceEvidence::Present
+                    } else {
+                        PresenceEvidence::Absent
+                    };
+                    (*peer, seen)
+                })
+                .collect(),
+            paid_list: HashMap::new(),
+        };
+
+        assert_eq!(
+            local_paid_fetch_authority(&key, &evidence(needed), &targets, &config),
+            FetchAuthority::Majority
+        );
+        assert_eq!(
+            local_paid_fetch_authority(&key, &evidence(needed - 1), &targets, &config),
+            FetchAuthority::OwnPaidList
+        );
+        assert_eq!(
+            local_paid_fetch_authority(&key, &evidence(0), &targets, &config),
+            FetchAuthority::OwnPaidList
+        );
+    }
+
+    /// The re-check refuses only where the entry records a class below the
+    /// bytes' class. An entry with no class (paid before notices recorded
+    /// one, or learned by sync or the paid-list quorum) passes at any
+    /// length, and so does a key no longer listed.
+    #[tokio::test]
+    async fn the_class_recheck_refuses_only_a_recorded_class_below_the_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paid_list = PaidList::new(dir.path()).await.unwrap();
+        let plain = test_key(0xCB);
+        let small = test_key(0xCC);
+        let absent = test_key(0xCD);
+        paid_list.insert(&plain).await.unwrap();
+        paid_list
+            .insert_class(&small, PaidClass::SMALLEST)
+            .await
+            .unwrap();
+
+        let full = crate::ant_protocol::MAX_CHUNK_SIZE;
+        for len in [0, 16 * 1024, 16 * 1024 + 1, full] {
+            assert_eq!(paid_class_below_held(&paid_list, &plain, len), None);
+            assert_eq!(paid_class_below_held(&paid_list, &absent, len), None);
+        }
+        assert_eq!(paid_class_below_held(&paid_list, &small, 16 * 1024), None);
+        assert_eq!(
+            paid_class_below_held(&paid_list, &small, 16 * 1024 + 1),
+            Some(PaidClass::SMALLEST)
+        );
+        assert_eq!(
+            paid_class_below_held(&paid_list, &small, full),
+            Some(PaidClass::SMALLEST)
+        );
+
+        // A later notice that pays the full class lets the same bytes in.
+        paid_list
+            .insert_class(&small, PaidClass::FULL)
+            .await
+            .unwrap();
+        assert_eq!(paid_class_below_held(&paid_list, &small, full), None);
     }
 
     #[test]

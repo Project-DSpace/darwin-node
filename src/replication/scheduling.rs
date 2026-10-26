@@ -13,7 +13,7 @@ use crate::logging::debug;
 use crate::ant_protocol::XorName;
 use crate::replication::config::VERIFICATION_RETRY_BACKOFF_MAX;
 use crate::replication::types::{
-    FetchCandidate, FetchOrder, FetchPayload, VerificationEntry, VerificationState,
+    FetchAuthority, FetchCandidate, FetchOrder, FetchPayload, VerificationEntry, VerificationState,
 };
 use saorsa_core::identity::PeerId;
 
@@ -182,6 +182,8 @@ pub struct InFlightEntry {
     pub tried: HashSet<PeerId>,
     /// Pending-verification entry to restore if all fetch sources fail.
     pub retry_verification: Option<VerificationEntry>,
+    /// What authorised the fetch.
+    pub authority: FetchAuthority,
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,7 +1109,7 @@ impl ReplicationQueues {
     /// place when the fetch queue is full (so verified work is retried on
     /// the next cycle instead of being silently lost).
     pub fn enqueue_fetch(&mut self, key: XorName, distance: XorName, sources: Vec<PeerId>) -> bool {
-        self.enqueue_fetch_with_retry(key, distance, sources, None)
+        self.enqueue_fetch_with_retry(key, distance, sources, None, FetchAuthority::Majority)
     }
 
     fn enqueue_fetch_with_retry(
@@ -1116,6 +1118,7 @@ impl ReplicationQueues {
         distance: XorName,
         sources: Vec<PeerId>,
         retry_verification: Option<VerificationEntry>,
+        authority: FetchAuthority,
     ) -> bool {
         if self.pending_verify.contains_key(&key)
             || self.fetch_payloads.contains_key(&key)
@@ -1135,6 +1138,7 @@ impl ReplicationQueues {
             FetchPayload {
                 sources,
                 retry_verification,
+                authority,
             },
         );
         self.fetch_queue.push(FetchOrder { key, distance });
@@ -1158,6 +1162,18 @@ impl ReplicationQueues {
         distance: XorName,
         sources: Vec<PeerId>,
     ) -> bool {
+        self.promote_pending_to_fetch_by(key, distance, sources, FetchAuthority::Majority)
+    }
+
+    /// As [`Self::promote_pending_to_fetch`], for a fetch `authority`
+    /// authorised.
+    pub fn promote_pending_to_fetch_by(
+        &mut self,
+        key: XorName,
+        distance: XorName,
+        sources: Vec<PeerId>,
+        authority: FetchAuthority,
+    ) -> bool {
         if self.fetch_payloads.len() >= MAX_FETCH_QUEUE {
             debug!(
                 "fetch_queue at capacity ({MAX_FETCH_QUEUE}); leaving {} pending \
@@ -1176,7 +1192,8 @@ impl ReplicationQueues {
         // capacity check above and the just-removed pending state make this
         // succeed. If a concurrent path put the key into fetch_queue/in_flight
         // between, dropping the duplicate is fine.
-        let enqueued = self.enqueue_fetch_with_retry(key, distance, sources, retry_verification);
+        let enqueued =
+            self.enqueue_fetch_with_retry(key, distance, sources, retry_verification, authority);
         if !enqueued && reserved_retry {
             self.release_retry_slot(&key);
             self.capacity_owner_by_key.remove(&key);
@@ -1210,6 +1227,7 @@ impl ReplicationQueues {
                 distance: order.distance,
                 sources: payload.sources,
                 retry_verification: payload.retry_verification,
+                authority: payload.authority,
             };
             if !self.in_flight_fetch.contains_key(&candidate.key) {
                 return Some(candidate);
@@ -1236,7 +1254,7 @@ impl ReplicationQueues {
     /// verification retry-slot reservation; [`Self::start_dequeued_fetch`]
     /// transfers that reservation into the in-flight entry.
     pub fn start_fetch(&mut self, key: XorName, source: PeerId, all_sources: Vec<PeerId>) {
-        self.start_fetch_with_retry(key, source, all_sources, None);
+        self.start_fetch_with_retry(key, source, all_sources, None, FetchAuthority::Majority);
     }
 
     /// Mark a key as in-flight and retain verification retry metadata.
@@ -1252,6 +1270,7 @@ impl ReplicationQueues {
         source: PeerId,
         all_sources: Vec<PeerId>,
         retry_verification: Option<VerificationEntry>,
+        authority: FetchAuthority,
     ) {
         let mut tried = HashSet::new();
         tried.insert(source);
@@ -1264,6 +1283,7 @@ impl ReplicationQueues {
                 all_sources,
                 tried,
                 retry_verification,
+                authority,
             },
         );
         if let Some(entry) = replaced {
@@ -1278,9 +1298,19 @@ impl ReplicationQueues {
             key,
             sources,
             retry_verification,
+            authority,
             ..
         } = candidate;
-        self.start_fetch_with_retry(key, source, sources, retry_verification);
+        self.start_fetch_with_retry(key, source, sources, retry_verification, authority);
+    }
+
+    /// What authorised the in-flight fetch of `key`:
+    /// [`FetchAuthority::Majority`] if none is in flight.
+    #[must_use]
+    pub fn fetch_authority(&self, key: &XorName) -> FetchAuthority {
+        self.in_flight_fetch
+            .get(key)
+            .map_or(FetchAuthority::Majority, |entry| entry.authority)
     }
 
     /// Mark a fetch as completed (success or permanent failure).

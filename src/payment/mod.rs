@@ -40,6 +40,7 @@
 
 mod cache;
 pub mod metrics;
+mod paid_class;
 pub mod pricing;
 pub mod proof;
 pub mod quote;
@@ -51,6 +52,7 @@ pub mod wallet;
 
 pub use cache::{CacheStats, VerifiedCache};
 pub use metrics::QuotingMetricsTracker;
+pub use paid_class::PaidClass;
 pub use pricing::calculate_price;
 pub use proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, serialize_merkle_proof,

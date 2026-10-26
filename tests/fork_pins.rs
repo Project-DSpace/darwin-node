@@ -344,6 +344,83 @@ fn every_chunk_payment_check_weighs_the_bytes_it_holds() {
     assert_eq!(found, expected);
 }
 
+/// A pointer's payment is weighed by its data type alone: every pointer as
+/// one of its fixed wire size, whatever a request declares, and its checks
+/// take no length.
+#[test]
+fn a_pointer_payment_is_weighed_by_its_data_type_alone() {
+    use ant_protocol::payment::pricing::record_weight;
+    use ant_protocol::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
+
+    assert_eq!(POINTER_WIRE_LEN, 5303);
+    let weight = record_weight(DATA_TYPE_POINTER, POINTER_WIRE_LEN);
+    for declared in [0, POINTER_WIRE_LEN, 16 * 1024, 4 * 1024 * 1024] {
+        assert_eq!(record_weight(DATA_TYPE_POINTER, declared), weight);
+    }
+    let verifier = repo_text("src/payment/verifier.rs");
+    assert!(verifier.contains(
+        "fn pointer_weight() -> RecordWeight {\n    record_weight(DATA_TYPE_POINTER, POINTER_WIRE_LEN)\n}"
+    ));
+    assert!(verifier.contains(
+        ".verify_payment_inner(&target, pointer_weight(), Some(payment_proof), context)"
+    ));
+}
+
+/// The revenue floor prices the close group's median count at the bottom of
+/// its price band, so an enforced floor never refuses a node quoting by its
+/// weight total.
+#[test]
+fn the_floor_prices_the_median_count_at_the_bottom_of_its_band() {
+    let verifier = repo_text("src/payment/verifier.rs");
+    assert!(verifier.contains("let bottom = band_bottom_count(u64::from(median_key_count));"));
+    assert!(verifier.contains(
+        "let reference = calculate_price(usize::try_from(bottom).unwrap_or(usize::MAX));"
+    ));
+}
+
+/// A payment notice records the size class its settled amount covers, and a
+/// fetch whose only authority is this node's own paid-list entry is checked
+/// against it when the bytes arrive, read from the paid list, never from the
+/// payment check's cache.
+#[test]
+fn a_notice_records_its_class_and_a_fetch_on_that_entry_alone_is_checked() {
+    let replication = repo_text("src/replication/mod.rs");
+    for needle in [
+        "payment_verifier.verify_paid_class(",
+        "paid_list.insert_class(&notify.key, class)",
+        "matches!(paid_list.class(key), Ok(Some(PaidClass::FULL)))",
+        "q.promote_pending_to_fetch_by(key, distance, sources, authority)",
+        "KeyVerificationOutcome::QuorumVerified { .. } => FetchAuthority::Majority,",
+        "if let Some(recorded) = paid_class_below_held(paid_list, &key, data.len()) {",
+        "| FetchResult::PaidClassBelowHeld => {",
+    ] {
+        assert!(replication.contains(needle), "missing: {needle}");
+    }
+    // Only notices write a class: every other paid-list write is the plain
+    // insert, whose empty value reads as the full class.
+    let mut sources = Vec::new();
+    rust_files(&repo_path("src"), &mut sources);
+    let mut writers = Vec::new();
+    for path in sources {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let tests = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("_tests.rs"));
+        // Up to the test module, which starts at the first unindented
+        // `#[cfg(test)]`.
+        let body = text.split("\n#[cfg(test)]").next().unwrap_or_default();
+        if !tests && body.contains(".insert_class(") {
+            writers.push(
+                path.strip_prefix(repo_path(""))
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    assert_eq!(writers, ["src/replication/mod.rs"]);
+}
+
 /// How the payment check reads the chain, through the path a node takes
 /// (`PaymentVerifier::verify_payment`) to a JSON-RPC provider on 127.0.0.1
 /// that answers as the vault's `completedPayments` does: no test override
