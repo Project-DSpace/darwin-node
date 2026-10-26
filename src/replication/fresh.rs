@@ -135,8 +135,8 @@ pub(crate) async fn send_fresh_offers(
     // itself counted). They take the offer, older nodes included, since a
     // chunk receiver admits a fresh offer anywhere among the key's 20 nearest
     // (`paid_list_close_group_size`). They are left unchecked because no peer
-    // past the close group was possession-checked before ds.17 (node release
-    // 1a checks the 7 nearest): nothing is waived for them, and one that
+    // past the close group was possession-checked before ds.17 (ds.16
+    // checks the 7 nearest): nothing is waived for them, and one that
     // takes the record is, by intent, not recorded as seen holding it.
     let checked_peers = possession_checked(&widened, &self_id, ctx.config.close_group_size);
     let target_peers: Vec<PeerId> = widened
@@ -237,7 +237,7 @@ pub(crate) async fn send_fresh_offers(
 /// The peers of `widened`, a key's close group widened past the peers marked
 /// full (nearest first, this node included), that the possession check
 /// probes: the unwidened close group, its first `close_group_size`, this
-/// node left out, exactly the peers node release 1a checks. A peer marked
+/// node left out, exactly the peers ds.16 checks. A peer marked
 /// full among them is still checked, through the waiver; the stand-ins
 /// beyond them are offered the record but not checked.
 fn possession_checked(
@@ -310,7 +310,7 @@ mod tests {
     use super::*;
 
     /// Ranks 1 to 7 of the widened group, the unwidened close group, are
-    /// possession-checked, as node release 1a checks them; ranks 8 and beyond
+    /// possession-checked, as ds.16 checks them; ranks 8 and beyond
     /// are stand-ins, offered the record but not checked. The node itself is
     /// never checked.
     #[test]

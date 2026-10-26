@@ -284,15 +284,14 @@ pub enum ReplicationMessageBody {
 /// index past it is unreadable on a ds.15 node.
 pub const DS15_LAST_INDEX: usize = 22;
 
-/// The last body index before the "full" notice: node-1b-sync's
+/// The last body index before the "full" notice: paged sync's
 /// `NeighborSyncPageResponse`, after its `NeighborSyncPageRequest` at 23.
 ///
-/// The merge order is fixed (build plan, ADR-0024): node-1b-sync keeps 23
-/// and 24, and the notice takes the next index after it, 25, since this
-/// branch merged second. The merge moved this one constant from ds.15's last
-/// (22) to 24; the notice's index, the variant count, the family table, the
-/// traffic summary, the notice's byte test and the check of its pins in
-/// `tests/wire_format.rs` follow from it.
+/// The order is fixed (ADR-0024): the two page messages hold 23 and 24, and
+/// the notice takes the next index, 25. The notice's index, the variant
+/// count, the family table, the traffic summary, the notice's byte test and
+/// the check of its pins in `tests/wire_format.rs` follow from this one
+/// constant.
 pub const BEFORE_FULL_NOTICE_LAST_INDEX: usize = 24;
 
 /// The "full" notice's body index: the first after

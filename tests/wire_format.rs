@@ -619,17 +619,17 @@ const PINNED: &[(&str, &str)] = &[
     // to peers known to read them; ds.15 drops the notice (`a_node_before_the_full_notice_reads_every_earlier_body_and_drops_the_notice`
     // in src/replication/protocol.rs).
     // Its index byte is FULL_NOTICE_INDEX (checked below): 25, after
-    // node-1b-sync's page messages (23, 24), which were merged before it.
+    // the page messages (23, 24).
     ("FullNotice, full", "b4241901"),
     ("FullNotice, no longer full", "b4241900"),
 ];
 
-/// The notice's pinned bytes carry the index the protocol gives it, so the
-/// merge that moves it past node-1b-sync's messages re-pins them here.
+/// The notice's pinned bytes carry the index the protocol gives it, so a
+/// change that moves it re-pins them here.
 #[test]
 fn the_full_notice_pins_carry_its_index() {
     use ant_node::replication::protocol::FULL_NOTICE_INDEX;
-    // After node-1b-sync's page messages, 23 and 24 (build plan, ADR-0024).
+    // After the page messages, 23 and 24 (ADR-0024).
     assert_eq!(FULL_NOTICE_INDEX, 25);
     for (name, flag) in [
         ("FullNotice, full", "01"),

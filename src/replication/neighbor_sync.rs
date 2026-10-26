@@ -78,7 +78,7 @@ const MAX_EXCHANGE_KEYS: usize = MAX_NEIGHBOR_SYNC_PAGES as usize * MAX_PAGE_KEY
 /// routing table that hasn't changed, without a lookup for every key.
 ///
 /// A snapshot taken for hints ([`Self::take_for_hints`]) also holds the
-/// peers marked full at that moment (Stage B, "full, not faulty"): a replica
+/// peers marked full at that moment (ADR-0024, "full, not faulty"): a replica
 /// hint's close group is then widened by one for each of them inside it, as
 /// [`full::widened_close_group_with`] widens a lookup's, at most
 /// [`full::MAX_WIDENED_WIDTH`]. Any other snapshot marks none, and its close
@@ -244,7 +244,7 @@ pub(crate) struct HintPage<'a> {
 /// A page of hints, or the hints of a single message, as it goes out: its
 /// replica hints less those of keys this node is erasing at that moment
 /// ([`erasing`]), and its paid hints. A key selected for erasure is named in
-/// no hint from then on (Stage B's two-phase erasure), and a hint set is held
+/// no hint from then on (ADR-0024's two-phase erasure), and a hint set is held
 /// across an exchange's pages for as long as minutes, so each page is
 /// filtered as it is sent, not only when the set is built. The repair proofs
 /// of a page are recorded for [`Self::replica`], this same list, so what is
@@ -286,7 +286,7 @@ impl HintPage<'_> {
 }
 
 /// Whether this node is erasing a key, as a record, so names it in no replica
-/// hint (Stage B's two-phase erasure): asked when hints are built, which keeps
+/// hint (ADR-0024's two-phase erasure): asked when hints are built, which keeps
 /// such keys out of a set's page count, and again as each page or single
 /// message goes out ([`HintPage::to_send`]).
 ///
@@ -676,7 +676,7 @@ fn hints_from_snapshot(
         .collect();
     if close_group_size > 0 {
         for key in keys {
-            // Widened past the peers marked full inside it (Stage B).
+            // Widened past the peers marked full inside it (ADR-0024).
             let width = snapshot.widened_width(key, close_group_size);
             for peer in &candidates {
                 if snapshot.ranks_within(peer, key, width) {
@@ -2473,7 +2473,7 @@ mod tests {
     }
 
     /// A snapshot taken for hints widens a key's close group as a lookup
-    /// widened past the peers marked full does (Stage B): by one for each of
+    /// widened past the peers marked full does (ADR-0024): by one for each of
     /// them inside it, at most `MAX_WIDENED_WIDTH`, and the batch scan gives
     /// a peer the replica hints of every key whose widened group holds it.
     /// With no peer marked, the groups are the plain ones.

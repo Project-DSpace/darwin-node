@@ -862,15 +862,19 @@ pub struct FullView {
 /// the state and sends it under one lock: a renewal that read "full" can't
 /// send it after the erasure task has told the peers the node left "full".
 ///
-/// A node at the line at start says so once, before its first prune pass
-/// (see [`Self::renewal_when_not_full`]). If that pass then doesn't put it in
-/// "full", the next renewal takes the notice back, so its peers don't keep
-/// widening and waiving for it until the notice goes stale.
+/// A node at the line at start says so before the first prune pass that
+/// decides, and at each renewal until one does (see
+/// [`Self::renewal_when_not_full`]). Passes that deferred candidates because
+/// bootstrap hasn't drained don't decide: the node may erase those once it
+/// has. If the deciding pass then doesn't put the node in "full", or the node
+/// leaves the line first, the next renewal takes the notice back, so its
+/// peers don't keep widening and waiving for it until the notice goes stale.
 #[derive(Debug, Default)]
 pub struct FullAnnouncer {
     /// Held across reading the state and sending it.
     send: tokio::sync::Mutex<()>,
-    /// Set once the erasure task's first prune pass has finished.
+    /// Set once a prune pass of the erasure task has decided whether the node
+    /// is full ([`Self::note_pass`]).
     first_pass_done: AtomicBool,
     /// Set when the at-start "full" was sent and not yet taken back or
     /// confirmed by a pass that put the node in "full".
@@ -891,9 +895,18 @@ impl FullAnnouncer {
         Some(send(full).await)
     }
 
-    /// The erasure task's prune pass finished.
-    pub fn note_pass_done(&self) {
-        self.first_pass_done.store(true, Ordering::Release);
+    /// The erasure task's prune passes finished, deferring
+    /// `bootstrap_deferred` candidates because bootstrap hasn't drained, and
+    /// changing the node's state when `changed` is `Some`.
+    ///
+    /// Passes that deferred candidates and changed nothing haven't decided
+    /// whether the node is full ([`after_passes`] doesn't enter "full" while
+    /// any are deferred): the at-start notice is neither skipped nor taken
+    /// back for them, and the first pass after bootstrap drains decides.
+    pub fn note_pass(&self, bootstrap_deferred: usize, changed: Option<bool>) {
+        if bootstrap_deferred == 0 || changed.is_some() {
+            self.first_pass_done.store(true, Ordering::Release);
+        }
     }
 
     /// A renewal while the node is in "full": its own notice says so, and
@@ -903,16 +916,19 @@ impl FullAnnouncer {
     }
 
     /// What a renewal sends while the node isn't in "full", if anything:
-    /// "full" once at start when it is at the line (`at_the_line_at_start`)
-    /// and no pass has run yet; "not full" once, after its first pass, if it
-    /// sent that and no pass has put it in "full" since; else nothing.
+    /// "full" while the node started at the line and is still at it
+    /// (`at_the_line_at_start`) and no pass has decided yet
+    /// ([`Self::note_pass`]), so its peers' marks don't lapse while bootstrap
+    /// defers the passes; "not full" once, if it sent that and a pass has
+    /// since decided without putting it in "full", or it has left the line;
+    /// else nothing.
     pub fn renewal_when_not_full(&self, at_the_line_at_start: bool) -> Option<bool> {
         let pass_done = self.first_pass_done.load(Ordering::Acquire);
         if at_the_line_at_start && !pass_done {
             self.announced_at_start.store(true, Ordering::Release);
             return Some(true);
         }
-        if pass_done && self.announced_at_start.swap(false, Ordering::AcqRel) {
+        if self.announced_at_start.swap(false, Ordering::AcqRel) {
             return Some(false);
         }
         None
@@ -1307,10 +1323,9 @@ mod tests {
         assert_eq!(FULL_NOTICE_FROM_RELEASE, 17);
     }
 
-    /// The notice ships in node release 1b with paged sync, as ds.17: the
-    /// release after node release 1a (ds.16), whose nodes neither read
-    /// pages nor the notice. This tree's version names ds.16 until 1b is
-    /// cut, or ds.17 once it is.
+    /// The notice ships in ds.17 with paged sync: the release after ds.16,
+    /// whose nodes neither read pages nor the notice. This tree's version
+    /// names ds.16 until ds.17 is cut, or ds.17 once it is.
     #[test]
     fn the_notice_comes_with_paged_sync_in_the_release_after_ds16() {
         assert_eq!(
@@ -1399,7 +1414,7 @@ mod tests {
     }
 
     /// A reader whose user agent later names a release that doesn't read the
-    /// notice (it rolled back to node release 1a, ds.16) isn't told, and is
+    /// notice (it rolled back to ds.16) isn't told, and is
     /// no longer a reader; its mark stays. With no user agent to read, the
     /// remembered readers are told; a peer never seen to read it isn't.
     #[test]
@@ -1724,14 +1739,14 @@ mod tests {
         let announcer = FullAnnouncer::default();
         assert_eq!(announcer.renewal_when_not_full(true), Some(true));
         // The pass erased and left the node above the line: no state change.
-        announcer.note_pass_done();
+        announcer.note_pass(0, None);
         assert_eq!(announcer.renewal_when_not_full(false), Some(false));
         assert_eq!(announcer.renewal_when_not_full(false), None, "once");
 
         // A pass that puts the node in "full" settles it: nothing to take back.
         let confirmed = FullAnnouncer::default();
         assert_eq!(confirmed.renewal_when_not_full(true), Some(true));
-        confirmed.note_pass_done();
+        confirmed.note_pass(0, Some(true));
         confirmed.state_sent();
         assert_eq!(confirmed.renewal_when_not_full(false), None);
 
@@ -1739,13 +1754,51 @@ mod tests {
         let renewed = FullAnnouncer::default();
         assert_eq!(renewed.renewal_when_not_full(true), Some(true));
         renewed.renewal_when_full();
-        renewed.note_pass_done();
+        renewed.note_pass(0, None);
         assert_eq!(renewed.renewal_when_not_full(false), None);
 
         // After the first pass, a node not in "full" never says "full" at start.
         let late = FullAnnouncer::default();
-        late.note_pass_done();
+        late.note_pass(0, None);
         assert_eq!(late.renewal_when_not_full(true), None);
+    }
+
+    /// A node restarted at the line whose passes defer candidates until
+    /// bootstrap drains keeps saying "full": those passes decide nothing. The
+    /// first pass after the drain decides.
+    #[test]
+    fn passes_deferred_for_bootstrap_neither_skip_nor_take_back_the_at_start_notice() {
+        // A deferred pass before the first renewal: the renewal still says
+        // "full", and so does each one after it while the deferral lasts.
+        let early = FullAnnouncer::default();
+        early.note_pass(3, None);
+        assert_eq!(early.renewal_when_not_full(true), Some(true));
+        early.note_pass(3, None);
+        assert_eq!(early.renewal_when_not_full(true), Some(true), "renewed");
+        // Bootstrap drained, and the pass put the node in "full", which its
+        // own notice says: nothing to take back.
+        early.note_pass(0, Some(true));
+        early.state_sent();
+        assert_eq!(early.renewal_when_not_full(true), None);
+
+        // A deferred pass after the at-start notice doesn't take it back.
+        let late = FullAnnouncer::default();
+        assert_eq!(late.renewal_when_not_full(true), Some(true));
+        late.note_pass(2, None);
+        assert_eq!(late.renewal_when_not_full(true), Some(true), "kept");
+        // The first pass after the drain doesn't put the node in "full": the
+        // next renewal takes the notice back, once.
+        late.note_pass(0, None);
+        assert_eq!(late.renewal_when_not_full(true), Some(false));
+        assert_eq!(late.renewal_when_not_full(true), None, "once");
+
+        // A node that left the line while its passes were deferred takes the
+        // notice back.
+        let left = FullAnnouncer::default();
+        assert_eq!(left.renewal_when_not_full(true), Some(true));
+        left.note_pass(1, None);
+        assert_eq!(left.renewal_when_not_full(false), Some(false));
+        assert_eq!(left.renewal_when_not_full(false), None, "once");
     }
 
     /// A renewal that read "full" and is still sending it holds the lock: the

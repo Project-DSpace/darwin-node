@@ -850,7 +850,7 @@ mod tests {
         }
     }
 
-    /// The release nodes page to is past ds.15 and ds.16 (node release 1a),
+    /// The release nodes page to is past ds.15 and ds.16,
     /// the releases before pages, whose nodes can't decode them, with or
     /// without an image marker.
     #[test]
@@ -867,7 +867,7 @@ mod tests {
         }
     }
 
-    /// The last release whose nodes read no pages: ds.16, node release 1a,
+    /// The last release whose nodes read no pages: ds.16,
     /// cut before the release that carries pages. This tree announces it, by
     /// its version, until the release that carries pages is cut. When a
     /// release without pages is cut before it, its number goes here.

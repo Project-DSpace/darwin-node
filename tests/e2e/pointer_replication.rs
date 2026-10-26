@@ -1544,7 +1544,7 @@ async fn quote_through(
 /// A pointer update near full nodes, over each node's real quote path: with
 /// 3 of the 7 nearest full and not holding the pointer, only 4 quote, fewer
 /// than the 5 of 7 a pointer write needs, so a client stops before paying
-/// (the stop itself is client release 1b's); with the same 3 full but
+/// (the stop itself is the client's); with the same 3 full but
 /// holding it, all 7 quote the update, and it goes through.
 #[tokio::test]
 #[serial]

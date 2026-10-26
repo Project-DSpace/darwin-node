@@ -12,10 +12,13 @@
 //! 2. **Erased.** It is erased only in a pass of a later cycle, after a whole
 //!    sync cycle passed without it being hinted ([`EPOCHS_BEFORE_ERASURE`]:
 //!    the cycle that starts as the pass selects it may have built its first
-//!    hints just before, so the cycle after that), through the usual
-//!    possession check and re-check; and never while this node answered
-//!    "present" for it within the last fetch window ([`FETCH_WINDOW`]), so a
-//!    node that said "present" doesn't say "not found" inside that window.
+//!    hints just before, so the cycle after that) and at least a fetch window
+//!    ([`FETCH_WINDOW`]) after it was selected, through the usual possession
+//!    check and re-check; and never while this node answered "present" for
+//!    it within the last fetch window, so a node that said "present" doesn't
+//!    say "not found" inside that window. An answer given before the key was
+//!    selected is a fetch window old before the key can be erased, however
+//!    fast the sync epochs move, so only selected keys' answers are kept.
 //!
 //! A record that is no longer eligible leaves the set, and is hinted again.
 //! So does one the pass that found it ready didn't try, for lack of audit
@@ -93,6 +96,9 @@ pub const RETRY_COOLDOWN_EPOCHS: u64 = EPOCHS_BEFORE_ERASURE + 1;
 struct Selected {
     /// The sync epoch in which it was selected.
     at: u64,
+    /// When it was selected: it is erased no sooner than [`FETCH_WINDOW`]
+    /// after, so any "present" answered before its selection has aged out.
+    since: Instant,
     /// Whether it was selected again once the cooldown after a failed
     /// possession check ended: tried again later, it doesn't keep a node from
     /// being full.
@@ -170,16 +176,19 @@ impl ErasureGate {
     /// than `max_selected`, except those whose check failed fewer than
     /// [`RETRY_COOLDOWN_EPOCHS`] epochs before ([`Self::fail`]), which stay
     /// hinted meanwhile. Returns the eligible keys selected
-    /// [`EPOCHS_BEFORE_ERASURE`] or more epochs before, in order: those a
-    /// whole cycle has passed without hinting, which the pass may now check
-    /// and erase. The pass gives back, with [`Self::release_untried`], those
-    /// it then doesn't try.
+    /// [`EPOCHS_BEFORE_ERASURE`] or more epochs before and [`FETCH_WINDOW`]
+    /// or longer before `now`, in order: those a whole cycle has passed
+    /// without hinting, with no "present" answered before their selection
+    /// still in its window, which the pass may now check and erase. The pass
+    /// gives back, with [`Self::release_untried`], those it then doesn't try;
+    /// selected again, a key waits again from then.
     pub fn select(
         &self,
         kind: ClockKind,
         eligible: &[XorName],
         epoch: u64,
         max_selected: usize,
+        now: Instant,
     ) -> Vec<XorName> {
         let keep: HashSet<&XorName> = eligible.iter().collect();
         let mut cooling = self.cooling_of(kind).lock();
@@ -200,7 +209,9 @@ impl ErasureGate {
         for key in eligible {
             match selected.get(key) {
                 Some(entry) => {
-                    if entry.at.saturating_add(EPOCHS_BEFORE_ERASURE) <= epoch {
+                    if entry.at.saturating_add(EPOCHS_BEFORE_ERASURE) <= epoch
+                        && now.saturating_duration_since(entry.since) >= FETCH_WINDOW
+                    {
                         ready.push(*key);
                     }
                 }
@@ -211,6 +222,7 @@ impl ErasureGate {
                             *key,
                             Selected {
                                 at: epoch,
+                                since: now,
                                 retry: was_retry || cooled.contains(key),
                             },
                         );
@@ -300,10 +312,10 @@ impl ErasureGate {
     /// being erased ([`Self::is_being_erased`]).
     ///
     /// A key not selected when it is answered can't be erased within the
-    /// fetch window: a later pass has to select it first, and it is erased no
-    /// sooner than [`EPOCHS_BEFORE_ERASURE`] sync cycles after that (a key
-    /// given back untried waits again from its new selection), each cycle far
-    /// longer than [`FETCH_WINDOW`]. So only selected keys are remembered:
+    /// fetch window: a later pass has to select it first, and
+    /// [`Self::select`] finds it ready no sooner than [`FETCH_WINDOW`] after
+    /// that (a key given back untried waits again from its new selection),
+    /// however fast the sync epochs move. So only selected keys are remembered:
     /// the record stays within the selected set's size, and the answers for
     /// the keys the node keeps anyway (its in-range keys among them) never
     /// fill it, which would fold every key into one time
@@ -604,20 +616,107 @@ mod tests {
     const R: ClockKind = ClockKind::Records;
     const P: ClockKind = ClockKind::Pointers;
 
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+    /// When sync epoch `epoch` of these tests starts: a fetch window apart,
+    /// so time never holds back a key the epochs let go.
+    fn at(epoch: u64) -> Instant {
+        *START + FETCH_WINDOW * u32::try_from(epoch).unwrap()
+    }
+
+    /// [`ErasureGate::select`] at the start of the sync epoch.
+    trait SelectInEpoch {
+        fn select_in(
+            &self,
+            kind: ClockKind,
+            eligible: &[XorName],
+            epoch: u64,
+            max_selected: usize,
+        ) -> Vec<XorName>;
+    }
+
+    impl SelectInEpoch for ErasureGate {
+        fn select_in(
+            &self,
+            kind: ClockKind,
+            eligible: &[XorName],
+            epoch: u64,
+            max_selected: usize,
+        ) -> Vec<XorName> {
+            self.select(kind, eligible, epoch, max_selected, at(epoch))
+        }
+    }
+
+    /// Sync epochs can move on faster than the fetch window (a burst of
+    /// topology changes starts rounds at once): a key two epochs past its
+    /// selection isn't ready until a fetch window has passed since then, so a
+    /// "present" this node answered before selecting it, which isn't kept,
+    /// has aged out before the key can be erased.
+    #[test]
+    fn a_key_is_erased_no_sooner_than_a_fetch_window_after_its_selection() {
+        let gate = ErasureGate::default();
+        let answered = *START;
+        // Answered before it was selected: not remembered.
+        gate.note_answered_present(&key(1), answered);
+        let selected = answered + Duration::from_secs(10);
+        assert_eq!(
+            gate.select(R, &[key(1)], 5, 10, selected),
+            Vec::<XorName>::new()
+        );
+        assert!(!gate.answered_present_lately(&key(1), selected));
+        // Two epochs on within a minute: not ready.
+        let soon = selected + Duration::from_secs(60);
+        assert_eq!(
+            gate.select(R, &[key(1)], 6, 10, soon),
+            Vec::<XorName>::new()
+        );
+        assert_eq!(
+            gate.select(R, &[key(1)], 7, 10, soon),
+            Vec::<XorName>::new()
+        );
+        let almost = selected + FETCH_WINDOW.saturating_sub(Duration::from_secs(1));
+        assert_eq!(
+            gate.select(R, &[key(1)], 9, 10, almost),
+            Vec::<XorName>::new()
+        );
+        assert!(gate.is_being_erased(&key(1)), "still hidden");
+        // A fetch window after its selection: ready, and the answer before it
+        // is older than the window.
+        let ready_at = selected + FETCH_WINDOW;
+        assert_eq!(gate.select(R, &[key(1)], 9, 10, ready_at), vec![key(1)]);
+        assert!(ready_at.duration_since(answered) >= FETCH_WINDOW);
+        // Given back untried and selected again, it waits again from then.
+        gate.release_untried(R, &[key(1)], &HashSet::new());
+        let again = ready_at + Duration::from_secs(1);
+        assert_eq!(
+            gate.select(R, &[key(1)], 10, 10, again),
+            Vec::<XorName>::new()
+        );
+        let later = again + FETCH_WINDOW.saturating_sub(Duration::from_secs(1));
+        assert_eq!(
+            gate.select(R, &[key(1)], 12, 10, later),
+            Vec::<XorName>::new()
+        );
+        assert_eq!(
+            gate.select(R, &[key(1)], 12, 10, again + FETCH_WINDOW),
+            vec![key(1)]
+        );
+    }
+
     #[test]
     fn a_key_is_erased_only_a_whole_cycle_after_the_one_it_was_selected_in() {
         assert_eq!(EPOCHS_BEFORE_ERASURE, 2);
         let gate = ErasureGate::default();
         let eligible = vec![key(1), key(2), key(3)];
-        assert_eq!(gate.select(R, &eligible, 5, 10), Vec::<XorName>::new());
+        assert_eq!(gate.select_in(R, &eligible, 5, 10), Vec::<XorName>::new());
         assert!(gate.is_being_erased(&key(1)));
         // The same epoch again: still not ready.
-        assert_eq!(gate.select(R, &eligible, 5, 10), Vec::<XorName>::new());
+        assert_eq!(gate.select_in(R, &eligible, 5, 10), Vec::<XorName>::new());
         assert_eq!(gate.not_yet_erased(), 3);
         // The next: the cycle that started as it was selected may have hinted it.
-        assert_eq!(gate.select(R, &eligible, 6, 10), Vec::<XorName>::new());
+        assert_eq!(gate.select_in(R, &eligible, 6, 10), Vec::<XorName>::new());
         // The one after: a whole cycle passed without hinting it.
-        assert_eq!(gate.select(R, &eligible, 7, 10), eligible);
+        assert_eq!(gate.select_in(R, &eligible, 7, 10), eligible);
         assert_eq!(gate.not_yet_erased(), 3, "ready, not yet erased");
         for key in &eligible {
             gate.release(R, key);
@@ -628,8 +727,8 @@ mod tests {
     #[test]
     fn no_hint_names_a_key_being_erased() {
         let gate = ErasureGate::default();
-        gate.select(R, &[key(2)], 1, 10);
-        gate.select(P, &[key(4)], 1, 10);
+        gate.select_in(R, &[key(2)], 1, 10);
+        gate.select_in(P, &[key(4)], 1, 10);
         let hints = [key(1), key(2), key(3), key(4)];
         let sent: Vec<XorName> = hints
             .iter()
@@ -642,8 +741,8 @@ mod tests {
     #[test]
     fn a_key_no_longer_eligible_is_hinted_again() {
         let gate = ErasureGate::default();
-        gate.select(R, &[key(1), key(2)], 1, 10);
-        assert_eq!(gate.select(R, &[key(2)], 3, 10), vec![key(2)]);
+        gate.select_in(R, &[key(1), key(2)], 1, 10);
+        assert_eq!(gate.select_in(R, &[key(2)], 3, 10), vec![key(2)]);
         assert!(!gate.is_being_erased(&key(1)));
         gate.release(R, &key(2));
         assert_eq!(gate.selected_count(), 0);
@@ -652,12 +751,12 @@ mod tests {
     #[test]
     fn records_and_pointers_are_selected_apart() {
         let gate = ErasureGate::default();
-        gate.select(R, &[key(1)], 1, 10);
-        gate.select(P, &[key(2)], 1, 10);
+        gate.select_in(R, &[key(1)], 1, 10);
+        gate.select_in(P, &[key(2)], 1, 10);
         // A pass of one kind keeps the other's selection.
-        assert_eq!(gate.select(R, &[key(1)], 3, 10), vec![key(1)]);
+        assert_eq!(gate.select_in(R, &[key(1)], 3, 10), vec![key(1)]);
         assert!(gate.is_being_erased(&key(2)));
-        assert_eq!(gate.select(P, &[key(2)], 3, 10), vec![key(2)]);
+        assert_eq!(gate.select_in(P, &[key(2)], 3, 10), vec![key(2)]);
         assert!(gate.is_being_erased(&key(1)));
         assert_eq!(gate.selected_count(), 2);
     }
@@ -666,15 +765,15 @@ mod tests {
     fn the_set_never_holds_more_than_its_cap() {
         let gate = ErasureGate::default();
         let eligible: Vec<XorName> = (0..10).map(key).collect();
-        gate.select(R, &eligible, 1, 4);
+        gate.select_in(R, &eligible, 1, 4);
         assert_eq!(gate.selected_count(), 4);
-        assert_eq!(gate.select(R, &eligible, 2, 4).len(), 0);
+        assert_eq!(gate.select_in(R, &eligible, 2, 4).len(), 0);
         assert_eq!(gate.selected_count(), 4, "no room, none added");
-        assert_eq!(gate.select(R, &eligible, 3, 4), eligible[..4].to_vec());
+        assert_eq!(gate.select_in(R, &eligible, 3, 4), eligible[..4].to_vec());
         // Two erased, so no longer eligible: room for two more.
         gate.release(R, &key(0));
         gate.release(R, &key(1));
-        gate.select(R, &eligible[2..], 3, 4);
+        gate.select_in(R, &eligible[2..], 3, 4);
         assert_eq!(gate.selected_count(), 4);
         assert!(gate.is_being_erased(&key(4)) && gate.is_being_erased(&key(5)));
     }
@@ -691,7 +790,7 @@ mod tests {
         let mut eligible: Vec<XorName> = (0..N).map(key).collect();
         let mut tried_ever = HashSet::new();
         for epoch in 1..200u64 {
-            let ready = gate.select(R, &eligible, epoch, CAP);
+            let ready = gate.select_in(R, &eligible, epoch, CAP);
             assert!(gate.selected_of(R) <= CAP, "at most the cap hidden");
             let hidden = eligible
                 .iter()
@@ -724,8 +823,8 @@ mod tests {
     fn what_keeps_a_node_from_being_full() {
         let gate = ErasureGate::default();
         let eligible = vec![key(1), key(2), key(3)];
-        gate.select(R, &eligible, 1, 10);
-        let ready = gate.select(R, &eligible, 3, 10);
+        gate.select_in(R, &eligible, 1, 10);
+        let ready = gate.select_in(R, &eligible, 3, 10);
         assert_eq!(ready, eligible);
         // key(1) tried and kept (answered "present"); key(2) failed; key(3)
         // deferred for lack of budget.
@@ -737,18 +836,18 @@ mod tests {
         gate.release(R, &key(1));
         assert_eq!(gate.not_yet_erased(), 1, "the deferred one");
         // The deferred one leaves eligibility: nothing is owed.
-        gate.select(R, &[key(2)], 4, 10);
+        gate.select_in(R, &[key(2)], 4, 10);
         assert_eq!(gate.not_yet_erased(), 0, "key(2) cooling");
         // key(2) is selected again after its cooldown: a retry, not owed.
-        gate.select(R, &[key(2)], 3 + RETRY_COOLDOWN_EPOCHS, 10);
+        gate.select_in(R, &[key(2)], 3 + RETRY_COOLDOWN_EPOCHS, 10);
         assert!(gate.is_being_erased(&key(2)));
         assert_eq!(gate.not_yet_erased(), 0, "a retry doesn't block full");
         // Deferred as a retry, it stays a retry.
-        let ready = gate.select(R, &[key(2)], 5 + RETRY_COOLDOWN_EPOCHS, 10);
+        let ready = gate.select_in(R, &[key(2)], 5 + RETRY_COOLDOWN_EPOCHS, 10);
         assert_eq!(ready, vec![key(2)]);
         gate.release_untried(R, &ready, &HashSet::new());
         assert_eq!(gate.not_yet_erased(), 0);
-        gate.select(R, &[key(2)], 6 + RETRY_COOLDOWN_EPOCHS, 10);
+        gate.select_in(R, &[key(2)], 6 + RETRY_COOLDOWN_EPOCHS, 10);
         assert!(gate.is_being_erased(&key(2)));
         assert_eq!(gate.not_yet_erased(), 0);
     }
@@ -764,9 +863,9 @@ mod tests {
         let gate = ErasureGate::default();
         let eligible = vec![key(1), key(2)];
         // Selected at 10, ready at 12.
-        gate.select(kind, &eligible, 10, 10);
+        gate.select_in(kind, &eligible, 10, 10);
         assert!(gate.is_being_erased(&key(1)));
-        assert_eq!(gate.select(kind, &eligible, 12, 10), eligible);
+        assert_eq!(gate.select_in(kind, &eligible, 12, 10), eligible);
         // Its check fails at 12: no longer hidden.
         gate.fail(kind, &key(1), 12);
         assert!(
@@ -776,7 +875,7 @@ mod tests {
         assert!(gate.is_being_erased(&key(2)));
         // Still eligible, with budget to spare, but cooling: not selected.
         for epoch in 12..12 + RETRY_COOLDOWN_EPOCHS {
-            assert_eq!(gate.select(kind, &eligible, epoch, 10), vec![key(2)]);
+            assert_eq!(gate.select_in(kind, &eligible, epoch, 10), vec![key(2)]);
             assert!(
                 !gate.is_being_erased(&key(1)),
                 "visible through the cooldown, at {epoch}"
@@ -784,13 +883,13 @@ mod tests {
         }
         // Then selected, hidden, and tried again two epochs later.
         let again = 12 + RETRY_COOLDOWN_EPOCHS;
-        assert_eq!(gate.select(kind, &eligible, again, 10), vec![key(2)]);
+        assert_eq!(gate.select_in(kind, &eligible, again, 10), vec![key(2)]);
         assert!(
             gate.is_being_erased(&key(1)),
             "selected again after the cooldown"
         );
         assert_eq!(
-            gate.select(kind, &eligible, again + EPOCHS_BEFORE_ERASURE, 10),
+            gate.select_in(kind, &eligible, again + EPOCHS_BEFORE_ERASURE, 10),
             eligible
         );
     }
@@ -808,12 +907,12 @@ mod tests {
     #[test]
     fn a_cooling_key_no_longer_eligible_is_forgotten() {
         let gate = ErasureGate::default();
-        gate.select(R, &[key(1)], 1, 10);
+        gate.select_in(R, &[key(1)], 1, 10);
         gate.fail(R, &key(1), 3);
         // Leaves eligibility (back in range, or erased elsewhere), then comes
         // back: a fresh candidate, selected at once.
-        gate.select(R, &[], 4, 10);
-        gate.select(R, &[key(1)], 4, 10);
+        gate.select_in(R, &[], 4, 10);
+        gate.select_in(R, &[key(1)], 4, 10);
         assert!(gate.is_being_erased(&key(1)));
         assert_eq!(gate.records_cooling.lock().len(), 0);
     }
@@ -822,7 +921,7 @@ mod tests {
     fn a_key_answered_present_is_kept_for_the_fetch_window() {
         let gate = ErasureGate::default();
         let now = Instant::now();
-        let _ = gate.select(ClockKind::Records, &[key(1), key(2)], 0, 8);
+        let _ = gate.select_in(ClockKind::Records, &[key(1), key(2)], 0, 8);
         assert!(!gate.answered_present_lately(&key(1), now));
         gate.note_answered_present(&key(1), now);
         assert!(gate.answered_present_lately(
@@ -844,7 +943,7 @@ mod tests {
                 k
             })
             .collect();
-        let _ = gate.select(ClockKind::Records, &keys, 0, usize::MAX);
+        let _ = gate.select_in(ClockKind::Records, &keys, 0, usize::MAX);
         for k in &keys {
             gate.note_answered_present(k, now);
         }
@@ -860,8 +959,8 @@ mod tests {
     fn answers_for_keys_not_being_erased_are_not_remembered() {
         let gate = ErasureGate::default();
         let now = Instant::now();
-        let _ = gate.select(ClockKind::Records, &[key(0xEE)], 0, 8);
-        let _ = gate.select(ClockKind::Pointers, &[key(0xEF)], 0, 8);
+        let _ = gate.select_in(ClockKind::Records, &[key(0xEE)], 0, 8);
+        let _ = gate.select_in(ClockKind::Pointers, &[key(0xEF)], 0, 8);
         for n in 0..=MAX_ANSWERED_PRESENT {
             let mut k = [0u8; 32];
             k[..8].copy_from_slice(&(n as u64).to_be_bytes());
@@ -883,7 +982,7 @@ mod tests {
         let b = PeerId::from_bytes([2; 32]);
         let gate = Arc::new(ErasureGate::default());
         register_gate(&a, &gate);
-        gate.select(R, &[key(1)], 1, 1);
+        gate.select_in(R, &[key(1)], 1, 1);
         assert!(gate_for(&a).is_being_erased(&key(1)));
         assert!(!gate_for(&b).is_being_erased(&key(1)));
         drop(gate);

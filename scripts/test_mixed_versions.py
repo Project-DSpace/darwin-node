@@ -126,7 +126,7 @@ It must show, beyond what every run shows:
   holds it at the mid count, before any mark lapses;
 - erasure goes ahead with 6 real proofs: every erasure a node logs needed at
   least 6 proofs, and had them;
-- a lapsed mark counts as missing (C06): once the stopped node's mark has
+- a lapsed mark counts as missing: once the stopped node's mark has
   lapsed, no erasure counts more members marked full than full nodes still
   run.
 

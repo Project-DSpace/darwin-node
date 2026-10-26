@@ -322,7 +322,7 @@ mod direct_first {
     const SAORSA_CORE_VERSION: &str = "0.29.1";
     const SAORSA_CORE_COMMIT: &str = "29bb069691880de59f5157c315a6233b1c57b20f";
 
-    /// The saorsa-transport release the lock holds (node release 1a's bump).
+    /// The saorsa-transport release the lock holds (ds.16's bump).
     const SAORSA_TRANSPORT_VERSION: &str = "0.38.2";
 
     const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -413,7 +413,7 @@ mod direct_first {
             locked("saorsa-core"),
             vec![(SAORSA_CORE_VERSION.to_string(), None)]
         );
-        // One saorsa-transport: 0.38.2 from crates.io (node release 1a's
+        // One saorsa-transport: 0.38.2 from crates.io (ds.16's
         // bump, Cargo.toml's direct requirement), which both this package's
         // requirement and the vendored saorsa-core's accept.
         let transport = locked("saorsa-transport");

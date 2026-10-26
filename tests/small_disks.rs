@@ -24,7 +24,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use ant_node::replication::erasure::{ClockKind, ErasureGate};
+use ant_node::replication::erasure::{ClockKind, ErasureGate, FETCH_WINDOW};
 use ant_node::replication::full;
 use ant_node::replication::retention::{
     leave_full_inode_margin, step_clamp, DiskRetention, FLOOR_STEPS, LAST_FLOOR_STEP,
@@ -37,6 +37,7 @@ use ant_node::test_seams::FREE_SPACE_FILE;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Bytes in a decimal gigabyte, as partitions are sold.
 const GB: u64 = 1_000_000_000;
@@ -225,8 +226,15 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
             // again meanwhile, still keeps the node from being full.
             let gate = ErasureGate::default();
             let deferred = [0xD7; 32];
-            gate.select(ClockKind::Records, &[deferred], 1, 1024);
-            let ready = gate.select(ClockKind::Records, &[deferred], 3, 1024);
+            let selected = Instant::now();
+            gate.select(ClockKind::Records, &[deferred], 1, 1024, selected);
+            let ready = gate.select(
+                ClockKind::Records,
+                &[deferred],
+                3,
+                1024,
+                selected + FETCH_WINDOW,
+            );
             assert_eq!(ready, vec![deferred]);
             gate.release_untried(ClockKind::Records, &ready, &HashSet::new());
             assert!(!gate.is_being_erased(&deferred));
@@ -239,7 +247,7 @@ async fn on_small_disks_the_floor_falls_onto_the_line_and_full_nodes_keep_what_t
                 assert!(!node.store.is_full(), "{what}");
             }
             // Once it is no longer eligible, nothing is owed.
-            gate.select(ClockKind::Records, &[], 4, 1024);
+            gate.select(ClockKind::Records, &[], 4, 1024, selected + FETCH_WINDOW);
             assert_eq!(gate.not_yet_erased(), 0);
             // Candidates the passes deferred because bootstrap hasn't
             // drained (after a restart): the node may erase them once it

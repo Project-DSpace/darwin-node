@@ -648,6 +648,7 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
                     &keys,
                     epoch,
                     MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS,
+                    Instant::now(),
                 )
                 .into_iter()
                 .collect();

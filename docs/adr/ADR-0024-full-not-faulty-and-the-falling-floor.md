@@ -79,11 +79,15 @@ Under disk pressure the erase floor falls as free space does:
 
 The prune passes run in a task of their own after each neighbour-sync cycle. An eligible
 record is first selected, and from then on named in no replica hint this node sends; it
-is erased only in a pass of a later cycle, after its possession check, and never while
-this node answered "present" for it within the fetch window (the verification and fetch
-timeouts plus the longest retry wait, 345 s), for chunks and pointers alike (a pointer
-state or fetch answered with the record counts as "present"). A node therefore never hints
-a record and then answers that it lacks it.
+is erased only in a pass of a later cycle, no sooner than a fetch window (the
+verification and fetch timeouts plus the longest retry wait, 345 s) after it was
+selected, after its possession check, and never while this node answered "present" for
+it within the fetch window, for chunks and pointers alike (a pointer state or fetch
+answered with the record counts as "present"). A node therefore never hints a record and
+then answers that it lacks it. Sync epochs can move on faster than the fetch window (each
+topology change starts a round at once), so the wait after selection is counted in time
+as well as in epochs; a record given back untried and selected again waits again from
+then.
 
 A record whose possession check fails leaves the selection at once and is hinted again,
 since its close group lacks copies and this node's hint is what lets the group fetch it
@@ -116,8 +120,9 @@ last step, erased nothing and left nothing selected for erasure and not yet eras
 candidate because bootstrap hasn't drained (after a restart it erases those once it has):
 a record retried after a failed possession check is tried again later, and doesn't keep a
 node from being full. A key is kept after an answer of "present" only if it was being
-erased when answered: one not selected then can't be erased within the fetch window
-anyway, and remembering only those keeps that record bounded. Then it:
+erased when answered: one not selected then is erased no sooner than a fetch window after
+its later selection, so that answer has aged out by then, and remembering only those
+keeps that record bounded. Then it:
 
 - prices no new data: a quote for data it doesn't hold is refused with the existing
   `QuoteFailed`. A chunk it holds is still answered as already stored, so nobody pays for
@@ -131,13 +136,12 @@ anyway, and remembering only those keeps that record bounded. Then it:
 - keeps serving and proving what it holds: its audit and possession replies keep their
   format, real digests for held keys and the absent digest for others;
 - tells its peers with a one-way `FullNotice`, appended to the replication messages (body
-  index 25: node-1b-sync's two page messages keep 23 and 24, and the notice, merged after
-  them in node-1b, takes the next; the merge moved one constant,
-  `BEFORE_FULL_NOTICE_LAST_INDEX`, from 22 to 24) and
-  sent only to peers whose user agent names the release that reads it, or that sent one
-  themselves, renewed every 10 minutes while it stays full; a peer once found to read it
-  is remembered (at most 4,096) until it leaves the routing table, so a renewal still
-  reaches it while it is disconnected; a user agent read at the time decides, so a peer
+  index 25, after the two page messages at 23 and 24; its index derives from
+  `BEFORE_FULL_NOTICE_LAST_INDEX` = 24) and sent only to peers whose user agent names
+  the release that reads it, or that sent one themselves, renewed every 10 minutes
+  while it stays full; a peer once found to read it is remembered (at most 4,096)
+  until it leaves the routing table, so a renewal still reaches it while it is
+  disconnected; a user agent read at the time decides, so a peer
   that rolled back to a release that can't read it is not told, and no longer remembered;
 - logs one line on entering ("Node full: since <unix seconds>") and one on leaving,
   under a target the log writer keeps first at the full line
@@ -145,10 +149,14 @@ anyway, and remembering only those keeps that record bounded. Then it:
   only at the line, where other INFO lines are dropped;
   the state isn't kept across a restart, so at start a node with room above the line
   logs "Node full: not at start", which `nodes status` reads as no longer full, and one
-  that starts at the line tells its peers once, at its first renewal, if no prune pass
-  has run by then, so their marks don't lapse in between; if that pass then doesn't make
-  it full, the next renewal takes the notice back. Every notice is read and sent under
-  one lock, so a renewal can't send "full" after the node has said it left;
+  that starts at the line tells its peers so at each renewal while it is still at the
+  line and no prune pass has decided, so their marks don't lapse in between. A pass
+  that deferred candidates because bootstrap hasn't drained doesn't decide, since the
+  node may erase those once it has; so a restart, an upgrade among them, keeps the
+  node's marks until the first pass after the drain. If the deciding pass doesn't make
+  it full, or the node leaves the line first, the next renewal takes the notice back.
+  Every notice is read and sent under one lock, so a renewal can't send "full" after
+  the node has said it left;
 - leaves "full" only with 256 MiB of free bytes above the line, and inodes, where
   counted, off their line; when inodes put it in "full", it also needs 65,536 inodes
   above their line, or a fortieth of the filesystem's inodes where that is fewer, so a
@@ -171,7 +179,7 @@ anyway, and remembering only those keeps that record bounded. Then it:
   announcing themselves full never lower the bar. Only a routing table that knows fewer
   peers than the close group (a tiny network) lowers it, as before.
 - The possession check after a write probes only the 7 nearest (the unwidened close
-  group, the writing node itself counted), as node release 1a does: stand-ins beyond
+  group, the writing node itself counted), as ds.16 does: stand-ins beyond
   them are offered the record, and take it, older nodes included, since a chunk
   receiver admits a fresh offer anywhere among the key's 20 nearest. They aren't
   possession-checked because no peer past the close group was before this release.
@@ -242,10 +250,10 @@ windows until they update.
   unless the peer proves the key again: the waiver may then apply to a key the peer
   proved that long ago. A generation holds 10 bits' worth of proofs for each of 20 peers
   per record held, so this is at least one generation's worth of other proofs later.
-  This turnover narrows "never seen" to "not seen within the two generations kept", and
-  is an amendment to the S4 wording, for Dan to confirm. Restarts don't forget: the
-  record is saved with its seed (up to 2 x 32 MiB on disk, written only when it changed).
-  The first start into this release, or one after the file is lost, starts it empty.
+  This turnover narrows the waiver's "never seen" to "not seen within the two
+  generations kept". Restarts don't forget: the record is saved with its seed (up to
+  2 x 32 MiB on disk, written only when it changed). The first start into this
+  release, or one after the file is lost, starts it empty.
 
 ### Neutral / Operational
 

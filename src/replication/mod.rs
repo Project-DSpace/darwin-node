@@ -4127,7 +4127,10 @@ impl ReplicationEngine {
                             not_yet_erased,
                             bootstrap_deferred,
                         );
-                        announcer.note_pass_done();
+                        // Passes that deferred candidates for bootstrap
+                        // and changed nothing haven't decided: the at-start
+                        // notice stands until one that has.
+                        announcer.note_pass(bootstrap_deferred, changed);
                         changed.map(|_| {
                             announcer.state_sent();
                             storage.is_full()
@@ -4159,10 +4162,12 @@ impl ReplicationEngine {
     ///
     /// The "full" state isn't kept across a restart: at start the node logs
     /// where it stands ([`full::at_start`]), and a node that starts at the
-    /// line tells its peers once, at the first renewal, if no prune pass has
-    /// run by then, so their marks from before the restart don't lapse while
-    /// it waits for that pass. If the pass then doesn't put it in "full", the
-    /// next renewal takes that back ([`full::FullAnnouncer`]).
+    /// line tells its peers so at each renewal while it is still at the line
+    /// and no prune pass has decided (passes that defer candidates for
+    /// bootstrap don't), so their marks from before the restart don't lapse
+    /// while it waits for that pass. If the pass then doesn't put it in
+    /// "full", or the node leaves the line first, the next renewal takes that
+    /// back ([`full::FullAnnouncer`]).
     fn start_full_notice_loop(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
@@ -4185,8 +4190,8 @@ impl ReplicationEngine {
                             announcer.renewal_when_full();
                             Some(full::leave_if_room(&storage, &disk_retention) != Some(false))
                         } else {
-                            let at_start = std::mem::take(&mut at_the_line_at_start)
-                                && disk_retention.at_the_line().is_some();
+                            let at_start =
+                                at_the_line_at_start && disk_retention.at_the_line().is_some();
                             announcer.renewal_when_not_full(at_start)
                         }
                     },
