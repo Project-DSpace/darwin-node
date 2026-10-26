@@ -25,13 +25,14 @@
 //! someone else's payment) is checked exactly as before.
 //!
 //! Every read goes through one pool of connections to the node's RPCs: the
-//! node's own, then, where it is one of Robinhood Chain's public RPCs, the
-//! others ([`crate::listings::listings_rpc_urls`]). A read starts with the RPC
-//! that answered last. An RPC that answered busy, or didn't answer in time, is
-//! asked after the others for [`HOLD_OFF`]; it is still asked when they fail,
-//! so being held off changes only the order. A failed call moves on to the
-//! next RPC at once, and a read of payment records that fails on every RPC is
-//! made again in a second round, [`PAYMENT_READ_BACKOFF`] later.
+//! node's own, then, where it is one of Robinhood Chain's public RPCs or one
+//! retired from them, the others ([`crate::listings::listings_rpc_urls`]). A
+//! read starts with the RPC that answered last. An RPC that answered busy, or
+//! didn't answer in time, is asked after the others for [`HOLD_OFF`]; it is
+//! still asked when they fail, so being held off changes only the order. A
+//! failed call moves on to the next RPC at once, and a read of payment records
+//! that fails on every RPC is made again in a second round,
+//! [`PAYMENT_READ_BACKOFF`] later.
 //!
 //! While a read of payment records is in flight, further reads wait for it and
 //! then go together, as one JSON-RPC batch; an RPC that refuses batches, or

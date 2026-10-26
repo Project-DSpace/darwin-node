@@ -2367,7 +2367,7 @@ impl PaymentVerifier {
     }
 
     /// The RPCs a payment is read through: the node's own, then, if it is one
-    /// of Robinhood Chain's public RPCs, the others.
+    /// of Robinhood Chain's public RPCs or one retired from them, the others.
     fn payment_rpc_urls(&self) -> Vec<reqwest::Url> {
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(urls) = self.test_payment_rpc_urls_override.read().as_ref() {
@@ -2377,7 +2377,8 @@ impl PaymentVerifier {
     }
 
     /// The RPCs payments on `network` are read through: its own, then, if it
-    /// is one of Robinhood Chain's public RPCs, the others.
+    /// is one of Robinhood Chain's public RPCs or one retired from them, the
+    /// others ([`crate::listings::listings_rpc_urls`]).
     fn network_rpc_urls(network: &EvmNetwork) -> Vec<reqwest::Url> {
         let own = network.rpc_url();
         let mut urls: Vec<reqwest::Url> = crate::listings::listings_rpc_urls(own.as_str())
@@ -4445,6 +4446,21 @@ mod tests {
             [
                 "https://rpc.mainnet.chain.robinhood.com",
                 "https://robinhood-rpc.publicnode.com",
+            ]
+        );
+        // A node still on rpc.ordofi.network, retired from the defaults,
+        // reads through it and then both defaults.
+        let urls: Vec<String> = verifier_reading_through("https://rpc.ordofi.network")
+            .payment_rpc_urls()
+            .iter()
+            .map(|url| url.as_str().trim_end_matches('/').to_string())
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://rpc.ordofi.network",
+                "https://robinhood-rpc.publicnode.com",
+                "https://rpc.mainnet.chain.robinhood.com",
             ]
         );
         // An operator's own RPC (a local chain here) is the only one.
