@@ -45,6 +45,7 @@ pub mod proof;
 pub mod quote;
 pub(crate) mod settlement;
 pub mod single_node;
+pub mod slim;
 pub(crate) mod traffic;
 mod verifier;
 pub mod wallet;

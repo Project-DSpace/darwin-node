@@ -192,6 +192,23 @@ impl PointerService {
         &self.store
     }
 
+    /// The proof this node forwards in a pointer's offers: the slim form of
+    /// the PUT's proof (`crate::payment::slim`), or none. A proof that fails
+    /// the slim builder's local checks (possible only when the payment was
+    /// answered from the payment cache, unread) is not forwarded, and
+    /// receivers penalise an offer without one, so no offer goes out; the
+    /// close group's sync covers it.
+    fn forwarded_proof(address: &[u8; 32], proof: Option<&[u8]>) -> Option<Vec<u8>> {
+        crate::payment::slim::forwardable_slim_proof(proof?)
+            .map_err(|declined| {
+                debug!(
+                    "Not offering pointer {} on: {declined}",
+                    hex::encode(address)
+                );
+            })
+            .ok()
+    }
+
     /// Handle a pointer PUT.
     ///
     /// Never returns `Err`: a rejection is a response the peer should see, so
@@ -283,10 +300,12 @@ impl PointerService {
         let record_bytes = request.record.to_vec();
         let response = match self.store.commit(record, reservation).await {
             Ok(PutOutcome::Changed) => {
-                // Offer it to the rest of the close group, proof included, so
-                // every member holds it whichever of them the client reached.
+                // Offer it to the rest of the close group, with the slim form
+                // of the proof, so every member holds it whichever of them
+                // the client reached.
                 let writes = self.fresh_writes.read().clone();
-                if let (Some(writes), Some(proof)) = (writes, request.payment_proof) {
+                let proof = Self::forwarded_proof(&address, request.payment_proof.as_deref());
+                if let (Some(writes), Some(proof)) = (writes, proof) {
                     if writes
                         .send(PointerFreshWrite {
                             record: record_bytes,

@@ -123,6 +123,7 @@ async fn normal_upload_never_reaches_fresh_offer_capacity() {
             .send(FreshWriteEvent {
                 key: *address,
                 payment_proof: DUMMY_POP.to_vec(),
+                stored: true,
             })
             .expect("queue fresh write");
     }

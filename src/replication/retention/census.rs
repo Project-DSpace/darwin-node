@@ -2064,11 +2064,13 @@ const LISTINGS_MESSAGES: &[(&str, &str)] = &[
 const PROOF_TYPES: &[(&str, &str)] = &[
     (
         "SingleNode",
-        "Verified: the median quote, its issuer's closeness and its settlement on chain.",
+        "Verified: the median quote, its issuer's closeness and its settlement on chain. \
+         Forwarded to other nodes only in its slim form (src/payment/slim.rs).",
     ),
     (
         "Merkle",
-        "Refused in every context, for chunks and pointers alike.",
+        "Refused in every context, for chunks and pointers alike, and never forwarded: \
+         the slim builder declines its tag.",
     ),
 ];
 
@@ -2109,6 +2111,99 @@ fn enum_variants(source: &str, name: &str) -> Vec<String> {
     }
     variants
 }
+
+/// Every place that puts a payment proof into a message to another node
+/// takes it from the slim builder (src/payment/slim.rs): a chunk's notices
+/// and offers from the PUT handler, and from the engine's direct entry point,
+/// and a pointer's offers from its write path. A new path that forwards a
+/// proof is reviewed here before it ships, so none forwards a whole one.
+#[test]
+fn every_forwarded_proof_comes_from_the_slim_builder() {
+    const BUILDER: &[(Option<&str>, &str)] = &[(None, "forwardable_slim_proof")];
+    const REVIEWED: &[Reviewed] = &[
+        (
+            "src/pointer/service.rs",
+            "PointerService::forwarded_proof",
+            "forwardable_slim_proof",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "ReplicationEngine::replicate_fresh",
+            "forwardable_slim_proof",
+            1,
+        ),
+        (
+            "src/storage/handler.rs",
+            "AntProtocol::forwarded_proof",
+            "forwardable_slim_proof",
+            1,
+        ),
+    ];
+    // The functions that put a proof into a message and send it: a chunk's
+    // notices, a chunk's offers, a pointer's offers. Each is reached only
+    // with a slim proof, or an empty one.
+    const SENDERS: &[(Option<&str>, &str)] = &[
+        (None, "send_notice"),
+        (None, "send_fresh_offers"),
+        (None, "replicate_fresh"),
+    ];
+    let builder = unreviewed(Counting::Calls(BUILDER), REVIEWED);
+    let messages = unreviewed(Counting::Calls(SENDERS), PROOF_SENDERS);
+    assert!(
+        builder.is_empty() && messages.is_empty(),
+        "\nThe places that put a payment proof into a message to another node are no \
+         longer the reviewed ones.\n\n{builder}{messages}\n\
+         A node forwards a proof only in its slim form, built by \
+         crate::payment::slim::forwardable_slim_proof: the median-priced quotes and the \
+         transaction hashes, as byte strings, with no sidecars. A proof the builder \
+         declines goes into no notice and no offer; the storer then sends holding notices \
+         only. Feed a new path from the builder, or review why it forwards something \
+         else, then list it here.\n"
+    );
+}
+
+/// Where production code calls a function that puts a payment proof into a
+/// message to another node, each reviewed: fed by the slim builder, or with
+/// an empty proof (a holding notice).
+const PROOF_SENDERS: &[Reviewed] = &[
+    // Holding notices only: an empty proof.
+    (
+        "src/replication/fresh.rs",
+        "announce_held",
+        "send_notice",
+        1,
+    ),
+    // A holding notice, and the notice with the slim proof the PUT handler
+    // or the engine's entry point built.
+    (
+        "src/replication/fresh.rs",
+        "send_paid_notices",
+        "send_notice",
+        2,
+    ),
+    // Offers, with the slim proof the engine's entry point built.
+    (
+        "src/replication/mod.rs",
+        "ReplicationEngine::replicate_fresh",
+        "send_fresh_offers",
+        1,
+    ),
+    // Offers, with the slim proof the PUT handler built; never for an empty one.
+    (
+        "src/replication/mod.rs",
+        "ReplicationEngine::start_fresh_offer_dispatcher",
+        "send_fresh_offers",
+        1,
+    ),
+    // A pointer's offers, with the slim proof its write path built.
+    (
+        "src/replication/pointer.rs",
+        "PointerReplication::start_fresh_drainer",
+        "replicate_fresh",
+        1,
+    ),
+];
 
 /// Every message the chunk protocol carries, and every kind of payment proof,
 /// is one whose handling has been reviewed. Both enums are `#[non_exhaustive]`

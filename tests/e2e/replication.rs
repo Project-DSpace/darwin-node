@@ -232,7 +232,7 @@ async fn test_fresh_replication_propagates_to_close_group() {
         .test_node(source_idx)
         .and_then(|node| node.replication_engine.as_ref())
         .expect("source replication engine")
-        .replicate_fresh(&address, content, &dummy_payment_proof())
+        .replicate_fresh(&address, content, &well_formed_payment_proof(&address))
         .await;
 
     assert!(
@@ -270,6 +270,7 @@ async fn fresh_write_pipeline_replicates_a_put_and_skips_missing_chunks() {
         .send(FreshWriteEvent {
             key: missing,
             payment_proof: dummy_payment_proof(),
+            stored: true,
         })
         .expect("queue missing write");
     let address = put_paid_chunk(
@@ -422,6 +423,7 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
         .send(FreshWriteEvent {
             key: faulty,
             payment_proof: dummy_payment_proof(),
+            stored: true,
         })
         .expect("queue write");
     // A failed read marks the chunk suspect, which hides it from `exists`:
@@ -454,6 +456,7 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
         .send(FreshWriteEvent {
             key: healthy,
             payment_proof: dummy_payment_proof(),
+            stored: true,
         })
         .expect("queue healthy write");
     let window = (FRESH_READ_RETRY_DELAY / 2).saturating_sub(fault_seen.elapsed());
@@ -527,6 +530,7 @@ async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
         .send(FreshWriteEvent {
             key: address,
             payment_proof: dummy_payment_proof(),
+            stored: true,
         })
         .expect("queue write");
     assert!(
@@ -554,6 +558,34 @@ fn dummy_payment_proof() -> Vec<u8> {
     vec![DUMMY_PAYMENT_PROOF_BYTE; DUMMY_PAYMENT_PROOF_LEN]
 }
 
+/// A single-node proof that passes the slim builder's local checks (one
+/// quote on the pricing curve, at the baseline count), so a storer forwards
+/// it. Its signature is a stand-in and it pays nothing on chain: receivers
+/// accept it only from the payment cache, which the tests fill.
+fn well_formed_payment_proof(address: &XorName) -> Vec<u8> {
+    use ant_node::payment::{calculate_price, serialize_single_node_proof, PaymentProof};
+    use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
+
+    let quote = PaymentQuote {
+        content: xor_name::XorName(*address),
+        timestamp: std::time::SystemTime::now(),
+        price: calculate_price(0),
+        rewards_address: RewardsAddress::new([0x5A; 20]),
+        committed_key_count: 0,
+        commitment_pin: None,
+        pub_key: vec![0x5B; 64],
+        signature: vec![0x5C; 64],
+    };
+    serialize_single_node_proof(&PaymentProof {
+        proof_of_payment: ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new([0x5D; 32]), quote)],
+        },
+        tx_hashes: vec![],
+        commitment_sidecars: vec![],
+    })
+    .expect("serialize the proof")
+}
+
 /// Store a chunk on the source directly, bypassing the handler, so no
 /// fresh-write event is emitted for it.
 async fn store_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]) -> XorName {
@@ -574,7 +606,8 @@ async fn store_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u
 
 /// PUT a chunk through the source node's handler, as a client would. The
 /// handler stores it and emits the fresh-write event itself, carrying the
-/// dummy proof it was paid with.
+/// slim form of the well-formed proof it was sent. The PUT is accepted from
+/// the payment cache, so the proof meets only the slim builder's local checks.
 async fn put_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]) -> XorName {
     let address = compute_address(content);
     harness.prepopulate_payment_cache_everywhere(&address);
@@ -583,7 +616,7 @@ async fn put_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]
         body: ChunkMessageBody::PutRequest(ChunkPutRequest::with_payment(
             address,
             Bytes::copy_from_slice(content),
-            dummy_payment_proof(),
+            well_formed_payment_proof(&address),
         )),
     };
     let protocol = harness

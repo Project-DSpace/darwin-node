@@ -513,34 +513,25 @@ impl AntProtocol {
         self.payment_verifier.attach_local_commitment_source(source);
     }
 
-    /// ADR-0004: return the proof with any commitment sidecars stripped, so a
-    /// replicated/persisted receipt carries only the pin and count (stored
-    /// proofs do not grow). Handles BOTH proof types — single-node and
-    /// merkle-batch — since both now carry sidecars. An unknown-tagged or
-    /// unparseable proof is returned unchanged. Best-effort: any
-    /// deserialize/reserialize failure returns the original bytes rather than
-    /// corrupting the proof.
-    fn strip_commitment_sidecars(proof: Vec<u8>) -> Vec<u8> {
-        use crate::payment::proof::{
-            deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type,
-            serialize_merkle_proof, serialize_single_node_proof, ProofType,
+    /// The proof this node forwards for a stored chunk: the slim form of the
+    /// PUT's proof (`crate::payment::slim`), or empty when there is none to
+    /// forward. Empty when the PUT carried no proof, or when its proof fails
+    /// the slim builder's local checks; that happens only for a PUT accepted
+    /// from the payment cache, whose proof the verifier never read. An empty
+    /// proof sends holding notices only: no notice and no offer carrying a
+    /// proof, since receivers penalise an offer whose proof is empty or short.
+    /// The slim proof keeps no sidecars (ADR-0004: replicated receipts keep
+    /// only the pin and count), as the stripped proof did before.
+    fn forwarded_proof(addr_hex: &str, proof: Option<&[u8]>) -> Vec<u8> {
+        let Some(proof) = proof else {
+            return Vec::new();
         };
-        match detect_proof_type(&proof) {
-            Some(ProofType::SingleNode) => match deserialize_single_node_proof(&proof) {
-                Ok(mut parsed) if !parsed.commitment_sidecars.is_empty() => {
-                    parsed.commitment_sidecars.clear();
-                    serialize_single_node_proof(&parsed).unwrap_or(proof)
-                }
-                _ => proof, // already sidecar-free, or unparseable: leave as-is
-            },
-            Some(ProofType::Merkle) => match deserialize_merkle_proof(&proof) {
-                Ok(mut parsed) if !parsed.commitment_sidecars.is_empty() => {
-                    parsed.commitment_sidecars.clear();
-                    serialize_merkle_proof(&parsed).unwrap_or(proof)
-                }
-                _ => proof,
-            },
-            _ => proof, // unknown tag: nothing to strip
+        match crate::payment::slim::forwardable_slim_proof(proof) {
+            Ok(slim) => slim,
+            Err(declined) => {
+                debug!("Not forwarding the proof for {addr_hex}: {declined}; holding notices only");
+                Vec::new()
+            }
         }
     }
 
@@ -810,6 +801,18 @@ impl AntProtocol {
             .await
         {
             debug!("Chunk {addr_hex} already exists");
+            // The node may tell its close group it holds the chunk, with
+            // holding notices, so their offers skip it. The drainer decides:
+            // only for a key in this node's paid list, inside its own close
+            // view, at most once per key in a while. Queued, never awaited,
+            // so the answer is not held up.
+            if let Some(ref tx) = self.fresh_write_tx {
+                let _ = tx.send(FreshWriteEvent {
+                    key: address,
+                    payment_proof: Vec::new(),
+                    stored: false,
+                });
+            }
             return ChunkPutResponse::AlreadyExists { address };
         }
 
@@ -899,27 +902,22 @@ impl AntProtocol {
                 // startup).
                 self.quote_generator.record_store();
 
-                // 7. Notify replication engine for fresh fan-out.
-                //    Only emit when a real proof is present — cached-as-verified
-                //    PUTs have no proof to forward, and the chunk would have
-                //    already replicated on the original write that carried one.
-                if let (Some(ref tx), Some(proof)) = (&self.fresh_write_tx, request.payment_proof) {
-                    // ADR-0004: strip any commitment sidecars before forwarding
-                    // to replication — the ADR specifies persisted/replicated
-                    // receipts "keep only the pin and count, so stored proofs do
-                    // not grow." The sidecars were already consumed by this
-                    // node's client-put cross-check; replicas resolve pins via
-                    // gossip/fetch (their context is Replication, which skips the
-                    // cross-check anyway). Best-effort: if sanitisation fails,
-                    // fall back to the original proof rather than dropping the
-                    // replication entirely.
-                    let proof = Self::strip_commitment_sidecars(proof);
+                // 7. Notify replication engine for fresh fan-out, with the slim
+                //    form of the proof. A PUT accepted from the payment cache
+                //    (the payment was verified on an earlier try, which did not
+                //    store) still carries the client's bytes, but the verifier
+                //    never read them: the slim builder's local checks stand in,
+                //    and a PUT with no proof, or one that fails them, is
+                //    announced with holding notices only.
+                if let Some(ref tx) = self.fresh_write_tx {
+                    let proof = Self::forwarded_proof(&addr_hex, request.payment_proof.as_deref());
                     // Storage has already accepted the chunk on this path, so
                     // the event carries only the key; the offer dispatcher
                     // reads the chunk back when it is ready to send it.
                     let event = FreshWriteEvent {
                         key: address,
                         payment_proof: proof,
+                        stored: true,
                     };
                     if tx.send(event).is_err() {
                         debug!("Fresh-write channel closed, skipping replication for {addr_hex}");
@@ -2394,33 +2392,45 @@ mod tests {
         );
     }
 
-    /// ADR-0004: `strip_commitment_sidecars` removes sidecars from a single-node
-    /// proof before replication/persistence (stored proofs do not grow), and is
-    /// a no-op on a sidecar-free proof.
+    /// The forwarded proof is the slim one: no sidecars (ADR-0004, stored
+    /// proofs do not grow). A PUT with no proof, or with one that fails the
+    /// slim builder's local checks (a PUT accepted from the payment cache),
+    /// forwards nothing, so the storer sends holding notices only.
     #[test]
-    fn strip_commitment_sidecars_clears_single_node_sidecars() {
+    fn the_forwarded_proof_is_slim_or_nothing() {
         use crate::payment::proof::{
             deserialize_single_node_proof, serialize_single_node_proof, PaymentProof,
         };
-        use evmlib::ProofOfPayment;
+        use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 
+        let quote = PaymentQuote {
+            content: xor_name::XorName([3u8; 32]),
+            timestamp: std::time::SystemTime::now(),
+            price: crate::payment::pricing::calculate_price(0),
+            rewards_address: RewardsAddress::new([1u8; 20]),
+            committed_key_count: 0,
+            commitment_pin: None,
+            pub_key: vec![0u8; 64],
+            signature: vec![0u8; 64],
+        };
         let with_sidecars = PaymentProof {
             proof_of_payment: ProofOfPayment {
-                peer_quotes: vec![],
+                peer_quotes: vec![(EncodedPeerId::new(rand::random()), quote)],
             },
             tx_hashes: vec![],
-            commitment_sidecars: vec![vec![1u8; 16], vec![2u8; 16]],
+            commitment_sidecars: vec![vec![1u8; 16]],
         };
         let bytes = serialize_single_node_proof(&with_sidecars).expect("serialize");
-        let stripped = AntProtocol::strip_commitment_sidecars(bytes);
-        let parsed = deserialize_single_node_proof(&stripped).expect("deserialize stripped");
-        assert!(
-            parsed.commitment_sidecars.is_empty(),
-            "sidecars must be stripped before replication"
-        );
+        let forwarded = AntProtocol::forwarded_proof("k", Some(&bytes));
+        let parsed = deserialize_single_node_proof(&forwarded).expect("deserialize slim");
+        assert!(parsed.commitment_sidecars.is_empty());
+        assert_eq!(parsed.proof_of_payment.peer_quotes.len(), 1);
 
-        // Idempotent: stripping an already-sidecar-free proof returns it intact.
-        let again = AntProtocol::strip_commitment_sidecars(stripped.clone());
-        assert_eq!(again, stripped, "stripping a sidecar-free proof is a no-op");
+        assert!(AntProtocol::forwarded_proof("k", None).is_empty());
+        assert!(AntProtocol::forwarded_proof("k", Some(&[0x01; 16])).is_empty());
+        let mut merkle = bytes;
+        merkle[0] = crate::ant_protocol::PROOF_TAG_MERKLE;
+        assert!(AntProtocol::forwarded_proof("k", Some(&merkle)).is_empty());
+        assert!(AntProtocol::forwarded_proof("k", Some(&[0x01; 64])).is_empty());
     }
 }

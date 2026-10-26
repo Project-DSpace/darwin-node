@@ -2528,15 +2528,33 @@ impl ReplicationEngine {
     /// Unlike the PUT path, this waits for a pending-offer permit before
     /// returning, and it offers the caller's bytes rather than reading them
     /// back from storage.
+    ///
+    /// The proof goes out in its slim form (`crate::payment::slim`), as on
+    /// the PUT path. A proof the slim builder declines is not forwarded: the
+    /// close group gets holding notices only, and no offers.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
+        let proof_of_payment = match crate::payment::slim::forwardable_slim_proof(proof_of_payment)
+        {
+            Ok(slim) => slim,
+            Err(declined) => {
+                debug!(
+                    "Not forwarding the proof for {}: {declined}; holding notices only",
+                    hex::encode(key)
+                );
+                Vec::new()
+            }
+        };
         fresh::announce_paid_write(
             key,
-            proof_of_payment,
+            &proof_of_payment,
             &self.paid_list,
             &self.p2p_node,
             &self.config,
         )
         .await;
+        if proof_of_payment.is_empty() {
+            return;
+        }
         // Never closed, so this cannot fail; the arm keeps the call panic-free.
         let Ok(pending_offer) = Arc::clone(&self.pending_offer_semaphore)
             .acquire_owned()
@@ -2548,7 +2566,7 @@ impl ReplicationEngine {
             &self.fresh_offer_context(),
             key,
             data.to_vec(),
-            proof_of_payment.to_vec(),
+            proof_of_payment,
             pending_offer,
         )
         .await;
@@ -2592,6 +2610,7 @@ impl ReplicationEngine {
         let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
+        let held = fresh::HeldNotices::default();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2602,6 +2621,12 @@ impl ReplicationEngine {
                         event
                     }
                 };
+                // An "already stored" answer: holding notices at most, never a
+                // proof or an offer.
+                if !event.stored {
+                    fresh::announce_held(&event.key, &paid_list, &p2p, &config, &held).await;
+                    continue;
+                }
                 // Stage one never waits for chunk back-pressure: the paid-list
                 // entry and PaidNotify are what let peers repair the key later,
                 // so every queued write gets them at arrival rate.
@@ -2613,6 +2638,13 @@ impl ReplicationEngine {
                     &config,
                 )
                 .await;
+                // No proof to send (a PUT accepted from the payment cache whose
+                // proof failed the slim builder's checks): no offer either, as
+                // receivers penalise an offer with an empty proof. The other
+                // storers and neighbour sync cover this storer's peers.
+                if event.payment_proof.is_empty() {
+                    continue;
+                }
                 if offer_tx
                     .send(fresh::FreshOfferEvent {
                         key: event.key,
