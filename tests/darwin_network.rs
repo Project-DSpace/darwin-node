@@ -147,10 +147,27 @@ fn the_image_runs_the_darwin_network() {
         payment_token_address: get("ANT_EVM_PAYMENT_TOKEN").to_string(),
         payment_vault_address: get("ANT_EVM_PAYMENT_VAULT").to_string(),
         payment_vault_deployment_block: None,
+        root_vault_address: None,
     };
     assert_eq!(
         without_the_block.vault_deployment_block(),
         ant_node::config::VaultDeploymentBlock::BuiltIn(DARWIN_VAULT_DEPLOYED.parse().unwrap())
+    );
+    // The same network takes the production root vault built in, paying in
+    // the image's token: the image gives no root vault, and a node that
+    // upgrades its binary alone knows it all the same.
+    let Ok(ant_node::config::RootVaultSetting::BuiltIn(root_vault)) =
+        without_the_block.root_vault()
+    else {
+        panic!("the image's network takes the built-in root vault");
+    };
+    assert_eq!(
+        format!("0x{}", hex::encode(root_vault.address)),
+        ant_node::config::PRODUCTION_ROOT_VAULT.to_lowercase()
+    );
+    assert_eq!(
+        format!("0x{}", hex::encode(root_vault.token)),
+        get("ANT_EVM_PAYMENT_TOKEN").to_lowercase()
     );
     let rpcs: Vec<&str> = get("RPC_URLS").split_whitespace().collect();
     assert!(rpcs.contains(&ROBINHOOD_RPC), "RPC_URLS={rpcs:?}");

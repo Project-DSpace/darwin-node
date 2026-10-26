@@ -11941,6 +11941,27 @@ mod tests {
         );
     }
 
+    /// A root proof (tag 0x03) passes the shape checks as a single-node proof
+    /// does, so its sender is never penalised for it: a payment the check
+    /// then can't find, or a read that fails, is never charged to the sender.
+    #[test]
+    fn a_root_proof_is_never_penalised_on_its_shape() {
+        use crate::payment::settlement::mock;
+
+        let data = vec![0x5Bu8; 64];
+        let key = crate::client::compute_address(&data);
+        let bundle = mock::Bundle::new(key);
+        let wave = mock::wave_of(&[&bundle]);
+        let named = [mock::tx(0xAA)];
+        for proof in [bundle.proof(&named), bundle.root_proof_in(&wave, &named)] {
+            assert!(
+                fresh_offer_structural_rejection(&key, &data, &proof).is_none(),
+                "tag 0x{:02x}",
+                proof[0]
+            );
+        }
+    }
+
     /// Knowing a key must not be enough to enter its entry.
     ///
     /// Opening an entry on an unverified key/bytes association would let a peer

@@ -2,8 +2,8 @@
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
 use crate::config::{
-    default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, VaultDeploymentBlock,
-    NODE_IDENTITY_FILENAME,
+    default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, RootVaultSetting,
+    VaultDeploymentBlock, NODE_IDENTITY_FILENAME,
 };
 use crate::error::{Error, Result};
 use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEventsSender};
@@ -570,8 +570,15 @@ impl NodeBuilder {
         let mut listings_vault = [0u8; 20];
         listings_vault.copy_from_slice(evm_network.payment_vault_address().as_slice());
         // The root vault root proofs are paid in, which listings read beside
-        // the per-quote vault. With none, root proofs are refused.
-        let root_vault: Option<ant_listings::RootVault> = None;
+        // the per-quote vault: the network's setting, else on the production
+        // network the one built in. With none, root proofs are refused.
+        let root_vault_setting = config
+            .payment
+            .evm_network
+            .root_vault()
+            .map_err(Error::Startup)?;
+        info!("{}", root_vault_line(root_vault_setting));
+        let root_vault = root_vault_setting.vault();
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evm_network,
@@ -675,6 +682,28 @@ fn vault_deployment_line(block: VaultDeploymentBlock) -> Option<String> {
              showing any block are checked on chain alone"
                 .to_string(),
         ),
+    }
+}
+
+/// What a node logs once at start about the root vault root proofs are
+/// paid in: its address, and where it is from, or that root proofs are
+/// refused.
+fn root_vault_line(setting: RootVaultSetting) -> String {
+    let address = |vault: ant_listings::RootVault| {
+        format!(
+            "{}",
+            evmlib::common::Address::from_slice(vault.address.as_slice())
+        )
+    };
+    match setting {
+        RootVaultSetting::Given(vault) => format!("Root vault {}", address(vault)),
+        RootVaultSetting::BuiltIn(vault) => format!(
+            "Root vault {}, the production network's: no setting gives one",
+            address(vault)
+        ),
+        RootVaultSetting::None => {
+            "No root vault is known for this network: root proofs are refused".to_string()
+        }
     }
 }
 
@@ -1856,6 +1885,7 @@ mod tests {
             payment_token_address: PRODUCTION_PAYMENT_TOKEN.to_string(),
             payment_vault_address: PRODUCTION_PAYMENT_VAULT.to_string(),
             payment_vault_deployment_block: block,
+            root_vault_address: None,
         };
         for (network, expected) in [
             (production(None), Some(PRODUCTION_VAULT_DEPLOYMENT_BLOCK)),
@@ -1874,6 +1904,78 @@ mod tests {
             assert_eq!(listings.vault_deployment_block(), expected, "{network:?}");
             node.shutdown.cancel();
         }
+    }
+
+    /// A built node on the production network takes the root vault built in,
+    /// with no setting, as after an upgrade of its binary alone, and its
+    /// payment check and its listings read the same one. A node on another
+    /// network has none, and refuses root proofs.
+    #[tokio::test]
+    async fn a_built_node_knows_its_root_vault_only_on_the_production_network() {
+        use crate::config::{
+            EvmNetworkConfig, PRODUCTION_PAYMENT_TOKEN, PRODUCTION_PAYMENT_VAULT,
+            PRODUCTION_ROOT_VAULT,
+        };
+        let production = EvmNetworkConfig::Custom {
+            rpc_url: "http://127.0.0.1:0".to_string(),
+            payment_token_address: PRODUCTION_PAYMENT_TOKEN.to_string(),
+            payment_vault_address: PRODUCTION_PAYMENT_VAULT.to_string(),
+            payment_vault_deployment_block: None,
+            root_vault_address: None,
+        };
+        let built_in = production.root_vault().expect("parses").vault();
+        assert_eq!(
+            built_in.map(|vault| format!("0x{}", hex::encode(vault.address))),
+            Some(PRODUCTION_ROOT_VAULT.to_lowercase())
+        );
+        for (network, expected) in [
+            (production, built_in),
+            (EvmNetworkConfig::ArbitrumOne, None),
+        ] {
+            let dir = TempDir::new().expect("temp dir");
+            let root = dir.path().join("node");
+            std::fs::create_dir_all(&root).expect("mkdir");
+            let node = build_on_a_free_port_paid_on(&root, network.clone()).await;
+            let protocol = node
+                .ant_protocol
+                .as_ref()
+                .expect("a built node has a protocol");
+            assert_eq!(
+                protocol.payment_verifier().root_vault(),
+                expected,
+                "{network:?}"
+            );
+            let listings = protocol
+                .listing_service()
+                .expect("a built node keeps listings");
+            assert_eq!(listings.vaults().root, expected, "{network:?}");
+            node.shutdown.cancel();
+        }
+    }
+
+    /// What a node logs at start about its root vault.
+    #[test]
+    fn the_root_vault_line_says_where_the_vault_is_from() {
+        let vault = ant_listings::RootVault {
+            address: [0xf6; 20],
+            token: [0x51; 20],
+        };
+        let shown = format!(
+            "{}",
+            evmlib::common::Address::from_slice(vault.address.as_slice())
+        );
+        assert_eq!(
+            root_vault_line(RootVaultSetting::Given(vault)),
+            format!("Root vault {shown}")
+        );
+        assert_eq!(
+            root_vault_line(RootVaultSetting::BuiltIn(vault)),
+            format!("Root vault {shown}, the production network's: no setting gives one")
+        );
+        assert_eq!(
+            root_vault_line(RootVaultSetting::None),
+            "No root vault is known for this network: root proofs are refused"
+        );
     }
 
     /// What a node logs once at start about the block its payment vault was
@@ -2015,6 +2117,7 @@ mod tests {
             payment_token_address: "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3".to_string(),
             payment_vault_address: "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B".to_string(),
             payment_vault_deployment_block: Some(81_897_121),
+            root_vault_address: None,
         }
         .into_evm_network();
         assert_eq!(

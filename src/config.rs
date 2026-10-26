@@ -437,6 +437,13 @@ pub enum EvmNetworkConfig {
         /// paid something else, and is never taken.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payment_vault_deployment_block: Option<u64>,
+        /// The root vault root proofs (tag 0x03) are paid in, through the
+        /// payment token, where the network has one. Without it, a node on
+        /// the production network takes the one built in
+        /// ([`PRODUCTION_ROOT_VAULT`]), and a node on any other refuses
+        /// every root proof.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_vault_address: Option<String>,
     },
 }
 
@@ -450,6 +457,7 @@ impl std::fmt::Debug for EvmNetworkConfig {
                 payment_token_address,
                 payment_vault_address,
                 payment_vault_deployment_block,
+                root_vault_address,
             } => f
                 .debug_struct("Custom")
                 .field("rpc_host", &rpc_host(rpc_url))
@@ -459,6 +467,7 @@ impl std::fmt::Debug for EvmNetworkConfig {
                     "payment_vault_deployment_block",
                     payment_vault_deployment_block,
                 )
+                .field("root_vault_address", root_vault_address)
                 .finish(),
         }
     }
@@ -520,6 +529,59 @@ impl EvmNetworkConfig {
         }
     }
 
+    /// The root vault's address as the network's config gives it: only a
+    /// custom network's can. A node takes [`Self::root_vault`], which falls
+    /// back on the production network's root vault when this gives none.
+    #[must_use]
+    pub fn root_vault_address(&self) -> Option<&str> {
+        match self {
+            Self::Custom {
+                root_vault_address, ..
+            } => root_vault_address.as_deref(),
+            Self::ArbitrumOne | Self::ArbitrumSepolia => None,
+        }
+    }
+
+    /// The root vault root proofs are paid in, as a node takes it: the one
+    /// the network's config gives ([`Self::root_vault_address`], from
+    /// `ANT_EVM_ROOT_VAULT` or its flag); else, on the production network
+    /// ([`Self::is_production`]), the one built in, [`PRODUCTION_ROOT_VAULT`];
+    /// else none, and the node refuses every root proof. The vault pays in
+    /// the network's payment token.
+    ///
+    /// # Errors
+    ///
+    /// The address the config gives, or the network's payment token beside
+    /// it, doesn't parse as an EVM address.
+    pub fn root_vault(&self) -> Result<RootVaultSetting, String> {
+        let Self::Custom {
+            payment_token_address,
+            root_vault_address,
+            ..
+        } = self
+        else {
+            return Ok(RootVaultSetting::None);
+        };
+        if root_vault_address.is_none() && !self.is_production() {
+            return Ok(RootVaultSetting::None);
+        }
+        let token = parse_address(payment_token_address).ok_or_else(|| {
+            format!("The payment token {payment_token_address:?} is not an EVM address")
+        })?;
+        Ok(match root_vault_address {
+            Some(address) => RootVaultSetting::Given(ant_listings::RootVault {
+                address: parse_address(address)
+                    .ok_or_else(|| format!("The root vault {address:?} is not an EVM address"))?,
+                token,
+            }),
+            None => RootVaultSetting::BuiltIn(ant_listings::RootVault {
+                address: parse_address(PRODUCTION_ROOT_VAULT)
+                    .ok_or_else(|| "The built-in root vault is not an EVM address".to_string())?,
+                token,
+            }),
+        })
+    }
+
     /// Whether this is the production network: a custom network paying in
     /// [`PRODUCTION_PAYMENT_TOKEN`] through [`PRODUCTION_PAYMENT_VAULT`],
     /// through whatever RPC. Addresses are compared as the node parses them,
@@ -555,6 +617,41 @@ pub const PRODUCTION_PAYMENT_VAULT: &str = "0xE0f627986c0438De0E314B644f3C8aA21D
 /// image that doesn't set it.
 pub const PRODUCTION_VAULT_DEPLOYMENT_BLOCK: u64 = 81_897_121;
 
+/// The production network's root vault, on Robinhood Chain: the address the
+/// standard CREATE2 deployer gives the frozen build, paying in
+/// [`PRODUCTION_PAYMENT_TOKEN`] with a limit of 512 leaves a wave.
+///
+/// It records each wave of root payments under one key, and root proofs
+/// (tag 0x03) settle in its record alone. Built in, as
+/// [`PRODUCTION_VAULT_DEPLOYMENT_BLOCK`] is, so a node that upgraded its
+/// binary alone, under an image that doesn't give it, knows it too. The
+/// node's identity stays [`PRODUCTION_PAYMENT_VAULT`]: this vault is never
+/// the network's payment vault.
+pub const PRODUCTION_ROOT_VAULT: &str = "0xf6675722f443132b045857546E57e35360Bb03b9";
+
+/// The root vault a node takes ([`EvmNetworkConfig::root_vault`]), and where
+/// it is from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootVaultSetting {
+    /// Given by the network's config.
+    Given(ant_listings::RootVault),
+    /// Not given, and built in for the production network.
+    BuiltIn(ant_listings::RootVault),
+    /// Not given, on a network with none built in: root proofs are refused.
+    None,
+}
+
+impl RootVaultSetting {
+    /// The root vault, where there is one.
+    #[must_use]
+    pub const fn vault(self) -> Option<ant_listings::RootVault> {
+        match self {
+            Self::Given(vault) | Self::BuiltIn(vault) => Some(vault),
+            Self::None => None,
+        }
+    }
+}
+
 /// The block a node's payment vault was deployed in, and where it is from
 /// ([`EvmNetworkConfig::vault_deployment_block`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -576,6 +673,16 @@ impl VaultDeploymentBlock {
             Self::Unknown => None,
         }
     }
+}
+
+/// `address`'s bytes, parsed as the node parses the addresses it is given:
+/// hex, with or without `0x`, in any case.
+fn parse_address(address: &str) -> Option<[u8; 20]> {
+    use std::str::FromStr;
+    let parsed = evmlib::common::Address::from_str(address).ok()?;
+    let mut bytes = [0u8; 20];
+    bytes.copy_from_slice(parsed.as_slice());
+    Some(bytes)
 }
 
 /// Whether `a` and `b` parse as the same EVM address, as the node parses
@@ -1083,6 +1190,7 @@ rewards_address = "0x0000000000000000000000000000000000000001"
                     payment_token_address: "0x511f76a3de41f000ec11ea4fd212fb3587c6cef3".to_string(),
                     payment_vault_address: "0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B".to_string(),
                     payment_vault_deployment_block: Some(81_897_121),
+                    root_vault_address: None,
                 },
                 ..PaymentConfig::default()
             },
@@ -1094,7 +1202,8 @@ rewards_address = "0x0000000000000000000000000000000000000001"
                 "Custom { rpc_host: Some(\"rpc.example.org\"), \
                  payment_token_address: \"0x511f76a3de41f000ec11ea4fd212fb3587c6cef3\", \
                  payment_vault_address: \"0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B\", \
-                 payment_vault_deployment_block: Some(81897121) }"
+                 payment_vault_deployment_block: Some(81897121), \
+                 root_vault_address: None }"
             ),
             "{logged}"
         );
@@ -1116,9 +1225,11 @@ rewards_address = "0x0000000000000000000000000000000000000001"
             payment_token_address: String::new(),
             payment_vault_address: String::new(),
             payment_vault_deployment_block: None,
+            root_vault_address: None,
         };
         assert!(
-            format!("{unparsed:?}").ends_with("payment_vault_deployment_block: None }"),
+            format!("{unparsed:?}")
+                .ends_with("payment_vault_deployment_block: None, root_vault_address: None }"),
             "{unparsed:?}"
         );
         let logged = format!("{unparsed:?}");
@@ -1186,7 +1297,136 @@ rewards_address = "0x0000000000000000000000000000000000000001"
             payment_token_address: token.to_string(),
             payment_vault_address: vault.to_string(),
             payment_vault_deployment_block: block,
+            root_vault_address: None,
         }
+    }
+
+    /// A custom network with these addresses and root vault.
+    fn custom_network_with_root(token: &str, vault: &str, root: &str) -> EvmNetworkConfig {
+        EvmNetworkConfig::Custom {
+            rpc_url: "http://127.0.0.1:8545".to_string(),
+            payment_token_address: token.to_string(),
+            payment_vault_address: vault.to_string(),
+            payment_vault_deployment_block: None,
+            root_vault_address: Some(root.to_string()),
+        }
+    }
+
+    /// The built-in root vault is the frozen build's address, as the vendored
+    /// listings' production vectors name it, and never the payment vault.
+    #[test]
+    fn the_built_in_root_vault_is_the_one_the_production_vectors_name() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../vendor/ant-listings/src/root/production-vectors.json"
+        ))
+        .unwrap();
+        let named = vectors["productionVault"].as_str().unwrap();
+        assert_eq!(parse_address(named), parse_address(PRODUCTION_ROOT_VAULT));
+        assert_eq!(
+            PRODUCTION_ROOT_VAULT.to_lowercase(),
+            "0xf6675722f443132b045857546e57e35360bb03b9"
+        );
+        assert!(!same_address(
+            PRODUCTION_ROOT_VAULT,
+            PRODUCTION_PAYMENT_VAULT
+        ));
+    }
+
+    /// The built-in root vault applies only where `is_production` holds:
+    /// through any RPC, with the addresses in any case, paying in the
+    /// production token. A setting wins, on the production network or
+    /// another; any other network without one has no root vault.
+    #[test]
+    fn the_built_in_root_vault_applies_only_on_the_production_network() {
+        let production_root = ant_listings::RootVault {
+            address: parse_address(PRODUCTION_ROOT_VAULT).unwrap(),
+            token: parse_address(PRODUCTION_PAYMENT_TOKEN).unwrap(),
+        };
+        let robinhood = "https://rpc.mainnet.chain.robinhood.com";
+        for (token, vault) in [
+            (PRODUCTION_PAYMENT_TOKEN, PRODUCTION_PAYMENT_VAULT),
+            (
+                "511F76A3DE41F000EC11EA4FD212FB3587C6CEF3",
+                "e0f627986c0438de0e314b644f3c8aa21d3f4f6b",
+            ),
+        ] {
+            let production = custom_network(robinhood, token, vault, None);
+            assert!(production.is_production());
+            assert_eq!(production.root_vault_address(), None);
+            assert_eq!(
+                production.root_vault(),
+                Ok(RootVaultSetting::BuiltIn(production_root))
+            );
+        }
+        let anvil_vault = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+        let anvil_token = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
+        let anvil_root = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
+        for other in [
+            EvmNetworkConfig::ArbitrumOne,
+            EvmNetworkConfig::ArbitrumSepolia,
+            custom_network(robinhood, PRODUCTION_PAYMENT_TOKEN, anvil_vault, None),
+            custom_network(robinhood, anvil_token, PRODUCTION_PAYMENT_VAULT, None),
+            custom_network("http://127.0.0.1:8545", anvil_token, anvil_vault, None),
+        ] {
+            assert!(!other.is_production(), "{other:?}");
+            assert_eq!(other.root_vault(), Ok(RootVaultSetting::None), "{other:?}");
+        }
+        assert_eq!(RootVaultSetting::None.vault(), None);
+        // A setting wins, and pays in the network's own token.
+        let custom = custom_network_with_root(anvil_token, anvil_vault, anvil_root);
+        let expected = ant_listings::RootVault {
+            address: parse_address(anvil_root).unwrap(),
+            token: parse_address(anvil_token).unwrap(),
+        };
+        assert_eq!(custom.root_vault(), Ok(RootVaultSetting::Given(expected)));
+        assert_eq!(custom.root_vault().unwrap().vault(), Some(expected));
+        let production = custom_network_with_root(
+            PRODUCTION_PAYMENT_TOKEN,
+            PRODUCTION_PAYMENT_VAULT,
+            anvil_root,
+        );
+        assert_eq!(
+            production.root_vault(),
+            Ok(RootVaultSetting::Given(ant_listings::RootVault {
+                address: parse_address(anvil_root).unwrap(),
+                token: parse_address(PRODUCTION_PAYMENT_TOKEN).unwrap(),
+            }))
+        );
+        // A setting that isn't an address is an error, never no root vault.
+        assert!(
+            custom_network_with_root(anvil_token, anvil_vault, "not an address")
+                .root_vault()
+                .is_err()
+        );
+        assert!(
+            custom_network_with_root("not an address", anvil_vault, anvil_root)
+                .root_vault()
+                .is_err()
+        );
+    }
+
+    /// A custom network can give its root vault, beside its payment vault; a
+    /// config without one reads as before and is written as before.
+    #[test]
+    fn a_custom_network_can_give_its_root_vault() {
+        let custom = "[payment.evm_network]\n\
+                      type = \"custom\"\n\
+                      rpc_url = \"http://127.0.0.1:8545\"\n\
+                      payment_token_address = \"0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512\"\n\
+                      payment_vault_address = \"0x5FbDB2315678afecb367f032d93F642f64180aa3\"\n";
+        let root = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
+        let given: NodeConfig =
+            toml::from_str(&format!("{custom}root_vault_address = \"{root}\"\n")).unwrap();
+        assert_eq!(given.payment.evm_network.root_vault_address(), Some(root));
+        let written = toml::to_string(&given.payment).unwrap();
+        assert!(
+            written.contains(&format!("root_vault_address = \"{root}\"")),
+            "{written}"
+        );
+        let without: NodeConfig = toml::from_str(custom).unwrap();
+        assert_eq!(without.payment.evm_network.root_vault_address(), None);
+        let written = toml::to_string(&without.payment).unwrap();
+        assert!(!written.contains("root_vault"), "{written}");
     }
 
     /// A node on the production network knows the block its payment vault

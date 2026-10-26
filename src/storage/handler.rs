@@ -1174,6 +1174,7 @@ impl AntProtocol {
     /// by size and is quoted at the weight total; every other client at
     /// today's price.
     fn handle_quote_v2(&self, request: &ChunkQuoteRequestV2) -> ChunkQuoteResponse {
+        traffic::record_quote_version(request.settlement_version);
         if let Some(refusal) = settlement_gate(request.settlement_version, "single_node") {
             return ChunkQuoteResponse::Error(refusal);
         }
@@ -2260,6 +2261,49 @@ mod tests {
         }
     }
 
+    /// Settlement version 3 means root proofs are accepted, and its quote is
+    /// a version-2 quote: every version from the minimum, 1, to 3 is quoted,
+    /// at one price, and each request is counted by its version.
+    #[tokio::test]
+    async fn settlement_versions_one_to_three_are_quoted_alike() {
+        assert_eq!(CURRENT_SETTLEMENT_VERSION, 3);
+        assert_eq!(MIN_SUPPORTED_SETTLEMENT_VERSION, 1);
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let mut prices = Vec::new();
+        for version in 1..=3u32 {
+            let counted = crate::storage::traffic::quote_versions(version);
+            let mut request = ChunkQuoteRequestV2::new([0xBC; 32], 4096);
+            request.settlement_version = version;
+            let msg = ChunkMessage {
+                request_id: 710 + u64::from(version),
+                body: ChunkMessageBody::QuoteRequestV2(request),
+            };
+            let response_bytes = protocol
+                .try_handle_request(&msg.encode().expect("encode request"))
+                .await
+                .expect("handle v2 quote")
+                .expect("expected response");
+            let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+            match response.body {
+                ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote, .. }) => {
+                    let quote: evmlib::PaymentQuote =
+                        rmp_serde::from_slice(&quote).expect("decode quote");
+                    prices.push(quote.price);
+                }
+                other => panic!("version {version} must be quoted, got: {other:?}"),
+            }
+            assert!(
+                crate::storage::traffic::quote_versions(version) > counted,
+                "version {version} is counted"
+            );
+        }
+        assert!(
+            prices.windows(2).all(|pair| pair[0] == pair[1]),
+            "one price for every version: {prices:?}"
+        );
+    }
+
     /// Legacy requests keep working. A node cannot tell a client that settles
     /// correctly but predates the version field from one that does not, so
     /// refusing both would break clients that are behaving.
@@ -2604,5 +2648,40 @@ mod tests {
 
         let again = AntProtocol::strip_commitment_sidecars(stripped.clone());
         assert_eq!(again, stripped, "stripping a sidecar-free proof is a no-op");
+    }
+
+    /// A forwarded root proof is the client's proof without its sidecars,
+    /// byte for byte, and within about 1 KB of the matching single-node proof
+    /// stripped: a wave of the leaf limit adds a path of 9 hashes, the leaf's
+    /// amount, place and count, and its quote hash.
+    #[test]
+    fn a_forwarded_root_proof_is_about_a_single_node_proofs_size() {
+        use crate::payment::proof::{deserialize_root_proof, serialize_root_proof};
+        use crate::payment::settlement::mock;
+
+        let bundle = mock::Bundle::new([0x5C; 32]);
+        let named = [mock::tx(0xAA)];
+        let path = vec![[0x77u8; 32]; 9];
+        let bare = bundle.root_proof(
+            evmlib::common::Amount::from(bundle.amount()),
+            511,
+            512,
+            &path,
+            &named,
+        );
+        let mut with_sidecars = deserialize_root_proof(&bare).expect("deserialize");
+        with_sidecars.payment.commitment_sidecars = vec![vec![1u8; 4096]; 7];
+        let sent = serialize_root_proof(&with_sidecars).expect("serialize");
+        assert!(sent.len() > bare.len());
+
+        let forwarded = AntProtocol::strip_commitment_sidecars(sent);
+        assert_eq!(forwarded, bare, "the forwarded proof is the bare proof");
+        let single = AntProtocol::strip_commitment_sidecars(bundle.proof(&named));
+        assert!(
+            forwarded.len() > single.len() && forwarded.len() - single.len() <= 1024,
+            "root {} bytes, single-node {} bytes",
+            forwarded.len(),
+            single.len()
+        );
     }
 }

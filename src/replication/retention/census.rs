@@ -1948,6 +1948,37 @@ fn the_payment_vault_is_read_only_through_the_rpc_fallback() {
     );
 }
 
+/// The per-quote cache of payment facts is filled from one vault's logs
+/// alone, the per-quote vault's, on purpose: single-node proofs (tag 0x01)
+/// settle there, and a root vault's `DataPaymentMade` log in the same
+/// receipt never stands in for a per-quote record. Root proofs (tag 0x03)
+/// settle in the root vault's record of their wave, read by its key.
+#[test]
+fn the_per_quote_cache_takes_the_per_quote_vaults_logs_alone() {
+    const VAULT_PAYMENTS: &[(Option<&str>, &str)] = &[(None, "vault_payments")];
+    const REVIEWED: &[Reviewed] = &[
+        // Re-exports of the function: no read of their own.
+        ("src/listings/mod.rs", "<module>", "vault_payments", 1),
+        ("src/payment/settlement.rs", "<module>", "vault_payments", 1),
+        // The per-quote cache, from the per-quote vault's address alone.
+        (
+            "src/payment/settlement.rs",
+            "SettlementReads::remember_payments",
+            "vault_payments",
+            1,
+        ),
+    ];
+    let report = unreviewed(Counting::Mentions(VAULT_PAYMENTS), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nA receipt's vault payments are taken somewhere new.\n\n{report}\n\
+         The per-quote cache takes the per-quote vault's logs alone \
+         (SettlementReads::remember_payments), so a root vault's log never settles a \
+         single-node proof. Listings take every vault's payments through the vault set. \
+         Say which vault a new place takes, and list it here.\n"
+    );
+}
+
 /// Every place that decides by a payment proof's type is a reviewed one
 /// ([`PROOF_TYPE_SITES`]).
 #[test]

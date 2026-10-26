@@ -114,6 +114,15 @@ pub struct Cli {
     #[arg(long, env = "ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK")]
     pub evm_payment_vault_deployment_block: Option<u64>,
 
+    /// The root vault on the custom EVM, which records each wave of root
+    /// payments (proof tag 0x03), paying in --evm-payment-token. Read only
+    /// with --evm-rpc-url. Without it, a node paid in the production
+    /// network's token through its vault takes the production root vault,
+    /// 0xf6675722f443132b045857546E57e35360Bb03b9; on other networks every
+    /// root proof is refused.
+    #[arg(long, env = "ANT_EVM_ROOT_VAULT")]
+    pub evm_root_vault: Option<String>,
+
     /// Metrics port for Prometheus scraping (0 to disable).
     #[arg(long, default_value = "9100", env = "ANT_METRICS_PORT")]
     pub metrics_port: u16,
@@ -326,6 +335,7 @@ impl Cli {
                 payment_token_address,
                 payment_vault_address,
                 payment_vault_deployment_block: self.evm_payment_vault_deployment_block,
+                root_vault_address: self.evm_root_vault,
             }
         } else {
             self.evm_network.into()
@@ -576,6 +586,7 @@ mod tests {
                 "evm_payment_vault_deployment_block",
                 "ANT_EVM_PAYMENT_VAULT_DEPLOYMENT_BLOCK",
             ),
+            ("evm_root_vault", "ANT_EVM_ROOT_VAULT"),
         ] {
             let arg = command.get_arguments().find(|arg| arg.get_id() == id);
             assert!(arg.is_some(), "no argument {id}");
@@ -651,6 +662,7 @@ mod tests {
                 payment_token_address: DARWIN_TOKEN.to_string(),
                 payment_vault_address: DARWIN_VAULT.to_string(),
                 payment_vault_deployment_block: Some(DARWIN_VAULT_DEPLOYED),
+                root_vault_address: None,
             }
         );
         assert_eq!(
@@ -748,6 +760,92 @@ mod tests {
         assert_eq!(
             config.payment.evm_network.vault_deployment_block(),
             VaultDeploymentBlock::Unknown
+        );
+        Ok(())
+    }
+
+    /// The root vault goes with the custom network: a preset network leaves
+    /// it out. A custom network gives it with --evm-root-vault; without it,
+    /// a node on the production network takes the one built in, and a node
+    /// on any other has none.
+    #[test]
+    fn the_root_vault_goes_with_the_custom_network() -> Result<(), Box<dyn std::error::Error>> {
+        use ant_node::config::{RootVaultSetting, PRODUCTION_ROOT_VAULT};
+
+        let anvil_root = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
+        let preset = Cli::try_parse_from([
+            "ant-node",
+            "--evm-network",
+            "arbitrum-one",
+            "--evm-root-vault",
+            anvil_root,
+        ])?;
+        let (config, _) = preset.into_config()?;
+        assert_eq!(config.payment.evm_network.root_vault_address(), None);
+        assert_eq!(
+            config.payment.evm_network.root_vault(),
+            Ok(RootVaultSetting::None)
+        );
+
+        let production = Cli::try_parse_from([
+            "ant-node",
+            "--evm-rpc-url",
+            DARWIN_RPC_URL,
+            "--evm-payment-token",
+            DARWIN_TOKEN,
+            "--evm-payment-vault",
+            DARWIN_VAULT,
+        ])?;
+        let (config, _) = production.into_config()?;
+        let RootVaultSetting::BuiltIn(built_in) = config.payment.evm_network.root_vault()? else {
+            return Err("the production network takes the built-in root vault".into());
+        };
+        assert_eq!(
+            format!("0x{}", hex::encode(built_in.address)),
+            PRODUCTION_ROOT_VAULT.to_lowercase()
+        );
+        assert_eq!(
+            format!("0x{}", hex::encode(built_in.token)),
+            DARWIN_TOKEN.to_lowercase()
+        );
+
+        let given = Cli::try_parse_from([
+            "ant-node",
+            "--evm-rpc-url",
+            "http://127.0.0.1:8545",
+            "--evm-payment-token",
+            DARWIN_TOKEN,
+            "--evm-payment-vault",
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "--evm-root-vault",
+            anvil_root,
+        ])?;
+        let (config, _) = given.into_config()?;
+        assert_eq!(
+            config.payment.evm_network.root_vault_address(),
+            Some(anvil_root)
+        );
+        let RootVaultSetting::Given(given) = config.payment.evm_network.root_vault()? else {
+            return Err("a custom network takes the root vault its setting gives".into());
+        };
+        assert_eq!(
+            format!("0x{}", hex::encode(given.address)),
+            anvil_root.to_lowercase()
+        );
+
+        let other = Cli::try_parse_from([
+            "ant-node",
+            "--evm-rpc-url",
+            "http://127.0.0.1:8545",
+            "--evm-payment-token",
+            DARWIN_TOKEN,
+            "--evm-payment-vault",
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+        ])?;
+        let (config, _) = other.into_config()?;
+        assert_eq!(
+            config.payment.evm_network.root_vault(),
+            Ok(RootVaultSetting::None)
         );
         Ok(())
     }

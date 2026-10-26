@@ -473,6 +473,12 @@ impl ListingService {
         self.vault_deployment_block
     }
 
+    /// Tests only: the vaults whose payments the service takes.
+    #[cfg(test)]
+    pub const fn vaults(&self) -> VaultSet {
+        self.vaults
+    }
+
     /// The permits listing requests from other nodes take while they are
     /// answered, until each answer has been sent: [`MAX_REQUESTS`], apart
     /// from those chunk requests take. Answers to this node's own requests
@@ -2986,6 +2992,59 @@ pub(super) mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("single-node or root"), "{error}");
+    }
+
+    /// An unlisted envelope paid in a root vault's wave, offered fresh to a
+    /// replica, is recorded there from the wave's transaction, as one paid
+    /// per chunk is.
+    #[tokio::test]
+    async fn a_root_paid_unlisted_offer_is_recorded_on_a_replica() {
+        use ::ant_protocol::payment::proof::{
+            deserialize_single_node_proof, serialize_root_proof, RootPaymentProof,
+        };
+        use ant_listings::root::{RootPayment, Wave};
+
+        let unlisted = envelope_with(2, ShownFields::ALL, false);
+        let quote = signed_quote(unlisted.address(), 0, 87);
+        let wave = Wave::new(vec![RootPayment {
+            quote_hash: quote.hash().0,
+            payee: quote.rewards_address.0 .0,
+            amount: ::ant_protocol::evm::Amount::from(261u64),
+        }])
+        .unwrap();
+        let mut chain = chain_with(400, &[]);
+        chain.add_receipt(wave_receipt([0x7a; 32], 300, &wave));
+        let url = MockChain::serve(Arc::new(Mutex::new(chain))).await;
+        let dir = TempDir::new().unwrap();
+        let (listings, chunks) = service_with_vaults(
+            &dir,
+            &url,
+            VaultSet::with_root(super::super::chain::tests::VAULT, ROOT),
+        )
+        .await;
+        chunks
+            .put(&unlisted.address(), &unlisted.to_bytes())
+            .await
+            .unwrap();
+
+        let single = deserialize_single_node_proof(&single_node_proof(&quote, [0x7a; 32])).unwrap();
+        let proof = serialize_root_proof(&RootPaymentProof {
+            payment: single,
+            quote_hash: quote.hash(),
+            amount: wave.payments()[0].amount,
+            index: 0,
+            leaf_count: wave.leaf_count(),
+            path: wave.path(0).unwrap().into_iter().map(Into::into).collect(),
+        })
+        .unwrap();
+        listings.record_from_fresh_offer(unlisted.address(), &unlisted.to_bytes(), &proof);
+        let store = listings.store.clone();
+        wait_until(async || store.contains(unlisted.address()).await.unwrap()).await;
+        let listing = get(&listings, unlisted.address()).await.unwrap();
+        assert_eq!(listing.payment.tx_hash, Some([0x7a; 32]));
+        assert_eq!(listing.payment.block_number, Some(300));
+        assert_eq!(listing.payment.log_index, Some(0));
+        assert!(listing.validate().is_ok());
     }
 
     #[tokio::test]

@@ -1005,6 +1005,12 @@ impl Drop for InflightGuard<'_> {
 }
 
 impl PaymentVerifier {
+    /// Tests only: the root vault root proofs settle in, if any.
+    #[cfg(test)]
+    pub(crate) fn root_vault(&self) -> Option<RootVault> {
+        self.reads.root_vault()
+    }
+
     /// Create a new payment verifier.
     #[must_use]
     pub fn new(config: PaymentVerifierConfig) -> Self {
@@ -1483,6 +1489,9 @@ impl PaymentVerifier {
                                 context,
                             )
                             .await?;
+                            crate::payment::traffic::record_settlement(
+                                crate::payment::traffic::SettledProof::SingleNode,
+                            );
                         }
                         // A payment recorded in a root vault's wave: settled
                         // in the root vault's record of the wave, never in
@@ -1493,6 +1502,9 @@ impl PaymentVerifier {
                             })?;
                             self.verify_root_payment(target, weight, &parsed, context)
                                 .await?;
+                            crate::payment::traffic::record_settlement(
+                                crate::payment::traffic::SettledProof::Root,
+                            );
                         }
                         None => {
                             let tag = proof.first().copied().unwrap_or(0);

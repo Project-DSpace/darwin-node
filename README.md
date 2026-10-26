@@ -33,7 +33,8 @@ never ran.
   peers and that every node names DARWIN's token and vault, and the Build
   workflow that the release binary reads the three variables.
 - **Batch payments are refused** (from ds.9). Nodes take per-chunk
-  (single-node) payments only. A merkle candidate quote request, versioned
+  (single-node) payments and root payments (below), never merkle ones. A
+  merkle candidate quote request, versioned
   or not, is answered `QuoteFailed("merkle (batch) payments are not
   accepted; pay per chunk")` before anything is signed: a batch is paid
   on-chain before any PUT, so refusing the quote is what keeps a client from
@@ -46,6 +47,34 @@ never ran.
   if production code reaches it (`the_merkle_payment_code_is_not_reached`),
   or if the vendored protocol gains a message or proof type nobody has
   reviewed (`the_wire_messages_are_the_reviewed_ones`).
+- **Root payments are taken beside per-chunk payments.** A client can pay a
+  wave of up to 512 chunks in one transaction through the root vault
+  `0xf6675722f443132b045857546E57e35360Bb03b9`, which records the wave under
+  one key, keccak256(0x02 ‖ vault ‖ root ‖ leaf count), from a tree whose
+  leaves bind each paid quote's hash, its payee's whole address and the
+  amount. A root proof (tag 0x03) carries a per-chunk proof's quotes, and the
+  paid leaf's amount, place, leaf count and path. The node runs every check a
+  per-chunk proof gets, rebuilds the leaf from the signed median quote, hashes
+  it up the path to the key, and reads the vault's record under it
+  (`records`), once more 1.5 seconds later if it reads empty; a recorded key
+  is kept. A malformed or underpaid root proof is refused before anything is
+  read. Root proofs settle in the root vault's records alone, and per-chunk
+  proofs in the payment vault's alone; merkle proofs are still refused first.
+  The address is built in for the production network (DARWIN through its
+  payment vault), so a node whose binary was upgraded alone knows it too; a
+  custom network gives one with `--evm-root-vault` (`ANT_EVM_ROOT_VAULT`),
+  and with none, root proofs are refused. The node's payment vault, which the
+  image and browsers check, stays the payment vault. Settlement version 3
+  means root proofs are accepted: a node quotes a version-3 request as a
+  version-2 one, and an older node answers it `StorerUpdateRequired` before
+  quoting, so a client never pays through the root vault to a node that
+  can't check the payment. The minimum stays version 1. The traffic lines
+  count quote requests by settlement version and settled proofs by tag, and
+  the record read as a kind of its own. Tests in
+  `src/payment/verifier/root_tests.rs` check root proofs through the real
+  reads against a stub chain with a root vault; the census lists the Root
+  type, each place that decides by proof type, the record read, and the
+  per-quote cache's single vault.
 - **Payment checks fall back across RPCs** (from ds.8). A node reads a
   storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a
@@ -1313,6 +1342,12 @@ Options:
         The block the custom network's vault was deployed in; listings showing
         an earlier one are never taken. Without it, a node paid in DARWIN
         through its vault takes 81897121, when that vault was deployed
+
+    --evm-root-vault <ADDRESS>
+        The custom network's root vault, which records waves of root payments.
+        Without it, a node paid in DARWIN through its vault takes
+        0xf6675722f443132b045857546E57e35360Bb03b9; other networks refuse
+        root proofs
 
     --enable-logging
         Turn on log output; the other --log-* options need it

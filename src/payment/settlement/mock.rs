@@ -28,6 +28,9 @@ use tokio::net::TcpListener;
 /// The vault the chain's payments go through.
 pub const VAULT: [u8; 20] = [0x69; 20];
 
+/// The account that pays the waves [`Chain::record_wave`] records.
+pub const PAYER: [u8; 20] = [0xc1; 20];
+
 /// The chain's root vault, which records each wave of payments under one
 /// key.
 pub const ROOT_VAULT: [u8; 20] = [0x6a; 20];
@@ -69,6 +72,8 @@ pub struct Tx {
 pub struct RecordedKey {
     pub key: [u8; 32],
     pub leaf_count: u32,
+    /// The account that paid the wave.
+    pub payer: [u8; 20],
     /// When a provider that isn't behind starts seeing it.
     pub seen_from: Instant,
 }
@@ -103,10 +108,17 @@ impl Chain {
 
     /// Record `wave` at the root vault, seen from now.
     pub fn record_wave(&mut self, wave: &Wave) {
+        self.record_wave_by(wave, PAYER, Duration::ZERO);
+    }
+
+    /// Record `wave` at the root vault, paid by `payer`, seen `after` from
+    /// now.
+    pub fn record_wave_by(&mut self, wave: &Wave, payer: [u8; 20], after: Duration) {
         self.waves.push(RecordedKey {
             key: wave.key(&ROOT_VAULT),
             leaf_count: u32::try_from(wave.leaf_count()).unwrap(),
-            seen_from: Instant::now(),
+            payer,
+            seen_from: Instant::now() + after,
         });
     }
 
@@ -122,7 +134,7 @@ impl Chain {
         {
             words[24..32].copy_from_slice(&block_time(100).to_be_bytes());
             words[60..64].copy_from_slice(&wave.leaf_count.to_be_bytes());
-            words[76..].copy_from_slice(&[0xc1; 20]);
+            words[76..].copy_from_slice(&wave.payer);
         }
         words
     }

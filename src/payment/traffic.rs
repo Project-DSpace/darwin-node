@@ -54,6 +54,41 @@ pub fn record(call: EvmRpcCall, ok: bool) {
     table[call.index()].fetch_add(1, Ordering::Relaxed);
 }
 
+/// A payment proof settled on chain, by its tag. A merkle proof (0x02) is
+/// refused before anything is read, so it never settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettledProof {
+    /// A single-node proof (0x01), settled in the per-quote vault's record.
+    SingleNode,
+    /// A root proof (0x03), settled in the root vault's record of its wave.
+    Root,
+}
+
+impl SettledProof {
+    const N: usize = 2;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::SingleNode => 0,
+            Self::Root => 1,
+        }
+    }
+}
+
+static SETTLED_COUNT: [AtomicU64; SettledProof::N] = [const { AtomicU64::new(0) }; SettledProof::N];
+
+/// Record one payment proof the payment check accepted on chain, by its tag:
+/// a proof the cache already held isn't counted again.
+pub fn record_settlement(proof: SettledProof) {
+    SETTLED_COUNT[proof.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The proofs of `proof`'s tag settled so far in this process.
+#[cfg(test)]
+pub fn settlements(proof: SettledProof) -> u64 {
+    SETTLED_COUNT[proof.index()].load(Ordering::Relaxed)
+}
+
 /// The calls of `call`'s kind recorded so far in this process, as
 /// `(ok, err)`.
 #[cfg(test)]
@@ -71,6 +106,7 @@ pub fn log_evm_rpc_summary() {
 
     let ok = |c: C| OK_COUNT[c.index()].load(Ordering::Relaxed);
     let err = |c: C| ERR_COUNT[c.index()].load(Ordering::Relaxed);
+    let settled = |p: SettledProof| SETTLED_COUNT[p.index()].load(Ordering::Relaxed);
 
     crate::logging::info!(
         target: "ant_node::payment::traffic",
@@ -86,6 +122,8 @@ pub fn log_evm_rpc_summary() {
         root_record_err_count = err(C::RootRecord),
         merkle_payment_ok_count = ok(C::CompletedMerklePayment),
         merkle_payment_err_count = err(C::CompletedMerklePayment),
+        settled_single_node_count = settled(SettledProof::SingleNode),
+        settled_root_count = settled(SettledProof::Root),
         "evm rpc summary (cumulative)"
     );
 }
@@ -111,5 +149,21 @@ mod tests {
         indexes.dedup();
         assert_eq!(indexes.len(), EvmRpcCall::N);
         assert!(indexes.iter().all(|index| *index < EvmRpcCall::N));
+    }
+
+    /// Each proof tag that settles has its own count.
+    #[test]
+    fn each_settled_proof_tag_is_counted_apart() {
+        let mut indexes: Vec<usize> = [SettledProof::SingleNode, SettledProof::Root]
+            .iter()
+            .map(|proof| proof.index())
+            .collect();
+        indexes.sort_unstable();
+        indexes.dedup();
+        assert_eq!(indexes.len(), SettledProof::N);
+        assert!(indexes.iter().all(|index| *index < SettledProof::N));
+        let before = settlements(SettledProof::Root);
+        record_settlement(SettledProof::Root);
+        assert!(settlements(SettledProof::Root) > before);
     }
 }

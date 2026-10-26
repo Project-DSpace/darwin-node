@@ -225,6 +225,11 @@ pub struct DevnetConfig {
     /// on-chain verification. Defaults to Arbitrum One when `None`.
     pub evm_network: Option<EvmNetwork>,
 
+    /// The root vault on `evm_network` that root proofs (tag 0x03) are paid
+    /// in, as a node's `--evm-root-vault` gives it. With none, the devnet's
+    /// nodes refuse every root proof.
+    pub root_vault: Option<ant_listings::RootVault>,
+
     /// Optional IPv4 to advertise to peers/clients (LAN devnet). When `Some`,
     /// nodes bind 0.0.0.0 and advertise this IP instead of 127.0.0.1.
     pub advertise_ip: Option<Ipv4Addr>,
@@ -260,6 +265,7 @@ impl Default for DevnetConfig {
             enable_node_logging: false,
             cleanup_data_dir: true,
             evm_network: None,
+            root_vault: None,
             advertise_ip: None,
             webrtc_direct: false,
             webrtc_direct_base_port: 0,
@@ -958,8 +964,9 @@ impl Devnet {
                 .evm_network
                 .clone()
                 .unwrap_or(EvmNetwork::ArbitrumOne),
-            // A devnet has no root vault: root proofs are refused.
-            root_vault: None,
+            // The devnet's root vault, if it has one; with none, root
+            // proofs are refused.
+            root_vault: config.root_vault,
         };
         // Listings check payments on the same chain, as on a production node.
         let listings_rpc_url = evm_config.network.rpc_url().to_string();

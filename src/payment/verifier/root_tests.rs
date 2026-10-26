@@ -8,7 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
-use crate::payment::settlement::mock::{self, Bundle, Chain, Spec};
+use crate::payment::settlement::mock::{self, Act, Bundle, Chain, Spec};
+use std::time::Duration;
 
 /// Check `bundle`'s address against `proof`.
 async fn check(
@@ -114,6 +115,200 @@ async fn an_unrecorded_wave_is_refused_after_one_read_again_whatever_the_per_quo
         "read, then read once more after the pause"
     );
     assert!(provider.receipt_reads().is_empty());
+}
+
+/// A wave whose record reads empty, and is recorded before the read again
+/// 1.5 s later, verifies on that read: a wave read just after its
+/// transaction may not be on the node's RPC yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wave_recorded_before_the_read_again_verifies() {
+    let chain = Chain::shared();
+    let (a, b, c) = three();
+    let wave = mock::wave_of(&[&a, &b, &c]);
+    chain
+        .lock()
+        .record_wave_by(&wave, mock::PAYER, Duration::from_millis(500));
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let verifier = mock::root_verifier(&[&provider]);
+
+    assert_eq!(
+        check(
+            &verifier,
+            &a,
+            &a.root_proof_in(&wave, &[mock::tx(0xAA)]),
+            VerificationContext::ClientPut
+        )
+        .await
+        .unwrap(),
+        PaymentStatus::PaymentVerified
+    );
+    assert_eq!(
+        provider.calls("eth_call").len(),
+        2,
+        "read empty, then read again and found"
+    );
+}
+
+/// An RPC that fails is passed over for another, which answers: the wave
+/// verifies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_rpc_is_passed_over_for_one_that_answers() {
+    let chain = Chain::shared();
+    let (a, b, c) = three();
+    let wave = mock::wave_of(&[&a, &b, &c]);
+    chain.lock().record_wave(&wave);
+    for act in [Act::Busy, Act::Drop] {
+        let failing = mock::provider(&chain, Spec::acting(move |_| act)).await;
+        let answering = mock::provider(&chain, Spec::default()).await;
+        let verifier = mock::root_verifier(&[&failing, &answering]);
+        assert_eq!(
+            check(
+                &verifier,
+                &a,
+                &a.root_proof_in(&wave, &[mock::tx(0xAA)]),
+                VerificationContext::ClientPut
+            )
+            .await
+            .unwrap(),
+            PaymentStatus::PaymentVerified,
+            "{act:?}"
+        );
+        assert!(
+            !answering.calls("eth_call").is_empty(),
+            "the answering RPC read the record"
+        );
+    }
+}
+
+/// A wave verifies whoever paid it, and whatever transaction the proof
+/// names: the record under the key is the payment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wave_recorded_by_another_payer_verifies() {
+    let chain = Chain::shared();
+    let (a, b, c) = three();
+    let wave = mock::wave_of(&[&a, &b, &c]);
+    chain
+        .lock()
+        .record_wave_by(&wave, [0xEE; 20], Duration::ZERO);
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let verifier = mock::root_verifier(&[&provider]);
+
+    assert_eq!(
+        check(
+            &verifier,
+            &b,
+            &b.root_proof_in(&wave, &[mock::tx(0xAF)]),
+            VerificationContext::ClientPut
+        )
+        .await
+        .unwrap(),
+        PaymentStatus::PaymentVerified
+    );
+}
+
+/// A proof whose path, place or leaf count leads to another key than the
+/// recorded wave's is refused, after the read and the read again: the path
+/// of another leaf, the place of another leaf, and another leaf count of
+/// the same depth. In a wave of 3, the leaves at places 0 and 1 have paths
+/// of the same length, and so does a wave of 4.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_place_or_leaf_count_of_another_wave_is_refused() {
+    let chain = Chain::shared();
+    let (a, b, c) = three();
+    let wave = mock::wave_of(&[&a, &b, &c]);
+    chain.lock().record_wave(&wave);
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let verifier = mock::root_verifier(&[&provider]);
+    let named = [mock::tx(0xAA)];
+    let first = [&a, &b, &c]
+        .into_iter()
+        .find(|bundle| wave.payments()[0].quote_hash == bundle.quote_hash())
+        .unwrap();
+    let amount = Amount::from(first.amount());
+    let (own_path, other_path) = (wave.path(0).unwrap(), wave.path(1).unwrap());
+    let refused = [
+        (
+            "the path of another leaf",
+            first.root_proof(amount, 0, 3, &other_path, &named),
+        ),
+        (
+            "the place of another leaf",
+            first.root_proof(amount, 1, 3, &own_path, &named),
+        ),
+        (
+            "another leaf count of the same depth",
+            first.root_proof(amount, 0, 4, &own_path, &named),
+        ),
+    ];
+    for (what, proof) in refused {
+        let error = check(&verifier, first, &proof, VerificationContext::ClientPut)
+            .await
+            .expect_err(what);
+        assert!(
+            error.to_string().contains("no wave recorded"),
+            "{what}: {error}"
+        );
+    }
+    assert_eq!(
+        check(
+            &verifier,
+            first,
+            &first.root_proof(amount, 0, 3, &own_path, &named),
+            VerificationContext::ClientPut
+        )
+        .await
+        .unwrap(),
+        PaymentStatus::PaymentVerified,
+        "the wave's own path, place and leaf count"
+    );
+}
+
+/// Neither a dust payment of the quote at the per-quote vault nor another
+/// recorded wave holding the same quote hash changes what a root proof
+/// settles: a proof in an unrecorded wave is refused beside both, and a
+/// proof in its recorded wave verifies beside both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dust_record_or_another_wave_of_the_quote_has_no_effect() {
+    let chain = Chain::shared();
+    let (a, b, c) = three();
+    let other_quote = Bundle::new([0x37; 32]);
+    let unrecorded_quote = Bundle::new([0x38; 32]);
+    let recorded = mock::wave_of(&[&a, &b, &c]);
+    let other = mock::wave_of(&[&a, &other_quote]);
+    let unrecorded = mock::wave_of(&[&a, &unrecorded_quote]);
+    {
+        let mut chain = chain.lock();
+        chain.record_wave(&recorded);
+        chain.record_wave(&other);
+        chain.pay(mock::tx(0xAD), vec![(a.quote_hash(), a.payee(), 1)]);
+    }
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let named = [mock::tx(0xAD)];
+
+    let error = check(
+        &mock::root_verifier(&[&provider]),
+        &a,
+        &a.root_proof_in(&unrecorded, &named),
+        VerificationContext::ClientPut,
+    )
+    .await
+    .expect_err("a proof in an unrecorded wave is refused");
+    assert!(error.to_string().contains("no wave recorded"), "{error}");
+    assert_eq!(
+        check(
+            &mock::root_verifier(&[&provider]),
+            &a,
+            &a.root_proof_in(&recorded, &named),
+            VerificationContext::ClientPut
+        )
+        .await
+        .unwrap(),
+        PaymentStatus::PaymentVerified
+    );
+    assert!(
+        provider.receipt_reads().is_empty(),
+        "no receipt is read for a root proof"
+    );
 }
 
 /// A proof out of shape is refused before anything is read: a leaf count of 0

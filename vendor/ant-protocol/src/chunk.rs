@@ -38,6 +38,17 @@ pub const DATA_TYPE_CHUNK: u32 = 0;
 /// Version 1 is the ADR-0008 rule set: a merkle batch settles at
 /// `3 x median16(price) x 2^depth`, matching the single-node path.
 ///
+/// Version 2 is the size-priced rule set: a record pays the weighted amount
+/// for its size class.
+///
+/// Version 3 means root proofs are accepted: a payment recorded in a root
+/// vault's wave, proved by its place in the wave (proof tag `0x03`), beside
+/// single-node proofs. A version-3 quote carries the same price as a
+/// version-2 quote. A storer on an older build, or one that knows no root
+/// vault, answers a version-3 request with `StorerUpdateRequired` before
+/// quoting, so a client never pays through the root vault to a storer that
+/// can't check the payment.
+///
 /// **Bump this whenever a change makes an older client pay an amount storers
 /// will refuse.** The multiplier moving, the median rule changing, the payable
 /// field being redefined: all of those. A change that only alters *how much* a
@@ -54,7 +65,7 @@ pub const DATA_TYPE_CHUNK: u32 = 0;
 ///
 /// Carrying the version in the quote request lets a storer refuse to quote a
 /// client it knows cannot pay correctly, before that client spends anything.
-pub const CURRENT_SETTLEMENT_VERSION: u32 = 2;
+pub const CURRENT_SETTLEMENT_VERSION: u32 = 3;
 
 /// Oldest settlement version this build will issue a quote for.
 ///
@@ -63,7 +74,8 @@ pub const CURRENT_SETTLEMENT_VERSION: u32 = 2;
 /// client generation: raise `CURRENT` first, let clients adopt, raise `MIN`
 /// once the payment rule actually changes. Version 2 pays a record by its
 /// size class; version 1 pays every record as a full chunk, which a version-2
-/// storer still accepts, so the minimum stays 1.
+/// storer still accepts, and version 3 adds root proofs beside version 2's
+/// rule, so the minimum stays 1.
 pub const MIN_SUPPORTED_SETTLEMENT_VERSION: u32 = 1;
 
 /// Whether a storer on this build can promise to accept what a client

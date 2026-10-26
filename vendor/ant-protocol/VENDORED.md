@@ -9,3 +9,5 @@
 # - Root payment proofs: PROOF_TAG_ROOT (0x03) in src/chunk.rs; ProofType::Root, RootPaymentProof,
 #   serialize_root_proof and deserialize_root_proof in src/payment/proof.rs, exported as the others
 #   are. ProofType is no longer #[non_exhaustive], so every match on it names each type.
+# - src/chunk.rs: CURRENT_SETTLEMENT_VERSION is 3, which means root proofs are accepted beside
+#   single-node proofs; MIN_SUPPORTED_SETTLEMENT_VERSION stays 1.
