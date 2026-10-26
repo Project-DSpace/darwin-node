@@ -73,9 +73,15 @@ const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
 /// [`SIZE_PRICED_SETTLEMENT_VERSION`](crate::payment::SIZE_PRICED_SETTLEMENT_VERSION)
 /// and is quoted at the node's weight total; a plain N quote declares no
 /// settlement version and is quoted at today's price. Every other request is
-/// accepted at N only, as before, and a node older than this one refuses an
-/// N + 1 request before quoting it.
+/// accepted at N only, as before. A node older than this one can't parse an
+/// N + 1 frame and closes the channel, dropping the requests in flight on it,
+/// so a browser sends one only to a node that advertises
+/// [`SIZE_PRICED_QUOTE_CAPABILITY`] in hello.
 const SIZE_PRICED_BROWSER_VERSION: u16 = BROWSER_PROTOCOL_VERSION + 1;
+
+/// Advertised in hello by a node that takes a `quote_chunk` at
+/// [`SIZE_PRICED_BROWSER_VERSION`] and quotes it at its weight total.
+const SIZE_PRICED_QUOTE_CAPABILITY: &str = "size_priced_quote";
 // Browser dials use a 10-second channel-open timeout. Give successful clients
 // modest server-side headroom while bounding associations that never open one.
 const FIRST_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -2223,6 +2229,7 @@ fn hello_capabilities(pointers: bool) -> Vec<String> {
         ant_protocol::transport::ADDRESS_V2_CAPABILITY.into(),
         "get_chunk".into(),
         "quote_chunk".into(),
+        SIZE_PRICED_QUOTE_CAPABILITY.into(),
         "put_chunk".into(),
     ];
     if pointers {
@@ -3455,6 +3462,19 @@ max_concurrent_requests = 12",
                 .expect("bounded quote");
             assert_eq!(bytes, message.encode().expect("shared wire encoding"));
             assert_eq!(bytes.capacity(), bytes.len());
+        }
+    }
+
+    /// Every node advertises the N + 1 `quote_chunk` it accepts, under the
+    /// name the browser core looks for, so a browser sends that frame only to
+    /// a node that parses it.
+    #[test]
+    fn hello_advertises_size_priced_quotes() {
+        assert_eq!(SIZE_PRICED_QUOTE_CAPABILITY, "size_priced_quote");
+        for pointers in [true, false] {
+            assert!(hello_capabilities(pointers)
+                .iter()
+                .any(|c| c == SIZE_PRICED_QUOTE_CAPABILITY));
         }
     }
 

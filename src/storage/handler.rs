@@ -2190,16 +2190,21 @@ mod tests {
             other => panic!("expected a quote, got: {other:?}"),
         }
 
-        // At this node's own settlement version, the price follows it.
-        let mut current = ChunkQuoteRequestV2::new([0xC4; 32], 1);
-        current.settlement_version = CURRENT_SETTLEMENT_VERSION;
-        let expected = match QuotePricing::for_settlement_version(CURRENT_SETTLEMENT_VERSION) {
-            QuotePricing::WeightTotal => calculate_price(253),
-            QuotePricing::KeyCount => calculate_price(1_000),
-        };
+        // A settlement-2 request, which a client paying by size sends, is
+        // quoted at the weight total: release 2 settles at version 2, so the
+        // gate admits it rather than answering StorerUpdateRequired.
+        assert_eq!(CURRENT_SETTLEMENT_VERSION, SIZE_PRICED_SETTLEMENT_VERSION);
+        let mut v2 = ChunkQuoteRequestV2::new([0xC4; 32], 1);
+        v2.settlement_version = 2;
+        assert_eq!(
+            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v2)).await,
+            calculate_price(253)
+        );
+        let current = ChunkQuoteRequestV2::new([0xC5; 32], 1);
+        assert_eq!(current.settlement_version, 2);
         assert_eq!(
             quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(current)).await,
-            expected
+            calculate_price(253)
         );
     }
 
