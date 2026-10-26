@@ -36,13 +36,12 @@ pub const DATA_TYPE_CHUNK: u32 = 0;
 /// conflating them is what made this constant necessary.
 ///
 /// Version 1 is the ADR-0008 rule set: a merkle batch settles at
-/// `3 x median16(price) x 2^depth`, matching the single-node path. Version 2
-/// pays a single-node record by its size class: `3 x median(price) x w`, with
-/// `w` the weight of the class (`payment::pricing::weighted_amount`), and its
-/// quotes are priced at the node's weight total.
+/// `3 x median16(price) x 2^depth`, matching the single-node path.
 ///
-/// Version 2 is the size-priced rule set: a record pays the weighted amount
-/// for its size class.
+/// Version 2 pays a single-node record by its size class:
+/// `3 x median(price) x w`, with `w` the weight of the class
+/// (`payment::pricing::weighted_amount`), and its quotes are priced at the
+/// node's weight total.
 ///
 /// Version 3 means root proofs are accepted: a payment recorded in a root
 /// vault's wave, proved by its place in the wave (proof tag `0x03`), beside
