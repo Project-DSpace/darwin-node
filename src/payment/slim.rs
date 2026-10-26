@@ -138,7 +138,25 @@ pub fn slim_proof(proof: &PaymentProof) -> Result<Vec<u8>, SlimDeclined> {
 ///
 /// The first check the bytes fail.
 pub fn forwardable_slim_proof(bytes: &[u8]) -> Result<Vec<u8>, SlimDeclined> {
-    slim_proof(&parse_forwardable(bytes)?)
+    let slim = parse_forwardable(bytes).and_then(|proof| slim_proof(&proof));
+    if slim.is_err() {
+        crate::replication::fresh_metrics::bump(
+            crate::replication::fresh_metrics::FreshCounter::SlimProofsDeclined,
+        );
+    }
+    slim
+}
+
+/// Whether a received proof is refused for its form: a single-node proof
+/// whose bytes don't decode, or whose quotes fail the structure check.
+/// Counted by where it arrived; a refusal for any other reason is not one.
+#[must_use]
+pub fn refused_for_form(bytes: &[u8]) -> bool {
+    match parse_forwardable(bytes) {
+        Err(SlimDeclined::Unparseable) => true,
+        Ok(proof) => PaymentVerifier::validate_quote_structure(&proof.proof_of_payment).is_err(),
+        Err(_) => false,
+    }
 }
 
 /// Write a single-node proof with its tag byte and the default field order,
@@ -347,6 +365,26 @@ mod tests {
         assert_eq!(slim_proof(&empty), Err(SlimDeclined::Structure));
         let eight = full_proof(&[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(slim_proof(&eight), Err(SlimDeclined::Structure));
+    }
+
+    /// A proof is refused for its form when it doesn't decode or its quotes
+    /// fail the structure check; a good proof, a merkle one and an off-curve
+    /// one are refused (or not) for other reasons, and not counted as form.
+    #[test]
+    fn only_undecodable_or_misshapen_proofs_are_refused_for_their_form() {
+        let whole = serialize_single_node_proof(&full_proof(&[1, 2, 3, 4, 5, 6, 7])).unwrap();
+        assert!(!refused_for_form(&whole));
+        assert!(refused_for_form(&[PROOF_TAG_SINGLE_NODE; 64]));
+        let eight = serialize_single_node_proof(&full_proof(&[1, 2, 3, 4, 5, 6, 7, 8])).unwrap();
+        assert!(refused_for_form(&eight));
+        let mut merkle = whole.clone();
+        merkle[0] = crate::ant_protocol::PROOF_TAG_MERKLE;
+        assert!(!refused_for_form(&merkle));
+        let mut off_curve = full_proof(&[1, 2, 3]);
+        off_curve.proof_of_payment.peer_quotes[0].1.price = Amount::from(12_345u64);
+        assert!(!refused_for_form(
+            &serialize_single_node_proof(&off_curve).unwrap()
+        ));
     }
 
     /// Every proof kind the protocol tells apart is either slimmed here or

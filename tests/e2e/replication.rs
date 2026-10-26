@@ -387,7 +387,11 @@ async fn fresh_write_pipeline_holds_a_burst_at_the_offer_budget() {
 #[tokio::test]
 #[serial]
 async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
+    // No hold: this test times the dispatcher in half a second, which a hold
+    // in front of it would only shift.
+    let mut config = TestNetworkConfig::minimal();
+    config.fresh_offer_hold = Duration::ZERO;
+    let harness = TestHarness::setup_with_config(config).await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
     let source = harness
@@ -549,6 +553,112 @@ async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
         engine.pending_offer_permits_available(),
         MAX_PENDING_FRESH_OFFERS
     );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// The hold set for [`a_put_to_the_whole_close_group_sends_holding_notices_and_no_offers`]:
+/// long enough that a hold ending at its time, not early, shows.
+const HOLD_UNDER_TEST: Duration = Duration::from_secs(8);
+
+/// A client PUT that reaches every close-group node: each storer sends the
+/// others holding notices, each hold ends early once every peer is heard
+/// from, and no offer goes out. Every peer is still served: skipped, and its
+/// possession check scheduled when the hold ends.
+#[tokio::test]
+#[serial]
+async fn a_put_to_the_whole_close_group_sends_holding_notices_and_no_offers() {
+    use ant_node::replication::fresh_metrics::{read, FreshCounter};
+
+    let mut config = TestNetworkConfig::minimal();
+    config.fresh_offer_hold = HOLD_UNDER_TEST;
+    let harness = TestHarness::setup_with_config(config).await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let nodes = harness.node_count();
+    let dispatched = || -> u64 {
+        (0..nodes)
+            .map(|i| {
+                harness
+                    .test_node(i)
+                    .and_then(|n| n.replication_engine.as_ref())
+                    .map_or(0, |e| e.fresh_offers_dispatched())
+            })
+            .sum()
+    };
+    // The counters are process-wide: read deltas.
+    let offers_before = dispatched();
+    let early_before = read(FreshCounter::HoldsEndedEarly);
+    let skipped_before = read(FreshCounter::OffersSkippedHeardFrom);
+    let holding_before = read(FreshCounter::HoldingNoticesReceived);
+    let checks_before = read(FreshCounter::PossessionChecksHeardFrom);
+    let unserved_before = read(FreshCounter::PeersLeftUnserved);
+
+    let content = b"a chunk every close-group node is sent";
+    for index in 0..nodes {
+        put_paid_chunk(&harness, index, content).await;
+    }
+    let nodes_u64 = u64::try_from(nodes).expect("node count");
+
+    // Every hold ends early, well before the hold time.
+    assert!(
+        wait_until(
+            || read(FreshCounter::HoldsEndedEarly) - early_before >= nodes_u64,
+            HOLD_UNDER_TEST / 2
+        )
+        .await,
+        "only {} of {nodes} holds ended early",
+        read(FreshCounter::HoldsEndedEarly) - early_before
+    );
+    // Past the hold time, nothing was offered.
+    tokio::time::sleep(HOLD_UNDER_TEST).await;
+    assert_eq!(
+        dispatched(),
+        offers_before,
+        "an offer went to a peer heard from"
+    );
+    let pairs = nodes_u64 * (nodes_u64 - 1);
+    assert!(read(FreshCounter::HoldingNoticesReceived) - holding_before >= pairs);
+    assert!(read(FreshCounter::OffersSkippedHeardFrom) - skipped_before >= pairs);
+    assert!(read(FreshCounter::PossessionChecksHeardFrom) - checks_before >= pairs);
+    assert_eq!(read(FreshCounter::PeersLeftUnserved), unserved_before);
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A PUT that reached one storer only: no peer is heard from, so the hold
+/// ends at its time and the storer offers the record to every peer.
+#[tokio::test]
+#[serial]
+async fn a_put_to_one_storer_is_offered_to_the_rest_when_its_hold_ends() {
+    use ant_node::replication::fresh_metrics::{read, FreshCounter};
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let engine = harness
+        .test_node(FRESH_PIPELINE_SOURCE_INDEX)
+        .and_then(|n| n.replication_engine.as_ref())
+        .expect("replication engine");
+    let at_hold_before = read(FreshCounter::HoldsEndedAtHold);
+    let offers_before = engine.fresh_offers_dispatched();
+
+    let address = put_paid_chunk(
+        &harness,
+        FRESH_PIPELINE_SOURCE_INDEX,
+        b"a chunk only one storer is sent",
+    )
+    .await;
+    assert!(
+        wait_until_replicated(
+            &harness,
+            FRESH_PIPELINE_SOURCE_INDEX,
+            &address,
+            PROPAGATION_TIMEOUT
+        )
+        .await,
+        "the record never reached the peers the storer did not hear from"
+    );
+    assert_eq!(engine.fresh_offers_dispatched(), offers_before + 1);
+    assert!(read(FreshCounter::HoldsEndedAtHold) > at_hold_before);
 
     harness.teardown().await.expect("teardown");
 }
@@ -947,10 +1057,10 @@ async fn possession_scheduler_penalises_absent_close_peer_after_delay() {
 
     // Trigger fresh replication; the engine enqueues the possession check, which
     // fires ~200-500 ms later and penalises the absent close peers.
-    let dummy_pop = dummy_payment_proof();
-    engine_a
-        .replicate_fresh(&address, content, &dummy_pop)
-        .await;
+    // A proof the slim builder forwards: a declined one sends no offer and
+    // schedules no check.
+    let pop = well_formed_payment_proof(&address);
+    engine_a.replicate_fresh(&address, content, &pop).await;
 
     // Poll until at least one absent close peer is penalised (trust drops).
     let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
@@ -2899,10 +3009,11 @@ async fn scenario_1_and_24_fresh_replication_stores_and_propagates_paid_list() {
     // (bypasses EVM verification, which is unavailable without Anvil).
     harness.prepopulate_payment_cache_everywhere(&address);
 
-    // Trigger fresh replication (sends FreshReplicationOffer + PaidNotify)
-    let dummy_pop = dummy_payment_proof();
+    // Trigger fresh replication (sends FreshReplicationOffer + PaidNotify),
+    // with a proof the slim builder forwards.
+    let pop = well_formed_payment_proof(&address);
     if let Some(ref engine) = source.replication_engine {
-        engine.replicate_fresh(&address, content, &dummy_pop).await;
+        engine.replicate_fresh(&address, content, &pop).await;
     }
 
     // Poll until replication propagates (or timeout).
@@ -3450,10 +3561,11 @@ async fn scenario_24_fresh_replication_propagates_paid_notify() {
     // and PaidNotify (bypasses EVM verification, unavailable without Anvil).
     harness.prepopulate_payment_cache_everywhere(&address);
 
-    // Trigger fresh replication (includes PaidNotify to PaidCloseGroup)
-    let dummy_pop = dummy_payment_proof();
+    // Trigger fresh replication (includes PaidNotify to PaidCloseGroup), with
+    // a proof the slim builder forwards.
+    let pop = well_formed_payment_proof(&address);
     if let Some(ref engine) = source.replication_engine {
-        engine.replicate_fresh(&address, content, &dummy_pop).await;
+        engine.replicate_fresh(&address, content, &pop).await;
     }
 
     // Poll until PaidNotify propagates (or timeout).
@@ -3873,12 +3985,12 @@ async fn test_late_joiner_replicates_responsible_chunks() {
     }
 
     // Trigger fresh replication for each chunk so they spread to close groups.
-    let dummy_pop = dummy_payment_proof();
     {
         let source = harness.test_node(source_idx).expect("source node");
         if let Some(ref engine) = source.replication_engine {
             for (address, content) in &chunks {
-                engine.replicate_fresh(address, content, &dummy_pop).await;
+                let pop = well_formed_payment_proof(address);
+                engine.replicate_fresh(address, content, &pop).await;
             }
         }
     }

@@ -271,6 +271,12 @@ static REPL_RX_BYTES: [AtomicU64; N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
 static REPL_RX_COUNT: [AtomicU64; N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
+// Per recipient: one encoded message sent to several peers counts once per
+// peer here, and once in the tx table above.
+static REPL_SENT_BYTES: [AtomicU64; N_REPLICATION_VARIANTS] =
+    [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
+static REPL_SENT_COUNT: [AtomicU64; N_REPLICATION_VARIANTS] =
+    [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
 
 impl ReplicationMessageBody {
     /// Stable counter-table index for this variant.
@@ -556,6 +562,71 @@ fn record_tx(body: &ReplicationMessageBody, bytes: usize) {
     let i = body.variant_index();
     REPL_TX_BYTES[i].fetch_add(bytes as u64, Ordering::Relaxed);
     REPL_TX_COUNT[i].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one send of an encoded replication message to one peer, by the
+/// variant its bytes name. Every send to a peer calls this, each attempt
+/// once, so the sent table counts recipients where the tx table counts
+/// encodings.
+pub(crate) fn record_sent(encoded: &[u8]) {
+    let Some(i) = peek_variant_index(encoded).filter(|i| *i < N_REPLICATION_VARIANTS) else {
+        return;
+    };
+    REPL_SENT_BYTES[i].fetch_add(encoded.len() as u64, Ordering::Relaxed);
+    REPL_SENT_COUNT[i].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The sends to peers recorded for a variant, as (count, bytes).
+#[must_use]
+pub fn sent_to_peers(variant_index: usize) -> (u64, u64) {
+    REPL_SENT_COUNT
+        .get(variant_index)
+        .zip(REPL_SENT_BYTES.get(variant_index))
+        .map_or((0, 0), |(count, bytes)| {
+            (count.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed))
+        })
+}
+
+/// Emit the per-recipient sends of every variant as two INFO lines, on the
+/// traffic summary's target and cadence: `<stem>_sent_count` and
+/// `<stem>_sent_bytes`, the stems of the per-variant lines.
+pub(crate) fn log_sent_summary() {
+    let sc = |i: usize| REPL_SENT_COUNT[i].load(Ordering::Relaxed);
+    let sb = |i: usize| REPL_SENT_BYTES[i].load(Ordering::Relaxed);
+    crate::logging::info!(
+        target: "ant_node::replication::traffic",
+        group = 5,
+        fresh_offer_sent_count = sc(0), fresh_offer_sent_bytes = sb(0),
+        fresh_response_sent_count = sc(1), fresh_response_sent_bytes = sb(1),
+        paid_notify_sent_count = sc(2), paid_notify_sent_bytes = sb(2),
+        neighbor_sync_request_sent_count = sc(3), neighbor_sync_request_sent_bytes = sb(3),
+        neighbor_sync_response_sent_count = sc(4), neighbor_sync_response_sent_bytes = sb(4),
+        verification_request_sent_count = sc(5), verification_request_sent_bytes = sb(5),
+        verification_response_sent_count = sc(6), verification_response_sent_bytes = sb(6),
+        fetch_request_sent_count = sc(7), fetch_request_sent_bytes = sb(7),
+        fetch_response_sent_count = sc(8), fetch_response_sent_bytes = sb(8),
+        audit_challenge_sent_count = sc(9), audit_challenge_sent_bytes = sb(9),
+        audit_response_sent_count = sc(10), audit_response_sent_bytes = sb(10),
+        subtree_audit_challenge_sent_count = sc(11), subtree_audit_challenge_sent_bytes = sb(11),
+        "replication sends per recipient (cumulative)"
+    );
+    crate::logging::info!(
+        target: "ant_node::replication::traffic",
+        group = 6,
+        subtree_audit_response_sent_count = sc(12), subtree_audit_response_sent_bytes = sb(12),
+        subtree_byte_challenge_sent_count = sc(13), subtree_byte_challenge_sent_bytes = sb(13),
+        subtree_byte_response_sent_count = sc(14), subtree_byte_response_sent_bytes = sb(14),
+        get_commitment_by_pin_sent_count = sc(15), get_commitment_by_pin_sent_bytes = sb(15),
+        get_commitment_by_pin_response_sent_count = sc(16),
+        get_commitment_by_pin_response_sent_bytes = sb(16),
+        pointer_fresh_offer_sent_count = sc(17), pointer_fresh_offer_sent_bytes = sb(17),
+        pointer_hints_sent_count = sc(18), pointer_hints_sent_bytes = sb(18),
+        pointer_fetch_request_sent_count = sc(19), pointer_fetch_request_sent_bytes = sb(19),
+        pointer_fetch_response_sent_count = sc(20), pointer_fetch_response_sent_bytes = sb(20),
+        pointer_state_request_sent_count = sc(21), pointer_state_request_sent_bytes = sb(21),
+        pointer_state_response_sent_count = sc(22), pointer_state_response_sent_bytes = sb(22),
+        "replication sends per recipient (cumulative)"
+    );
 }
 
 /// Record a decoded (rx) replication message against its variant.

@@ -673,3 +673,47 @@ fn the_variants_are_the_pinned_ones() {
         );
     }
 }
+
+/// The messages a release with slim proofs, holding notices and held offers
+/// sends are ones ds.15 already reads, with the same bytes: a holding notice
+/// is a `PaidNotify` with an empty proof, and a slim proof is opaque bytes
+/// in a notice or an offer, as any proof is. No variant, field or reply is
+/// added (the counts above stay 23 and 2).
+#[test]
+fn a_holding_notice_is_a_paid_notify_ds15_reads() {
+    let holding = ReplicationMessageBody::PaidNotify(PaidNotify {
+        key: key(0x04),
+        proof_of_payment: Vec::new(),
+    });
+    let bytes = encode(holding);
+    assert_eq!(
+        hex::encode(&bytes),
+        "b42402040404040404040404040404040404040404040404040404040404040404040400",
+    );
+    let decoded = ReplicationMessage::decode(&bytes).unwrap();
+    match decoded.body {
+        ReplicationMessageBody::PaidNotify(notify) => {
+            assert_eq!(notify.key, key(0x04));
+            assert!(notify.proof_of_payment.is_empty());
+        }
+        other => panic!("decoded as {}", name(&other)),
+    }
+
+    // A slim proof is any proof's bytes to the message: the same frame as the
+    // pinned notice and offer, with a longer proof.
+    let slim_like: Vec<u8> = std::iter::once(0x01).chain(0..=200u8).collect();
+    for body in [
+        ReplicationMessageBody::PaidNotify(PaidNotify {
+            key: key(0x04),
+            proof_of_payment: slim_like.clone(),
+        }),
+        ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+            key: key(0x01),
+            data: vec![0xD0],
+            proof_of_payment: slim_like.clone(),
+        }),
+    ] {
+        let decoded = ReplicationMessage::decode(&encode(body.clone())).unwrap();
+        assert_eq!(name(&decoded.body), name(&body));
+    }
+}

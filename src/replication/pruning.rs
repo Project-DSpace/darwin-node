@@ -1775,6 +1775,7 @@ async fn send_prune_audit_challenge(
         "Outbound audit request started"
     );
     let request_started = Instant::now();
+    crate::replication::protocol::record_sent(&encoded);
     let response = match p2p_node
         .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
         .await

@@ -610,6 +610,7 @@ fn spawn_verification_batch_task(
         #[cfg(any(test, feature = "test-utils"))]
         crate::replication::record_verification_request_sent(p2p.peer_id(), &requested_keys);
 
+        crate::replication::protocol::record_sent(&encoded);
         let response = match p2p
             .send_request(&peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
             .await

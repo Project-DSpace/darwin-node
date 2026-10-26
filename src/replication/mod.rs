@@ -23,6 +23,8 @@ pub mod commitment;
 pub mod commitment_state;
 pub mod config;
 pub mod fresh;
+pub mod fresh_metrics;
+pub mod heard_from;
 pub mod neighbor_sync;
 pub mod paid_list;
 pub mod pointer;
@@ -1099,8 +1101,9 @@ const PAID_NOTIFY_WORKER_LIMIT: usize = 2;
 /// [`PAID_NOTIFY_WORKER_LIMIT`], bounding the concurrent EVM and DHT work that
 /// is actually expensive, rather than this queue depth.
 ///
-/// A client PUT fans one notify per key out to the whole paid close group, so
-/// a single upload legitimately arrives as a burst of tens. At the 512 KiB
+/// A client PUT fans one notify per key out to the whole paid close group (a
+/// holding notice, which skips admission, to the close group), so a single
+/// upload legitimately arrives as a burst of tens. At the 512 KiB
 /// `MAX_PAYMENT_PROOF_SIZE_BYTES` worst case, sixty-four outstanding is a
 /// 32 MiB ceiling — half the fresh-offer admission ceiling, for messages that
 /// carry no chunk payload.
@@ -1231,9 +1234,10 @@ type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> 
 
 /// Fresh-offer keys currently being handled, each with the proofs still to try.
 ///
-/// Concurrent duplicates are routine: a client PUT is confirmed by
-/// `CLOSE_GROUP_MAJORITY` nodes and each of them fans the chunk out, so one key
-/// commonly arrives from several senders at once. Collapsing them onto one
+/// Concurrent duplicates still happen: a client PUT is confirmed by
+/// `CLOSE_GROUP_MAJORITY` nodes, and each of them offers the chunk to the
+/// close-group peers it hasn't heard from when its hold ends, so a peer the
+/// PUT missed can be offered one key by several senders at once. Collapsing them onto one
 /// handler is what keeps a burst of PUTs from costing a permit, a worker slot,
 /// and an on-chain verification per copy.
 ///
@@ -1773,6 +1777,9 @@ pub struct ReplicationEngine {
     pending_offer_semaphore: Arc<Semaphore>,
     /// Fresh offers encoded and handed to their per-peer sends.
     fresh_offers_dispatched: Arc<AtomicU64>,
+    /// Which peers this node has heard from for a key: written by the
+    /// message handler, read only by the hold's skip function.
+    heard_from: Arc<heard_from::HeardFrom>,
     /// Bounds concurrent IN-FLIGHT LIGHT audit-responder tasks (responsible-chunk
     /// audits + subtree slice round 2). The heavy subtree round 1 has its own
     /// tighter pool ([`SubtreeRound1Limiter`]). Those are spawned off the serial
@@ -1952,6 +1959,7 @@ impl ReplicationEngine {
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             pending_offer_semaphore: Arc::new(Semaphore::new(MAX_PENDING_FRESH_OFFERS)),
             fresh_offers_dispatched: Arc::new(AtomicU64::new(0)),
+            heard_from: Arc::new(heard_from::HeardFrom::default()),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             audit_responder_metrics: Arc::new(AuditResponderMetrics::default()),
@@ -2159,7 +2167,10 @@ impl ReplicationEngine {
     pub async fn run_possession_check_now(&self, key: XorName, peers: Vec<PeerId>) {
         possession::run_possession_check(
             key,
-            peers,
+            peers
+                .into_iter()
+                .map(|peer| (peer, heard_from::Served::Offered))
+                .collect(),
             &self.p2p_node,
             &self.storage,
             &self.config,
@@ -2525,9 +2536,9 @@ impl ReplicationEngine {
     /// send its offers and schedule the delayed possession check for the
     /// responsible close-group peers (ADR-0003), as the PUT path does.
     ///
-    /// Unlike the PUT path, this waits for a pending-offer permit before
-    /// returning, and it offers the caller's bytes rather than reading them
-    /// back from storage.
+    /// Unlike the PUT path, this holds nothing: it offers the whole close
+    /// group at once, waits for a pending-offer permit before returning, and
+    /// offers the caller's bytes rather than reading them back from storage.
     ///
     /// The proof goes out in its slim form (`crate::payment::slim`), as on
     /// the PUT path. A proof the slim builder declines is not forwarded: the
@@ -2544,7 +2555,7 @@ impl ReplicationEngine {
                 Vec::new()
             }
         };
-        fresh::announce_paid_write(
+        let announced = fresh::announce_paid_write(
             key,
             &proof_of_payment,
             &self.paid_list,
@@ -2553,6 +2564,7 @@ impl ReplicationEngine {
         )
         .await;
         if proof_of_payment.is_empty() {
+            fresh_metrics::bump(fresh_metrics::FreshCounter::HoldsWithoutProof);
             return;
         }
         // Never closed, so this cannot fail; the arm keeps the call panic-free.
@@ -2567,6 +2579,8 @@ impl ReplicationEngine {
             key,
             data.to_vec(),
             proof_of_payment,
+            announced.close_group,
+            announced.recorded,
             pending_offer,
         )
         .await;
@@ -2576,7 +2590,6 @@ impl ReplicationEngine {
     fn fresh_offer_context(&self) -> fresh::FreshOfferContext {
         fresh::FreshOfferContext {
             p2p_node: Arc::clone(&self.p2p_node),
-            config: Arc::clone(&self.config),
             send_semaphore: Arc::clone(&self.send_semaphore),
             possession_check_tx: self.possession_check_tx.clone(),
             dispatched: Arc::clone(&self.fresh_offers_dispatched),
@@ -2587,24 +2600,63 @@ impl ReplicationEngine {
     // Background task launchers
     // =======================================================================
 
-    /// Spawn fresh replication's two stages, joined by an unbounded FIFO of
-    /// key + proof events: the drainer, which announces every write at arrival
-    /// rate, and the offer dispatcher, the only permit-gated stage.
+    /// Spawn fresh replication's stages: the drainer, which announces every
+    /// write at arrival rate and holds its offers; the hold keeper, which ends
+    /// the holds; and the offer dispatcher, the only permit-gated stage, fed by
+    /// an unbounded FIFO of key + proof events from the ended holds.
     fn start_fresh_replication(&mut self) {
         let Some(writes) = self.fresh_write_rx.take() else {
             return;
         };
         let (offer_tx, offer_rx) = mpsc::unbounded_channel();
-        self.start_fresh_write_drainer(writes, offer_tx.clone());
+        let holds = fresh::HoldContext {
+            p2p_node: Arc::clone(&self.p2p_node),
+            config: Arc::clone(&self.config),
+            paid_list: Arc::clone(&self.paid_list),
+            heard_from: Arc::clone(&self.heard_from),
+            holds: Arc::new(fresh::Holds::default()),
+            offer_tx: offer_tx.clone(),
+            possession_check_tx: self.possession_check_tx.clone(),
+        };
+        self.start_fresh_write_drainer(writes, holds.clone());
+        self.start_hold_keeper(holds);
         self.start_fresh_offer_dispatcher(offer_rx, offer_tx);
     }
 
+    /// Spawn the task that ends holds and hands their offers to the
+    /// dispatcher. Each hold ends at its own time, so the sends keep the
+    /// spacing the writes arrived with; every [`fresh::HOLD_POLL`] the task
+    /// also ends the holds whose close group has all been heard from.
+    fn start_hold_keeper(&mut self, holds: fresh::HoldContext) {
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let mut next_poll = Instant::now() + fresh::HOLD_POLL;
+            loop {
+                let wake = holds
+                    .next_hold_end()
+                    .map_or(next_poll, |end| end.min(next_poll));
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => {
+                        holds.end_due_holds().await;
+                        if Instant::now() >= next_poll {
+                            holds.end_ended_holds().await;
+                            next_poll = Instant::now() + fresh::HOLD_POLL;
+                        }
+                    }
+                }
+            }
+            debug!("Fresh-offer hold keeper shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
     /// Spawn a task that drains the fresh-write channel: it announces each
-    /// newly-stored chunk and hands it to the offer dispatcher.
+    /// newly-stored chunk and holds its offers.
     fn start_fresh_write_drainer(
         &mut self,
         mut rx: mpsc::UnboundedReceiver<fresh::FreshWriteEvent>,
-        offer_tx: mpsc::UnboundedSender<fresh::FreshOfferEvent>,
+        holds: fresh::HoldContext,
     ) {
         let p2p = Arc::clone(&self.p2p_node);
         let paid_list = Arc::clone(&self.paid_list);
@@ -2630,7 +2682,7 @@ impl ReplicationEngine {
                 // Stage one never waits for chunk back-pressure: the paid-list
                 // entry and PaidNotify are what let peers repair the key later,
                 // so every queued write gets them at arrival rate.
-                fresh::announce_paid_write(
+                let announced = fresh::announce_paid_write(
                     &event.key,
                     &event.payment_proof,
                     &paid_list,
@@ -2643,18 +2695,12 @@ impl ReplicationEngine {
                 // receivers penalise an offer with an empty proof. The other
                 // storers and neighbour sync cover this storer's peers.
                 if event.payment_proof.is_empty() {
+                    fresh_metrics::bump(fresh_metrics::FreshCounter::HoldsWithoutProof);
                     continue;
                 }
-                if offer_tx
-                    .send(fresh::FreshOfferEvent {
-                        key: event.key,
-                        payment_proof: event.payment_proof,
-                        read_attempts: 0,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                // The other storers' holding notices normally arrive within
+                // the hold, and only the peers not heard from are offered.
+                holds.hold(event.key, event.payment_proof, announced).await;
             }
             debug!("Fresh-write drainer shut down");
         });
@@ -2710,6 +2756,7 @@ impl ReplicationEngine {
                     Ok(Some(data)) => data,
                     Ok(None) => {
                         debug!("Chunk {key_hex} no longer stored, skipping fresh replication");
+                        fresh::notify_unoffered(&ctx.p2p_node, &event);
                         continue;
                     }
                     Err(e) => {
@@ -2720,6 +2767,7 @@ impl ReplicationEngine {
                             warn!(
                                 "Giving up fresh replication of {key_hex} after {attempts} failed reads: {e}"
                             );
+                            fresh::notify_unoffered(&ctx.p2p_node, &event);
                             continue;
                         }
                         // One warning per write: a store-wide fault fails the
@@ -2761,6 +2809,8 @@ impl ReplicationEngine {
                     &event.key,
                     data,
                     event.payment_proof,
+                    event.targets,
+                    event.notify_after,
                     pending_offer,
                 )
                 .await;
@@ -2776,6 +2826,11 @@ impl ReplicationEngine {
     /// randomised 5-15 minute settle delay before probing every responsible
     /// peer for actual possession. A peer that fails to prove possession or does
     /// not answer is penalised at `AuditChallenge` severity.
+    ///
+    /// After its delay a check takes a share of the node's possession byte
+    /// budget the size of its record before it reads its copy, and gives it
+    /// back when its last probe ends. Behind a slow peer, checks wait for
+    /// budget holding only their key and peers, so memory stays bounded.
     fn start_possession_check_scheduler(&mut self) {
         let Some(mut rx) = self.possession_check_rx.take() else {
             return;
@@ -2787,6 +2842,7 @@ impl ReplicationEngine {
         let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let shutdown = self.shutdown.clone();
         let detached_task_tracker = self.detached_task_tracker.clone();
+        let budget = possession::PossessionBudget::new(config::POSSESSION_BYTE_BUDGET);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2803,6 +2859,7 @@ impl ReplicationEngine {
                         let sync_state = Arc::clone(&sync_state);
                         let audit_challenge_coordinator = Arc::clone(&audit_challenge_coordinator);
                         let shutdown = shutdown.clone();
+                        let budget = budget.clone();
                         let delay_min = config.possession_check_delay_min;
                         let delay_max = config.possession_check_delay_max;
                         detached_task_tracker.spawn(async move {
@@ -2826,6 +2883,21 @@ impl ReplicationEngine {
                                 () = shutdown.cancelled() => {}
                                 () = async {
                                     tokio::time::sleep(delay).await;
+                                    // The share is held until the last probe
+                                    // ends; a record no longer held is skipped
+                                    // by the check, so it takes none.
+                                    let share = match storage.stored_len(&event.key).await {
+                                        Ok(None) => None,
+                                        Ok(Some(len)) => Some(possession::PossessionBudget::share_for(len)),
+                                        Err(_) => Some(possession::PossessionBudget::share_for(u64::MAX)),
+                                    };
+                                    let _share = match share {
+                                        Some(bytes) => match budget.take(bytes).await {
+                                            Some(share) => Some(share),
+                                            None => return,
+                                        },
+                                        None => None,
+                                    };
                                     possession::run_possession_check(
                                         event.key,
                                         event.peers,
@@ -3153,6 +3225,7 @@ impl ReplicationEngine {
         let paid_notify_admission_semaphore = Arc::clone(&self.paid_notify_admission_semaphore);
         let paid_notify_responder_inflight = Arc::clone(&self.paid_notify_responder_inflight);
         let paid_notify_flights = Arc::clone(&self.paid_notify_flights);
+        let heard_from = Arc::clone(&self.heard_from);
         let detached_task_tracker = self.detached_task_tracker.clone();
         let subtree_round1 = self.subtree_round1.clone();
 
@@ -3206,6 +3279,7 @@ impl ReplicationEngine {
             paid_notify_admission_semaphore,
             paid_notify_responder_inflight,
             paid_notify_flights,
+            heard_from,
             pointers: self.pointers.clone(),
             listings: self.listings.clone(),
             shutdown: shutdown.clone(),
@@ -3840,6 +3914,8 @@ impl ReplicationEngine {
                         TRAFFIC_SUMMARY_INTERVAL_SECS,
                     )) => {
                         protocol::log_traffic_summary();
+                        protocol::log_sent_summary();
+                        fresh_metrics::log_fresh_summary();
                         protocol::log_served_peers_summary();
                         protocol::log_audit_outcome_summary();
                         audit_metrics::log_responder_admission_summary();
@@ -4686,6 +4762,8 @@ struct ReplicationMessageHandlerContext {
     paid_notify_admission_semaphore: Arc<Semaphore>,
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     paid_notify_flights: Arc<PaidNotifyFlights>,
+    /// Notes which peers were heard from for a key; never read here.
+    heard_from: Arc<heard_from::HeardFrom>,
     /// Pointer replication, when this node stores pointers.
     pointers: Option<Arc<pointer::PointerReplication>>,
     /// Listings, recorded from fresh offers' payment proofs.
@@ -6114,11 +6192,13 @@ fn fresh_offer_structural_rejection(
     None
 }
 
-/// Tell `source` its offer for `key` was not taken.
+/// Tell `source` its offer for `key` was not taken, when the offer came as a
+/// request.
 ///
-/// Note the sender does not currently read this: `fresh::send_fresh_offers` uses
-/// one-way `send_message`, so the refusal is observed only as a later absence by
-/// the delayed possession check. Recorded in ADR-0005 as a known gap.
+/// `fresh::send_fresh_offers` sends one-way (`send_message`), and no sender
+/// reads an answer, so an offer that arrived one-way gets none
+/// (`is_answer_to_one_way_offer`); a refusal is observed only as a later
+/// absence by the delayed possession check, the gap ADR-0005 records.
 async fn refuse_fresh_offer(
     source: &PeerId,
     key: XorName,
@@ -6251,6 +6331,12 @@ async fn dispatch_fresh_offer(
         )
         .await;
         return Ok(());
+    }
+
+    // The bytes hash to the key, so the sender holds the record. Noted before
+    // admission, and only ever read to skip an offer.
+    if !ctx.heard_from.note(offer.key, source, Instant::now()) {
+        fresh_metrics::bump(fresh_metrics::FreshCounter::HeardFromNotKept);
     }
 
     // Join the work already in flight for this key before taking an admission
@@ -6675,6 +6761,11 @@ async fn handle_fresh_offer(
         // fault. Another proof still gets its turn, since the next call may well
         // succeed against a recovered endpoint.
         Err(e) => {
+            fresh_metrics::bump(fresh_metrics::FreshCounter::PopVerificationErrors);
+            fresh_metrics::note_refused_proof(
+                fresh_metrics::RefusedIn::Offer,
+                &attempt.proof_of_payment,
+            );
             warn!("PoP verification error for key {}: {e}", hex::encode(key));
             send_replication_response(
                 source,
@@ -6761,6 +6852,10 @@ async fn dispatch_paid_notify(
     ctx: &ReplicationMessageHandlerContext,
     received_at: Instant,
 ) -> Result<()> {
+    if !note_paid_notify(&ctx.heard_from, &source, &notify) {
+        return Ok(());
+    }
+
     // Already known: nothing to admit, verify or write.
     if paid_notify_key_known(&ctx.paid_list, &notify.key) {
         debug!(
@@ -6787,6 +6882,7 @@ async fn dispatch_paid_notify(
                 ReplicationResponderClass::PaidNotify,
                 failure.reason.into(),
             );
+            fresh_metrics::bump(fresh_metrics::FreshCounter::PaidNotifyDroppedAtAdmission);
             // WARN for the same reason as fresh offers: PaidNotify is one-way,
             // so a refusal discards durable paid-list evidence outright rather
             // than pushing work back onto a requester.
@@ -6853,6 +6949,29 @@ async fn dispatch_paid_notify(
     });
 
     Ok(())
+}
+
+/// Note a paid notify's sender as heard from for its key, and say whether the
+/// notify goes on to admission: only one with a proof does.
+///
+/// The sender holds the key: every release sends a notice only after storing
+/// it. The note comes before admission and before the "already known" drop,
+/// and is only ever read to skip an offer. A holding notice (an empty proof)
+/// carries nothing to record, so it never takes an admission slot or a worker.
+fn note_paid_notify(
+    heard_from: &heard_from::HeardFrom,
+    source: &PeerId,
+    notify: &protocol::PaidNotify,
+) -> bool {
+    if !heard_from.note(notify.key, *source, Instant::now()) {
+        fresh_metrics::bump(fresh_metrics::FreshCounter::HeardFromNotKept);
+    }
+    if notify.proof_of_payment.is_empty() {
+        fresh_metrics::bump(fresh_metrics::FreshCounter::HoldingNoticesReceived);
+        return false;
+    }
+    fresh_metrics::bump(fresh_metrics::FreshCounter::ProofNoticesReceived);
+    true
 }
 
 /// Whether a paid notify's key is already known: in this node's paid list,
@@ -7014,6 +7133,7 @@ async fn record_paid_notify(
             );
         }
         Ok(_) => {
+            fresh_metrics::bump(fresh_metrics::FreshCounter::PaidNotifyRejected);
             warn!(
                 "Paid notify rejected: payment required for key {}",
                 hex::encode(notify.key)
@@ -7021,6 +7141,11 @@ async fn record_paid_notify(
             return Ok(());
         }
         Err(e) => {
+            fresh_metrics::bump(fresh_metrics::FreshCounter::PopVerificationErrors);
+            fresh_metrics::note_refused_proof(
+                fresh_metrics::RefusedIn::Notice,
+                &notify.proof_of_payment,
+            );
             warn!(
                 "PoP verification error for paid notify key {}: {e}",
                 hex::encode(notify.key)
@@ -7836,6 +7961,14 @@ fn commitment_pin_response_kind(response: &protocol::GetCommitmentByPinResponse)
 // Message sending helper
 // ---------------------------------------------------------------------------
 
+/// Whether `body` answers a fresh offer that arrived one-way, with no
+/// request-response id. Every release sends offers one-way and no sender
+/// reads the answer, so none is sent; an offer that came as a request still
+/// gets one.
+fn is_answer_to_one_way_offer(body: &ReplicationMessageBody, rr_message_id: Option<&str>) -> bool {
+    rr_message_id.is_none() && matches!(body, ReplicationMessageBody::FreshReplicationResponse(_))
+}
+
 /// Send a replication response message as a best-effort reply.
 ///
 /// Encode and send failures are logged by the checked helper. Most response
@@ -7876,6 +8009,10 @@ async fn send_replication_response_checked(
     rr_message_id: Option<&str>,
     protocol: Option<&'static str>,
 ) -> bool {
+    if is_answer_to_one_way_offer(&body, rr_message_id) {
+        fresh_metrics::bump(fresh_metrics::FreshCounter::OfferAnswersNotSent);
+        return false;
+    }
     let msg = ReplicationMessage { request_id, body };
     let encoded = match msg.encode() {
         Ok(data) => data,
@@ -7896,6 +8033,7 @@ async fn send_replication_response_checked(
         protocol::record_served(peer, encoded.len());
     }
     let protocol = protocol.unwrap_or_else(|| response_protocol_for(&msg.body));
+    protocol::record_sent(&encoded);
     let result = if let Some(msg_id) = rr_message_id {
         p2p_node
             .send_response(peer, protocol, msg_id, encoded)
@@ -9387,6 +9525,7 @@ async fn execute_single_fetch(
         }
     };
 
+    protocol::record_sent(&encoded);
     let result = p2p_node
         .send_request(
             &source,
@@ -10766,6 +10905,52 @@ mod paid_notify_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    /// A holding notice is noted as heard from and goes no further: it never
+    /// takes an admission slot or a worker. A notice with a proof is noted
+    /// too, and goes on to admission.
+    #[test]
+    fn a_holding_notice_is_noted_and_never_reaches_admission() {
+        let table = super::heard_from::HeardFrom::default();
+        let source = saorsa_core::identity::PeerId::from_bytes([3; 32]);
+        let now = std::time::Instant::now();
+        let holding = super::protocol::PaidNotify {
+            key: [1; 32],
+            proof_of_payment: Vec::new(),
+        };
+        assert!(!super::note_paid_notify(&table, &source, &holding));
+        assert_eq!(
+            table.offer_skip_reason(&[1; 32], &source, false, now),
+            Some(super::heard_from::Served::HeardFrom)
+        );
+        let with_proof = super::protocol::PaidNotify {
+            key: [2; 32],
+            proof_of_payment: vec![1; 64],
+        };
+        assert!(super::note_paid_notify(&table, &source, &with_proof));
+        assert_eq!(
+            table.offer_skip_reason(&[2; 32], &source, false, now),
+            Some(super::heard_from::Served::HeardFrom)
+        );
+    }
+
+    /// An offer that arrived one-way gets no answer; one that came as a
+    /// request still does, and no other reply is held back.
+    #[test]
+    fn only_an_offer_that_came_as_a_request_is_answered() {
+        use super::protocol::{FreshReplicationResponse, ReplicationMessageBody};
+        let answer =
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Accepted {
+                key: [1; 32],
+            });
+        assert!(super::is_answer_to_one_way_offer(&answer, None));
+        assert!(!super::is_answer_to_one_way_offer(&answer, Some("rr-1")));
+        let other =
+            ReplicationMessageBody::FetchResponse(super::protocol::FetchResponse::NotFound {
+                key: [1; 32],
+            });
+        assert!(!super::is_answer_to_one_way_offer(&other, None));
+    }
 
     /// The responder's answer says whether it lacks the chunk or failed to read it.
     ///

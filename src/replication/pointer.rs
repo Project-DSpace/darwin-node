@@ -909,6 +909,7 @@ impl PointerReplication {
             warn!("Failed to encode a pointer replication message");
             return false;
         };
+        crate::replication::protocol::record_sent(&bytes);
         self.p2p
             .send_message(peer, REPLICATION_PROTOCOL_ID, bytes, &[])
             .await
@@ -947,6 +948,7 @@ impl PointerReplication {
         let Ok(bytes) = msg.encode() else {
             return Asked::NotSent;
         };
+        crate::replication::protocol::record_sent(&bytes);
         let Ok(response) = self
             .p2p
             .send_request(peer, REPLICATION_PROTOCOL_ID, bytes, timeout)
@@ -1607,6 +1609,7 @@ impl PointerReplication {
                     return;
                 };
                 for attempt in 0..=FRESH_REPLICATION_DELIVERY_MAX_RETRIES {
+                    crate::replication::protocol::record_sent(&bytes);
                     match p2p
                         .send_message(&peer, REPLICATION_PROTOCOL_ID, bytes.as_ref().clone(), &[])
                         .await
@@ -1717,6 +1720,13 @@ impl PointerReplication {
             )
             .await
         {
+            crate::replication::fresh_metrics::bump(
+                crate::replication::fresh_metrics::FreshCounter::PointerOffersRefused,
+            );
+            crate::replication::fresh_metrics::note_refused_proof(
+                crate::replication::fresh_metrics::RefusedIn::PointerOffer,
+                &offer.proof_of_payment,
+            );
             info!(
                 "Fresh pointer offer for {} from {source} is not paid for: {e}",
                 hex::encode(state.address)

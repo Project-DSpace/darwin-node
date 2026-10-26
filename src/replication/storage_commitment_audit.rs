@@ -274,6 +274,7 @@ pub(crate) async fn run_subtree_audit_with_origin(
         "Outbound audit request started"
     );
     let request_started = Instant::now();
+    crate::replication::protocol::record_sent(&encoded);
     let response = match p2p_node
         .send_request(challenged_peer, SUBTREE_AUDIT_PROTOCOL_ID, encoded, timeout)
         .await
@@ -431,6 +432,7 @@ async fn request_slice_proof(ctx: &AuditCtx<'_>, openings: &[SubtreeSliceOpening
         "Outbound audit request started"
     );
     let request_started = Instant::now();
+    crate::replication::protocol::record_sent(&encoded);
     let response = match ctx
         .p2p_node
         .send_request(

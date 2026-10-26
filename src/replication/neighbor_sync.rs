@@ -414,6 +414,7 @@ pub(crate) async fn sync_with_peer_with_hints(
         }
     };
 
+    crate::replication::protocol::record_sent(&encoded);
     let response = match p2p_node
         .send_request(
             peer,

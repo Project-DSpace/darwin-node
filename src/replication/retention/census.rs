@@ -2182,6 +2182,29 @@ const PROOF_SENDERS: &[Reviewed] = &[
         "send_notice",
         2,
     ),
+    // When a hold ends: the notice with the slim proof the PUT handler
+    // built, to the close-group peers not heard from and marked full.
+    (
+        "src/replication/fresh.rs",
+        "HoldContext::end_hold",
+        "send_notice",
+        1,
+    ),
+    // After each offer: the notice with the offer's own slim proof.
+    (
+        "src/replication/fresh.rs",
+        "send_fresh_offers",
+        "send_notice",
+        1,
+    ),
+    // An offer dropped before dispatch: the same notice, with the event's
+    // slim proof.
+    (
+        "src/replication/fresh.rs",
+        "notify_unoffered",
+        "send_notice",
+        1,
+    ),
     // Offers, with the slim proof the engine's entry point built.
     (
         "src/replication/mod.rs",
@@ -2205,31 +2228,83 @@ const PROOF_SENDERS: &[Reviewed] = &[
     ),
 ];
 
-/// Every message the chunk protocol carries, and every kind of payment proof,
-/// is one whose handling has been reviewed. Both enums are `#[non_exhaustive]`
-/// in the vendored protocol, so the compiler says nothing when a new version
-/// of it adds a variant, or when a merge adds the handling of one; this does.
+/// Every message nodes exchange between themselves, the replication
+/// protocol's, with what each release does with it. A new one is reviewed
+/// here before it ships: F1 added none, and sends only messages every release
+/// from ds.1 handles (a holding notice is a `PaidNotify` with an empty proof,
+/// which every release drops before any work).
+const REPLICATION_MESSAGES: &[(&str, &str)] = &[
+    (
+        "FreshReplicationOffer",
+        "A record with its proof, sent one-way only to close-group peers not heard from and not marked full when the storer's hold ends; the proof is slim.",
+    ),
+    (
+        "FreshReplicationResponse",
+        "Sent only to an offer that came as a request; never to a one-way offer. No sender reads it.",
+    ),
+    (
+        "PaidNotify",
+        "A notice with the slim proof, or a holding notice with an empty proof, which adds nothing to the paid list and is only noted as heard from.",
+    ),
+    ("NeighborSyncRequest", "Neighbour sync: hints, answered."),
+    ("NeighborSyncResponse", "Neighbour sync's answer."),
+    ("VerificationRequest", "Presence and paid-list questions."),
+    ("VerificationResponse", "Their answer."),
+    ("FetchRequest", "A record asked for by key."),
+    ("FetchResponse", "The record."),
+    (
+        "AuditChallenge",
+        "Per-key digests: audits, possession checks and prune confirmations.",
+    ),
+    ("AuditResponse", "Their digests."),
+    ("SubtreeAuditChallenge", "The storage-bound audit, round 1."),
+    ("SubtreeAuditResponse", "Its proof."),
+    ("SubtreeSliceChallenge", "The storage-bound audit, round 2."),
+    ("SubtreeSliceResponse", "Its slices."),
+    ("GetCommitmentByPin", "A commitment asked for by its pin."),
+    ("GetCommitmentByPinResponse", "The commitment, or that it isn't kept."),
+    (
+        "PointerFreshOffer",
+        "A pointer state with its slim proof, sent one-way.",
+    ),
+    ("PointerHints", "Pointer states the receiver should hold."),
+    ("PointerFetchRequest", "A pointer record asked for."),
+    ("PointerFetchResponse", "The pointer record."),
+    ("PointerStateRequest", "Which pointer states a peer holds."),
+    ("PointerStateResponse", "Its answer."),
+];
+
+/// Every message the chunk protocol carries, every kind of payment proof, and
+/// every message nodes exchange is one whose handling has been reviewed. The
+/// vendored enums are `#[non_exhaustive]`, so the compiler says nothing when a
+/// new version of the protocol adds a variant, or when a merge adds the
+/// handling of one; this does.
 #[test]
 fn the_wire_messages_are_the_reviewed_ones() {
-    let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, name, reviewed) in [
         (
-            "ant-protocol/src/chunk.rs",
+            "vendor/ant-protocol/src/chunk.rs",
             "ChunkMessageBody",
             CHUNK_MESSAGES,
         ),
         (
-            "ant-protocol/src/payment/proof.rs",
+            "vendor/ant-protocol/src/payment/proof.rs",
             "ProofType",
             PROOF_TYPES,
         ),
         (
-            "ant-listings/src/message.rs",
+            "vendor/ant-listings/src/message.rs",
             "ListingsBody",
             LISTINGS_MESSAGES,
         ),
+        (
+            "src/replication/protocol.rs",
+            "ReplicationMessageBody",
+            REPLICATION_MESSAGES,
+        ),
     ] {
-        let source = std::fs::read_to_string(vendor.join(file)).unwrap_or_default();
+        let source = std::fs::read_to_string(root.join(file)).unwrap_or_default();
         let declared = enum_variants(&source, name);
         let declared_set: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
         let listed: BTreeSet<&str> = reviewed.iter().map(|(variant, _)| *variant).collect();
@@ -2245,7 +2320,7 @@ fn the_wire_messages_are_the_reviewed_ones() {
                 && not_reviewed.is_empty()
                 && gone.is_empty()
                 && without_reason.is_empty(),
-            "\n{name} in vendor/{file} no longer matches the reviewed list \
+            "\n{name} in {file} no longer matches the reviewed list \
              in src/replication/retention/census.rs.\n\n  declared: {declared:?}\n  \
              not reviewed: {not_reviewed:?}\n  listed but gone: {gone:?}\n  \
              listed without a reason: {without_reason:?}\n\n\
@@ -2254,9 +2329,36 @@ fn the_wire_messages_are_the_reviewed_ones() {
              sure the node's handler (src/storage/handler.rs) and payment check \
              (src/payment/verifier.rs) take it through those rules, with tests that pin it; \
              until then, refuse it. A listings message is answered, or dropped, by \
-             src/listings/service.rs: list what it does there.\n"
+             src/listings/service.rs: list what it does there. A replication message \
+             goes to nodes of every release: one older nodes can't decode is lost, so \
+             review what each release does with it first.\n"
         );
     }
+}
+
+/// The heard-from table has one reader: the hold's skip function in
+/// src/replication/fresh.rs. A holding notice is the sender's own claim,
+/// never checked against bytes, so it may only save an offer.
+#[test]
+fn the_heard_from_table_has_one_reader() {
+    const READ: &[(Option<&str>, &str)] = &[(None, "offer_skip_reason")];
+    const REVIEWED: &[Reviewed] = &[(
+        "src/replication/fresh.rs",
+        "skip_reasons",
+        "offer_skip_reason",
+        1,
+    )];
+    let found = unreviewed(Counting::Calls(READ), REVIEWED);
+    assert!(
+        found.is_empty(),
+        "\nThe heard-from table is read somewhere other than the hold's skip function.\n\n\
+         {found}\n\
+         A holding notice is not possession evidence: it is the sender's own claim, never \
+         checked against bytes. Erasure (6 real proofs near a full node), repair, the \
+         paid-list quorum and audits rest on possession proofs, and a sender's claim never \
+         adds a key to the paid list by itself. The table may only skip an offer; read it \
+         nowhere else.\n"
+    );
 }
 
 #[cfg(test)]

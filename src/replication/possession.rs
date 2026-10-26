@@ -36,6 +36,8 @@ use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::config::{
     ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, REPLICATION_PROTOCOL_ID,
 };
+use crate::replication::fresh_metrics::{self, FreshCounter};
+use crate::replication::heard_from::Served;
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
@@ -57,8 +59,86 @@ pub(crate) fn possession_probe_response_timeout(config: &ReplicationConfig) -> D
 pub struct PossessionCheckEvent {
     /// Content-address of the chunk.
     pub key: XorName,
-    /// Close-group peers responsible for holding it (excludes self).
-    pub peers: Vec<PeerId>,
+    /// Close-group peers responsible for holding it (excludes self), each
+    /// with how the storer served it: heard from, marked full, or offered.
+    pub peers: Vec<(PeerId, Served)>,
+}
+
+/// The node-wide byte budget of possession checks
+/// ([`crate::replication::config::POSSESSION_BYTE_BUDGET`]). A check takes a
+/// share the size of its record before it reads its copy, and the share goes
+/// back when the check ends, so the record bytes checks hold never exceed the
+/// budget. A check waiting for its share holds no record bytes.
+#[derive(Clone)]
+pub(crate) struct PossessionBudget {
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// A check's share of the budget, given back when dropped.
+pub(crate) struct BudgetShare {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    bytes: u64,
+}
+
+impl Drop for BudgetShare {
+    fn drop(&mut self) {
+        fresh_metrics::sub(FreshCounter::PossessionBudgetBytesHeld, self.bytes);
+    }
+}
+
+/// Counts a check waiting for its share for as long as it waits, however the
+/// wait ends.
+struct Waiting;
+
+impl Waiting {
+    fn new() -> Self {
+        fresh_metrics::bump(FreshCounter::PossessionChecksWaitingBudget);
+        Self
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        fresh_metrics::sub(FreshCounter::PossessionChecksWaitingBudget, 1);
+    }
+}
+
+impl PossessionBudget {
+    /// A budget of `bytes`.
+    pub(crate) fn new(bytes: usize) -> Self {
+        let permits = u32::try_from(bytes).unwrap_or(u32::MAX) as usize;
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+        }
+    }
+
+    /// The share a check of a record of `stored_len` bytes takes: its length,
+    /// at most the largest record, and at least one byte.
+    pub(crate) fn share_for(stored_len: u64) -> u32 {
+        let max = crate::replication::config::POSSESSION_SHARE_MAX as u64;
+        u32::try_from(stored_len.clamp(1, max)).unwrap_or(u32::MAX)
+    }
+
+    /// Wait for a share of `bytes`. `None` only if the budget was closed.
+    pub(crate) async fn take(&self, bytes: u32) -> Option<BudgetShare> {
+        let waiting = Waiting::new();
+        let permit = Arc::clone(&self.permits)
+            .acquire_many_owned(bytes)
+            .await
+            .ok()?;
+        drop(waiting);
+        fresh_metrics::add(FreshCounter::PossessionBudgetBytesHeld, u64::from(bytes));
+        Some(BudgetShare {
+            _permit: permit,
+            bytes: u64::from(bytes),
+        })
+    }
+
+    /// Bytes not taken.
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
 }
 
 /// Verdict of cryptographically probing a single peer for possession of a chunk.
@@ -135,7 +215,7 @@ pub fn random_delay(min: Duration, max: Duration) -> Duration {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_possession_check(
     key: XorName,
-    peers: Vec<PeerId>,
+    peers: Vec<(PeerId, Served)>,
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<ChunkStore>,
     config: &ReplicationConfig,
@@ -169,7 +249,7 @@ pub(crate) async fn run_possession_check(
     // the bytes blows it, generous for an honest local-disk read).
     let probe_timeout = possession_probe_response_timeout(config);
 
-    for peer in peers {
+    for (peer, served) in peers {
         if shutdown.is_cancelled() {
             return;
         }
@@ -189,7 +269,8 @@ pub(crate) async fn run_possession_check(
             }
             ProbeOutcome::Failed(reason) => {
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
-                report_possession_confirmed_failure(&peer, &key_hex, reason, p2p_node).await;
+                report_possession_confirmed_failure(&peer, &key_hex, reason, served, p2p_node)
+                    .await;
             }
             ProbeOutcome::NoResponse(class) => {
                 audit_metrics::record_audit_no_response(AuditType::Possession, class);
@@ -219,17 +300,23 @@ async fn report_possession_confirmed_failure(
     peer: &PeerId,
     key_hex: &str,
     failure_reason: PossessionFailureReason,
+    served: Served,
     p2p_node: &Arc<P2PNode>,
 ) {
+    if served.skipped() {
+        fresh_metrics::bump(FreshCounter::PossessionFailuresSkipped);
+    }
     warn!(
         audit_type = AuditType::Possession.as_str(),
         audit_failure_class = "confirmed",
         possession_failure_reason = failure_reason.as_str(),
+        served = served.as_str(),
         peer = %peer,
         key = %key_hex,
         trust_weight = AUDIT_FAILURE_TRUST_WEIGHT,
-        "Possession check: {peer} failed to prove possession for {key_hex} ({}); recorded at audit severity",
-        failure_reason.as_str()
+        "Possession check: {peer} failed to prove possession for {key_hex} ({}; served: {}); recorded at audit severity",
+        failure_reason.as_str(),
+        served.as_str()
     );
     p2p_node
         .report_trust_event(
@@ -374,6 +461,7 @@ async fn probe_once(
         "Outbound audit request started"
     );
     let request_started = Instant::now();
+    crate::replication::protocol::record_sent(&encoded);
     let response = match p2p_node
         .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, probe_timeout)
         .await
@@ -503,6 +591,43 @@ mod tests {
             challenge_id,
             digests,
         }
+    }
+
+    /// The bytes checks hold never exceed the budget: a check that would pass
+    /// it waits, holding no record bytes, until a running check gives its
+    /// share back. A share is the record's length, at most the largest record.
+    #[tokio::test]
+    async fn the_bytes_checks_hold_never_exceed_the_budget() {
+        let max = crate::replication::config::POSSESSION_SHARE_MAX;
+        assert_eq!(PossessionBudget::share_for(0), 1);
+        assert_eq!(PossessionBudget::share_for(1000), 1000);
+        assert_eq!(PossessionBudget::share_for(u64::MAX) as usize, max);
+
+        let budget = PossessionBudget::new(2 * max);
+        let share = |n: usize| u32::try_from(n).unwrap();
+        let first = budget.take(share(max)).await.unwrap();
+        let second = budget.take(share(max)).await.unwrap();
+        assert_eq!(budget.available(), 0);
+
+        let waiting = budget.clone();
+        let third = tokio::spawn(async move { waiting.take(share(max)).await.map(|_| ()) });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!third.is_finished(), "a check past the budget waits");
+
+        drop(first);
+        assert!(third.await.unwrap().is_some());
+        drop(second);
+        assert_eq!(budget.available(), 2 * max);
+    }
+
+    /// The default budget fits 16 checks of the largest record at once.
+    #[test]
+    fn the_budget_fits_sixteen_of_the_largest_records() {
+        assert_eq!(
+            crate::replication::config::POSSESSION_BYTE_BUDGET
+                / crate::replication::config::POSSESSION_SHARE_MAX,
+            16
+        );
     }
 
     #[test]

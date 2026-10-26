@@ -246,6 +246,7 @@ pub async fn audit_tick_with_repair_proofs(
         "Outbound audit request started"
     );
     let audit_started = Instant::now();
+    crate::replication::protocol::record_sent(&encoded);
     let response = match p2p_node
         .send_request(
             &challenged_peer,

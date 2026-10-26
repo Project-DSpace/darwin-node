@@ -107,6 +107,26 @@ pub const POSSESSION_CHECK_DELAY_MIN: Duration =
 pub const POSSESSION_CHECK_DELAY_MAX: Duration =
     Duration::from_secs(POSSESSION_CHECK_DELAY_MAX_SECS);
 
+/// How long a storer holds its offers after a store, so the other storers'
+/// holding notices can arrive first: the client's fixed wait for a store
+/// answer. A hold ends sooner once every close-group peer has been heard from
+/// or is marked full.
+pub const FRESH_OFFER_HOLD: Duration = Duration::from_secs(10);
+
+/// The most bytes of proofs a node's holds keep at once. At the cap the
+/// oldest hold ends early, which only means more sends.
+pub const HELD_PROOFS_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// The node-wide byte budget of possession checks. After its settle delay, a
+/// check takes a share the size of its record before it reads its copy, and
+/// gives it back when its last probe ends; a check waiting for budget holds
+/// only the key and its peers.
+pub const POSSESSION_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+
+/// The largest share of [`POSSESSION_BYTE_BUDGET`] one check takes: the
+/// largest record.
+pub const POSSESSION_SHARE_MAX: usize = crate::ant_protocol::MAX_CHUNK_SIZE;
+
 // The possession probe reuses the `AuditChallenge` wire and the bandwidth-
 // calibrated `audit_response_timeout(1)` deadline, so it needs no bespoke
 // per-probe timeout or retry constants.
@@ -972,6 +992,11 @@ pub struct ReplicationConfig {
     /// [`SubtreeRound1Limiter::new`](crate::replication) rather than disabling
     /// round 1 outright.
     pub subtree_round1_max_concurrent: usize,
+    /// How long a storer holds its offers ([`FRESH_OFFER_HOLD`]). A test-only
+    /// seam, so tests that count offers can shorten it; no release carries it,
+    /// and operators can't set it.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fresh_offer_hold: Duration,
 }
 
 impl Default for ReplicationConfig {
@@ -1001,11 +1026,27 @@ impl Default for ReplicationConfig {
             possession_check_delay_max: POSSESSION_CHECK_DELAY_MAX,
             subtree_round1_responder_cooldown: SUBTREE_ROUND1_RESPONDER_COOLDOWN,
             subtree_round1_max_concurrent: MAX_CONCURRENT_SUBTREE_ROUND1,
+            #[cfg(any(test, feature = "test-utils"))]
+            fresh_offer_hold: FRESH_OFFER_HOLD,
         }
     }
 }
 
 impl ReplicationConfig {
+    /// How long a storer holds its offers after a store: [`FRESH_OFFER_HOLD`],
+    /// or a test's shorter hold.
+    #[must_use]
+    pub fn fresh_offer_hold(&self) -> Duration {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            self.fresh_offer_hold
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        {
+            FRESH_OFFER_HOLD
+        }
+    }
+
     /// Validate safety constraints. Returns `Err` with a description if any
     /// constraint is violated.
     ///

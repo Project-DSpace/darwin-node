@@ -1568,3 +1568,94 @@ mod payment_encodings {
         }
     }
 }
+
+/// The names of fresh replication's counters, which the network monitor reads
+/// from the traffic summary: holding notices and notices with a proof, offers
+/// sent and skipped, how holds end, peers left unserved, slim proofs
+/// declined, proofs refused for their form, possession checks by how each
+/// peer was served, the byte budget, and the warnings, as counts. A rename
+/// would zero the monitor's reading of it without an error.
+#[test]
+fn the_fresh_replication_counters_keep_their_names() {
+    assert_eq!(
+        ant_node::replication::fresh_metrics::SUMMARY_FIELDS,
+        [
+            "holding_notices_sent",
+            "held_answer_notices_sent",
+            "proof_notices_sent",
+            "holding_notices_received",
+            "proof_notices_received",
+            "offers_sent",
+            "offers_skipped_heard_from",
+            "offers_skipped_marked_full",
+            "holds_ended_early",
+            "holds_ended_at_hold",
+            "holds_ended_at_cap",
+            "peers_left_unserved",
+            "holds_without_proof",
+            "heard_from_not_kept",
+            "slim_proofs_declined",
+            "proofs_refused_form_notice",
+            "proofs_refused_form_offer",
+            "proofs_refused_form_pointer_offer",
+            "possession_checks_heard_from",
+            "possession_checks_marked_full",
+            "possession_checks_offered",
+            "possession_checks_waiting_budget",
+            "possession_budget_bytes_held",
+            "possession_failures_skipped",
+            "pop_verification_errors",
+            "paid_notify_rejected",
+            "paid_notify_dropped_at_admission",
+            "pointer_offers_refused",
+            "offer_answers_not_sent",
+        ]
+    );
+}
+
+/// The per-recipient send counters of every message between nodes keep
+/// their names and their message: `<stem>_sent_count` and `<stem>_sent_bytes`,
+/// beside the per-encoding `<stem>_tx_*` fields.
+#[test]
+fn the_per_recipient_send_counters_keep_their_names() {
+    const STEMS: [&str; 23] = [
+        "fresh_offer",
+        "fresh_response",
+        "paid_notify",
+        "neighbor_sync_request",
+        "neighbor_sync_response",
+        "verification_request",
+        "verification_response",
+        "fetch_request",
+        "fetch_response",
+        "audit_challenge",
+        "audit_response",
+        "subtree_audit_challenge",
+        "subtree_audit_response",
+        "subtree_byte_challenge",
+        "subtree_byte_response",
+        "get_commitment_by_pin",
+        "get_commitment_by_pin_response",
+        "pointer_fresh_offer",
+        "pointer_hints",
+        "pointer_fetch_request",
+        "pointer_fetch_response",
+        "pointer_state_request",
+        "pointer_state_response",
+    ];
+    let source: String = repo_text("src/replication/protocol.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (i, stem) in STEMS.iter().enumerate() {
+        for field in [
+            format!("{stem}_sent_count = sc({i})"),
+            format!("{stem}_sent_bytes = sb({i})"),
+        ] {
+            assert!(
+                source.contains(&field),
+                "src/replication/protocol.rs no longer logs `{field}`"
+            );
+        }
+    }
+}
