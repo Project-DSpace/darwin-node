@@ -92,9 +92,8 @@ impl Search {
 /// payments through the others too: a provider can refuse a method these
 /// reads need (PublicNode refuses `eth_getLogs`, which finding a payment
 /// whose transaction hash is hidden takes).
-const ROBINHOOD_PUBLIC_RPCS: [&str; 3] = [
+const ROBINHOOD_PUBLIC_RPCS: [&str; 2] = [
     "https://robinhood-rpc.publicnode.com",
-    "https://rpc.ordofi.network",
     "https://rpc.mainnet.chain.robinhood.com",
 ];
 
@@ -1360,7 +1359,6 @@ pub mod tests {
             listings_rpc_urls("https://robinhood-rpc.publicnode.com/"),
             vec![
                 "https://robinhood-rpc.publicnode.com/",
-                "https://rpc.ordofi.network",
                 "https://rpc.mainnet.chain.robinhood.com",
             ]
         );
@@ -1369,7 +1367,6 @@ pub mod tests {
             vec![
                 "https://rpc.mainnet.chain.robinhood.com",
                 "https://robinhood-rpc.publicnode.com",
-                "https://rpc.ordofi.network",
             ]
         );
         // Its own provider, or a local chain: that one alone.

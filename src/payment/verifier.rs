@@ -4445,7 +4445,6 @@ mod tests {
             [
                 "https://rpc.mainnet.chain.robinhood.com",
                 "https://robinhood-rpc.publicnode.com",
-                "https://rpc.ordofi.network",
             ]
         );
         // An operator's own RPC (a local chain here) is the only one.
@@ -4498,8 +4497,8 @@ mod tests {
             })
             .await;
         let rounds = usize::try_from(PAYMENT_READ_ROUNDS).unwrap_or(usize::MAX);
-        assert_eq!(calls, 3 * rounds);
-        assert_eq!(answer, Err(format!("failure {}", 3 * rounds)));
+        assert_eq!(calls, 2 * rounds);
+        assert_eq!(answer, Err(format!("failure {}", 2 * rounds)));
     }
 
     /// One request a stub RPC received: its method, its parameters and when.
