@@ -867,28 +867,40 @@ mod tests {
         }
     }
 
-    /// The last release whose nodes read no pages: ds.16,
-    /// cut before the release that carries pages. This tree announces it, by
-    /// its version, until the release that carries pages is cut. When a
-    /// release without pages is cut before it, its number goes here.
+    /// The last release whose nodes read no pages: ds.16.
     const LAST_RELEASE_WITHOUT_PAGES: u64 = 16;
 
-    /// The release nodes page from is the one this tree is cut as: nodes of
-    /// this tree page to each other only once their agents name it, and a
-    /// release numbered past it that lacked pages would be paged and never
-    /// answer. So the tree's version names the release before pages (not cut
-    /// yet) or the release nodes page from (the cut). Once that release has
-    /// shipped, this relaxes to "at least the release nodes page from".
+    /// Nodes page from ds.17, the release that first carried pages, which
+    /// has shipped: the release stays ds.17 whatever this tree's version, so a
+    /// node of this tree pages to ds.17 nodes and later and sends a single
+    /// message to ds.16 and older. This tree is cut at ds.17 or a later
+    /// release, every one of which carries pages.
     #[test]
-    fn the_release_nodes_page_from_is_the_one_this_tree_is_cut_as() {
+    fn the_release_nodes_page_from_is_ds17_and_this_tree_is_at_or_after_it() {
+        assert_eq!(NEIGHBOR_SYNC_PAGES_FROM_RELEASE, 17);
+        assert_eq!(
+            LAST_RELEASE_WITHOUT_PAGES + 1,
+            NEIGHBOR_SYNC_PAGES_FROM_RELEASE
+        );
         let own = release_of(env!("CARGO_PKG_VERSION")).expect("a +ds version");
         assert!(
-            own == LAST_RELEASE_WITHOUT_PAGES || own == NEIGHBOR_SYNC_PAGES_FROM_RELEASE,
+            own >= NEIGHBOR_SYNC_PAGES_FROM_RELEASE,
             "this tree is ds.{own}: nodes page from ds.{NEIGHBOR_SYNC_PAGES_FROM_RELEASE} \
-             (NEIGHBOR_SYNC_PAGES_FROM_RELEASE), and the last release without pages is \
-             ds.{LAST_RELEASE_WITHOUT_PAGES}; set the one that moved"
+             (NEIGHBOR_SYNC_PAGES_FROM_RELEASE), already shipped"
         );
-        const { assert!(LAST_RELEASE_WITHOUT_PAGES < NEIGHBOR_SYNC_PAGES_FROM_RELEASE) };
+        let this_tree = format!("node/{}", env!("CARGO_PKG_VERSION"));
+        assert!(agent_reads_pages(
+            &this_tree,
+            NEIGHBOR_SYNC_PAGES_FROM_RELEASE
+        ));
+        assert!(agent_reads_pages(
+            "node/0.23.0+ds.17",
+            NEIGHBOR_SYNC_PAGES_FROM_RELEASE
+        ));
+        assert!(!agent_reads_pages(
+            &format!("node/0.23.0+ds.{LAST_RELEASE_WITHOUT_PAGES}"),
+            NEIGHBOR_SYNC_PAGES_FROM_RELEASE
+        ));
     }
 
     #[test]

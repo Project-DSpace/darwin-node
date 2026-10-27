@@ -231,7 +231,8 @@ pub const NEIGHBOR_SYNC_RECEIVED_HINTS_MAX_BYTES: usize = NEIGHBOR_SYNC_HINT_SET
 /// Its `+ds.<n>` build number. A node pages its hints to a peer whose user
 /// agent names this release or a later one, and sends a single message to any
 /// other. It must be the release that first carries pages, and every release
-/// numbered from it on must carry them: a test ties it to this tree's version,
+/// numbered from it on must carry them: a test pins it at ds.17 and this tree
+/// at or after it,
 /// and the Release workflow checks the tag and every earlier release tag.
 pub const NEIGHBOR_SYNC_PAGES_FROM_RELEASE: u64 = 17;
 

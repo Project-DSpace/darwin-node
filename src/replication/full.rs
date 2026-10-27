@@ -1324,10 +1324,13 @@ mod tests {
     }
 
     /// The notice ships in ds.17 with paged sync: the release after ds.16,
-    /// whose nodes neither read pages nor the notice. This tree's version
-    /// names ds.16 until ds.17 is cut, or ds.17 once it is.
+    /// whose nodes neither read pages nor the notice. ds.17 has shipped, so the
+    /// release stays ds.17 whatever this tree's version: a node of this tree
+    /// tells ds.17 nodes and later, and not ds.16 or older. This tree is cut
+    /// at ds.17 or a later release.
     #[test]
     fn the_notice_comes_with_paged_sync_in_the_release_after_ds16() {
+        assert_eq!(FULL_NOTICE_FROM_RELEASE, 17);
         assert_eq!(
             FULL_NOTICE_FROM_RELEASE,
             crate::replication::config::NEIGHBOR_SYNC_PAGES_FROM_RELEASE
@@ -1335,9 +1338,18 @@ mod tests {
         let own = crate::replication::sync_pages::release_of(env!("CARGO_PKG_VERSION"))
             .expect("a +ds version");
         assert!(
-            own == 16 || own == FULL_NOTICE_FROM_RELEASE,
+            own >= FULL_NOTICE_FROM_RELEASE,
             "this tree is ds.{own}: the notice comes from ds.{FULL_NOTICE_FROM_RELEASE}"
         );
+        let this_tree = format!("node/{}", env!("CARGO_PKG_VERSION"));
+        assert!(agent_reads_full_notice(
+            &this_tree,
+            FULL_NOTICE_FROM_RELEASE
+        ));
+        assert!(agent_reads_full_notice(
+            "node/0.23.0+ds.17",
+            FULL_NOTICE_FROM_RELEASE
+        ));
         assert!(!agent_reads_full_notice(
             "node/0.23.0+ds.16",
             FULL_NOTICE_FROM_RELEASE
