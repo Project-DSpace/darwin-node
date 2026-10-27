@@ -317,10 +317,15 @@ tracking must live at the storage layer, not at each call site:
   node silently lost paid-list entries for a fraction of the keys it was
   responsible for and never fetched them inside a 90s window
   (`test_late_joiner_replicates_responsible_chunks`). The bounds are therefore
-  set as a **memory ceiling** (64 outstanding, 16 per peer — 32 MiB at the
-  512 KiB worst-case proof) and the staleness shed uses one slow-cadence
-  neighbor-sync interval, the point at which the pull path would have learned
-  the same fact. The class's real protection is `PAID_NOTIFY_WORKER_LIMIT` = 2,
+  set as a **memory ceiling** (64 outstanding — 32 MiB at the 512 KiB
+  worst-case proof), and one peer may hold all but 16 of them (48): a reserve
+  for other peers, as fresh-offer admission has, rather than a quarter-of-the-
+  pool quota. One storer's notices reach a receiver as a one-way bulk fan-out,
+  so the share bounds that storer's backlog, and
+  `tests/e2e/fresh_offer_capacity.rs` uploads three times the share and checks
+  each receiver's peak from one sender stays below it. The staleness shed uses
+  one slow-cadence neighbor-sync interval, the point at which the pull path
+  would have learned the same fact. The class's real protection is `PAID_NOTIFY_WORKER_LIMIT` = 2,
   which bounds the concurrent EVM and DHT work that is actually expensive.
 - **Fresh-offer admission is bounded by a reserve, not a quota**, for the same
   reason. Reaching this ceiling is a *health signal*, not routine backpressure:

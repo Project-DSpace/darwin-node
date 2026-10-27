@@ -49,7 +49,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1126,10 +1126,14 @@ const PAID_NOTIFY_RESERVED_FOR_OTHER_SOURCES: usize = 16;
 /// the notices that reach its admission come from a storer whose hold ended
 /// without hearing from it, one per record, sent with that storer's offers at
 /// the pace the upload reached it. That is the fresh offers' traffic shape: a
-/// one-way bulk fan-out from one peer, with no reply to slow the sender. At a
-/// quarter of the pool, an ordinary 48-chunk upload from one storer had notices
-/// dropped (see `tests/e2e/fresh_offer_capacity.rs`), all of them at this
-/// share and none at the pool.
+/// one-way bulk fan-out from one peer, with no reply to slow the sender, so
+/// how many are outstanding at once depends on how fast the receiver drains
+/// them. In `tests/e2e/fresh_offer_capacity.rs` (five nodes in one process,
+/// on a multi-threaded runtime) uploads of 48, 144 and 288 records peaked at
+/// 5 to 12 per sender; with the whole fleet on one thread, a receiver fell
+/// behind and every size reached even this share. The reserve rule keeps the
+/// most room for a receiver that is slower than the sender, while the pool,
+/// and with it the memory ceiling, is unchanged.
 // The cast is from a compile-time constant difference of two small literals
 // (64 - 16), so truncation is impossible.
 #[allow(clippy::cast_possible_truncation)]
@@ -1860,6 +1864,10 @@ pub struct ReplicationEngine {
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Paid notifies being handled, by key: one at a time per key.
     paid_notify_flights: Arc<PaidNotifyFlights>,
+    /// Most paid notifies one source has had admitted at once since the
+    /// engine was created, so tests and operators can see how close one
+    /// sender came to [`PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER`].
+    paid_notify_peak_peer_inflight: Arc<AtomicU32>,
     /// Resource controls for the HEAVY subtree-audit round 1: its own
     /// tight admission pool (so a burst of full-subtree hashing can't starve the
     /// light audits), a per-peer rate cooldown, and single-use round-1 → round-2
@@ -2012,6 +2020,7 @@ impl ReplicationEngine {
             paid_notify_admission_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_MAX_OUTSTANDING)),
             paid_notify_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             paid_notify_flights: Arc::new(PaidNotifyFlights::default()),
+            paid_notify_peak_peer_inflight: Arc::new(AtomicU32::new(0)),
             subtree_round1: SubtreeRound1Limiter::new(
                 config.subtree_round1_responder_cooldown,
                 config.subtree_round1_max_concurrent,
@@ -2369,6 +2378,25 @@ impl ReplicationEngine {
     #[must_use]
     pub fn fresh_offers_dispatched(&self) -> u64 {
         self.fresh_offers_dispatched.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: the most paid notifies one source has had admitted at once
+    /// on this node since the engine was created. Below the per-sender share
+    /// ([`paid_notify_per_peer_share`]) it is the real per-sender
+    /// demand; at the share, notices beyond it were dropped.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn paid_notify_peak_peer_inflight(&self) -> u32 {
+        self.paid_notify_peak_peer_inflight.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: paid notifies admitted on this node and not yet finished,
+    /// whether on a worker or queued for one.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn paid_notifies_in_flight(&self) -> usize {
+        PAID_NOTIFY_MAX_OUTSTANDING
+            .saturating_sub(self.paid_notify_admission_semaphore.available_permits())
     }
 
     /// Test-only: take every outbound replication send permit. Until the
@@ -3297,6 +3325,7 @@ impl ReplicationEngine {
         let paid_notify_admission_semaphore = Arc::clone(&self.paid_notify_admission_semaphore);
         let paid_notify_responder_inflight = Arc::clone(&self.paid_notify_responder_inflight);
         let paid_notify_flights = Arc::clone(&self.paid_notify_flights);
+        let paid_notify_peak_peer_inflight = Arc::clone(&self.paid_notify_peak_peer_inflight);
         let heard_from = Arc::clone(&self.heard_from);
         let detached_task_tracker = self.detached_task_tracker.clone();
         let subtree_round1 = self.subtree_round1.clone();
@@ -3351,6 +3380,7 @@ impl ReplicationEngine {
             paid_notify_admission_semaphore,
             paid_notify_responder_inflight,
             paid_notify_flights,
+            paid_notify_peak_peer_inflight,
             heard_from,
             pointers: self.pointers.clone(),
             listings: self.listings.clone(),
@@ -4697,6 +4727,15 @@ pub fn fresh_offer_admission_refusals() -> u64 {
     audit_metrics::responder_admission_drops(ReplicationResponderClass::FreshOffer)
 }
 
+/// Test-only: the most paid notifies one source may have admitted at once
+/// (`PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER`), so a load test can size itself
+/// above it.
+#[cfg(any(test, feature = "test-utils"))]
+#[must_use]
+pub fn paid_notify_per_peer_share() -> u32 {
+    PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER
+}
+
 /// Cumulative paid-list notification admission refusals in this process.
 ///
 /// As with [`fresh_offer_admission_refusals`], zero is the expected value.
@@ -4834,6 +4873,7 @@ struct ReplicationMessageHandlerContext {
     paid_notify_admission_semaphore: Arc<Semaphore>,
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     paid_notify_flights: Arc<PaidNotifyFlights>,
+    paid_notify_peak_peer_inflight: Arc<AtomicU32>,
     /// Notes which peers were heard from for a key; never read here.
     heard_from: Arc<heard_from::HeardFrom>,
     /// Pointer replication, when this node stores pointers.
@@ -6948,7 +6988,11 @@ async fn dispatch_paid_notify(
     )
     .await
     {
-        Ok(guard) => guard,
+        Ok(guard) => {
+            ctx.paid_notify_peak_peer_inflight
+                .fetch_max(guard.peer_inflight, Ordering::Relaxed);
+            guard
+        }
         Err(failure) => {
             audit_metrics::record_responder_admission_drop(
                 ReplicationResponderClass::PaidNotify,
@@ -12123,9 +12167,9 @@ mod tests {
     /// The paid-notify per-source bound keeps its reserve for a peer holding
     /// nothing, without throttling one storer's notices at a hold's end.
     ///
-    /// Sized as a quarter of the pool, this bound dropped notices during an
-    /// ordinary single-storer upload (see `tests/e2e/fresh_offer_capacity.rs`),
-    /// and each drop discards paid-list evidence the sender never resends.
+    /// Each drop discards paid-list evidence the sender never resends, so the
+    /// share is the pool minus the reserve, as for fresh offers; the e2e
+    /// capacity test measures how much of it an upload uses.
     #[test]
     fn paid_notify_share_reserves_headroom_without_throttling_one_sender() {
         let share = usize::try_from(PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER).unwrap_or(usize::MAX);
@@ -12141,8 +12185,8 @@ mod tests {
         );
         assert!(
             share > PAID_NOTIFY_MAX_OUTSTANDING / 4,
-            "notices reaching admission are one storer's bulk fan-out; a \
-             quarter of the pool binds on an ordinary upload"
+            "notices reaching admission are one storer's bulk fan-out; the \
+             share is a reserve rule, not a quarter-of-the-pool quota"
         );
     }
 
