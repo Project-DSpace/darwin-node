@@ -252,7 +252,7 @@ this order:
   and ties between lookup reports break as upstream's do.
 - The order in which a node publishes its own addresses (its relay first when it has
   one) and the relay switch (`ANT_RELAY_SERVING`) are unchanged.
-- Only the dialling node's choice changes: no message changes, and peers of any release
+- Only the dialling node's choice changes: no message format changes (lookup replies list a peer's direct address before its relay, which receivers ignore since they choose by address type), and peers of any release
   are dialled the same way.
 
 ## Consequences
