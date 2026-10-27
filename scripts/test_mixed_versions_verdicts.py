@@ -603,6 +603,75 @@ def main():
             else:
                 print(f"ok: {name}")
 
+    # The run waits for that erasure as long as the node's constants say it
+    # can take, read from this tree's source.
+    fetch_window = sum(harness.rust_const(harness.REPLICATION_CONFIG, name) for name in (
+        "VERIFICATION_REQUEST_TIMEOUT_SECS", "FETCH_REQUEST_TIMEOUT_SECS",
+        "VERIFICATION_RETRY_BACKOFF_MAX_SECS"))
+    expect_equal("the fetch window, read from the source", fetch_window, 15 + 30 + 300)
+    expect_equal("the epochs before erasure, read from the source",
+                 harness.rust_const(harness.ERASURE_SOURCE, "EPOCHS_BEFORE_ERASURE"), 2)
+    longest = harness.lapse_erasure_seconds()
+    expect_equal("the full run observes past the lapse, the out-of-range wait and the fetch "
+                 "window", longest > harness.FULL_RUN_FRESHNESS_SECS
+                 + harness.FULL_RUN_HYSTERESIS_SECS + fetch_window + 10 * 60, True)
+
+    # The retention width, as src/replication/full.rs counts it.
+    numbers = list(range(30))
+    expect_equal("a window widens by one for each full node inside it",
+                 [harness.widened_len(numbers, 7, {n for n in numbers if n % 2}),
+                  harness.widened_len(numbers, 9, set()),
+                  harness.widened_len(numbers, 9, {0, 1, 2}),
+                  harness.widened_len(numbers, 9, set(range(15))),
+                  harness.widened_len(numbers[:5], 7, set())],
+                 [13, 9, 12, 20, 5])
+
+    # Which records a full node's lapse lets be erased in a group holding it.
+    # Nodes by letter, nearest first: F full; D the devnet's; the 9th node
+    # not full (Y) holds the record just inside the retention width F widens.
+    peers = {name: f"{index + 0x10:02x}" * 32 for index, name in enumerate("ABCDEFGHXYZ")}
+    peer = peers.get
+
+    def layout(order, held, devnet=()):
+        nearest = [peer(name) for name in order]
+        return ({"address": "ab" * 32, "nearest": nearest,
+                 "answers": [{"peer": peer(name), "outcome": "held"} for name in held]},
+                {peer(name) for name in devnet})
+
+    full = {peer("F")}
+    pressured = {peer(name) for name in "ABCDEGHXYZ"}
+    for name, order, held, devnet, wanted in [
+            ("a full node's lapse narrows the width past a holder: erasable",
+             "ABCFDEGHXYZ", "ABCDEGY", "", ["ab" * 32]),
+            ("a devnet node among the group leaves 5 proofs: not erasable",
+             "ABCFDEGHXYZ", "ABCDEGY", "B", []),
+            ("a node of the group without the record leaves 5 proofs: not erasable",
+             "ABCFDEGHXYZ", "ABCEGY", "", []),
+            ("the node the width leaves out lacks the record: nothing to erase",
+             "ABCFDEGHXYZ", "ABCDEGHX", "", []),
+            ("a full node past the group: its lapse doesn't make the group's",
+             "ABCDEGHFXYZ", "ABCDEGHXY", "", []),
+    ]:
+        record, devnet_ids = layout(order, held, devnet)
+        found = harness.lapse_candidates([record], full, devnet_ids, pressured)
+        expect_equal(name, found, {peer("F"): wanted})
+
+    # Choosing the full joiners gives a share of records.
+    expect_equal("place_full chooses among the joiners and gives a share",
+                 isinstance(harness.place_full(
+                     {f"joiner-{index:02d}": f"{0x40 + index:02x}" * 32 for index in range(8)},
+                     [f"{0x80 + index:02x}" * 32 for index in range(8)],
+                     {"f0" * 32, "f1" * 32}, 2)[1], float), True)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        folder = Path(temporary)
+        run = full_run(folder, ())
+        run["full_phases"]["stopped"]["candidates"] = []
+        found = harness.full_run_checks(run, [], [])
+        expect_equal("a full run whose layout let no lapse matter says so",
+                     [failure for failure in found["failures"]
+                      if "no full joiner's lapse would let" in failure] != [], True)
+
     listed(options())
 
     names =["all-old", "all-old-2", "all-old-12", "all-old-1", "all-old-x", "new-hosts-old"]

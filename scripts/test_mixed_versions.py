@@ -22,7 +22,7 @@ The runs (`--runs`):
   all-new        this tree throughout (not run unless asked for)
   full           this tree throughout, with --full joiners whose disk reads as
                  full through the free-space seam (run when --full is given),
-                 and the incumbents under disk pressure once the records are
+                 and every other node under disk pressure once the records are
                  stored, so they erase what they may (see "The full run")
   paged          this tree throughout, its incumbents admitting --busy-limit
                  sync requests at once through the admission seam, so that
@@ -121,14 +121,23 @@ sets.
 The full run. Every node of it runs with short timings through the seams
 (neighbour sync every FULL_RUN_SYNC_SECS, an out-of-range wait of
 FULL_RUN_HYSTERESIS_SECS, a "full" mark fresh for FULL_RUN_FRESHNESS_SECS),
-so erasure in two phases goes ahead within the run. The --full first joiners
-read a full disk from the start. After the uploads, and a few sync cycles, the
+so erasure in two phases goes ahead within the run. The joiners' identities
+are drawn before they join, and --full of them, chosen so that a full node's
+lapse can let records be erased in a group that holds it (place_full: the
+devnet's nodes, which answer no possession check, are often among a record's
+7 nearest not full in a network this small), read a full disk from the
+start. After the uploads, and a few sync cycles, the
 harness asks each record's nearest nodes (up to 20) for it: the early count.
-It then puts every incumbent under pressure at the falling floor's last step,
-above the full line, so each may erase the copies it holds out of its range;
-asks again halfway through the observation (the mid count); stops the first
-full joiner, whose mark then lapses at its peers; and asks again at the end.
-It must show, beyond what every run shows:
+It then puts every node not full under pressure at the falling floor's last
+step, above the full line, so each may erase the copies it holds out of its
+range, and asks again halfway through the observation (the mid count). It
+stops the full joiner whose mark's lapse lets the most counted records be
+erased (see lapse_candidates()), uploading and counting FULL_RUN_EXTRA_BATCHES
+more batches of records at most while no full joiner's would; its mark then
+lapses at its peers. It observes on until a node erases, after the lapse, a
+record whose group held the stopped node, up to the longest such an erasure
+can take (lapse_erasure_seconds(), from the node's own timing constants), and
+asks again at the end. It must show, beyond what every run shows:
 
 - copies stay at 7: at each count, every record is held by at least 7 nodes
   not full, less the devnet's nodes among its 7 nearest not full (they take no
@@ -180,9 +189,11 @@ removing its own folder there: the verdict reads every run the folder holds.
 import argparse
 import datetime
 import io
+import itertools
 import json
 import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -330,6 +341,33 @@ FRESHNESS_SEAM = "ANT_TEST_SEAM_FULL_FRESHNESS_SECS"
 FULL_RUN_SYNC_SECS = 30
 FULL_RUN_HYSTERESIS_SECS = 60
 FULL_RUN_FRESHNESS_SECS = 120
+# When no full joiner's lapse would let a counted record be erased (the
+# devnet's nodes, which answer no possession check, or joiners that never
+# got a record, among its 7 nearest not full), the full run uploads and
+# counts another batch of --records-after records, at most this many times.
+FULL_RUN_EXTRA_BATCHES = 3
+# The full run draws its joiners' identities before they join, and chooses
+# which are full so that the best one's lapse would let at least this share
+# of records be erased in a group that holds it (place_full), drawing again,
+# at most FULL_RUN_LAYOUT_TRIES times in all, while no choice reaches it.
+# With a quarter, the --records-after records give about nine runs in ten
+# such a record before any extra batch. The share is estimated over
+# FULL_RUN_LAYOUT_SAMPLE addresses, for at most FULL_RUN_LAYOUT_CHOICES
+# choices of the full joiners.
+FULL_RUN_LAYOUT_SHARE = 0.25
+FULL_RUN_LAYOUT_TRIES = 10
+FULL_RUN_LAYOUT_SAMPLE = 500
+FULL_RUN_LAYOUT_CHOICES = 100
+# A bootstrap address no node answers, for a node started only to draw its
+# identity; and the file its identity is kept in (src/config.rs).
+UNANSWERED_BOOTSTRAP = "127.0.0.1:9"
+IDENTITY_FILE = "node_identity.key"
+
+# The node's timing constants an erasure after a lapse waits on, read from
+# this tree's source (rust_const), so the full run observes as long as they
+# say.
+REPLICATION_CONFIG = "src/replication/config.rs"
+ERASURE_SOURCE = "src/replication/erasure.rs"
 
 # The seams (src/test_seams.rs) set on this tree's nodes in the runs in which
 # every node is of this tree (SEAMED_RUNS), so that within a run the joiners
@@ -357,7 +395,7 @@ RUN_AUDIT_SECS = 180
 # none is a failure.
 AUDIT_EXCHANGE_FLOOR = 50
 
-# The incumbents' disk under pressure in the full run: 2 GiB free of a 1 TB
+# The disk of every node not full in the full run, under pressure: 2 GiB free of a 1 TB
 # partition, under the falling floor's last step (2.5%), so a node may erase
 # anything out of its range, and above the full line (1 GiB), so it isn't
 # full.
@@ -717,6 +755,74 @@ class ExchangeWatch:
                 and (not answered or exchange.get("pages_answered", 0) >= 1)]
 
 
+class ErasureWatch:
+    """Follows logs for the erasures their nodes log, as they are written."""
+
+    def __init__(self, logs, records, since):
+        self.offsets = {path: 0 for path in logs}
+        self.records = records
+        self.since = since
+        self.erasures = []
+
+    def seen(self):
+        """Reads what the logs gained since the last call; returns every
+        erasure seen so far of one of `records` after `since`, as (time,
+        record)."""
+        for path, offset in self.offsets.items():
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(offset)
+                    data = handle.read()
+            except OSError:
+                continue
+            whole = data.rfind(b"\n") + 1
+            self.offsets[path] = offset + whole
+            for raw in data[:whole].splitlines():
+                text = ANSI.sub("", raw.decode("utf-8", "replace"))
+                if ERASED_LINE not in text:
+                    continue
+                stamp = parse_time(text)
+                record = fields(text).get("erased_record")
+                if stamp is not None and stamp > self.since and record in self.records:
+                    self.erasures.append((stamp, record))
+        return self.erasures
+
+
+def rust_const(path, name):
+    """The integer constant `name` of this tree's Rust source `path` (from the
+    repository root): its literal or product or sum of literals."""
+    text = (REPO / path).read_text(encoding="utf-8")
+    match = re.search(rf"\bconst {name}: \w+ = ([0-9_ *+]+);", text)
+    if not match:
+        raise HarnessError(f"{path} has no integer constant {name}")
+    return eval(match.group(1), {"__builtins__": {}})  # digits, *, + only
+
+
+def lapse_erasure_seconds():
+    """The longest from a full node's stop to an erasure its mark's lapse
+    allows, in the full run, by the node's constants and the run's seams:
+    the mark lapses (FULL_RUN_FRESHNESS_SECS); a prune pass, at most a sync
+    cycle later, starts the record's out-of-range clock; one at most a cycle
+    after the out-of-range wait (FULL_RUN_HYSTERESIS_SECS) selects it; and
+    one erases it at most a cycle after both EPOCHS_BEFORE_ERASURE cycles
+    and FETCH_WINDOW (the verification and fetch timeouts and the longest
+    retry backoff) have passed. A prune pass runs once a sync cycle
+    completes: NEIGHBOR_SYNC_SCOPE peers in rounds of
+    NEIGHBOR_SYNC_PEER_COUNT, each round started at most twice
+    FULL_RUN_SYNC_SECS after the last ended and over within the exchange
+    deadline."""
+    rounds = math.ceil(rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_SCOPE")
+                       / rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_PEER_COUNT"))
+    cycle = rounds * (2 * FULL_RUN_SYNC_SECS
+                      + rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_EXCHANGE_DEADLINE_SECS"))
+    fetch_window = sum(rust_const(REPLICATION_CONFIG, name) for name in (
+        "VERIFICATION_REQUEST_TIMEOUT_SECS", "FETCH_REQUEST_TIMEOUT_SECS",
+        "VERIFICATION_RETRY_BACKOFF_MAX_SECS"))
+    epochs = rust_const(ERASURE_SOURCE, "EPOCHS_BEFORE_ERASURE")
+    return (FULL_RUN_FRESHNESS_SECS + cycle + FULL_RUN_HYSTERESIS_SECS + cycle
+            + max(epochs * cycle, fetch_window + cycle))
+
+
 def paging_plan(name, new, old, paging_from, args):
     """What this tree's nodes are given in run `name` so that they page, and
     what its neighbour sync must then show. Until the release that reads
@@ -800,25 +906,30 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
                 values[NEIGHBOR_SYNC_SEAM] = str(FULL_RUN_SYNC_SECS)
                 values[HYSTERESIS_SEAM] = str(FULL_RUN_HYSTERESIS_SECS)
                 values[FRESHNESS_SEAM] = str(FULL_RUN_FRESHNESS_SECS)
-            if node.full or (name == "full" and node.role == "incumbent"):
+            if node.full or name == "full":
                 values[FREE_SPACE_SEAM] = str(folder / "seams" / f"{node.name}.free")
             return values
 
-        def launch(node, release):
-            """Starts `release`'s binary as `node`, on its data folder."""
+        def command_for(release, root, rewards, bootstraps):
+            """`release`'s node binary run on the data folder `root`."""
             command = [
-                str(release.node), "--root-dir", str(node.root), "--port", "0", "--ipv4-only",
+                str(release.node), "--root-dir", str(root), "--port", "0", "--ipv4-only",
                 "--network-mode", args.network_mode, "--metrics-port", "0",
                 "--evm-rpc-url", evm["rpc_url"],
                 "--evm-payment-token", evm["payment_token_address"],
                 "--evm-payment-vault", evm["payment_vault_address"],
-                "--rewards-address", node.rewards,
+                "--rewards-address", rewards,
                 "--config", str(node_config), "--enable-logging", "--log-level", "info",
             ]
             if args.network_mode == "development":
                 command += ["--webrtc-direct-bind", "127.0.0.1:0"]
-            for address in bootstrap:
+            for address in bootstraps:
                 command += ["--bootstrap", address]
+            return command
+
+        def launch(node, release):
+            """Starts `release`'s binary as `node`, on its data folder."""
+            command = command_for(release, node.root, node.rewards, bootstrap)
             node.process = Process(node.name, command, folder / f"{node.name}.log",
                                    node_env(node, release))
             processes.append(node.process)
@@ -826,10 +937,11 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
         def start(role, index, release, full):
             node_name = f"{role}-{index:02d}"
             root = folder / "nodes" / node_name
-            root.mkdir(parents=True)
-            if full or (name == "full" and role == "incumbent"):
-                # A full joiner reads no free space; an incumbent of the full
-                # run reads the host's own until it is put under pressure.
+            root.mkdir(parents=True, exist_ok=True)
+            if full or name == "full":
+                # A full joiner reads no free space; every other node of the
+                # full run reads the host's own until it is put under
+                # pressure.
                 seam = folder / "seams" / f"{node_name}.free"
                 seam.parent.mkdir(exist_ok=True)
                 disk = shutil.disk_usage(folder)
@@ -911,9 +1023,66 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
                     "restarts": [[stopped_old.isoformat(), up_old.isoformat()],
                                  [stopped_new.isoformat(), up_new.isoformat()]]}
 
+        def identities(release, count):
+            """Gives the data folders of `count` joiners an identity each:
+            `release`'s binary started on each, its bootstrap an address no
+            node answers (so no node learns of it), until it logs its
+            identity, and nothing but the identity kept. Returns the peer ids,
+            by joiner name."""
+            starting = []
+            for index in range(count):
+                node_name = f"joiner-{index:02d}"
+                root = folder / "nodes" / node_name
+                shutil.rmtree(root, ignore_errors=True)
+                root.mkdir(parents=True)
+                log_path = folder / "identities" / f"{node_name}.log"
+                log_path.parent.mkdir(exist_ok=True)
+                log_path.unlink(missing_ok=True)
+                starting.append((node_name, root, Process(
+                    f"{node_name} (identity)",
+                    command_for(release, root, "0x" + "d1" * 20, [UNANSWERED_BOOTSTRAP]),
+                    log_path, env)))
+            found = {}
+            try:
+                for node_name, _, process in starting:
+                    found[node_name] = wait_for(
+                        f"{node_name}'s identity",
+                        lambda process=process: peer_id_in(process.log_path), 120, process)
+            finally:
+                for _, _, process in starting:
+                    process.signal()
+                    process.stop()
+            for _, root, _ in starting:
+                for entry in root.iterdir():
+                    if entry.name != IDENTITY_FILE:
+                        if entry.is_dir():
+                            shutil.rmtree(entry)
+                        else:
+                            entry.unlink()
+            return found
+
         incumbents = [start("incumbent", index, network_release, False)
                       for index in range(args.incumbents)]
         started(incumbents)
+        full_names = {f"joiner-{index:02d}" for index in range(full_count)}
+        if name == "full":
+            # Which joiners are full: those whose lapse lets the most records
+            # be erased in a group that holds them, in the layout their
+            # identities and the others' make (place_full).
+            devnet_ids = {path.name for path in (devnet_data / "nodes").iterdir()
+                          if path.is_dir()}
+            for attempt in range(1, FULL_RUN_LAYOUT_TRIES + 1):
+                ids = identities(joiner_release, args.joiners)
+                chosen, share = place_full(ids, [node.peer_id for node in incumbents],
+                                           devnet_ids, full_count)
+                if share >= FULL_RUN_LAYOUT_SHARE or attempt == FULL_RUN_LAYOUT_TRIES:
+                    break
+            full_names = set(chosen)
+            log(f"{name}: full joiners {', '.join(sorted(full_names))}: the best one's lapse "
+                f"would let {share:.0%} of records be erased in its group "
+                f"(identities drawn {attempt} time(s))")
+            timeline["layout"] = {"full": sorted(full_names), "share": share,
+                                  "attempts": attempt}
         log(f"{name}: {len(incumbents)} incumbents up; settling {args.settle_seconds} s")
         time.sleep(args.settle_seconds)
 
@@ -921,7 +1090,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
         uploads.append(upload(harness, manifest_path, folder / "uploads-before.json",
                               args.records_before))
         timeline["joiners"] = utc_now().isoformat()
-        joiners = [start("joiner", index, joiner_release, index < full_count)
+        joiners = [start("joiner", index, joiner_release, f"joiner-{index:02d}" in full_names)
                    for index in range(args.joiners)]
         started(joiners)
         log(f"{name}: {len(joiners)} joiners up ({joiner_release.name}); settling "
@@ -944,26 +1113,73 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
             log(f"{name}: waiting {4 * FULL_RUN_SYNC_SECS} s, then counting copies")
             observe(4 * FULL_RUN_SYNC_SECS / 60)
             phases["early"] = [path.name for path in check_all("early")]
-            for node in incumbents:
-                (folder / "seams" / f"{node.name}.free").write_text(
-                    f"{PRESSURED_FREE} {PRESSURED_TOTAL}\n")
+            for node in nodes:
+                if not node.full:
+                    (folder / "seams" / f"{node.name}.free").write_text(
+                        f"{PRESSURED_FREE} {PRESSURED_TOTAL}\n")
             timeline["pressure"] = utc_now().isoformat()
             first_half = args.observe_minutes / 2
-            log(f"{name}: incumbents under pressure; observing for {first_half:g} min")
+            log(f"{name}: every node not full under pressure; observing for {first_half:g} min")
             observe(first_half)
-            phases["mid"] = [path.name for path in check_all("mid")]
+            mid = check_all("mid")
             full_joiners = [node for node in joiners if node.full]
-            victim = full_joiners[0]
+            pressured = {node.peer_id for node in nodes if not node.full}
+
+            def counted(paths):
+                return [found for path in paths
+                        for found in json.loads(path.read_text())["records"]]
+
+            for batch in range(FULL_RUN_EXTRA_BATCHES + 1):
+                candidates = lapse_candidates(counted(mid),
+                                              {node.peer_id for node in full_joiners},
+                                              devnet_ids, pressured)
+                victim = max(full_joiners, key=lambda node: len(candidates[node.peer_id]))
+                if candidates[victim.peer_id] or batch == FULL_RUN_EXTRA_BATCHES:
+                    break
+                log(f"{name}: no full joiner's lapse would let a counted record be erased; "
+                    f"uploading more ({batch + 1} of {FULL_RUN_EXTRA_BATCHES})")
+                extra = upload(harness, manifest_path, folder / f"uploads-extra-{batch + 1}.json",
+                               args.records_after)
+                uploads.append(extra)
+                observe(4 * FULL_RUN_SYNC_SECS / 60)
+                mid.append(check(harness, manifest_path, extra,
+                                 folder / f"check-mid-{extra.stem}.json"))
+            phases["mid"] = [path.name for path in mid]
+            # Every record whose group held the victim at a count, as the
+            # verdict reads them: an erasure of one after the lapse is what
+            # the run waits for.
+            group = set()
+            for found in counted([folder / name for name in phases["early"]] + mid):
+                nearest = found.get("nearest") or found["close_group"]
+                not_full, full_inside = window_of(nearest, {node.peer_id
+                                                            for node in full_joiners})
+                if victim.peer_id in not_full + full_inside:
+                    group.add(found["address"])
             victim.process.signal()
             victim.process.stop()
             stopped.add(victim.process.name)
+            stopped_at = utc_now()
             timeline["stopped"] = {"node": victim.name, "peer_id": victim.peer_id,
-                                   "at": utc_now().isoformat()}
+                                   "at": stopped_at.isoformat(),
+                                   "candidates": candidates[victim.peer_id]}
             second_half = max(args.observe_minutes / 2,
                               (FULL_RUN_FRESHNESS_SECS + 6 * FULL_RUN_SYNC_SECS) / 60)
-            log(f"{name}: stopped {victim.name}, whose mark lapses in "
-                f"{FULL_RUN_FRESHNESS_SECS} s; observing for {second_half:g} min")
-            observe(second_half)
+            if candidates[victim.peer_id]:
+                longest = lapse_erasure_seconds() / 60
+                log(f"{name}: stopped {victim.name}, whose mark lapses in "
+                    f"{FULL_RUN_FRESHNESS_SECS} s and then lets "
+                    f"{len(candidates[victim.peer_id])} counted record(s) be erased; observing "
+                    f"for {second_half:g} min, and on until one is, up to {longest:g} min")
+                watch = ErasureWatch([folder / f"{node.name}.log" for node in nodes], group,
+                                     stopped_at + datetime.timedelta(
+                                         seconds=FULL_RUN_FRESHNESS_SECS))
+                found = observe(second_half, watch.seen, max(second_half, longest))
+                log(f"{name}: {len(found or [])} erasure(s) after the lapse in a group that "
+                    f"held {victim.name}")
+            else:
+                log(f"{name}: stopped {victim.name}; no full joiner's lapse would let a "
+                    f"counted record be erased; observing for {second_half:g} min")
+                observe(second_half)
         else:
             log(f"{name}: observing for {args.observe_minutes} min")
             observe(args.observe_minutes)
@@ -993,7 +1209,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
         "audit_seam": name in SEAMED_RUNS,
         "rollback": rolled,
         "phase_checks": phases,
-        "full_phases": {key: timeline[key] for key in ("pressure", "stopped")
+        "full_phases": {key: timeline[key] for key in ("layout", "pressure", "stopped")
                         if key in timeline},
     }
     (folder / "run.json").write_text(json.dumps(record, indent=2))
@@ -1363,6 +1579,86 @@ def holders(record):
     return {answer["peer"] for answer in record["answers"] if answer["outcome"] == "held"}
 
 
+def widened_len(nearest, base, full):
+    """How many of `nearest` a window of `base` nodes holds once widened past
+    the nodes marked full (`full`): the nearest prefix holding `base` nodes
+    not full, at most WIDEST (as src/replication/full.rs counts it)."""
+    not_full = 0
+    for index, peer in enumerate(nearest):
+        if index >= WIDEST or not_full >= base:
+            return index
+        if peer not in full:
+            not_full += 1
+    return min(len(nearest), WIDEST)
+
+
+def place_full(joiners, others, devnet, count):
+    """Which `count` of `joiners` (peer ids by name) to make full, and the
+    share of records the best one's lapse would then let be erased in a group
+    that holds it (lapse_candidates), over FULL_RUN_LAYOUT_SAMPLE addresses
+    drawn the same way each time: a record at each held by every node not
+    full in its retention width, as the full run's records just stored are,
+    its nearest the nodes by XOR distance from it. `others` are the
+    incumbents' peer ids, `devnet` the devnet's; every node of ours not full
+    is under pressure. At most FULL_RUN_LAYOUT_CHOICES choices are tried,
+    drawn the same way each time when there are more."""
+    draw = random.Random(0)
+    names = sorted(joiners)
+    choices = list(itertools.combinations(names, count))
+    if len(choices) > FULL_RUN_LAYOUT_CHOICES:
+        choices = draw.sample(choices, FULL_RUN_LAYOUT_CHOICES)
+    peers = [joiners[name] for name in names] + list(others) + sorted(devnet)
+    records = []
+    for _ in range(FULL_RUN_LAYOUT_SAMPLE):
+        address = draw.getrandbits(256)
+        nearest = sorted(peers, key=lambda peer: int(peer, 16) ^ address)[:WIDEST]
+        records.append((f"{address:064x}", nearest))
+    best, best_share = choices[0], -1.0
+    for chosen in choices:
+        full = {joiners[name] for name in chosen}
+        pressured = set(peers) - full - set(devnet)
+        found = {peer: 0 for peer in full}
+        for address, nearest in records:
+            width = widened_len(nearest, ADMISSION_WIDTH, full)
+            record = {"address": address, "nearest": nearest,
+                      "answers": [{"peer": peer, "outcome": "held"}
+                                  for peer in nearest[:width] if peer not in full]}
+            for peer, erasable in lapse_candidates([record], full, devnet, pressured).items():
+                found[peer] += bool(erasable)
+        share = max(found.values()) / len(records)
+        if share > best_share:
+            best, best_share = chosen, share
+    return list(best), best_share
+
+
+def lapse_candidates(records, full, devnet, pressured):
+    """For each full node, the counted `records` an erasure could take once
+    its mark lapses, in a group that holds it: those whose window holds it
+    (window_of: the group an erasure takes its proofs from), so that, counted
+    not full, it narrows the retention width (ADMISSION_WIDTH nodes not full
+    and the full ones among them) by one. A holder under pressure
+    (`pressured`) left outside that width may then erase the record, with
+    ERASE_PROOFS proofs from the group, the stopped node aside: from holders,
+    none of them the devnet's nodes, which answer no possession check."""
+    found = {peer: [] for peer in full}
+    for record in records:
+        nearest = (record.get("nearest") or record["close_group"])[:WIDEST]
+        held = holders(record)
+        _, full_inside = window_of(nearest, full)
+        width = widened_len(nearest, ADMISSION_WIDTH, full)
+        for peer in full_inside:
+            rest = full - {peer}
+            not_full, still_full = window_of(nearest, rest)
+            narrower = widened_len(nearest, ADMISSION_WIDTH, rest)
+            erasers = [other for other in nearest[narrower:width]
+                       if other in held and other in pressured]
+            proofs = [other for other in not_full + still_full
+                      if other != peer and other in held and other not in devnet]
+            if erasers and len(proofs) >= ERASE_PROOFS:
+                found[peer].append(record["address"])
+    return found
+
+
 def full_run_checks(run, records, end_checks):
     """The full run's checks: copies at each count, stand-ins kept, the
     erasures' proofs, and a lapsed mark counted as missing."""
@@ -1458,17 +1754,23 @@ def full_run_checks(run, records, end_checks):
                                 f"the stopped node's mark lapsed counting {group_full} "
                                 f"members marked full, more than the {still_full} still "
                                 "running: a lapsed mark wasn't counted as missing")
-    # The run puts its incumbents under pressure so that they erase: with no
-    # erasure, the two checks above tested nothing.
+    # The run puts its nodes not full under pressure so that they erase:
+    # with no erasure, the two checks above tested nothing. The harness stops
+    # the full joiner whose lapse lets the most counted records be erased;
+    # none at all means the layout gave the run nothing to show.
+    layout = ("; in this layout no full joiner's lapse would let a counted record be "
+              "erased (the devnet's nodes, or nodes without the record, among its 7 "
+              "nearest not full): run again"
+              if (run["full_phases"].get("stopped") or {}).get("candidates") == [] else "")
     if not erasures:
         failures.append("no node erased a record, so \"erasure goes ahead with 6 real "
-                        "proofs\" and \"a lapsed mark counts as missing\" tested nothing")
+                        f"proofs\" and \"a lapsed mark counts as missing\" tested nothing{layout}")
     elif lapsed_at is not None and not any(erasure["after_lapse"] and erasure["held_stopped"]
                                            for erasure in erasures):
         after = sum(1 for erasure in erasures if erasure["after_lapse"])
         failures.append(f"no erasure after the lapse in a group that held the stopped node "
                         f"({after} after it in other groups, {len(erasures) - after} before), "
-                        "so \"a lapsed mark counts as missing\" tested nothing")
+                        f"so \"a lapsed mark counts as missing\" tested nothing{layout}")
     return {"failures": failures, "by_f": by_f, "copies": counts,
             "stand_ins_kept": stand_ins_kept, "erasures": erasures,
             "stopped": run["full_phases"].get("stopped")}
