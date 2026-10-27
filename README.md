@@ -3,10 +3,10 @@
 **Quantum-proof storage nodes for the Darwin network.**
 
 darwin-node is the node software for Darwin, our storage network. It is a fork
-of [Autonomi's ant-node](https://github.com/WithAutonomi/ant-node)
+of [ant-node](https://github.com/WithAutonomi/ant-node)
 (MIT/Apache-2.0), built on upstream's v0.23.0, and keeps upstream's crate and
 binary name, `ant-node`. Most of this README is upstream's. Where it talks
-about the "legacy" network, it means Autonomi's earlier network, which Darwin
+about the "legacy" network, it means upstream's earlier network, which Darwin
 never ran.
 
 ## What differs in this fork
@@ -17,7 +17,7 @@ never ran.
   `PRICE_MULTIPLIER` in `vendor/ant-protocol` (32). The storage-node Docker
   image sets this with `ANT_EVM_RPC_URL`, `ANT_EVM_PAYMENT_TOKEN` and
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
-  (Autonomi's contracts): run it on Darwin only with those three set (see
+  (upstream's contracts): run it on Darwin only with those three set (see
   [Join the Network](#join-the-network)). `tests/darwin_network.rs` checks
   that the image sets DARWIN's token and vault, the block that vault was
   deployed in (which the binary has built in for them), Robinhood Chain's RPC,
@@ -286,10 +286,10 @@ never ran.
   of these nodes: weekly in the Test workflow, against its main branch, and
   by hand.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
-  is empty on purpose, so an unconfigured node can't join Autonomi's network.
+  is empty on purpose, so an unconfigured node can't join upstream's network.
   The image passes Darwin's bootstrap servers itself. From ds.13 the binary
   reads a bootstrap peers file only from `$ANT_BOOTSTRAP_PEERS_PATH` or beside
-  itself, not from the `ant` folders it shares with Autonomi's programs (see
+  itself, not from the `ant` folders it shares with upstream's programs (see
   [Bootstrap Peers File](#bootstrap-peers-file)). `tests/fork_pins.rs`
   checks that the shipped file and every preset name no peers.
 - **Run nodes with the Docker image**: [docker/README.md](docker/README.md).
@@ -303,8 +303,8 @@ never ran.
   the Build workflow with `--locked` from the darwin-client commit
   `docker/manager-revision` pins, which must be on darwin-client's main
   (a change the image needs lands there first, then the pin follows it), in
-  place of Autonomi's `ant` 0.3.9, which the images up to ds.15's
-  downloaded. It deletes no node's data: Autonomi's
+  place of upstream's `ant` 0.3.9, which the images up to ds.15's
+  downloaded. It deletes no node's data: upstream's
   deleted the data of the node holding the least at 500 MiB free on a disk
   shared by 2 or more nodes. It keeps the registry where `ant` did
   (`/data/manager/ant/node_registry.json`), and passes nodes the same
@@ -421,7 +421,7 @@ never ran.
   marker names, or, for an image with none, its release's tag): `withdraw`
   is needed for any move to an older image, not only to an older node. It
   refuses a move from an image with an image marker (`darwin-nodes` as its
-  node manager) to one with none (Autonomi's manager, which deletes a
+  node manager) to one with none (upstream's manager, which deletes a
   node's data when its disk runs low) unless the run is a withdrawal and
   `allow_unmarked` is set, which only withdrawing the first image release
   needs, and the summary then says so in bold. A withdrawal goes back one
@@ -1038,7 +1038,7 @@ For connections, ant-node implements Happy Eyeballs:
 ## Migration from Legacy ant-node
 
 > **Not in this code.** This section is upstream's design for moving data
-> from Autonomi's legacy network. Neither upstream v0.23.0 nor this fork has
+> from upstream's legacy network. Neither upstream v0.23.0 nor this fork has
 > the migration tool: there is no `--migrate-ant-data` flag, no `[migration]`
 > config section and no legacy-network payment check. It does not apply to
 > Darwin, which has no legacy network.
@@ -1524,7 +1524,7 @@ cargo build --release
 ### Join the Network
 
 On first startup, the node needs bootstrap peers to join the network.
-Upstream ships Autonomi's peers in `bootstrap_peers.toml` next to the binary;
+Upstream ships its own network's peers in `bootstrap_peers.toml` next to the binary;
 in this fork that file is empty, so pass Darwin's peers yourself, along with
 the Robinhood Chain payment settings (the binary otherwise checks payments on
 Arbitrum One). Set a fixed `--port` as well: the default, 0, picks a random
@@ -1656,9 +1656,9 @@ peers = [
 Upstream also searches the platform config directory (`~/.config/ant/` on
 Linux, `~/Library/Application Support/ant/` on macOS, `%APPDATA%\ant\` on
 Windows) and `/etc/ant/`. This fork doesn't (from ds.13): those folders are
-shared with Autonomi's own programs, and Autonomi's installer writes its
+shared with upstream's own programs, and upstream's installer writes its
 network's bootstrap peers to the first, so a node started there without
-`--bootstrap` would join Autonomi's network.
+`--bootstrap` would join upstream's network.
 
 **Bootstrap peer precedence** (highest wins):
 1. `--bootstrap` CLI argument or `ANT_BOOTSTRAP` env var

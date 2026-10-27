@@ -10,7 +10,8 @@
   ADR-0022 (the unheld-chunk penalty restored on every lane); builds on ADR-0005
   Amendment 1 and ADR-0003 Amendment 1 (records outside the retention width kept while the
   disk has room, erased under disk pressure beyond ten times the distance to the 7th-nearest
-  peer)
+  peer); also records the order in which a node dials a peer's addresses, which
+  replaces upstream saorsa-core's relay-first order
 
 ## Context
 
@@ -226,6 +227,34 @@ group still checks it, and still charges it for anything outside the waiver abov
 of earlier releases drop the notice, keep charging a full node and don't widen their
 windows until they update.
 
+### Dial order: a verified direct address before a relay
+
+This release also changes the order in which a node dials a peer's addresses. Upstream's
+saorsa-core 0.29.1 dials a peer's relay first, so traffic to a reachable node passes
+through another node's relay. From ds.17 the vendored saorsa-core (`vendor/saorsa-core`)
+builds each peer's dial plan, at most 5 addresses tried in turn until one connects, in
+this order:
+
+1. a LAN address, when the peer is behind the node's own public IP address (at most one
+   per IP family);
+2. a verified direct address (at most one WAN address per IP family, a verified one
+   chosen over an unverified one);
+3. the peer's relay, skipped when the relay is behind the node's own public IP address;
+4. an unverified address;
+5. a LAN address, only when the peer has no WAN or relay address.
+
+- A node behind NAT has no verified direct address, so its relay is still dialled first,
+  and no direct connect attempt (1.25 s) is spent before it.
+- `AddressType::priority` sorts a peer's addresses in the same order (direct, relay,
+  unverified, LAN), so lookups and dials agree. Weighing one view of a peer against
+  another keeps upstream's order (relay, direct, unverified, LAN) in
+  `AddressType::tag_rank`: a lookup's hint still can't re-tag a relay address as direct,
+  and ties between lookup reports break as upstream's do.
+- The order in which a node publishes its own addresses (its relay first when it has
+  one) and the relay switch (`ANT_RELAY_SERVING`) are unchanged.
+- Only the dialling node's choice changes: no message format changes (lookup replies list a peer's direct address before its relay, which receivers ignore since they choose by address type), and peers of any release
+  are dialled the same way.
+
 ## Consequences
 
 ### Positive
@@ -272,6 +301,10 @@ windows until they update.
   (`protocol.rs`).
 - The census pins each lane's one waiver site and the lane it names
   (`retention/census.rs`).
+- The dial order: saorsa-core's own unit tests (`dht_network_manager.rs`,
+  `dht/core_engine.rs`, `client_routing.rs`), run by the Test workflow; `tests/fork_pins.rs`
+  pins the address priority, that those tests stay and run, and that `Cargo.lock` holds
+  only the vendored saorsa-core.
 - Integration tests on simulated small partitions with the shipped line
   (`tests/small_disks.rs`), and the quote, pointer and possession paths of a full node.
 
