@@ -462,7 +462,7 @@ async fn the_possession_check_penalises_only_a_member_that_dropped_the_record() 
     let keeper_before = checker_p2p.peer_trust(&keeper_peer);
 
     replication(checker_node)
-        .check_possession(record.state(), &[dropper_peer, keeper_peer])
+        .check_possession(record.state(), &[dropper_peer, keeper_peer], None)
         .await;
 
     assert!(
@@ -472,6 +472,74 @@ async fn the_possession_check_penalises_only_a_member_that_dropped_the_record() 
     assert!(
         checker_p2p.peer_trust(&keeper_peer) >= keeper_before,
         "the member that holds the record was penalised"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Full, not faulty: a new pointer written near a full node (one whose "full"
+/// notice is fresh, and that refused the offer, so it holds no state of the
+/// pointer) costs that node nothing in the possession check after the write,
+/// when it wasn't paid for the write. A member that isn't full and lacks the
+/// pointer is still penalised, and so is the full one if it was paid.
+#[tokio::test]
+#[serial]
+async fn the_pointer_possession_check_does_not_penalise_a_full_member_for_a_new_pointer() {
+    use ant_node::replication::full;
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let record = signed(&pk, &sk, 0, 1);
+    let checker = 3;
+    let full_member = 1;
+    let lacking = 2;
+    for i in others(&harness, &[full_member, lacking]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put");
+    }
+
+    // The checker only asks peers that understand pointers.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[checker]).await;
+
+    let checker_node = harness.test_node(checker).expect("node");
+    let checker_p2p = checker_node.p2p_node.as_ref().expect("p2p");
+    let full_peer = peer(harness.test_node(full_member).expect("node"));
+    let lacking_peer = peer(harness.test_node(lacking).expect("node"));
+    full::view_for(&peer(checker_node)).marks.note_notice(
+        full_peer,
+        true,
+        std::time::Instant::now(),
+    );
+    let full_before = checker_p2p.peer_trust(&full_peer);
+    let lacking_before = checker_p2p.peer_trust(&lacking_peer);
+
+    // Neither was among the write's paid quotes.
+    let paid: Vec<PeerId> = Vec::new();
+    replication(checker_node)
+        .check_possession(record.state(), &[full_peer, lacking_peer], Some(&paid))
+        .await;
+    assert!(
+        checker_p2p.peer_trust(&full_peer) >= full_before,
+        "the full member was penalised for a new pointer it couldn't take"
+    );
+    assert!(
+        checker_p2p.peer_trust(&lacking_peer) < lacking_before,
+        "the member that isn't full and lacks the pointer was not penalised"
+    );
+
+    // Paid for the write, the full member is charged like any other.
+    let full_before = checker_p2p.peer_trust(&full_peer);
+    replication(checker_node)
+        .check_possession(record.state(), &[full_peer], Some(&[full_peer]))
+        .await;
+    assert!(
+        checker_p2p.peer_trust(&full_peer) < full_before,
+        "the full member paid for the write was not penalised"
     );
 
     harness.teardown().await.expect("teardown");
@@ -719,7 +787,7 @@ async fn the_possession_check_does_not_penalise_the_other_side_of_a_fork() {
     let dropper_before = checker_p2p.peer_trust(&dropper_peer);
 
     replication(checker_node)
-        .check_possession(one_side.state(), &[forked_peer, dropper_peer])
+        .check_possession(one_side.state(), &[forked_peer, dropper_peer], None)
         .await;
 
     assert!(
@@ -765,10 +833,7 @@ fn disk_state(under_pressure: bool) -> DiskRetention {
 fn disk_state_with_floor(under_pressure: bool, floor: Option<XorName>) -> DiskRetention {
     let retention = DiskRetention::new(std::env::temp_dir());
     let available = if under_pressure { 5 } else { 50 };
-    retention.set_space_for_test(Some(DiskSpace {
-        available,
-        total: 100,
-    }));
+    retention.set_space_for_test(Some(DiskSpace::bytes(available, 100)));
     retention.set_floor_for_test(floor);
     retention
 }
@@ -961,10 +1026,7 @@ async fn pointer_erasure_goes_farthest_first_and_stops_once_fifteen_percent_is_f
         } else {
             15
         };
-        Some(DiskSpace {
-            available,
-            total: 100,
-        })
+        Some(DiskSpace::bytes(available, 100))
     });
 
     let result = replication(pruner_node)
@@ -1352,6 +1414,318 @@ async fn a_node_that_dropped_its_committed_pointers_fails_the_storage_audit() {
     assert!(
         matches!(result, AuditTickResult::Failed { .. }),
         "a node that dropped its committed pointers must fail, got {result:?}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A pointer hint reaches a stand-in for full peers, and the stand-in takes
+/// it: senders widen the hint's targets past the peers they mark full, and
+/// the receiver admits it across the storage admission width widened the
+/// same way, not the base width alone.
+///
+/// Five nodes and a close group of two, so the admission width is four: the
+/// fifth nearest stands in once the three between it and the nearest are
+/// marked full. While only the sender marks them, the stand-in drops the
+/// hint; once it marks them too, it takes the pointer.
+#[tokio::test]
+#[serial]
+async fn a_stand_in_for_full_peers_takes_a_pointer_hint() {
+    use ant_node::replication::full;
+
+    let harness = TestHarness::setup_with_config(prune_network(20))
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let record = signed(&pk, &sk, 1, 1);
+    mark_paid(&harness, &record);
+    let view = harness.test_node(0).expect("node");
+    let nearest: Vec<PeerId> = view
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&record.address(), 5)
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .collect();
+    assert_eq!(nearest.len(), 5);
+    let index_of = |peer: &PeerId| {
+        (0..harness.node_count())
+            .find(|i| {
+                harness
+                    .test_node(*i)
+                    .is_some_and(|node| self::peer(node) == *peer)
+            })
+            .expect("a node of the harness")
+    };
+    let sender = index_of(&nearest[0]);
+    let stand_in = index_of(&nearest[4]);
+    // Held by the four nearest, so the stand-in's check finds it.
+    for peer in &nearest[..4] {
+        store(harness.test_node(index_of(peer)).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put");
+    }
+    let mark = |index: usize| {
+        let node = harness.test_node(index).expect("node");
+        let marks = &full::view_for(&self::peer(node)).marks;
+        for peer in &nearest[1..4] {
+            marks.mark_for_test(*peer, std::time::Instant::now());
+        }
+    };
+    // Each learns the others understand pointers. Nobody is marked yet, so
+    // nobody hints the stand-in the record.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &everyone).await;
+    assert_eq!(
+        replication(harness.test_node(stand_in).expect("node")).pending_len(),
+        0
+    );
+
+    // Only the sender marks them: it hints the stand-in, which drops it.
+    mark(sender);
+    exchange_hints(&harness, &[sender], &[stand_in]).await;
+    let stand_in_node = harness.test_node(stand_in).expect("node");
+    assert_eq!(replication(stand_in_node).pending_len(), 0);
+    assert!(held(stand_in_node, &record).is_none());
+
+    // The stand-in marks them too: it takes the hint and fetches the record.
+    mark(stand_in);
+    exchange_hints(&harness, &[sender], &[stand_in]).await;
+    assert!(
+        replication(stand_in_node).pending_len() > 0 || held(stand_in_node, &record).is_some(),
+        "a stand-in for full peers takes the pointer hint"
+    );
+    replication(stand_in_node).verify_due().await;
+    assert!(
+        wait_for(&harness, stand_in, &record).await,
+        "and stores the record its close group holds"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A node's answer to a quote request through its own request handler, as a
+/// client's quote arrives.
+async fn quote_through(
+    node: &TestNode,
+    address: XorName,
+    data_type: u32,
+    data_size: u64,
+) -> ant_node::ant_protocol::ChunkQuoteResponse {
+    use ant_node::ant_protocol::ChunkQuoteRequest;
+    let message = ChunkMessage {
+        request_id: 7,
+        body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+            address,
+            data_size,
+            data_type,
+        }),
+    };
+    let reply = node
+        .ant_protocol
+        .as_ref()
+        .expect("protocol")
+        .try_handle_request(&message.encode().expect("encode"))
+        .await
+        .expect("handle")
+        .expect("answered");
+    match ChunkMessage::decode(&reply).expect("decode").body {
+        ChunkMessageBody::QuoteResponse(response) => response,
+        other => panic!("expected a quote response, got {other:?}"),
+    }
+}
+
+/// A pointer update near full nodes, over each node's real quote path: with
+/// 3 of the 7 nearest full and not holding the pointer, only 4 quote, fewer
+/// than the 5 of 7 a pointer write needs, so a client stops before paying
+/// (the stop itself is the client's); with the same 3 full but
+/// holding it, all 7 quote the update, and it goes through.
+#[tokio::test]
+#[serial]
+async fn a_pointer_update_near_full_nodes_is_quoted_only_by_those_that_can_take_it() {
+    use ant_node::ant_protocol::ChunkQuoteResponse;
+    use ant_node::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
+    use ant_node::storage::FullTrigger;
+
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let record = signed(&pk, &sk, 1, 1);
+    let nearest: Vec<PeerId> = harness
+        .test_node(0)
+        .expect("node")
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&record.address(), 7)
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .collect();
+    assert_eq!(nearest.len(), 7);
+    let index_of = |peer: &PeerId| {
+        (0..harness.node_count())
+            .find(|i| {
+                harness
+                    .test_node(*i)
+                    .is_some_and(|node| self::peer(node) == *peer)
+            })
+            .expect("a node of the harness")
+    };
+    let group: Vec<usize> = nearest.iter().map(index_of).collect();
+    let chunks = |index: usize| {
+        harness
+            .test_node(index)
+            .expect("node")
+            .ant_protocol
+            .as_ref()
+            .expect("protocol")
+            .storage()
+    };
+    let quoting = |answers: &[ChunkQuoteResponse]| {
+        answers
+            .iter()
+            .filter(|answer| matches!(answer, ChunkQuoteResponse::Success { .. }))
+            .count()
+    };
+    let ask_all = || async {
+        let mut answers = Vec::new();
+        for index in &group {
+            answers.push(
+                quote_through(
+                    harness.test_node(*index).expect("node"),
+                    record.address(),
+                    DATA_TYPE_POINTER,
+                    POINTER_WIRE_LEN as u64,
+                )
+                .await,
+            );
+        }
+        answers
+    };
+
+    // Held by the four not full; three full nodes that don't hold it.
+    for index in &group[3..] {
+        store(harness.test_node(*index).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("stored");
+    }
+    for index in &group[..3] {
+        chunks(*index).set_full_for_test(Some(FullTrigger::Bytes));
+    }
+    let answers = ask_all().await;
+    assert_eq!(
+        quoting(&answers),
+        4,
+        "only the 4 not full quote: {answers:?}"
+    );
+    for answer in &answers[..3] {
+        assert!(
+            matches!(answer, ChunkQuoteResponse::Error(_)),
+            "a full node that doesn't hold the pointer prices no new data: {answer:?}"
+        );
+    }
+
+    // The three full nodes now hold it: they quote its update too.
+    for index in &group[..3] {
+        store(harness.test_node(*index).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("stored");
+    }
+    let answers = ask_all().await;
+    assert_eq!(
+        quoting(&answers),
+        7,
+        "a full holder quotes an update of what it holds: {answers:?}"
+    );
+    for index in &group[..3] {
+        chunks(*index).set_full_for_test(None);
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A full node repairs a pointer it holds and doesn't look for one it
+/// doesn't: a newer state of a held pointer takes no new space, a new pointer
+/// would (`may_repair_address`). Both hints are queued; the round fetches only
+/// the held one, and the other is fetched once the node is no longer full,
+/// which shows its hint was sound and only the full gate held it back.
+#[tokio::test]
+#[serial]
+async fn a_full_node_repairs_a_pointer_it_holds_and_fetches_none_it_does_not() {
+    use ant_node::storage::FullTrigger;
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let created = signed(&pk, &sk, 0, 1);
+    let updated = signed(&pk, &sk, 3, 2);
+    let (other_pk, other_sk) = owner();
+    let unheld = signed(&other_pk, &other_sk, 0, 3);
+    let full_node = 4;
+    let current = others(&harness, &[full_node]);
+
+    // Everyone holds the create; everyone but the full node holds the update
+    // and a second pointer, written straight into their stores so nothing
+    // replicates them.
+    for i in 0..harness.node_count() {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&created.to_bytes())
+            .await
+            .expect("put");
+    }
+    for i in &current {
+        let node_store = store(harness.test_node(*i).expect("node"));
+        node_store
+            .put_bytes(&updated.to_bytes())
+            .await
+            .expect("put");
+        node_store.put_bytes(&unheld.to_bytes()).await.expect("put");
+    }
+
+    let node = harness.test_node(full_node).expect("node");
+    let chunks = node.ant_protocol.as_ref().expect("protocol").storage();
+    chunks.set_full_for_test(Some(FullTrigger::Bytes));
+
+    // The engine's own verification loop may take the held pointer's hint
+    // before this round does; either way only that one is fetched.
+    exchange_hints(&harness, &current, &[full_node]).await;
+    replication(node).verify_due().await;
+
+    assert!(
+        wait_for(&harness, full_node, &updated).await,
+        "the full node didn't repair the pointer it holds"
+    );
+    // Give a fetch of the unheld pointer, were one started, time to land;
+    // the engine's own verification loop runs meanwhile too.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        held(node, &unheld).is_none(),
+        "the full node fetched a pointer it doesn't hold"
+    );
+    assert_eq!(
+        replication(node).pending_len(),
+        1,
+        "the unheld pointer's hint was queued and waits"
+    );
+
+    // No longer full, it fetches the hint it held back.
+    chunks.set_full_for_test(None);
+    replication(node).verify_due().await;
+    assert!(
+        wait_for(&harness, full_node, &unheld).await,
+        "the hint held back while full was not sound"
     );
 
     harness.teardown().await.expect("teardown");

@@ -1273,6 +1273,13 @@ impl TestNetwork {
                 .bootstrap_peers
                 .clone_from(&node.bootstrap_addrs);
             core_config.diversity_config = Some(CoreDiversityConfig::permissive());
+            // The user agent a node announces (src/node.rs), which names its
+            // release: peers read from it which messages it reads. A test may
+            // set the release it names (ANT_TEST_SEAM_ANNOUNCED_RELEASE).
+            core_config.custom_user_agent = Some(format!(
+                "node/{}",
+                ant_node::test_seams::announced_version(env!("CARGO_PKG_VERSION"))
+            ));
             // Inject the ML-DSA identity so the P2PNode's transport peer ID
             // matches the pub_key embedded in payment quotes.
             core_config.node_identity.clone_from(&node.node_identity);

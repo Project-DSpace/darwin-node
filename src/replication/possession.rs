@@ -36,6 +36,7 @@ use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::config::{
     ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, REPLICATION_PROTOCOL_ID,
 };
+use crate::replication::full::{self, Lane, OwnQuote, UnheldAnswer, UnheldCase};
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
@@ -59,6 +60,10 @@ pub struct PossessionCheckEvent {
     pub key: XorName,
     /// Close-group peers responsible for holding it (excludes self).
     pub peers: Vec<PeerId>,
+    /// The issuers of the paid quotes in the write's payment proof, `None`
+    /// when the proof couldn't be read: a full peer paid for the record is
+    /// charged for not holding it (see [`crate::replication::full`]).
+    pub paid_quote_issuers: Option<Vec<PeerId>>,
 }
 
 /// Verdict of cryptographically probing a single peer for possession of a chunk.
@@ -136,6 +141,7 @@ pub fn random_delay(min: Duration, max: Duration) -> Duration {
 pub(crate) async fn run_possession_check(
     key: XorName,
     peers: Vec<PeerId>,
+    paid_quote_issuers: Option<&[PeerId]>,
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<ChunkStore>,
     config: &ReplicationConfig,
@@ -185,11 +191,16 @@ pub(crate) async fn run_possession_check(
         {
             ProbeOutcome::Present => {
                 debug!("Possession check: {peer} proved possession of {key_hex}");
+                full::view_for(p2p_node.peer_id()).seen.record(&peer, &key);
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
             }
             ProbeOutcome::Failed(reason) => {
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
-                report_possession_confirmed_failure(&peer, &key_hex, reason, p2p_node).await;
+                let own_quote = full::own_quote(&peer, paid_quote_issuers);
+                report_possession_confirmed_failure(
+                    &peer, &key, &key_hex, reason, own_quote, p2p_node,
+                )
+                .await;
             }
             ProbeOutcome::NoResponse(class) => {
                 audit_metrics::record_audit_no_response(AuditType::Possession, class);
@@ -217,10 +228,29 @@ async fn clear_possession_bootstrap_claim(
 
 async fn report_possession_confirmed_failure(
     peer: &PeerId,
+    key: &XorName,
     key_hex: &str,
     failure_reason: PossessionFailureReason,
+    own_quote: OwnQuote,
     p2p_node: &Arc<P2PNode>,
 ) {
+    // Full, not faulty: a full peer that answered it lacks the key, in the one case the
+    // waiver allows (its own quote not among the paid ones), is not charged.
+    let case = UnheldCase {
+        lane: Lane::PossessionFailed,
+        peer,
+        key,
+        answer: if failure_reason == PossessionFailureReason::AbsentKey {
+            UnheldAnswer::Absent
+        } else {
+            UnheldAnswer::Other
+        },
+        commitment_pinned: false,
+        own_quote,
+    };
+    if full::view_for(p2p_node.peer_id()).waives_unheld_penalty(&case, Instant::now()) {
+        return;
+    }
     warn!(
         audit_type = AuditType::Possession.as_str(),
         audit_failure_class = "confirmed",

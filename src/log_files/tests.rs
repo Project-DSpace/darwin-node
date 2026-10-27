@@ -616,9 +616,10 @@ fn warnings_and_errors_are_marked_to_be_kept_first() {
     assert!(lines.iter().all(|line| line.ends_with(b"\n")));
 }
 
-/// The INFO summary lines a canary reads, the browser refusal counts and
-/// the commitment tick, are marked to be kept first, and so written at the
-/// full line, where other INFO lines are dropped.
+/// The INFO summary lines a canary or an operator reads, the browser
+/// refusal counts, the commitment tick and the "Node full:" lines `nodes
+/// status` reads, are marked to be kept first, and so written at the full
+/// line, where other INFO lines are dropped.
 #[test]
 fn the_summary_lines_a_canary_reads_are_written_at_the_full_line() {
     use tracing_subscriber::prelude::*;
@@ -631,16 +632,29 @@ fn the_summary_lines_a_canary_reads_are_written_at_the_full_line() {
     tracing::subscriber::with_default(subscriber, || {
         tracing::info!(target: "ant_node::web_rtc::refusals", total = 3, "browser refusals");
         tracing::info!(target: "ant_node::replication::commitment_tick", "Storage commitment tick");
+        tracing::info!(
+            target: "ant_node::replication::full_state",
+            "Node full: since 1700000000, at the full line by bytes"
+        );
         tracing::info!(target: "ant_node::replication", "other news");
     });
     let lines = capture.0.lock().unwrap().clone();
     let tags: Vec<u8> = lines.iter().map(|line| line[0]).collect();
-    assert_eq!(tags, [TAG_KEEP_FIRST, TAG_KEEP_FIRST, TAG_DROP_FIRST]);
+    assert_eq!(
+        tags,
+        [
+            TAG_KEEP_FIRST,
+            TAG_KEEP_FIRST,
+            TAG_KEEP_FIRST,
+            TAG_DROP_FIRST
+        ]
+    );
     assert_eq!(
         KEEP_FIRST_TARGETS,
         [
             "ant_node::web_rtc::refusals",
-            "ant_node::replication::commitment_tick"
+            "ant_node::replication::commitment_tick",
+            "ant_node::replication::full_state"
         ]
     );
 
@@ -655,5 +669,6 @@ fn the_summary_lines_a_canary_reads_are_written_at_the_full_line() {
     let text = text_of(dir.path());
     assert!(text.contains("browser refusals"), "{text}");
     assert!(text.contains("Storage commitment tick"), "{text}");
+    assert!(text.contains("Node full: since 1700000000"), "{text}");
     assert!(!text.contains("other news"), "{text}");
 }

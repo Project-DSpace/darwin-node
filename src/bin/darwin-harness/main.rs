@@ -69,6 +69,10 @@ const SETTLEMENT_VERSION: u32 = 1;
 /// What a quote refusal from a node that settles under older rules than the
 /// client's contains (`ProtocolError::StorerUpdateRequired`, as debug text).
 const STORER_UPDATE_REQUIRED: &str = "StorerUpdateRequired";
+/// How many of the nodes nearest a record `check` asks for it: the widest a
+/// key's window grows around nodes marked full (`full::MAX_WIDENED_WIDTH`),
+/// so the analysis can count copies on nodes not full and on stand-ins.
+const WIDEST: usize = ant_node::replication::full::MAX_WIDENED_WIDTH;
 
 /// The client side of the mixed-version harness.
 #[derive(Parser, Debug)]
@@ -209,6 +213,10 @@ struct Check {
     storers: Vec<String>,
     /// The nodes nearest it now, nearest first.
     close_group: Vec<String>,
+    /// The nodes nearest it now, nearest first, up to [`WIDEST`] of them,
+    /// as many as the lookup found: each is asked too.
+    #[serde(default)]
+    nearest: Vec<String>,
     /// Each of those nodes' answer, once each.
     answers: Vec<Answer>,
     /// How many of the storers returned the record's bytes.
@@ -344,6 +352,22 @@ async fn nearest(client: &P2PNode, address: &[u8; 32], count: usize) -> Result<V
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Up to [`WIDEST`] nodes nearest `address`, nearest first, from one
+/// network lookup: as many as it finds, the client left out.
+async fn widest(client: &P2PNode, address: &[u8; 32]) -> Vec<PeerId> {
+    let mut found: Vec<PeerId> = client
+        .dht()
+        .find_closest_nodes(address, WIDEST + 1)
+        .await
+        .map(|nodes| nodes.into_iter().map(|node| node.peer_id).collect())
+        .unwrap_or_default();
+    found.retain(|peer| peer != client.peer_id());
+    found.sort_by_key(|peer| xor_distance(address, peer.as_bytes()));
+    found.dedup();
+    found.truncate(WIDEST);
+    found
 }
 
 /// A chunk-protocol request to `peer`, answered by `pick` within `timeout`.
@@ -654,8 +678,13 @@ async fn check(client: &P2PNode, uploads: &Uploads) -> Result<Checks> {
             .map(|answer| bytes32(&answer.peer).map(PeerId::from_bytes))
             .collect::<Result<Vec<_>>>()?;
         let group = close_group(client, &address).await?;
+        let nearest = widest(client, &address).await;
         let mut asked = storers.clone();
-        asked.extend(group.iter().filter(|peer| !storers.contains(peer)));
+        for peer in group.iter().chain(&nearest) {
+            if !asked.contains(peer) {
+                asked.push(*peer);
+            }
+        }
         let answers = futures::future::join_all(asked.iter().map(|peer| async move {
             let outcome = ask(
                 client,
@@ -703,6 +732,7 @@ async fn check(client: &P2PNode, uploads: &Uploads) -> Result<Checks> {
             address: upload.address.clone(),
             storers: storers.iter().map(PeerId::to_hex).collect(),
             close_group: group.iter().map(PeerId::to_hex).collect(),
+            nearest: nearest.iter().map(PeerId::to_hex).collect(),
             answers,
             held_by_storers,
             held_by_close_group,

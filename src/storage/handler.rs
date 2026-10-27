@@ -1130,6 +1130,16 @@ impl AntProtocol {
             });
         }
 
+        // Full, not faulty: a node at the full line, or full, prices no
+        // new data. A chunk it holds is still answered as already stored, so
+        // nobody pays for it again, and an update of a pointer it holds is
+        // still quoted, since it takes no new space.
+        if !already_stored && !self.holds_pointer_for_quote(request) {
+            if let Some(refusal) = self.full_quote_refusal(data_size_usize) {
+                return ChunkQuoteResponse::Error(refusal);
+            }
+        }
+
         match self.quote_generator.create_priced_quote(
             request.address,
             data_size_usize,
@@ -1161,6 +1171,44 @@ impl AntProtocol {
             }
             Err(e) => ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(e.to_string())),
         }
+    }
+
+    /// Whether `request` asks for a quote for an update of a pointer this
+    /// node holds.
+    fn holds_pointer_for_quote(&self, request: &ChunkQuoteRequest) -> bool {
+        request.data_type == crate::pointer::DATA_TYPE_POINTER
+            && self
+                .pointers
+                .as_ref()
+                .is_some_and(|pointers| pointers.store().state(&request.address).is_some())
+    }
+
+    /// The refusal of a quote for `data_size` bytes of new data, when this
+    /// node is full or at the full line: the existing quote failure, so
+    /// the client asks the next node. `None` when it can take the data.
+    fn full_quote_refusal(&self, data_size: usize) -> Option<ProtocolError> {
+        // One line every few minutes: at the full line every quote is refused.
+        static REFUSED: crate::logging::Repeats = crate::logging::Repeats::new();
+        let refusal = if let Some(state) = self.storage.full_state() {
+            format!(
+                "This node is full (at the full line by {}) and prices no new data",
+                state.trigger.as_str()
+            )
+        } else {
+            let bytes = u64::try_from(data_size).unwrap_or(u64::MAX);
+            let Err(e) = self.storage.check_capacity_for(bytes) else {
+                return None;
+            };
+            format!("This node prices no new data: {e}")
+        };
+        if let Some(held_back) = REFUSED.admit() {
+            info!(
+                target: "ant_node::storage::disk_precheck",
+                held_back,
+                "Refusing a quote for new data: {refusal}"
+            );
+        }
+        Some(ProtocolError::QuoteFailed(refusal))
     }
 
     /// Handle a version-declaring storage quote request.
@@ -2439,6 +2487,130 @@ pub mod tests {
             }
             other => panic!("expected Success with already_stored=false, got: {other:?}"),
         }
+    }
+
+    /// Full, not faulty: a full node prices no new data, but a chunk it holds
+    /// is still answered as already stored, so with a majority of a chunk's
+    /// holders full the client is told to skip it and pays nothing.
+    #[tokio::test]
+    async fn a_full_node_prices_no_new_data_and_answers_already_stored() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let content = b"held by a node that then fills";
+        let address = ChunkStore::compute_address(content);
+        protocol.payment_verifier().cache_insert(address);
+        let put_msg = ChunkMessage {
+            request_id: 340,
+            body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(
+                address,
+                Bytes::copy_from_slice(content),
+            )),
+        };
+        let _ = protocol
+            .try_handle_request(&put_msg.encode().expect("encode put"))
+            .await
+            .expect("handle put");
+        protocol
+            .storage()
+            .set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+
+        let quote = |address: XorName| {
+            protocol.handle_quote(&ChunkQuoteRequest {
+                address,
+                data_size: 100,
+                data_type: DATA_TYPE_CHUNK,
+            })
+        };
+        assert!(
+            matches!(
+                quote(address),
+                ChunkQuoteResponse::Success {
+                    already_stored: true,
+                    ..
+                }
+            ),
+            "a chunk the full node holds is answered as already stored"
+        );
+        match quote([0xEE; 32]) {
+            ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(message)) => {
+                assert!(message.contains("full"), "{message}");
+            }
+            other => panic!("a full node prices no new data, got {other:?}"),
+        }
+
+        protocol.storage().set_full_for_test(None);
+        assert!(matches!(
+            quote([0xEE; 32]),
+            ChunkQuoteResponse::Success {
+                already_stored: false,
+                ..
+            }
+        ));
+    }
+
+    /// At the full line a node prices no new data, full or not yet.
+    #[tokio::test]
+    async fn a_node_at_the_full_line_prices_no_new_data() {
+        let (protocol, _temp) = create_test_protocol_with_reserve(u64::MAX).await;
+        let response = protocol.handle_quote(&ChunkQuoteRequest {
+            address: [0xED; 32],
+            data_size: 100,
+            data_type: DATA_TYPE_CHUNK,
+        });
+        assert!(
+            matches!(
+                response,
+                ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(_))
+            ),
+            "got {response:?}"
+        );
+    }
+
+    /// A full node still quotes an update of a pointer it holds, which takes
+    /// no new space, and refuses a quote for a pointer it doesn't hold.
+    #[tokio::test]
+    async fn a_full_node_quotes_updates_of_the_pointers_it_holds_only() {
+        use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
+        use saorsa_pqc::api::sig::ml_dsa_65;
+
+        let (protocol, temp) = create_test_protocol().await;
+        let store = crate::pointer::store::PointerStore::new(&temp.path().join("pointers"))
+            .await
+            .expect("pointer store");
+        let pointers = PointerService::new(store);
+        let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[3; 32]);
+        let target = PointerTarget::new(PointerTargetKind::Chunk, [1; 32]);
+        let record = Pointer::sign(&sk, &pk, 0, target).expect("sign");
+        assert!(matches!(
+            pointers
+                .handle_put(ant_protocol::chunk::PointerPutRequest::new(Bytes::from(
+                    record.to_bytes()
+                )))
+                .await,
+            PointerPutResponse::Success { .. }
+        ));
+        let protocol = protocol.with_pointer_service(pointers);
+        protocol
+            .storage()
+            .set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+
+        let quote = |address: XorName| {
+            protocol.handle_quote(&ChunkQuoteRequest {
+                address,
+                data_size: POINTER_WIRE_LEN as u64,
+                data_type: DATA_TYPE_POINTER,
+            })
+        };
+        assert!(
+            matches!(quote(record.address()), ChunkQuoteResponse::Success { .. }),
+            "an update of a pointer the full node holds is quoted"
+        );
+        assert!(
+            matches!(
+                quote([0xEC; 32]),
+                ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(_))
+            ),
+            "a pointer the full node doesn't hold is not"
+        );
     }
 
     /// Drive the real quote handler, then read the record count it priced on.

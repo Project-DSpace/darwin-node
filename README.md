@@ -3,10 +3,10 @@
 **Quantum-proof storage nodes for the Darwin network.**
 
 darwin-node is the node software for Darwin, our storage network. It is a fork
-of [Autonomi's ant-node](https://github.com/WithAutonomi/ant-node)
+of [ant-node](https://github.com/WithAutonomi/ant-node)
 (MIT/Apache-2.0), built on upstream's v0.23.0, and keeps upstream's crate and
 binary name, `ant-node`. Most of this README is upstream's. Where it talks
-about the "legacy" network, it means Autonomi's earlier network, which Darwin
+about the "legacy" network, it means upstream's earlier network, which Darwin
 never ran.
 
 ## What differs in this fork
@@ -17,7 +17,7 @@ never ran.
   `PRICE_MULTIPLIER` in `vendor/ant-protocol` (32). The storage-node Docker
   image sets this with `ANT_EVM_RPC_URL`, `ANT_EVM_PAYMENT_TOKEN` and
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
-  (Autonomi's contracts): run it on Darwin only with those three set (see
+  (upstream's contracts): run it on Darwin only with those three set (see
   [Join the Network](#join-the-network)). `tests/darwin_network.rs` checks
   that the image sets DARWIN's token and vault, the block that vault was
   deployed in (which the binary has built in for them), Robinhood Chain's RPC,
@@ -125,6 +125,26 @@ never ran.
   relay. The node can still use other peers' relays. Unset, nodes serve
   relays, as upstream's do. The Docker image passes the variable through to
   every node.
+- **A verified direct address is dialled before a relay** (from ds.17). A
+  node dials a peer's addresses in this order: a LAN address first when the
+  peer is behind the node's own public IP address; then a verified direct
+  address; then the peer's relay, skipped when the relay is behind the
+  node's own public IP address; then an unverified address; and a LAN
+  address only when nothing else is known. Upstream dials the relay first,
+  so traffic to a reachable node passed through another node's relay. A
+  node behind NAT has no verified direct address, so its relay is still
+  dialled first, with no 1.25-second direct attempt before it. Lookups order
+  a peer's addresses the same way (`AddressType::priority`), and the relay
+  switch above is unchanged. Weighing one view of a peer against another
+  keeps upstream's order (`AddressType::tag_rank`): a lookup's hint still
+  can't re-tag a relay address as direct, and a lookup breaks ties between
+  reports as upstream does. The change is a patch to saorsa-core 0.29.1,
+  vendored in `vendor/saorsa-core`. Its own tests pin the order, and the
+  Test workflow runs them (`cargo test --locked -p saorsa-core --lib`);
+  `tests/fork_pins.rs` pins the address priority, that those tests stay and
+  run, and that `Cargo.lock` holds one saorsa-core, the vendored copy, and
+  one saorsa-transport, a crates.io release that `Cargo.toml` and the
+  vendored copy both accept.
 - **Request routing survives falling behind** (from ds.10). The loop that
   hands chunk and listings requests to their handlers reads saorsa-core's
   event broadcast, which keeps 1,000 events. Upstream's loop stopped for good
@@ -168,10 +188,32 @@ never ran.
   stays and is named in a warning (upstream's ADR-0022). A census test
   checks that each lane charges the peer and that the switch which withheld
   the penalty is gone, `tests/fork_pins.rs` that nothing in the node or the
-  image can withhold it, and a build whose trust weights are zero doesn't
-  compile. A test of a built node (`src/node.rs`) checks that it announces
-  `node/<version>` alone in its user agent. The listing store sizes its own
-  LMDB map from the disk as before (`src/listings/map_size.rs`).
+  image can withhold it but one bounded case (below), and a build whose
+  trust weights are zero doesn't compile. A test of a built node
+  (`src/node.rs`) checks that it announces `node/<version>` alone in its
+  user agent. The listing store sizes its own LMDB map from the disk as
+  before (`src/listings/map_size.rs`).
+- **Full, not faulty** (from ds.17, [ADR-0024](docs/adr/ADR-0024-full-not-faulty-and-the-falling-floor.md),
+  amending ADR-0003 and ADR-0022). Under disk pressure the erase floor
+  falls with free space, from 10 times the distance to the node's
+  7th-nearest peer at 10% free to the edge of its own range below 2.5%,
+  each step also firing at the full line plus 4 MiB on small disks; free
+  inodes count as free space; records are erased in two phases, named in
+  no hint a whole sync cycle before; and their out-of-range clocks survive
+  restarts (`{root}/out_of_range.mdb`). A node at the full line with
+  nothing left it may erase is full: it prices and takes no new data (a
+  chunk it holds is still answered as already stored, a pointer it holds
+  still updated), keeps serving and proving what it holds, and tells its
+  peers with a one-way notice, renewed every 10 minutes. They widen their
+  windows around it (7 + f and 9 + f for f full peers, at most 20), erase
+  near it only with 6 proofs from the 7 nearest not full, and waive the
+  unheld-chunk penalty for it only when its notice is under 40 minutes old,
+  it answered that it lacks the key, the check isn't pinned to its
+  commitment, it was never seen proving the key (a record kept across
+  restarts in `{root}/seen_holders.bin`), and, after a write, it
+  wasn't paid for it. Every lane asks one function at one reviewed site
+  (the census), and `tests/fork_pins.rs` pins the waiver's conditions on
+  each lane.
 - **Nodes keep listings** (from ds.2) of the files stored with an
   envelope: a node records the payment of each envelope chunk it stores,
   found from the proof that comes with a PUT or a fresh replication offer,
@@ -244,10 +286,10 @@ never ran.
   of these nodes: weekly in the Test workflow, against its main branch, and
   by hand.
 - **No bootstrap peers ship with the binary.** `config/bootstrap_peers.toml`
-  is empty on purpose, so an unconfigured node can't join Autonomi's network.
+  is empty on purpose, so an unconfigured node can't join upstream's network.
   The image passes Darwin's bootstrap servers itself. From ds.13 the binary
   reads a bootstrap peers file only from `$ANT_BOOTSTRAP_PEERS_PATH` or beside
-  itself, not from the `ant` folders it shares with Autonomi's programs (see
+  itself, not from the `ant` folders it shares with upstream's programs (see
   [Bootstrap Peers File](#bootstrap-peers-file)). `tests/fork_pins.rs`
   checks that the shipped file and every preset name no peers.
 - **Run nodes with the Docker image**: [docker/README.md](docker/README.md).
@@ -261,8 +303,8 @@ never ran.
   the Build workflow with `--locked` from the darwin-client commit
   `docker/manager-revision` pins, which must be on darwin-client's main
   (a change the image needs lands there first, then the pin follows it), in
-  place of Autonomi's `ant` 0.3.9, which the images up to ds.15's
-  downloaded. It deletes no node's data: Autonomi's
+  place of upstream's `ant` 0.3.9, which the images up to ds.15's
+  downloaded. It deletes no node's data: upstream's
   deleted the data of the node holding the least at 500 MiB free on a disk
   shared by 2 or more nodes. It keeps the registry where `ant` did
   (`/data/manager/ant/node_registry.json`), and passes nodes the same
@@ -379,7 +421,7 @@ never ran.
   marker names, or, for an image with none, its release's tag): `withdraw`
   is needed for any move to an older image, not only to an older node. It
   refuses a move from an image with an image marker (`darwin-nodes` as its
-  node manager) to one with none (Autonomi's manager, which deletes a
+  node manager) to one with none (upstream's manager, which deletes a
   node's data when its disk runs low) unless the run is a withdrawal and
   `allow_unmarked` is set, which only withdrawing the first image release
   needs, and the summary then says so in bold. A withdrawal goes back one
@@ -425,7 +467,7 @@ never ran.
   publish job runs in the release environment and only latest.yml's
   `latest` job in the `latest` environment, `docker/release-images` keeps
   its lines, test.yml's test job runs every test: the library and
-  binaries, both vendored crates' own tests and every target in `tests/`,
+  binaries, the vendored crates' own tests and every target in `tests/`,
   and build.yml builds the image's node manager with `--locked` from the
   pinned darwin-client commit, once it has checked that the commit is on
   darwin-client's main, checks the binary, gives the image its marker and
@@ -435,22 +477,25 @@ never ran.
   is there. Both build.yml and release.yml build the node with exactly
   `cargo build --release --locked --bin ant-node`, and check it for test
   seams before packaging it.
-- **Three crates are vendored**, each with a `VENDORED.md` saying what it
-  is: `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
+- **Four crates are vendored**, each with a `VENDORED.md` saying what it is:
+  `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
   `VENDORED.md` lists, `PRICE_MULTIPLIER` and the functions that price a
   record by its size, which nothing uses yet; `vendor/webrtc` is webrtc
   0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
-  in progress; and `vendor/ant-listings` is darwin-listings 0.3.1,
-  unchanged: the envelope format, listings, their payment checks, the
-  listings protocol and its change feeds. `[patch.crates-io]` puts the
-  first two in place of the crates.io releases. `vendor/ant-listings` and
-  `vendor/ant-protocol` are workspace members, so their own tests run
-  under this repository's
-  `Cargo.lock` in the Test workflow (`cargo test --locked -p ant-listings`,
-  `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml`),
-  and the Build workflow checks `vendor/ant-listings`' git objects against
-  its `VENDORED.md`. saorsa-core and saorsa-transport are their crates.io
-  releases, as upstream's are.
+  in progress; `vendor/saorsa-core` is saorsa-core 0.29.1, which dials a
+  verified direct address before a relay; and `vendor/ant-listings` is
+  darwin-listings 0.3.1, unchanged: the envelope format, listings, their
+  payment checks, the listings protocol and its change feeds.
+  `[patch.crates-io]` puts the first three in place of the crates.io
+  releases. `vendor/ant-listings`, `vendor/ant-protocol` and
+  `vendor/saorsa-core` are workspace members, so their own tests run under
+  this repository's `Cargo.lock` in the Test workflow (`cargo test --locked
+  -p ant-listings`, `cargo test --locked --manifest-path
+  vendor/ant-protocol/Cargo.toml`, `cargo test --locked -p saorsa-core
+  --lib`), and the Build workflow checks the git objects of
+  `vendor/ant-listings` and `vendor/saorsa-core` against their
+  `VENDORED.md`. saorsa-transport is its crates.io release, as
+  upstream's is.
 - **Release builds link self_encryption** (GPL-3.0 with MaidSafe's linking
   exception), which upstream's don't: `vendor/ant-listings` reads the data
   maps in file envelopes with it. The exception lets the binary be
@@ -471,6 +516,109 @@ never ran.
   New connections over saorsa-core's rate per IP are only logged, and
   unpaid storage and quote requests aren't limited; see [Rate
   Limiting](#rate-limiting).
+- **Neighbour sync is paged** (from ds.17). A node's hints for a neighbour,
+  the keys it believes the neighbour should hold and the paid-list keys it
+  should track, went in one message capped at 10 MiB and never split, about
+  327,000 keys: a node with more could no longer build it, and its sync
+  stopped. Between nodes of ds.17 and later, each side's hints go in pages of
+  up to 256 KiB of keys (8,192), replica hints first, each page its own
+  request and answer carrying the exchange's number and "page n of N", the
+  next sent only once the last is answered, up to 256 pages a side, and one
+  exchange at a time with each neighbour. Hints for a neighbour that come to
+  more than one exchange carries (256 pages, or the 9 MiB of keys of a
+  single message) go a window at a time: each exchange with that neighbour
+  carries the next keys of each list, each list its share in proportion to
+  its length, round and round, the node keeping one window as requester and
+  another as responder, so two exchanges at once in both roles don't pass
+  over each other's undelivered keys. The window moves
+  on by the keys that arrived (the requester's on the pages the responder
+  answered, the responder's on the pages the requester's later requests
+  show arrived, and a single message's once it is answered or sent), so
+  keys an exchange that ended part way didn't deliver go first in the next;
+  after 3 exchanges in a row deliver none, the window moves on a few keys,
+  so one stuck range can't hold it. A requester that gets a single answer of
+  as many keys as a single message carries counts the neighbour as having
+  more, not done. A side's pages
+  announce every page its hints take, so the other side, having had the 256
+  an exchange runs, knows more are to come. The responder builds its hints
+  for the requester once, at the first page, from one snapshot of its
+  routing table, keeps only the window it serves, and serves every page
+  from them; what it holds for exchanges in progress comes to at most 64 MiB
+  of keys, and one more exchange's (at most 256 pages) for each of its two
+  workers, and is dropped after each exchange's last page, when its
+  requester starts another, or once its requester stops asking. A requester
+  takes at most 256 pages of 8,192 keys of a neighbour's answer in one
+  exchange, however the neighbour cuts its pages, and holds at most 64 MiB
+  of keys of answers across its exchanges in progress; past either it stops
+  following the neighbour's pages, and the rest come in a later exchange. A page the responder can't take now,
+  refused at admission (1 a peer, 8 in all, as before), left waiting
+  15 seconds for a worker, or of an exchange whose hints it doesn't hold, is
+  answered busy: the requester ends the exchange and syncs again in a later
+  cycle. So is a single request refused at admission or left waiting 7.5
+  seconds for a worker (half the requester's 15-second wait, so the answer
+  reaches it while it waits), when the requester's agent names a release
+  that reads pages (one falling back to a single message after an
+  unanswered page); a requester of an older release gets no answer, as
+  before, and its request is dropped only once it has waited 15 seconds. Pages go on the peer's connection without trust reporting, so
+  silence, a timeout or an answer that doesn't decode never counts against
+  the responder. A requester waits 30 seconds for each page, sync's own
+  deadline, and an exchange runs at most 2 minutes in all
+  (`NEIGHBOR_SYNC_EXCHANGE_DEADLINE`), so a slow neighbour can't hold a
+  round, whose exchanges run one after another: past it the exchange
+  stops, its window moving on by what was delivered. Only a complete
+  exchange that carried all of the node's own hints puts the neighbour on
+  the sync cooldown; one that ended part way, busy, failed or stopped, a
+  single answer filled to the message from a neighbour of a paging release,
+  or one that carried only a window of the node's own hints, leaves it to
+  the next cycle. A record selected for erasure is named in no hint: it is
+  left out when hints are built, and again as each page or single message
+  goes out, since a responder's hints are held across an exchange's pages;
+  repair proofs are recorded for the list sent. Repair proofs are recorded only for acknowledged delivery:
+  the requester's for the pages the responder answered, the responder's once
+  the requester's next request of the exchange shows the page arrived. The
+  last page's keys get none from the exchange, so in a one-page exchange,
+  today's usual one, the responder records none; it does where it hints the
+  same keys as requester of its own exchanges with that neighbour, which
+  neighbour selection doesn't promise for every pair. Accepted: fewer audits
+  of such a pair, never a penalty for keys not known to have arrived; the
+  mixed-version harness reports audits per exchange, so the drop is
+  measured. A node
+  bootstrapping counts a neighbour as done only once that neighbour's last
+  announced page has arrived. A neighbour that answers its first page busy,
+  or that another exchange holds, is tried again within the bootstrap sync,
+  after 5, 10 and 20 seconds; one whose own last answer was still busy owes
+  all its hints, and keeps bootstrap from draining until a later exchange
+  delivers them or its record expires (110 seconds, as for a
+  capacity-rejected source). One another exchange still held at its last
+  try owes nothing here: that exchange accounts for it itself. A
+  neighbour whose first page failed or timed out isn't known to be there,
+  and is not waited for. A node pages to a peer whose user agent names
+  ds.17 or later (`NEIGHBOR_SYNC_PAGES_FROM_RELEASE`), decided again for
+  each exchange from the agent of the peer's connection. Any other peer, one
+  that isn't connected or of unknown release among them, gets a single
+  message, as before, which every release reads; sending it connects the
+  peer, so its next exchange reads a fresh agent. So does a peer whose last
+  exchange's first page got no answer because the send failed or the answer
+  didn't decode, or timed out while its agent no longer names a paging
+  release, so an agent left from a connection that has since ended pages it
+  at most once. A first page that timed out while the agent still names a
+  paging release is a slow peer that pages: it is paged again next cycle,
+  not sent a single message that would count the same slowness against it.
+  The Release workflow refuses a
+  tag numbered below `NEIGHBOR_SYNC_PAGES_FROM_RELEASE` (a dotted tag,
+  `+ds.17.1`, by its leading number; a tag with no number fails), or any earlier
+  release tag at or past it without paged sync, and a unit test ties the
+  constant to this tree's version. Scans of a node's keys, for hints and for
+  the hourly rebuild of its storage commitment, compute close groups from one
+  routing snapshot, off the async workers, instead of a routing-table lookup
+  for every key. Tests: `tests/wire_format.rs` pins the two new messages'
+  bytes, and `src/replication/protocol.rs` that a node of ds.15 refuses them
+  whole; `tests/e2e/sync_pages.rs` runs paged exchanges between nodes: both
+  lists over several pages from one scan, busy answers at admission and
+  after a wait with the requester's trust in the responder unchanged (and a
+  single request from a peer that reads pages, at admission), a
+  page's repair proofs waiting for the requester's next page, paging chosen
+  by the peer's agent, and nodes announcing ds.17 paging to each other.
 - **Messages between nodes keep their bytes.** `tests/wire_format.rs` pins
   the bytes of every replication message, and of every variant of the
   replies, as ds.15 writes them, and fails when a message or a reply gains
@@ -494,17 +642,36 @@ never ran.
   penalties, for any pair of roles and reason, more than 10 above the
   highest count in two runs of the previous release alone (the spread
   measured between such runs); on more than 3 penalties for a failure
-  reason those runs never charged a role with; or on a message family that
-  stopped reaching nodes. Run it before a node release's canary.
+  reason those runs never charged a role with; on a message family that
+  stopped reaching nodes; or, of neighbour sync, on a node paging its hints
+  to a node of the previous release, this tree's nodes not paging to each
+  other, no single message from them to the previous release's nodes, or a
+  requester charging its responder during an exchange the responder
+  answered busy. In every run but the all-old and full ones, this tree's
+  nodes put two keys on a sync page, and, until the release that reads pages
+  is cut, announce that release in their user agent. With `--paged` it adds
+  a run of this tree's nodes alone, their incumbents admitting one sync
+  request at once, which must show both hint lists going over more than one
+  page each way, each responder's hints built once per exchange, pages
+  served in order, and pages answered busy, with no penalty for them; it is
+  measured against the previous release's runs for new failure reasons only.
+  With `--rollback` it adds a run in which one of this tree's nodes is
+  started again on the previous release's binary with its data folder, then
+  on this tree's again: while it ran the previous release, this tree's nodes
+  must send it a single message and no page it answered, at most one page
+  each left unanswered over the connection its earlier process left; once it
+  came back, a page to it, answered. Run it before a node release's canary.
   Its report and summary.json list every count measured against those runs,
   with the excess over them and the limit, within the limit or not.
   The Test workflow tests what fails a run, on made-up results
   (`scripts/test_mixed_versions_verdicts.py`).
   Builds with the `test-utils` feature, which the harness uses, have test
   seams (`src/test_seams.rs`), such as one that makes a node's disk read as
-  full; the Build workflow checks that the image's node has none, and the
-  Release workflow that the node releases install has none, before it is
-  packaged and signed.
+  full, and four for paged sync: the page size, the release from which a
+  node pages, the release a node announces in its user agent, and the sync
+  requests a node admits at once; the Build workflow checks that the image's
+  node has none, and the Release workflow that the node releases install has
+  none, before it is packaged and signed.
 
 ---
 
@@ -874,7 +1041,7 @@ For connections, ant-node implements Happy Eyeballs:
 ## Migration from Legacy ant-node
 
 > **Not in this code.** This section is upstream's design for moving data
-> from Autonomi's legacy network. Neither upstream v0.23.0 nor this fork has
+> from upstream's legacy network. Neither upstream v0.23.0 nor this fork has
 > the migration tool: there is no `--migrate-ant-data` flag, no `[migration]`
 > config section and no legacy-network payment check. It does not apply to
 > Darwin, which has no legacy network.
@@ -1360,7 +1527,7 @@ cargo build --release
 ### Join the Network
 
 On first startup, the node needs bootstrap peers to join the network.
-Upstream ships Autonomi's peers in `bootstrap_peers.toml` next to the binary;
+Upstream ships its own network's peers in `bootstrap_peers.toml` next to the binary;
 in this fork that file is empty, so pass Darwin's peers yourself, along with
 the Robinhood Chain payment settings (the binary otherwise checks payments on
 Arbitrum One). Set a fixed `--port` as well: the default, 0, picks a random
@@ -1492,9 +1659,9 @@ peers = [
 Upstream also searches the platform config directory (`~/.config/ant/` on
 Linux, `~/Library/Application Support/ant/` on macOS, `%APPDATA%\ant\` on
 Windows) and `/etc/ant/`. This fork doesn't (from ds.13): those folders are
-shared with Autonomi's own programs, and Autonomi's installer writes its
+shared with upstream's own programs, and upstream's installer writes its
 network's bootstrap peers to the first, so a node started there without
-`--bootstrap` would join Autonomi's network.
+`--bootstrap` would join upstream's network.
 
 **Bootstrap peer precedence** (highest wins):
 1. `--bootstrap` CLI argument or `ANT_BOOTSTRAP` env var
@@ -1563,7 +1730,7 @@ What is limited:
 | Watches on a node's listing change feed | `ListingService::changes` in `src/listings/service.rs` | 4 at once, each for 3 minutes or until its reader's next request; a fifth is refused, its request answered |
 | Records read for one change feed request | `ListingService::changes` in `src/listings/service.rs` | 4,096, of which at most 256 are sent |
 | Listing checks after their schedule has run out | `ListingService::recheck_slot` in `src/listings/service.rs` | 60 an hour per node, a minute apart; each envelope's for at most 7 days |
-| Replication requests from other nodes: chunk fetches, verification, neighbour sync, paid notifications, fresh offers and audits | `src/replication/mod.rs`, and `src/replication/config.rs` for audits | for each kind, in all and per peer; any more are turned away |
+| Replication requests from other nodes: chunk fetches, verification, neighbour sync, paid notifications, fresh offers and audits | `src/replication/mod.rs`, and `src/replication/config.rs` for audits | for each kind, in all and per peer; any more are turned away, a neighbour-sync page with a busy answer |
 | Pointer requests from other nodes | `src/replication/pointer.rs` | fetch and state requests: 128 admitted in all and 16 from one peer, 32 of them served at once, any more dropped; fresh offers: 16 verified at once, any more dropped |
 
 Logged only: saorsa-core's transport counts new connections, per IP and in
@@ -1627,9 +1794,23 @@ erase records (free space fell below 10% and is not yet back to 15%),
 `beyond_floor=` counts the records far enough from it to be erased, and the
 `pruned=` before `; paid` counts the records erased in that pass; the one
 after `paid` counts payment bookkeeping entries, which are dropped whatever
-the disk. `Disk pressure:` and `Disk pressure over:` mark when erasing may
-start and when it stops, and `Free space on the record store's partition
-could not be measured` that it stopped because the disk could not be read.
+the disk. After `pruned=` come `floor_step=` (0 without pressure, then 1 for
+10 times the distance to the node's 7th-nearest peer, 2 for 5 times, 3 for 2
+times, 4 for the edge of its own range), `being_erased=` (records selected
+for erasure, named in no hint, and erased a whole sync cycle later),
+`near_full_peers=` (held records with a peer marked full among their nearest
+nodes), `few_holders=` (keys whose verification since the last pass found
+fewer than 4 holders), `seen_fill=` and `seen_false=` (how full the node's
+record of keys peers were seen proving is, and its estimated share of false
+"seen" answers, which charge a full peer) and `full=` (1 while the node is
+full: at the full line with nothing left it may erase). `Disk pressure:` and `Disk pressure over:`
+mark when erasing may start and when it stops, `Disk pressure: the erase
+floor moves to step` each step down, and `Free space on the record store's
+partition could not be measured` that it stopped because the disk could not
+be read. `Node full: since <unix seconds>` and `Node full: no longer` mark a
+node entering and leaving "full" ([ADR-0024](docs/adr/ADR-0024-full-not-faulty-and-the-falling-floor.md));
+they are logged under `ant_node::replication::full_state`, which the log
+writer keeps at the full line, where other INFO lines are dropped.
 
 ---
 
