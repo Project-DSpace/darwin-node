@@ -134,10 +134,12 @@ range, and asks again halfway through the observation (the mid count). It
 stops the full joiner whose mark's lapse lets the most counted records be
 erased (see lapse_candidates()), uploading and counting FULL_RUN_EXTRA_BATCHES
 more batches of records at most while no full joiner's would; its mark then
-lapses at its peers. It observes on until a node erases, after the lapse, a
-record whose group held the stopped node, up to the longest such an erasure
-can take (lapse_erasure_seconds(), from the node's own timing constants), and
-asks again at the end. It must show, beyond what every run shows:
+lapses at its peers. It observes on until, after the lapse, a node the
+stopped node's fresh mark kept inside a record's retention width (see
+lapse_erasers()) erases that record, one of those the stopped node was
+chosen for, up to the longest such an erasure can take
+(lapse_erasure_seconds(), from the node's own timing constants), and asks
+again at the end. It must show, beyond what every run shows:
 
 - copies stay at 7: at each count, every record is held by at least 7 nodes
   not full, less the devnet's nodes among its 7 nearest not full (they take no
@@ -149,9 +151,11 @@ asks again at the end. It must show, beyond what every run shows:
   least 6 proofs, and had them;
 - a lapsed mark counts as missing: once the stopped node's mark has
   lapsed, no erasure counts more members marked full than full nodes still
-  run;
+  run, and a node the stopped node's fresh mark kept inside a record's
+  retention width erases that record, one the stopped node was chosen for:
+  only a width narrowed by the lapse leaves that node outside it;
 - and neither passes for want of an erasure: the run fails if no node
-  erased a record, or none did after the stopped node's mark lapsed.
+  erased a record, or none erased such a record after the lapse.
 
 The report lists, for each count, the records by how many of their 7 + f
 nearest are full (f), so runs with --full 1, 2, 3 and 4 show which f each
@@ -758,16 +762,17 @@ class ExchangeWatch:
 class ErasureWatch:
     """Follows logs for the erasures their nodes log, as they are written."""
 
-    def __init__(self, logs, records, since):
-        self.offsets = {path: 0 for path in logs}
+    def __init__(self, records, since):
         self.records = records
+        self.offsets = {path: 0 for path in records}
         self.since = since
         self.erasures = []
 
     def seen(self):
         """Reads what the logs gained since the last call; returns every
-        erasure seen so far of one of `records` after `since`, as (time,
-        record)."""
+        erasure seen so far after `since`, by the node of a log of
+        `records` (log path: the records that count from it), of one of
+        that log's records, as (time, record)."""
         for path, offset in self.offsets.items():
             try:
                 with open(path, "rb") as handle:
@@ -783,7 +788,7 @@ class ErasureWatch:
                     continue
                 stamp = parse_time(text)
                 record = fields(text).get("erased_record")
-                if stamp is not None and stamp > self.since and record in self.records:
+                if stamp is not None and stamp > self.since and record in self.records[path]:
                     self.erasures.append((stamp, record))
         return self.erasures
 
@@ -1145,16 +1150,17 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
                 mid.append(check(harness, manifest_path, extra,
                                  folder / f"check-mid-{extra.stem}.json"))
             phases["mid"] = [path.name for path in mid]
-            # Every record whose group held the victim at a count, as the
-            # verdict reads them: an erasure of one after the lapse is what
-            # the run waits for.
-            group = set()
-            for found in counted([folder / name for name in phases["early"]] + mid):
-                nearest = found.get("nearest") or found["close_group"]
-                not_full, full_inside = window_of(nearest, {node.peer_id
-                                                            for node in full_joiners})
-                if victim.peer_id in not_full + full_inside:
-                    group.add(found["address"])
+            # What the run waits for, as the verdict reads it: an erasure
+            # after the lapse of one of the victim's candidates, by a node
+            # the victim's fresh mark kept inside that record's width.
+            awaited = {folder / f"{node.name}.log": set() for node in nodes}
+            log_of = {node.peer_id: folder / f"{node.name}.log" for node in nodes}
+            for address, nearest in lapse_records(counted(mid),
+                                                  candidates[victim.peer_id]).items():
+                for peer in lapse_erasers(nearest, {node.peer_id for node in full_joiners},
+                                          victim.peer_id):
+                    if peer in log_of:
+                        awaited[log_of[peer]].add(address)
             victim.process.signal()
             victim.process.stop()
             stopped.add(victim.process.name)
@@ -1170,12 +1176,11 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
                     f"{FULL_RUN_FRESHNESS_SECS} s and then lets "
                     f"{len(candidates[victim.peer_id])} counted record(s) be erased; observing "
                     f"for {second_half:g} min, and on until one is, up to {longest:g} min")
-                watch = ErasureWatch([folder / f"{node.name}.log" for node in nodes], group,
-                                     stopped_at + datetime.timedelta(
-                                         seconds=FULL_RUN_FRESHNESS_SECS))
+                watch = ErasureWatch(awaited, stopped_at + datetime.timedelta(
+                    seconds=FULL_RUN_FRESHNESS_SECS))
                 found = observe(second_half, watch.seen, max(second_half, longest))
-                log(f"{name}: {len(found or [])} erasure(s) after the lapse in a group that "
-                    f"held {victim.name}")
+                log(f"{name}: {len(found or [])} erasure(s) after the lapse of a record "
+                    f"only {victim.name}'s lapse let be erased")
             else:
                 log(f"{name}: stopped {victim.name}; no full joiner's lapse would let a "
                     f"counted record be erased; observing for {second_half:g} min")
@@ -1631,6 +1636,25 @@ def place_full(joiners, others, devnet, count):
     return list(best), best_share
 
 
+def lapse_erasers(nearest, full, peer):
+    """Those of a record's `nearest` that the lapse of full node `peer`'s
+    mark alone leaves outside the retention width (ADMISSION_WIDTH nodes not
+    full and the full ones among them, `full` marked full): inside it while
+    the mark is fresh, past it once `peer` counts as not full."""
+    nearest = nearest[:WIDEST]
+    width = widened_len(nearest, ADMISSION_WIDTH, full)
+    narrower = widened_len(nearest, ADMISSION_WIDTH, full - {peer})
+    return nearest[narrower:width]
+
+
+def lapse_records(records, addresses):
+    """The nearest nodes (up to WIDEST) of those of `records` whose address
+    is among `addresses`, by address, as the last of them to count it gave
+    them."""
+    return {record["address"]: (record.get("nearest") or record["close_group"])[:WIDEST]
+            for record in records if record["address"] in addresses}
+
+
 def lapse_candidates(records, full, devnet, pressured):
     """For each full node, the counted `records` an erasure could take once
     its mark lapses, in a group that holds it: those whose window holds it
@@ -1645,12 +1669,9 @@ def lapse_candidates(records, full, devnet, pressured):
         nearest = (record.get("nearest") or record["close_group"])[:WIDEST]
         held = holders(record)
         _, full_inside = window_of(nearest, full)
-        width = widened_len(nearest, ADMISSION_WIDTH, full)
         for peer in full_inside:
-            rest = full - {peer}
-            not_full, still_full = window_of(nearest, rest)
-            narrower = widened_len(nearest, ADMISSION_WIDTH, rest)
-            erasers = [other for other in nearest[narrower:width]
+            not_full, still_full = window_of(nearest, full - {peer})
+            erasers = [other for other in lapse_erasers(nearest, full, peer)
                        if other in held and other in pressured]
             proofs = [other for other in not_full + still_full
                       if other != peer and other in held and other not in devnet]
@@ -1718,16 +1739,22 @@ def full_run_checks(run, records, end_checks):
         lapsed_at = (datetime.datetime.fromisoformat(stopped_at)
                      + datetime.timedelta(seconds=FULL_RUN_FRESHNESS_SECS))
     still_full = len(full - ({stopped} if stopped else set()))
-    # The harness's records whose group held the stopped node: its 7 nearest
-    # not full and the full nodes among them, at any of the counts. Only an
-    # erasure of one of them after the lapse tests "a lapsed mark counts as
-    # missing": in any other group the stopped node's mark played no part.
-    held_stopped = set()
-    for record in early + mid + list(end_checks):
-        nearest = record.get("nearest") or record["close_group"]
-        not_full, full_inside = window_of(nearest, full)
-        if stopped is not None and stopped in not_full + full_inside:
-            held_stopped.add(record["address"])
+    # The records the stopped node was chosen for (lapse_candidates: its
+    # lapse narrows their retention width past a holder), and for each the
+    # nodes its fresh mark kept inside that width. Only an erasure of one of
+    # them, by one of those nodes, after the lapse tests "a lapsed mark
+    # counts as missing": with the mark still counted, that node is inside
+    # the width and erases nothing. A record already outside a node's width
+    # when the pressure began may be erased after the lapse too, without the
+    # lapse playing any part.
+    chosen = (run["full_phases"].get("stopped") or {}).get("candidates")
+    # A run recorded before the harness kept them: work them out the same way.
+    if chosen is None and stopped is not None:
+        pressured = {node["peer_id"] for node in run["nodes"] if not node["full"]}
+        chosen = lapse_candidates(mid or early, full, devnet, pressured).get(stopped, [])
+    erasers = {address: set(lapse_erasers(nearest, full, stopped))
+               for address, nearest in lapse_records(early + mid, set(chosen or [])).items()}
+    peer_of = {node["name"]: node["peer_id"] for node in run["nodes"]}
     for node in run["nodes"]:
         for stamp, text in read_log(run["folder"] / node["log"], run["window"]):
             if ERASED_LINE not in text:
@@ -1744,7 +1771,8 @@ def full_run_checks(run, records, end_checks):
             erasures.append({"node": node["name"], "record": found.get("erased_record"),
                              "proofs": proofs, "needed": needed, "group_full": group_full,
                              "after_lapse": after_lapse,
-                             "held_stopped": found.get("erased_record") in held_stopped})
+                             "by_lapse": peer_of.get(node["name"]) in erasers.get(
+                                 found.get("erased_record"), ())})
             if needed < ERASE_PROOFS or proofs < needed:
                 failures.append(f"{node['name']} erased {found.get('erased_record')} with "
                                 f"{proofs} proofs, needing {needed}: fewer than "
@@ -1765,12 +1793,14 @@ def full_run_checks(run, records, end_checks):
     if not erasures:
         failures.append("no node erased a record, so \"erasure goes ahead with 6 real "
                         f"proofs\" and \"a lapsed mark counts as missing\" tested nothing{layout}")
-    elif lapsed_at is not None and not any(erasure["after_lapse"] and erasure["held_stopped"]
+    elif lapsed_at is not None and not any(erasure["after_lapse"] and erasure["by_lapse"]
                                            for erasure in erasures):
         after = sum(1 for erasure in erasures if erasure["after_lapse"])
-        failures.append(f"no erasure after the lapse in a group that held the stopped node "
-                        f"({after} after it in other groups, {len(erasures) - after} before), "
-                        f"so \"a lapsed mark counts as missing\" tested nothing{layout}")
+        failures.append(f"no erasure after the lapse of a record the stopped node was chosen "
+                        f"for, by a node its fresh mark kept inside the record's retention "
+                        f"width ({after} other erasure(s) after it, {len(erasures) - after} "
+                        f"before), so \"a lapsed mark counts as missing\" tested "
+                        f"nothing{layout}")
     return {"failures": failures, "by_f": by_f, "copies": counts,
             "stand_ins_kept": stand_ins_kept, "erasures": erasures,
             "stopped": run["full_phases"].get("stopped")}
@@ -2168,11 +2198,11 @@ def report(results, args):
                          f"{run['stand_ins_kept']}")
             erasures = run["erasures"]
             lapsed = sum(1 for erasure in erasures if erasure["after_lapse"])
-            in_group = sum(1 for erasure in erasures
-                           if erasure["after_lapse"] and erasure["held_stopped"])
+            by_lapse = sum(1 for erasure in erasures
+                           if erasure["after_lapse"] and erasure["by_lapse"])
             fewest = min((erasure["proofs"] for erasure in erasures), default=0)
             lines.append(f"erasures: {len(erasures)} ({lapsed} after the stopped node's "
-                         f"mark lapsed, {in_group} of them in a group that held it), with "
+                         f"mark lapsed, {by_lapse} of them only its lapse allowed), with "
                          f"{fewest} proofs or more each")
             if run["stopped"]:
                 lines.append(f"stopped: {run['stopped']['node']} at {run['stopped']['at']}")

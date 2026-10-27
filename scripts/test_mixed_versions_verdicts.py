@@ -12,7 +12,8 @@ not, and the audits made per exchange, which a run with the audit seam must
 make; that the all-new and paged runs, whose nodes carry the bootstrap and
 audit seams the all-old runs lack, are measured on refused PUTs only; and
 that the full run fails when no node erased a record, or none after the
-stopped node's mark lapsed in a group that held the stopped node. The Test
+stopped node's mark lapsed of a record it was chosen for, by a node its
+fresh mark kept inside that record's retention width. The Test
 workflow runs it; run it by
 hand with `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
 """
@@ -125,49 +126,62 @@ def rollback_sync(extra_paged=(), single=None):
 
 
 # Seven nodes not full, each holding every record the full run's checks
-# count; and the full run's records: in the first, the stopped node (ROLLED,
-# marked full) is among the 7 nearest not full; in the second it is nearest
-# after them, outside the group; the third's nearest don't hold it.
+# count, then INSIDE and ERASER, not full, the 8th and 9th by distance from
+# the first two records; and the full run's records: in the first (the one
+# the stopped node was chosen for) and the second, the stopped node (ROLLED,
+# marked full) is among the 7 nearest not full, so its fresh mark keeps
+# ERASER, which holds both, inside their retention width, and its lapse
+# leaves ERASER outside it; in the third it is nearest after them, outside
+# the group; the fourth's nearest don't hold it.
 NOT_FULL = [f"{index:02x}" * 32 for index in range(1, 8)]
-IN_GROUP, PAST_GROUP, NOT_NEAR = "cd" * 32, "ce" * 32, "cf" * 32
+INSIDE, ERASER = "a8" * 32, "aa" * 32
+IN_GROUP, NOT_CHOSEN, PAST_GROUP, NOT_NEAR = "cd" * 32, "cc" * 32, "ce" * 32, "cf" * 32
 NOT_CHECKED = "c0" * 32
 
 
-def full_check(address, nearest):
+def full_check(address, nearest, held=()):
     """A record as the full run's counts give it, held by every node not
-    full."""
+    full of the first seven and by `held`."""
     return {"address": address, "close_group": nearest[:harness.CLOSE_GROUP],
             "nearest": nearest,
-            "answers": [{"peer": peer, "outcome": "held"} for peer in NOT_FULL]}
+            "answers": [{"peer": peer, "outcome": "held"} for peer in NOT_FULL + list(held)]}
 
 
-FULL_CHECKS = [full_check(IN_GROUP, NOT_FULL[:3] + [ROLLED] + NOT_FULL[3:]),
+WIDENED = NOT_FULL[:3] + [ROLLED] + NOT_FULL[3:] + [INSIDE, ERASER]
+FULL_CHECKS = [full_check(IN_GROUP, WIDENED, [ERASER]),
+               full_check(NOT_CHOSEN, WIDENED, [ERASER]),
                full_check(PAST_GROUP, NOT_FULL + [ROLLED]),
                full_check(NOT_NEAR, list(NOT_FULL))]
 
 
 def full_run(folder, erased_at=()):
-    """A full run's record as full_run_checks() reads it: one incumbent,
-    whose log holds an erasure with 6 proofs of each (minutes after T0,
-    record) of `erased_at`; the stopped node stopped at minute 10, so its
-    mark lapses FULL_RUN_FRESHNESS_SECS later; FULL_CHECKS counted early."""
-    lines = []
-    for at, record in erased_at:
+    """A full run's record as full_run_checks() reads it: two incumbents,
+    ERASER (incumbent-00) and INSIDE (incumbent-01), whose logs hold an
+    erasure with 6 proofs of each (minutes after T0, record[, node]) of
+    `erased_at`, by incumbent-00 unless named; the stopped node, chosen for
+    IN_GROUP, stopped at minute 10, so its mark lapses
+    FULL_RUN_FRESHNESS_SECS later; FULL_CHECKS counted early."""
+    lines = {"incumbent-00": [], "incumbent-01": []}
+    for at, record, *node in erased_at:
         stamp = minutes(at).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
-        lines.append(f"{stamp}  INFO ant_node::replication::pruning: {harness.ERASED_LINE} "
-                     f"with 6 proofs from peers not marked full erased_record={record} "
-                     "proofs_not_full=6 proofs_full=0 proofs_needed=6 group_not_full=7 "
-                     "group_full=0")
-    (folder / "incumbent-00.log").write_text("\n".join(lines) + "\n")
+        lines[node[0] if node else "incumbent-00"].append(
+            f"{stamp}  INFO ant_node::replication::pruning: {harness.ERASED_LINE} "
+            f"with 6 proofs from peers not marked full erased_record={record} "
+            "proofs_not_full=6 proofs_full=0 proofs_needed=6 group_not_full=7 "
+            "group_full=0")
+    for name, written in lines.items():
+        (folder / f"{name}.log").write_text("\n".join(written) + "\n")
     (folder / "joiner-00.log").write_text("")
     return {
         "folder": folder, "window": (T0, minutes(30)), "devnet_peers": [],
-        "nodes": [{"name": "incumbent-00", "role": "incumbent", "peer_id": "aa" * 32,
+        "nodes": [{"name": "incumbent-00", "role": "incumbent", "peer_id": ERASER,
                    "full": False, "log": "incumbent-00.log"},
+                  {"name": "incumbent-01", "role": "incumbent", "peer_id": INSIDE,
+                   "full": False, "log": "incumbent-01.log"},
                   {"name": "joiner-00", "role": "joiner", "peer_id": ROLLED, "full": True,
                    "log": "joiner-00.log"}],
         "full_phases": {"stopped": {"node": "joiner-00", "peer_id": ROLLED,
-                                    "at": minutes(10).isoformat()}},
+                                    "at": minutes(10).isoformat(), "candidates": [IN_GROUP]}},
         "phase_checks": {"early": FULL_CHECKS},
     }
 
@@ -573,29 +587,44 @@ def main():
     with tempfile.TemporaryDirectory() as temporary:
         folder = Path(temporary)
         lapse = 10 + harness.FULL_RUN_FRESHNESS_SECS / 60
-        for name, erased_at, failing in [
+        def missed(after, before):
+            return [f"no erasure after the lapse of a record the stopped node was chosen for, "
+                    f"by a node its fresh mark kept inside the record's retention width "
+                    f"({after} other erasure(s) after it, {before} before)"]
+
+        for name, erased_at, failing, candidates in [
                 ("a full run with no erasure fails", (),
-                 ["no node erased a record"]),
+                 ["no node erased a record"], [IN_GROUP]),
                 ("a full run with erasures only before the mark lapsed fails",
                  ((5, IN_GROUP),),
-                 ["no erasure after the lapse in a group that held the stopped node (0 after "
-                  "it in other groups, 1 before)"]),
-                ("a full run with an erasure after the mark lapsed, in a group that held the "
-                 "stopped node, passes", ((5, IN_GROUP), (lapse + 1, IN_GROUP)), []),
+                 missed(0, 1), [IN_GROUP]),
+                ("a full run with an erasure after the mark lapsed of a record the stopped "
+                 "node was chosen for, by a node only the lapse left outside its width, "
+                 "passes", ((5, IN_GROUP), (lapse + 1, IN_GROUP)), [], [IN_GROUP]),
+                ("a run recorded without its candidates has them worked out from its counts",
+                 ((lapse + 1, IN_GROUP),), [], None),
+                ("an erasure after the lapse by a node inside the narrowed width doesn't "
+                 "count", ((lapse + 1, IN_GROUP, "incumbent-01"),),
+                 missed(1, 0), [IN_GROUP]),
+                ("an erasure after the lapse of a record whose group held the stopped node, "
+                 "but which it wasn't chosen for, doesn't count", ((lapse + 1, NOT_CHOSEN),),
+                 missed(1, 0), [IN_GROUP]),
                 ("an erasure after the lapse of a record whose nearest hold the stopped node "
                  "past its 7 not full doesn't count", ((5, IN_GROUP), (lapse + 1, PAST_GROUP)),
-                 ["no erasure after the lapse in a group that held the stopped node (1 after "
-                  "it in other groups, 1 before)"]),
+                 missed(1, 1), [IN_GROUP]),
                 ("an erasure after the lapse of a record whose nearest don't hold the stopped "
                  "node doesn't count", ((lapse + 1, NOT_NEAR),),
-                 ["no erasure after the lapse in a group that held the stopped node (1 after "
-                  "it in other groups, 0 before)"]),
+                 missed(1, 0), [IN_GROUP]),
                 ("an erasure after the lapse of a record the harness didn't count doesn't "
                  "count", ((lapse + 1, NOT_CHECKED),),
-                 ["no erasure after the lapse in a group that held the stopped node (1 after "
-                  "it in other groups, 0 before)"]),
+                 missed(1, 0), [IN_GROUP]),
         ]:
-            found = harness.full_run_checks(full_run(folder, erased_at), [], [])
+            run = full_run(folder, erased_at)
+            if candidates is None:
+                del run["full_phases"]["stopped"]["candidates"]
+            else:
+                run["full_phases"]["stopped"]["candidates"] = candidates
+            found = harness.full_run_checks(run, [], [])
             if len(found["failures"]) != len(failing) or not all(
                     any(text in failure for failure in found["failures"]) for text in failing):
                 FAILED.append(name)
