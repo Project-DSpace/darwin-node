@@ -21,9 +21,11 @@
 //! lapse within the run, and the first release a full node tells it is full
 //! ([`FULL_NOTICE_FROM_RELEASE`]), which the harness's `full` run sets so that
 //! nodes of a tree between releases tell each other; the neighbour-sync
-//! interval ([`NEIGHBOR_SYNC_SECS`]) and the out-of-range wait
-//! ([`PRUNE_HYSTERESIS_SECS`]), for a run in which erasure in two phases must
-//! go ahead within the run; how long a node may stay bootstrapping
+//! interval ([`NEIGHBOR_SYNC_SECS`]), the out-of-range wait
+//! ([`PRUNE_HYSTERESIS_SECS`]) and the fetch window ([`FETCH_WINDOW_SECS`]),
+//! for a run in which erasure in two phases must go ahead within the run, and
+//! one a stopped node's lapsed "full" mark allows must go ahead before that
+//! node drops out of its peers' views; how long a node may stay bootstrapping
 //! ([`BOOTSTRAP_SECS`]), for a run in which joiners must answer possession
 //! and audit challenges while it lasts; and the responsible-chunk audit's tick
 //! and the age a repair hint must reach before its key is audited
@@ -166,6 +168,25 @@ pub const NEIGHBOR_SYNC_SECS: &str = "ANT_TEST_SEAM_NEIGHBOR_SYNC_SECS";
 /// node's range before it may be erased, in place of the default 3 days. A
 /// value that isn't a whole number is ignored.
 pub const PRUNE_HYSTERESIS_SECS: &str = "ANT_TEST_SEAM_PRUNE_HYSTERESIS_SECS";
+
+/// The fetch window, in whole seconds: how long after its selection a record
+/// or pointer may be erased, and how long after answering "present" for a key
+/// a node keeps it from erasure.
+///
+/// In place of
+/// [`FETCH_WINDOW`](crate::replication::erasure::FETCH_WINDOW)'s verification
+/// and fetch timeouts and five-minute retry wait, so that an erasure a
+/// stopped node's lapsed "full" mark allows goes ahead within minutes, well
+/// before that node drops out of its peers' routing tables and the record
+/// comes back into the eraser's range. A value that isn't a whole number of
+/// seconds, at least 1, is ignored.
+pub const FETCH_WINDOW_SECS: &str = "ANT_TEST_SEAM_FETCH_WINDOW_SECS";
+
+/// The fetch window a test set for this process, if it set a valid one
+/// ([`FETCH_WINDOW_SECS`]).
+pub(crate) fn fetch_window() -> Option<std::time::Duration> {
+    parse_whole_secs(&std::env::var(FETCH_WINDOW_SECS).ok()?)
+}
 
 /// How long, in whole seconds, a node may stay bootstrapping.
 ///
@@ -422,6 +443,7 @@ mod tests {
             FULL_NOTICE_FROM_RELEASE,
             NEIGHBOR_SYNC_SECS,
             PRUNE_HYSTERESIS_SECS,
+            FETCH_WINDOW_SECS,
             BOOTSTRAP_SECS,
             AUDIT_SECS,
         ] {

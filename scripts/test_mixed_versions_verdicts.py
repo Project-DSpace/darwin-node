@@ -13,7 +13,9 @@ make; that the all-new and paged runs, whose nodes carry the bootstrap and
 audit seams the all-old runs lack, are measured on refused PUTs only; and
 that the full run fails when no node erased a record, or none after the
 stopped node's mark lapsed of a record it was chosen for, by a node its
-fresh mark kept inside that record's retention width. The Test
+fresh mark kept inside that record's retention width, and that the run's
+seams let that erasure go ahead before the stopped node drops out of its
+peers' routing tables. The Test
 workflow runs it; run it by
 hand with `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
 """
@@ -632,18 +634,40 @@ def main():
             else:
                 print(f"ok: {name}")
 
-    # The run waits for that erasure as long as the node's constants say it
-    # can take, read from this tree's source.
-    fetch_window = sum(harness.rust_const(harness.REPLICATION_CONFIG, name) for name in (
-        "VERIFICATION_REQUEST_TIMEOUT_SECS", "FETCH_REQUEST_TIMEOUT_SECS",
-        "VERIFICATION_RETRY_BACKOFF_MAX_SECS"))
+    # The run waits for that erasure as long as the node's constants, read
+    # from this tree's source, and the run's seams say it can take. The seam
+    # shortens the node's fetch window to one still past the verification
+    # and fetch timeouts.
+    timeouts = sum(harness.rust_const(harness.REPLICATION_CONFIG, name) for name in (
+        "VERIFICATION_REQUEST_TIMEOUT_SECS", "FETCH_REQUEST_TIMEOUT_SECS"))
+    fetch_window = timeouts + harness.rust_const(harness.REPLICATION_CONFIG,
+                                                 "VERIFICATION_RETRY_BACKOFF_MAX_SECS")
     expect_equal("the fetch window, read from the source", fetch_window, 15 + 30 + 300)
+    expect_equal("the full run's fetch window is past the timeouts and shorter than the node's",
+                 timeouts < harness.FULL_RUN_FETCH_WINDOW_SECS < fetch_window, True)
     expect_equal("the epochs before erasure, read from the source",
                  harness.rust_const(harness.ERASURE_SOURCE, "EPOCHS_BEFORE_ERASURE"), 2)
     longest = harness.lapse_erasure_seconds()
     expect_equal("the full run observes past the lapse, the out-of-range wait and the fetch "
                  "window", longest > harness.FULL_RUN_FRESHNESS_SECS
-                 + harness.FULL_RUN_HYSTERESIS_SECS + fetch_window + 10 * 60, True)
+                 + harness.FULL_RUN_HYSTERESIS_SECS + harness.FULL_RUN_FETCH_WINDOW_SECS
+                 + 10 * 60, True)
+    # And that erasure, in sync cycles whose rounds start at their longest
+    # wait and exchange at once, goes ahead before the stopped node drops out
+    # of its peers' routing tables, which brings the record back into the
+    # eraser's range. With 30 s syncs and the node's own fetch window it
+    # didn't: the record came back first.
+    view = harness.stopped_peer_view_seconds()
+    expect_equal("a stopped peer stays in view, read from saorsa-core's source", view, 15 * 60)
+    expect_equal("the full run's awaited erasure goes ahead while the stopped node is in view",
+                 harness.lapse_erasure_seconds(exchange=0) < view, True)
+    seams = (harness.FULL_RUN_SYNC_SECS, harness.FULL_RUN_FETCH_WINDOW_SECS)
+    harness.FULL_RUN_SYNC_SECS, harness.FULL_RUN_FETCH_WINDOW_SECS = 30, fetch_window
+    try:
+        expect_equal("with 30 s syncs and the node's fetch window it may not",
+                     harness.lapse_erasure_seconds(exchange=0) < view, False)
+    finally:
+        harness.FULL_RUN_SYNC_SECS, harness.FULL_RUN_FETCH_WINDOW_SECS = seams
 
     # The retention width, as src/replication/full.rs counts it.
     numbers = list(range(30))

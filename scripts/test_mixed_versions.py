@@ -120,8 +120,11 @@ sets.
 
 The full run. Every node of it runs with short timings through the seams
 (neighbour sync every FULL_RUN_SYNC_SECS, an out-of-range wait of
-FULL_RUN_HYSTERESIS_SECS, a "full" mark fresh for FULL_RUN_FRESHNESS_SECS),
-so erasure in two phases goes ahead within the run. The joiners' identities
+FULL_RUN_HYSTERESIS_SECS, a "full" mark fresh for FULL_RUN_FRESHNESS_SECS, a
+fetch window of FULL_RUN_FETCH_WINDOW_SECS), so erasure in two phases goes
+ahead within the run, and the erasure a stopped node's lapse allows goes
+ahead before that node drops out of its peers' routing tables (see
+lapse_erasure_seconds()). The joiners' identities
 are drawn before they join, and --full of them, chosen so that a full node's
 lapse can let records be erased in a group that holds it (place_full: the
 devnet's nodes, which answer no possession check, are often among a record's
@@ -138,7 +141,8 @@ lapses at its peers. It observes on until, after the lapse, a node the
 stopped node's fresh mark kept inside a record's retention width (see
 lapse_erasers()) erases that record, one of those the stopped node was
 chosen for, up to the longest such an erasure can take
-(lapse_erasure_seconds(), from the node's own timing constants), and asks
+(lapse_erasure_seconds(), from the node's timing constants and the run's
+seams), and asks
 again at the end. It must show, beyond what every run shows:
 
 - copies stay at 7: at each count, every record is held by at least 7 nodes
@@ -335,16 +339,32 @@ FULL_NOTICE_SEAM = "ANT_TEST_SEAM_FULL_NOTICE_FROM_RELEASE"
 
 # The full run's timing seams (src/test_seams.rs), set on every node of the
 # run, so that the several sync cycles an erasure takes, the out-of-range
-# wait and a mark's lapse all fall within it. A sync cycle every 30 to 60 s
-# gives an erasure (selected, then tried two epochs later) within a few
-# minutes; a mark fresh for 120 s, renewed every 30 s, lapses two minutes
-# after its node stops.
+# wait and a mark's lapse all fall within it. A mark fresh for 120 s, renewed
+# every 30 s, lapses two minutes after its node stops. The erasure that
+# lapse allows then takes about four sync cycles (one to start the record's
+# out-of-range clock, one past the out-of-range wait to select it, two more
+# before it is tried) and the fetch window, and must go ahead before the
+# stopped node drops out of its peers' routing tables, about a quarter of an
+# hour after they last heard from it (STOPPED_PEER_VIEW): the record is then
+# back in the eraser's range, and kept. A round of a sync cycle every 10 to
+# 20 s, the cycle's few rounds taking a minute or two, and a fetch window of
+# a minute, past the verification and fetch timeouts, in place of the five
+# minutes of the retry wait, have it go ahead within ten minutes of the stop.
 NEIGHBOR_SYNC_SEAM = "ANT_TEST_SEAM_NEIGHBOR_SYNC_SECS"
 HYSTERESIS_SEAM = "ANT_TEST_SEAM_PRUNE_HYSTERESIS_SECS"
 FRESHNESS_SEAM = "ANT_TEST_SEAM_FULL_FRESHNESS_SECS"
-FULL_RUN_SYNC_SECS = 30
+FETCH_WINDOW_SEAM = "ANT_TEST_SEAM_FETCH_WINDOW_SECS"
+FULL_RUN_SYNC_SECS = 10
 FULL_RUN_HYSTERESIS_SECS = 60
 FULL_RUN_FRESHNESS_SECS = 120
+FULL_RUN_FETCH_WINDOW_SECS = 60
+# How long the full run waits for the fresh offers and the full nodes'
+# notices to land before it counts copies, and for an extra batch's.
+FULL_RUN_COUNT_WAIT_SECS = 120
+# How long a node keeps a peer it no longer hears from in its routing table:
+# saorsa-core's live threshold, read from the vendored copy's source. Its
+# periodic self-lookup then evicts the peer if a ping goes unanswered.
+STOPPED_PEER_VIEW = ("vendor/saorsa-core/src/dht/core_engine.rs", "LIVE_THRESHOLD")
 # When no full joiner's lapse would let a counted record be erased (the
 # devnet's nodes, which answer no possession check, or joiners that never
 # got a record, among its 7 nearest not full), the full run uploads and
@@ -611,7 +631,8 @@ class Release:
         self.number = int(number.group(1)) if number else None
         self.full_notice_seam = FULL_NOTICE_SEAM.encode() in binary
         self.timing_seams = all(seam.encode() in binary for seam in
-                                (NEIGHBOR_SYNC_SEAM, HYSTERESIS_SEAM, FRESHNESS_SEAM))
+                                (NEIGHBOR_SYNC_SEAM, HYSTERESIS_SEAM, FRESHNESS_SEAM,
+                                 FETCH_WINDOW_SEAM))
         self.audit_seams = all(seam.encode() in binary for seam in (BOOTSTRAP_SEAM, AUDIT_SEAM))
 
     def __str__(self):
@@ -803,29 +824,37 @@ def rust_const(path, name):
     return eval(match.group(1), {"__builtins__": {}})  # digits, *, + only
 
 
-def lapse_erasure_seconds():
+def lapse_erasure_seconds(exchange=None):
     """The longest from a full node's stop to an erasure its mark's lapse
     allows, in the full run, by the node's constants and the run's seams:
     the mark lapses (FULL_RUN_FRESHNESS_SECS); a prune pass, at most a sync
     cycle later, starts the record's out-of-range clock; one at most a cycle
     after the out-of-range wait (FULL_RUN_HYSTERESIS_SECS) selects it; and
     one erases it at most a cycle after both EPOCHS_BEFORE_ERASURE cycles
-    and FETCH_WINDOW (the verification and fetch timeouts and the longest
-    retry backoff) have passed. A prune pass runs once a sync cycle
-    completes: NEIGHBOR_SYNC_SCOPE peers in rounds of
-    NEIGHBOR_SYNC_PEER_COUNT, each round started at most twice
-    FULL_RUN_SYNC_SECS after the last ended and over within the exchange
-    deadline."""
+    and the fetch window (FULL_RUN_FETCH_WINDOW_SECS) have passed. A prune
+    pass runs once a sync cycle completes: NEIGHBOR_SYNC_SCOPE peers in
+    rounds of NEIGHBOR_SYNC_PEER_COUNT, each round started at most twice
+    FULL_RUN_SYNC_SECS after the last ended and its exchanges over within
+    `exchange` seconds, by default the exchange deadline."""
     rounds = math.ceil(rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_SCOPE")
                        / rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_PEER_COUNT"))
-    cycle = rounds * (2 * FULL_RUN_SYNC_SECS
-                      + rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_EXCHANGE_DEADLINE_SECS"))
-    fetch_window = sum(rust_const(REPLICATION_CONFIG, name) for name in (
-        "VERIFICATION_REQUEST_TIMEOUT_SECS", "FETCH_REQUEST_TIMEOUT_SECS",
-        "VERIFICATION_RETRY_BACKOFF_MAX_SECS"))
+    if exchange is None:
+        exchange = rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_EXCHANGE_DEADLINE_SECS")
+    cycle = rounds * (2 * FULL_RUN_SYNC_SECS + exchange)
     epochs = rust_const(ERASURE_SOURCE, "EPOCHS_BEFORE_ERASURE")
     return (FULL_RUN_FRESHNESS_SECS + cycle + FULL_RUN_HYSTERESIS_SECS + cycle
-            + max(epochs * cycle, fetch_window + cycle))
+            + max(epochs * cycle, FULL_RUN_FETCH_WINDOW_SECS + cycle))
+
+
+def stopped_peer_view_seconds():
+    """How long, in seconds, a node keeps a peer it no longer hears from in
+    its routing table (STOPPED_PEER_VIEW)."""
+    path, name = STOPPED_PEER_VIEW
+    text = (REPO / path).read_text(encoding="utf-8")
+    match = re.search(rf"\bconst {name}: Duration = Duration::from_secs\(([0-9_]+)\);", text)
+    if not match:
+        raise HarnessError(f"{path} has no constant {name} of whole seconds")
+    return int(match.group(1).replace("_", ""))
 
 
 def paging_plan(name, new, old, paging_from, args):
@@ -911,6 +940,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
                 values[NEIGHBOR_SYNC_SEAM] = str(FULL_RUN_SYNC_SECS)
                 values[HYSTERESIS_SEAM] = str(FULL_RUN_HYSTERESIS_SECS)
                 values[FRESHNESS_SEAM] = str(FULL_RUN_FRESHNESS_SECS)
+                values[FETCH_WINDOW_SEAM] = str(FULL_RUN_FETCH_WINDOW_SECS)
             if node.full or name == "full":
                 values[FREE_SPACE_SEAM] = str(folder / "seams" / f"{node.name}.free")
             return values
@@ -1115,8 +1145,8 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
         elif name == "full":
             # A few sync cycles for the fresh offers and the full nodes'
             # notices to land, then the early count.
-            log(f"{name}: waiting {4 * FULL_RUN_SYNC_SECS} s, then counting copies")
-            observe(4 * FULL_RUN_SYNC_SECS / 60)
+            log(f"{name}: waiting {FULL_RUN_COUNT_WAIT_SECS} s, then counting copies")
+            observe(FULL_RUN_COUNT_WAIT_SECS / 60)
             phases["early"] = [path.name for path in check_all("early")]
             for node in nodes:
                 if not node.full:
@@ -1146,7 +1176,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
                 extra = upload(harness, manifest_path, folder / f"uploads-extra-{batch + 1}.json",
                                args.records_after)
                 uploads.append(extra)
-                observe(4 * FULL_RUN_SYNC_SECS / 60)
+                observe(FULL_RUN_COUNT_WAIT_SECS / 60)
                 mid.append(check(harness, manifest_path, extra,
                                  folder / f"check-mid-{extra.stem}.json"))
             phases["mid"] = [path.name for path in mid]
@@ -2522,8 +2552,8 @@ def main():
             log(f"{name}: this tree's nodes announce release {paging['announced']}, the first "
                 "that reads pages")
     if "full" in runs and not new.timing_seams:
-        raise HarnessError("this tree's ant-node lacks the sync, out-of-range wait or "
-                           "freshness seam the full run needs")
+        raise HarnessError("this tree's ant-node lacks the sync, out-of-range wait, "
+                           "freshness or fetch-window seam the full run needs")
     seamed = [name for name in runs if name in SEAMED_RUNS]
     if seamed and not new.audit_seams:
         raise HarnessError(f"this tree's ant-node lacks the bootstrap or audit seam the "

@@ -69,6 +69,17 @@ pub const FETCH_WINDOW: Duration = Duration::from_secs(
         + VERIFICATION_RETRY_BACKOFF_MAX.as_secs(),
 );
 
+/// The fetch window in this process: [`FETCH_WINDOW`], or, in a `test-utils`
+/// build, the window a test set ([`crate::test_seams::FETCH_WINDOW_SECS`]).
+#[must_use]
+pub fn fetch_window() -> Duration {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(window) = crate::test_seams::fetch_window() {
+        return window;
+    }
+    FETCH_WINDOW
+}
+
 /// The most keys whose last "present" answer a node remembers one by one.
 /// Past it the oldest are folded into one time that stands for all of them.
 const MAX_ANSWERED_PRESENT: usize = 1 << 16;
@@ -190,6 +201,7 @@ impl ErasureGate {
         max_selected: usize,
         now: Instant,
     ) -> Vec<XorName> {
+        let window = fetch_window();
         let keep: HashSet<&XorName> = eligible.iter().collect();
         let mut cooling = self.cooling_of(kind).lock();
         let mut cooled = HashSet::new();
@@ -210,7 +222,7 @@ impl ErasureGate {
             match selected.get(key) {
                 Some(entry) => {
                     if entry.at.saturating_add(EPOCHS_BEFORE_ERASURE) <= epoch
-                        && now.saturating_duration_since(entry.since) >= FETCH_WINDOW
+                        && now.saturating_duration_since(entry.since) >= window
                     {
                         ready.push(*key);
                     }
@@ -327,9 +339,10 @@ impl ErasureGate {
         }
         let mut answered = self.answered.lock();
         if answered.at.len() >= MAX_ANSWERED_PRESENT && !answered.at.contains_key(key) {
+            let window = fetch_window();
             answered
                 .at
-                .retain(|_, at| now.saturating_duration_since(*at) < FETCH_WINDOW);
+                .retain(|_, at| now.saturating_duration_since(*at) < window);
             if answered.at.len() >= MAX_ANSWERED_PRESENT {
                 let latest = answered.at.values().max().copied();
                 answered.at.clear();
@@ -344,8 +357,9 @@ impl ErasureGate {
     /// the record bounded counts as answered when the forgotten ones were.
     #[must_use]
     pub fn answered_present_lately(&self, key: &XorName, now: Instant) -> bool {
+        let window = fetch_window();
         let answered = self.answered.lock();
-        let within = |at: Instant| now.saturating_duration_since(at) < FETCH_WINDOW;
+        let within = |at: Instant| now.saturating_duration_since(at) < window;
         answered.at.get(key).copied().is_some_and(within)
             || answered.forgotten_until.is_some_and(within)
     }

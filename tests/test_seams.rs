@@ -5,7 +5,9 @@
 //! peer's "full" notice stays fresh, so a run can see a mark lapse, and the
 //! first release a full node tells it is full. The bootstrap seam bounds how
 //! long a node stays bootstrapping, and the audit seam reaches the audit's
-//! tick and the age a repair hint must reach. Each seam is set by one test
+//! tick and the age a repair hint must reach. The fetch-window seam reaches
+//! the erasure gate: how long after its selection a key may be erased, and
+//! how long a "present" answer keeps it. Each seam is set by one test
 //! alone, in this process of its own, because the seams are read from the
 //! environment.
 
@@ -15,6 +17,9 @@ use ant_node::replication::config::{
     repair_hint_min_age, ReplicationConfig, AUDIT_TICK_INTERVAL_MAX, AUDIT_TICK_INTERVAL_MIN,
     REPAIR_HINT_MIN_AGE,
 };
+use ant_node::replication::erasure::{
+    fetch_window, ClockKind, ErasureGate, EPOCHS_BEFORE_ERASURE, FETCH_WINDOW,
+};
 use ant_node::replication::full::{
     full_notice_freshness, full_notice_from_release, full_notice_renewal, FullMarks,
     FULL_NOTICE_FRESHNESS, FULL_NOTICE_FROM_RELEASE,
@@ -23,8 +28,8 @@ use ant_node::replication::retention::DiskRetention;
 use ant_node::storage::chunk_store::CapacityVerdict;
 use ant_node::storage::{ChunkStore, ChunkStoreConfig, GIB, MIB};
 use ant_node::test_seams::{
-    bootstrap_deadline, replication_timing, AUDIT_SECS, BOOTSTRAP_SECS, FREE_SPACE_FILE,
-    FULL_FRESHNESS_SECS, FULL_NOTICE_FROM_RELEASE as FROM_RELEASE_SEAM,
+    bootstrap_deadline, replication_timing, AUDIT_SECS, BOOTSTRAP_SECS, FETCH_WINDOW_SECS,
+    FREE_SPACE_FILE, FULL_FRESHNESS_SECS, FULL_NOTICE_FROM_RELEASE as FROM_RELEASE_SEAM,
 };
 use saorsa_core::identity::PeerId;
 use std::time::{Duration, Instant};
@@ -143,4 +148,39 @@ fn the_audit_seam_reaches_the_tick_and_the_repair_hint_age() {
     assert_eq!(repair_hint_min_age(), REPAIR_HINT_MIN_AGE);
     std::env::remove_var(AUDIT_SECS);
     assert_eq!(repair_hint_min_age(), REPAIR_HINT_MIN_AGE);
+}
+
+#[test]
+fn the_fetch_window_seam_reaches_the_erasure_gate() {
+    assert_eq!(fetch_window(), FETCH_WINDOW);
+
+    // A minute: a key selected is ready a minute later, once its epochs have
+    // passed, and a "present" answer keeps it a minute.
+    std::env::set_var(FETCH_WINDOW_SECS, "60");
+    assert_eq!(fetch_window(), Duration::from_secs(60));
+    let gate = ErasureGate::default();
+    let key = [7; 32];
+    let selected = Instant::now();
+    assert!(gate
+        .select(ClockKind::Records, &[key], 0, 8, selected)
+        .is_empty());
+    let almost = selected + Duration::from_secs(59);
+    assert!(gate
+        .select(ClockKind::Records, &[key], EPOCHS_BEFORE_ERASURE, 8, almost)
+        .is_empty());
+    let ready = selected + Duration::from_secs(60);
+    assert_eq!(
+        gate.select(ClockKind::Records, &[key], EPOCHS_BEFORE_ERASURE, 8, ready),
+        vec![key],
+        "ready at the seam's window, not the shipped one"
+    );
+    gate.note_answered_present(&key, selected);
+    assert!(gate.answered_present_lately(&key, almost));
+    assert!(!gate.answered_present_lately(&key, ready));
+
+    // Zero is ignored: the shipped window.
+    std::env::set_var(FETCH_WINDOW_SECS, "0");
+    assert_eq!(fetch_window(), FETCH_WINDOW);
+    std::env::remove_var(FETCH_WINDOW_SECS);
+    assert_eq!(fetch_window(), FETCH_WINDOW);
 }
