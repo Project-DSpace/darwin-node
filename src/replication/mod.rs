@@ -2627,6 +2627,10 @@ impl ReplicationEngine {
         self.start_fetch_worker();
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
+        // A test-utils build only: the bound a test set on how long the node
+        // stays bootstrapping.
+        #[cfg(any(test, feature = "test-utils"))]
+        self.start_bootstrap_deadline_seam();
         self.start_fresh_replication();
         self.start_possession_check_scheduler();
         // The prune passes in a task of their own, erasing in two
@@ -4265,6 +4269,48 @@ impl ReplicationEngine {
                 }
             }
             debug!("Replication traffic summary loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// In a `test-utils` build with the bootstrap seam set
+    /// ([`crate::test_seams::BOOTSTRAP_SECS`]): once that long has passed
+    /// since the engine started, count the bootstrap drained, with whatever
+    /// keys are still pending, so a test run's joiners stop answering
+    /// "bootstrapping" and start auditing within the run. A released node has
+    /// no such bound.
+    #[cfg(any(test, feature = "test-utils"))]
+    fn start_bootstrap_deadline_seam(&mut self) {
+        let Some(deadline) = crate::test_seams::bootstrap_deadline() else {
+            return;
+        };
+        let shutdown = self.shutdown.clone();
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                () = shutdown.cancelled() => {}
+                () = tokio::time::sleep(deadline) => {
+                    let pending = {
+                        let state = bootstrap_state.read().await;
+                        if state.is_drained() {
+                            None
+                        } else {
+                            Some(state.pending_keys.len())
+                        }
+                    };
+                    if let Some(pending) = pending {
+                        warn!(
+                            "Bootstrap drained by the test seam after {}s, with {pending} \
+                             key(s) still pending",
+                            deadline.as_secs()
+                        );
+                        bootstrap::mark_bootstrap_drained(&bootstrap_state).await;
+                        complete_bootstrap(&is_bootstrapping, &bootstrap_complete_notify).await;
+                    }
+                }
+            }
         });
         self.task_handles.push(handle);
     }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::REPAIR_HINT_MIN_AGE;
+use crate::replication::config::repair_hint_min_age;
 use saorsa_core::identity::PeerId;
 
 // ---------------------------------------------------------------------------
@@ -518,7 +518,9 @@ impl RepairProofs {
     /// The check invalidates proofs for peers that have left the current
     /// self-inclusive close group. A proof is mature only after at least one
     /// later local sync-cycle epoch and the repair hint is at least
-    /// [`REPAIR_HINT_MIN_AGE`] old.
+    /// [`repair_hint_min_age`] old (an hour,
+    /// [`REPAIR_HINT_MIN_AGE`](crate::replication::config::REPAIR_HINT_MIN_AGE),
+    /// in a released node).
     pub fn has_mature_replica_hint(
         &mut self,
         peer: &PeerId,
@@ -534,7 +536,7 @@ impl RepairProofs {
             .and_then(|entry| entry.peer_proofs.get(peer))
             .is_some_and(|proof| {
                 proof.hinted_at_epoch < current_epoch
-                    && now.saturating_duration_since(proof.hinted_at) >= REPAIR_HINT_MIN_AGE
+                    && now.saturating_duration_since(proof.hinted_at) >= repair_hint_min_age()
             })
     }
 
@@ -889,6 +891,7 @@ impl Default for BootstrapState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::config::REPAIR_HINT_MIN_AGE;
 
     /// Helper: build a `PeerId` from a single byte (zero-padded to 32 bytes).
     fn peer_id_from_byte(b: u8) -> PeerId {

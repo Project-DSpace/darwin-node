@@ -8,7 +8,9 @@ previous release's nodes single messages, never pages, no penalty for a
 busy answer, and what the paged and rollback runs must show besides, with
 the releases the rolled-back node ran; and that the report and summary.json
 list every count measured, with its excess and limit, within the limit or
-not, and the audits made per exchange. The Test workflow runs it; run it by
+not, and the audits made per exchange, which a run with the audit seam must
+make; and that the full run fails when no node erased a record, or none
+after the stopped node's mark lapsed. The Test workflow runs it; run it by
 hand with `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
 """
 
@@ -16,6 +18,7 @@ import argparse
 import datetime
 import importlib.util
 import sys
+import tempfile
 from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent / "test_mixed_versions.py"
@@ -116,6 +119,32 @@ def rollback_sync(extra_paged=(), single=None):
     return paged_sync(
         exchanges=[exchange(), rolled(at=35)] + list(extra_paged),
         single=[rolled(form="single", peer_release="old", at=15)] if single is None else single)
+
+
+def full_run(folder, erased_at=()):
+    """A full run's record as full_run_checks() reads it: one incumbent,
+    whose log holds an erasure with 6 proofs at each of `erased_at`, minutes
+    after T0; the stopped node stopped at minute 10, so its mark lapses
+    FULL_RUN_FRESHNESS_SECS later."""
+    lines = []
+    for at in erased_at:
+        stamp = minutes(at).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+        lines.append(f"{stamp}  INFO ant_node::replication::pruning: {harness.ERASED_LINE} "
+                     f"with 6 proofs from peers not marked full erased_record={'cd' * 32} "
+                     "proofs_not_full=6 proofs_full=0 proofs_needed=6 group_not_full=7 "
+                     "group_full=0")
+    (folder / "incumbent-00.log").write_text("\n".join(lines) + "\n")
+    (folder / "joiner-00.log").write_text("")
+    return {
+        "folder": folder, "window": (T0, minutes(30)), "devnet_peers": [],
+        "nodes": [{"name": "incumbent-00", "role": "incumbent", "peer_id": "aa" * 32,
+                   "full": False, "log": "incumbent-00.log"},
+                  {"name": "joiner-00", "role": "joiner", "peer_id": ROLLED, "full": True,
+                   "log": "joiner-00.log"}],
+        "full_phases": {"stopped": {"node": "joiner-00", "peer_id": ROLLED,
+                                    "at": minutes(10).isoformat()}},
+        "phase_checks": {},
+    }
 
 
 def options(**overrides):
@@ -474,6 +503,45 @@ def main():
                  [line for line in harness.sync_lines(result(sync=paged_sync(exchanges=[])))
                   if "audits made" in line],
                  ["  audits made: 0 over 0 exchange(s), per exchange: no exchanges"])
+
+    seamed = result(sync=paged_sync(exchanges=[exchange(pages=1)] * harness.AUDIT_EXCHANGE_FLOOR))
+    seamed["audit_seam"] = True
+    expect("a run with the audit seam that made no audit over many exchanges fails",
+           {"all-new": seamed}, options(),
+           [f"no audit made over {harness.AUDIT_EXCHANGE_FLOOR} exchanges"])
+    seamed["audits"] = {"incumbent-00": {"responsible_audit_pass": 1}}
+    expect("a run with the audit seam that made an audit passes", {"all-new": seamed},
+           options(), [])
+    few = result(sync=paged_sync(exchanges=[exchange(pages=1)] * 3))
+    few["audit_seam"] = True
+    expect("a run with the audit seam and few exchanges need make no audit", {"all-new": few},
+           options(), [])
+    unseamed = result(sync=paged_sync(exchanges=[exchange(pages=1)] * 60))
+    expect("a run without the audit seam need make no audit",
+           {"new-hosts-old": unseamed}, options(), [])
+    expect_equal("the report says when a run had no audit seam",
+                 [line for line in harness.sync_lines(unseamed) if "audits made" in line],
+                 ["  audits made: 0 over 60 exchange(s), per exchange: 0.000; no audit seam "
+                  "in this run, so none is due: a key is audited an hour after its repair "
+                  "hint"])
+
+    with tempfile.TemporaryDirectory() as temporary:
+        folder = Path(temporary)
+        lapse = 10 + harness.FULL_RUN_FRESHNESS_SECS / 60
+        for name, erased_at, failing in [
+                ("a full run with no erasure fails", (),
+                 ["no node erased a record"]),
+                ("a full run with erasures only before the mark lapsed fails", (5,),
+                 ["no node erased a record after the stopped node's mark lapsed (1 before)"]),
+                ("a full run with an erasure after the mark lapsed passes", (5, lapse + 1), []),
+        ]:
+            found = harness.full_run_checks(full_run(folder, erased_at), [], [])
+            if len(found["failures"]) != len(failing) or not all(
+                    any(text in failure for failure in found["failures"]) for text in failing):
+                FAILED.append(name)
+                print(f"FAILED: {name}: {found['failures']}")
+            else:
+                print(f"ok: {name}")
 
     listed(options())
 

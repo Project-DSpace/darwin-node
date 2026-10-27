@@ -103,7 +103,15 @@ The test-only seams (src/test_seams.rs) are compiled only into builds with the
 seam makes a node's disk read as full (the `full` run), and in that run the
 full-notice seam lets a full node of this tree tell the others that it is
 full, which they read from the release that brings the notice on; the
-page-size, announced-release and admission seams are the ones above. The
+page-size, announced-release and admission seams are the ones above. In
+the runs in which every node is of this tree (all-new, full and paged), this
+tree's nodes also get the bootstrap seam, so a joiner stops answering
+"bootstrapping" RUN_BOOTSTRAP_SECS after it starts (in this network it
+otherwise never does: the devnet's nodes answer no replication), and the
+audit seam, so every node audits every RUN_AUDIT_SECS to twice that, a key
+whose repair hint is that old (an hour otherwise, longer than any run). Such
+a run must make an audit if it has AUDIT_EXCHANGE_FLOOR exchanges or more;
+the others make none, and their audits per exchange are reported only. The
 harness refuses a run with a binary that lacks the seams it sets.
 
 The full run. Every node of it runs with short timings through the seams
@@ -128,7 +136,9 @@ It must show, beyond what every run shows:
   least 6 proofs, and had them;
 - a lapsed mark counts as missing: once the stopped node's mark has
   lapsed, no erasure counts more members marked full than full nodes still
-  run.
+  run;
+- and neither passes for want of an erasure: the run fails if no node
+  erased a record, or none did after the stopped node's mark lapsed.
 
 The report lists, for each count, the records by how many of their 7 + f
 nearest are full (f), so runs with --full 1, 2, 3 and 4 show which f each
@@ -316,6 +326,30 @@ FRESHNESS_SEAM = "ANT_TEST_SEAM_FULL_FRESHNESS_SECS"
 FULL_RUN_SYNC_SECS = 30
 FULL_RUN_HYSTERESIS_SECS = 60
 FULL_RUN_FRESHNESS_SECS = 120
+
+# The seams (src/test_seams.rs) set on this tree's nodes in the runs in which
+# every node is of this tree (SEAMED_RUNS), so that within a run the joiners
+# answer challenges and every node audits:
+# - a node stays bootstrapping at most RUN_BOOTSTRAP_SECS. Without the bound
+#   a joiner here never finishes bootstrapping: the devnet's nodes answer no
+#   replication, so keys near them stay unsettled for the half hour before
+#   they are evicted, and in the full run every 30 s sync brings them back.
+#   A joiner bootstrapping answers every possession check "bootstrapping",
+#   which blocks every erasure whose close group holds it, and doesn't audit;
+# - the responsible-chunk audit ticks every RUN_AUDIT_SECS to twice that,
+#   and audits a key once its repair hint is RUN_AUDIT_SECS old, in place of
+#   10 to 20 minutes and an hour, which no run of minutes reaches: without
+#   it no node audits, in any release.
+# The previous release has neither seam, so the all-old and mixed runs make
+# no audits: their audits per exchange are reported, not checked.
+BOOTSTRAP_SEAM = "ANT_TEST_SEAM_BOOTSTRAP_SECS"
+AUDIT_SEAM = "ANT_TEST_SEAM_AUDIT_SECS"
+SEAMED_RUNS = ("all-new", "full", "paged")
+RUN_BOOTSTRAP_SECS = 180
+RUN_AUDIT_SECS = 180
+# A run with the audit seam must audit: over at least this many exchanges,
+# none is a failure.
+AUDIT_EXCHANGE_FLOOR = 50
 
 # The incumbents' disk under pressure in the full run: 2 GiB free of a 1 TB
 # partition, under the falling floor's last step (2.5%), so a node may erase
@@ -530,6 +564,7 @@ class Release:
         self.full_notice_seam = FULL_NOTICE_SEAM.encode() in binary
         self.timing_seams = all(seam.encode() in binary for seam in
                                 (NEIGHBOR_SYNC_SEAM, HYSTERESIS_SEAM, FRESHNESS_SEAM))
+        self.audit_seams = all(seam.encode() in binary for seam in (BOOTSTRAP_SEAM, AUDIT_SEAM))
 
     def __str__(self):
         return f"{self.name}: {self.version}, {self.label}"
@@ -752,6 +787,9 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
                     values[ADMISSION_SEAM] = str(paging["busy_limit"])
             if name == "full" and release.full_notice_seam:
                 values[FULL_NOTICE_SEAM] = "0"
+            if name in SEAMED_RUNS and release.name == "new":
+                values[BOOTSTRAP_SEAM] = str(RUN_BOOTSTRAP_SECS)
+                values[AUDIT_SEAM] = str(RUN_AUDIT_SECS)
             if name == "full":
                 values[NEIGHBOR_SYNC_SEAM] = str(FULL_RUN_SYNC_SECS)
                 values[HYSTERESIS_SEAM] = str(FULL_RUN_HYSTERESIS_SECS)
@@ -946,6 +984,7 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
         "checks": [path.name for path in checks],
         "page_bytes": paging.get("page_bytes"),
         "paging": paging,
+        "audit_seam": name in SEAMED_RUNS,
         "rollback": rolled,
         "phase_checks": phases,
         "full_phases": {key: timeline[key] for key in ("pressure", "stopped")
@@ -1202,6 +1241,7 @@ def analyze(run):
         "unanswered": unanswered,
         "sync": sync,
         "paging": run.get("paging") or {},
+        "audit_seam": run.get("audit_seam", False),
         "rollback": rollback,
         "stalled_seconds": run.get("stalled_seconds", 0),
         "roles": {node["name"]: node["role"] for node in run["nodes"]},
@@ -1401,6 +1441,15 @@ def full_run_checks(run, records, end_checks):
                                 f"the stopped node's mark lapsed counting {group_full} "
                                 f"members marked full, more than the {still_full} still "
                                 "running: a lapsed mark wasn't counted as missing")
+    # The run puts its incumbents under pressure so that they erase: with no
+    # erasure, the two checks above tested nothing.
+    if not erasures:
+        failures.append("no node erased a record, so \"erasure goes ahead with 6 real "
+                        "proofs\" and \"a lapsed mark counts as missing\" tested nothing")
+    elif lapsed_at is not None and not any(erasure["after_lapse"] for erasure in erasures):
+        failures.append(f"no node erased a record after the stopped node's mark lapsed "
+                        f"({len(erasures)} before), so \"a lapsed mark counts as missing\" "
+                        "tested nothing")
     return {"failures": failures, "by_f": by_f, "copies": counts,
             "stand_ins_kept": stand_ins_kept, "erasures": erasures,
             "stopped": run["full_phases"].get("stopped")}
@@ -1656,6 +1705,7 @@ def verdicts(results, args):
                 if families.get(family, 0) == 0:
                     failures.append(f"{name}: the {role}s received no {family}")
         failures += sync_failures(name, result)
+        failures += audit_failures(name, result)
         kinds = measured(name, baselines)
         if not kinds:
             continue
@@ -1810,6 +1860,30 @@ def report(results, args):
     return "\n".join(lines)
 
 
+def audits_made(result):
+    """The audits a run's nodes made, passed or failed, responsible-chunk and
+    subtree, from the last audit summary each logged in the window, and the
+    neighbour-sync exchanges, paged and single, the requesters logged."""
+    sync = result.get("sync") or {}
+    audits = sum(value for counters in (result.get("audits") or {}).values()
+                 for key, value in counters.items()
+                 if key.startswith(("responsible_audit_", "subtree_audit_")))
+    return audits, len(sync.get("paged", [])) + len(sync.get("single", []))
+
+
+def audit_failures(name, result):
+    """A run whose nodes all carry the audit seam must audit: none over
+    AUDIT_EXCHANGE_FLOOR exchanges or more fails it, since audits per
+    exchange then measure nothing."""
+    if not result.get("audit_seam"):
+        return []
+    audits, exchanges = audits_made(result)
+    if audits == 0 and exchanges >= AUDIT_EXCHANGE_FLOOR:
+        return [f"{name}: no audit made over {exchanges} exchanges, with the audit seam "
+                f"set: audits per exchange measure nothing"]
+    return []
+
+
 def sync_lines(result):
     """The report's lines on neighbour sync: exchanges paged and single, by the
     releases of the two nodes, the most pages one took, busy answers, and how
@@ -1840,13 +1914,13 @@ def sync_lines(result):
     # A responder keeps repair proofs only for pages a later request showed
     # arrived, so its one-page exchanges give it none: audits per exchange
     # measure what that costs, run against run.
-    audits = sum(value for counters in (result.get("audits") or {}).values()
-                 for key, value in counters.items()
-                 if key.startswith(("responsible_audit_", "subtree_audit_")))
-    exchanges = len(paged) + len(sync.get("single", []))
+    audits, exchanges = audits_made(result)
     per_exchange = f"{audits / exchanges:.3f}" if exchanges else "no exchanges"
+    unseamed = ("; no audit seam in this run, so none is due: a key is audited an hour "
+                "after its repair hint"
+                if exchanges and not audits and not result.get("audit_seam") else "")
     lines.append(f"  audits made: {audits} over {exchanges} exchange(s), per exchange: "
-                 f"{per_exchange}")
+                 f"{per_exchange}{unseamed}")
     rollback = result.get("rollback")
     if rollback:
         rolled = rollback["peer_id"]
@@ -2078,6 +2152,11 @@ def main():
     if "full" in runs and not new.timing_seams:
         raise HarnessError("this tree's ant-node lacks the sync, out-of-range wait or "
                            "freshness seam the full run needs")
+    seamed = [name for name in runs if name in SEAMED_RUNS]
+    if seamed and not new.audit_seams:
+        raise HarnessError(f"this tree's ant-node lacks the bootstrap or audit seam the "
+                           f"{', '.join(seamed)} run(s) set: build it with --features "
+                           "test-utils")
 
     work = Path(args.work) if args.work else (
         cache / "runs" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))

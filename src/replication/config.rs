@@ -261,6 +261,18 @@ const REPAIR_HINT_MIN_AGE_SECS: u64 = 60 * 60; // 1 hour
 /// for that key.
 pub const REPAIR_HINT_MIN_AGE: Duration = Duration::from_secs(REPAIR_HINT_MIN_AGE_SECS);
 
+/// How old a repair hint must be before the hinted peer is audited for its
+/// key in this process: [`REPAIR_HINT_MIN_AGE`], or, in a `test-utils` build,
+/// the age a test set ([`crate::test_seams::AUDIT_SECS`]).
+#[must_use]
+pub fn repair_hint_min_age() -> Duration {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(age) = crate::test_seams::repair_hint_min_age() {
+        return age;
+    }
+    REPAIR_HINT_MIN_AGE
+}
+
 /// Minimum self-lookup cadence.
 const SELF_LOOKUP_INTERVAL_MIN_SECS: u64 = 5 * 60;
 /// Maximum self-lookup cadence.

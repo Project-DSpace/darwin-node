@@ -3,12 +3,18 @@
 //! capacity check and the disk-pressure state, so a test can make a node's
 //! disk read as full on a disk with room. The "full" seams reach how long a
 //! peer's "full" notice stays fresh, so a run can see a mark lapse, and the
-//! first release a full node tells it is full. Each seam is set by one test
+//! first release a full node tells it is full. The bootstrap seam bounds how
+//! long a node stays bootstrapping, and the audit seam reaches the audit's
+//! tick and the age a repair hint must reach. Each seam is set by one test
 //! alone, in this process of its own, because the seams are read from the
 //! environment.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use ant_node::replication::config::{
+    repair_hint_min_age, ReplicationConfig, AUDIT_TICK_INTERVAL_MAX, AUDIT_TICK_INTERVAL_MIN,
+    REPAIR_HINT_MIN_AGE,
+};
 use ant_node::replication::full::{
     full_notice_freshness, full_notice_from_release, full_notice_renewal, FullMarks,
     FULL_NOTICE_FRESHNESS, FULL_NOTICE_FROM_RELEASE,
@@ -17,7 +23,8 @@ use ant_node::replication::retention::DiskRetention;
 use ant_node::storage::chunk_store::CapacityVerdict;
 use ant_node::storage::{ChunkStore, ChunkStoreConfig, GIB, MIB};
 use ant_node::test_seams::{
-    FREE_SPACE_FILE, FULL_FRESHNESS_SECS, FULL_NOTICE_FROM_RELEASE as FROM_RELEASE_SEAM,
+    bootstrap_deadline, replication_timing, AUDIT_SECS, BOOTSTRAP_SECS, FREE_SPACE_FILE,
+    FULL_FRESHNESS_SECS, FULL_NOTICE_FROM_RELEASE as FROM_RELEASE_SEAM,
 };
 use saorsa_core::identity::PeerId;
 use std::time::{Duration, Instant};
@@ -104,4 +111,36 @@ fn the_full_seams_reach_the_freshness_and_the_release() {
     assert_eq!(full_notice_from_release(), FULL_NOTICE_FROM_RELEASE);
     std::env::remove_var(FROM_RELEASE_SEAM);
     assert_eq!(full_notice_from_release(), FULL_NOTICE_FROM_RELEASE);
+}
+
+#[test]
+fn the_bootstrap_seam_bounds_how_long_a_node_bootstraps() {
+    assert_eq!(bootstrap_deadline(), None, "unset: no bound");
+    std::env::set_var(BOOTSTRAP_SECS, "180");
+    assert_eq!(bootstrap_deadline(), Some(Duration::from_secs(180)));
+    std::env::set_var(BOOTSTRAP_SECS, "0");
+    assert_eq!(bootstrap_deadline(), None, "0 is ignored");
+    std::env::remove_var(BOOTSTRAP_SECS);
+    assert_eq!(bootstrap_deadline(), None);
+}
+
+#[test]
+fn the_audit_seam_reaches_the_tick_and_the_repair_hint_age() {
+    assert_eq!(repair_hint_min_age(), REPAIR_HINT_MIN_AGE);
+    let config = replication_timing(ReplicationConfig::default());
+    assert_eq!(config.audit_tick_interval_min, AUDIT_TICK_INTERVAL_MIN);
+    assert_eq!(config.audit_tick_interval_max, AUDIT_TICK_INTERVAL_MAX);
+
+    // Three minutes: a tick every three to six, and a hint audited once it is
+    // three minutes old.
+    std::env::set_var(AUDIT_SECS, "180");
+    assert_eq!(repair_hint_min_age(), Duration::from_secs(180));
+    let config = replication_timing(ReplicationConfig::default());
+    assert_eq!(config.audit_tick_interval_min, Duration::from_secs(180));
+    assert_eq!(config.audit_tick_interval_max, Duration::from_secs(360));
+
+    std::env::set_var(AUDIT_SECS, "soon");
+    assert_eq!(repair_hint_min_age(), REPAIR_HINT_MIN_AGE);
+    std::env::remove_var(AUDIT_SECS);
+    assert_eq!(repair_hint_min_age(), REPAIR_HINT_MIN_AGE);
 }

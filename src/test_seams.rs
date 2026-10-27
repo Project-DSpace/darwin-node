@@ -23,7 +23,12 @@
 //! nodes of a tree between releases tell each other; the neighbour-sync
 //! interval ([`NEIGHBOR_SYNC_SECS`]) and the out-of-range wait
 //! ([`PRUNE_HYSTERESIS_SECS`]), for a run in which erasure in two phases must
-//! go ahead within the run. Each is compiled only with `test-utils` and named
+//! go ahead within the run; how long a node may stay bootstrapping
+//! ([`BOOTSTRAP_SECS`]), for a run in which joiners must answer possession
+//! and audit challenges while it lasts; and the responsible-chunk audit's tick
+//! and the age a repair hint must reach before its key is audited
+//! ([`AUDIT_SECS`]), for a run that counts the audits each exchange gives.
+//! Each is compiled only with `test-utils` and named
 //! under [`PREFIX`], so the Build workflow's check covers it, and the harness
 //! refuses a run that needs a seam with a binary that lacks it, as it refuses
 //! the `full` run without [`FREE_SPACE_FILE`].
@@ -162,17 +167,79 @@ pub const NEIGHBOR_SYNC_SECS: &str = "ANT_TEST_SEAM_NEIGHBOR_SYNC_SECS";
 /// value that isn't a whole number is ignored.
 pub const PRUNE_HYSTERESIS_SECS: &str = "ANT_TEST_SEAM_PRUNE_HYSTERESIS_SECS";
 
+/// How long, in whole seconds, a node may stay bootstrapping.
+///
+/// Once that long has passed from the start of its replication engine, the
+/// node counts its bootstrap drained with keys still pending, stops answering
+/// challenges with "bootstrapping" and starts its audits. A released node has no such bound: it stays bootstrapping until every key
+/// it learned of while bootstrapping has been settled. In the harness's
+/// network that can take the whole run: the devnet's in-process nodes answer
+/// no replication, so keys near them stay unsettled until they are evicted
+/// half an hour later, and in a run with a short sync interval every cycle
+/// brings the keys back. A run that needs its joiners to answer possession
+/// checks, as erasure does, or to audit, sets this. A value that isn't a whole
+/// number of seconds, at least 1, is ignored.
+pub const BOOTSTRAP_SECS: &str = "ANT_TEST_SEAM_BOOTSTRAP_SECS";
+
+/// The responsible-chunk audit's tick and the repair hint's age, in whole
+/// seconds.
+///
+/// A node audits one peer every this to twice this, in place of the 10 to 20
+/// minutes of [`ReplicationConfig`](crate::replication::config::ReplicationConfig)'s
+/// defaults, and audits a peer for a key once the repair hint it sent that
+/// peer for it is this old, in place of
+/// [`REPAIR_HINT_MIN_AGE`](crate::replication::config::REPAIR_HINT_MIN_AGE)'s
+/// hour, so a run of minutes makes audits and can count them per exchange. A
+/// value that isn't a whole number of seconds, at least 1, is ignored.
+pub const AUDIT_SECS: &str = "ANT_TEST_SEAM_AUDIT_SECS";
+
 /// `config` with the timing seams a test set for this process applied
-/// ([`NEIGHBOR_SYNC_SECS`], [`PRUNE_HYSTERESIS_SECS`]).
+/// ([`NEIGHBOR_SYNC_SECS`], [`PRUNE_HYSTERESIS_SECS`], [`AUDIT_SECS`]).
 #[must_use]
 pub fn replication_timing(
     config: crate::replication::config::ReplicationConfig,
 ) -> crate::replication::config::ReplicationConfig {
-    apply_replication_timing(
+    let config = apply_replication_timing(
         config,
         std::env::var(NEIGHBOR_SYNC_SECS).ok().as_deref(),
         std::env::var(PRUNE_HYSTERESIS_SECS).ok().as_deref(),
-    )
+    );
+    apply_audit_timing(config, std::env::var(AUDIT_SECS).ok().as_deref())
+}
+
+fn apply_audit_timing(
+    mut config: crate::replication::config::ReplicationConfig,
+    audit: Option<&str>,
+) -> crate::replication::config::ReplicationConfig {
+    if let Some(tick) = audit.and_then(parse_whole_secs) {
+        config.audit_tick_interval_min = tick;
+        config.audit_tick_interval_max = tick.saturating_mul(2);
+    }
+    config
+}
+
+/// How long the node may stay bootstrapping, if a test set a valid value
+/// ([`BOOTSTRAP_SECS`]).
+#[must_use]
+pub fn bootstrap_deadline() -> Option<std::time::Duration> {
+    parse_whole_secs(&std::env::var(BOOTSTRAP_SECS).ok()?)
+}
+
+/// How old a repair hint must be before its key is audited, if a test set a
+/// valid value ([`AUDIT_SECS`]).
+#[must_use]
+pub fn repair_hint_min_age() -> Option<std::time::Duration> {
+    parse_whole_secs(&std::env::var(AUDIT_SECS).ok()?)
+}
+
+/// A whole number of seconds, at least 1.
+fn parse_whole_secs(value: &str) -> Option<std::time::Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|secs| *secs >= 1)
+        .map(std::time::Duration::from_secs)
 }
 
 fn apply_replication_timing(
@@ -355,6 +422,8 @@ mod tests {
             FULL_NOTICE_FROM_RELEASE,
             NEIGHBOR_SYNC_SECS,
             PRUNE_HYSTERESIS_SECS,
+            BOOTSTRAP_SECS,
+            AUDIT_SECS,
         ] {
             assert!(seam.starts_with(PREFIX), "{seam}");
         }
@@ -415,6 +484,45 @@ mod tests {
                 config.neighbor_sync_interval_min, default.neighbor_sync_interval_min,
                 "{ignored:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_audit_seam_shortens_the_audit_tick() {
+        use crate::replication::config::ReplicationConfig;
+        use std::time::Duration;
+        let config = apply_audit_timing(ReplicationConfig::default(), Some("120"));
+        assert_eq!(config.audit_tick_interval_min, Duration::from_secs(120));
+        assert_eq!(config.audit_tick_interval_max, Duration::from_secs(240));
+        assert!(config.validate().is_ok());
+        let default = ReplicationConfig::default();
+        for ignored in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("1.5"),
+            Some("120s"),
+        ] {
+            let config = apply_audit_timing(ReplicationConfig::default(), ignored);
+            assert_eq!(
+                config.audit_tick_interval_min, default.audit_tick_interval_min,
+                "{ignored:?}"
+            );
+            assert_eq!(
+                config.audit_tick_interval_max, default.audit_tick_interval_max,
+                "{ignored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_seam_of_seconds_is_a_whole_number_of_at_least_one() {
+        use std::time::Duration;
+        assert_eq!(parse_whole_secs("1"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_whole_secs(" 180\n"), Some(Duration::from_secs(180)));
+        for ignored in ["", "0", "-5", "5s", "2.5"] {
+            assert_eq!(parse_whole_secs(ignored), None, "{ignored:?}");
         }
     }
 
