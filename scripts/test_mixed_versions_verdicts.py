@@ -9,8 +9,11 @@ busy answer, and what the paged and rollback runs must show besides, with
 the releases the rolled-back node ran; and that the report and summary.json
 list every count measured, with its excess and limit, within the limit or
 not, and the audits made per exchange, which a run with the audit seam must
-make; and that the full run fails when no node erased a record, or none
-after the stopped node's mark lapsed. The Test workflow runs it; run it by
+make; that the all-new and paged runs, whose nodes carry the bootstrap and
+audit seams the all-old runs lack, are measured on refused PUTs only; and
+that the full run fails when no node erased a record, or none after the
+stopped node's mark lapsed in a group that held the stopped node. The Test
+workflow runs it; run it by
 hand with `python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
 """
 
@@ -121,16 +124,38 @@ def rollback_sync(extra_paged=(), single=None):
         single=[rolled(form="single", peer_release="old", at=15)] if single is None else single)
 
 
+# Seven nodes not full, each holding every record the full run's checks
+# count; and the full run's records: in the first, the stopped node (ROLLED,
+# marked full) is among the 7 nearest not full; in the second it is nearest
+# after them, outside the group; the third's nearest don't hold it.
+NOT_FULL = [f"{index:02x}" * 32 for index in range(1, 8)]
+IN_GROUP, PAST_GROUP, NOT_NEAR = "cd" * 32, "ce" * 32, "cf" * 32
+NOT_CHECKED = "c0" * 32
+
+
+def full_check(address, nearest):
+    """A record as the full run's counts give it, held by every node not
+    full."""
+    return {"address": address, "close_group": nearest[:harness.CLOSE_GROUP],
+            "nearest": nearest,
+            "answers": [{"peer": peer, "outcome": "held"} for peer in NOT_FULL]}
+
+
+FULL_CHECKS = [full_check(IN_GROUP, NOT_FULL[:3] + [ROLLED] + NOT_FULL[3:]),
+               full_check(PAST_GROUP, NOT_FULL + [ROLLED]),
+               full_check(NOT_NEAR, list(NOT_FULL))]
+
+
 def full_run(folder, erased_at=()):
     """A full run's record as full_run_checks() reads it: one incumbent,
-    whose log holds an erasure with 6 proofs at each of `erased_at`, minutes
-    after T0; the stopped node stopped at minute 10, so its mark lapses
-    FULL_RUN_FRESHNESS_SECS later."""
+    whose log holds an erasure with 6 proofs of each (minutes after T0,
+    record) of `erased_at`; the stopped node stopped at minute 10, so its
+    mark lapses FULL_RUN_FRESHNESS_SECS later; FULL_CHECKS counted early."""
     lines = []
-    for at in erased_at:
+    for at, record in erased_at:
         stamp = minutes(at).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
         lines.append(f"{stamp}  INFO ant_node::replication::pruning: {harness.ERASED_LINE} "
-                     f"with 6 proofs from peers not marked full erased_record={'cd' * 32} "
+                     f"with 6 proofs from peers not marked full erased_record={record} "
                      "proofs_not_full=6 proofs_full=0 proofs_needed=6 group_not_full=7 "
                      "group_full=0")
     (folder / "incumbent-00.log").write_text("\n".join(lines) + "\n")
@@ -143,7 +168,7 @@ def full_run(folder, erased_at=()):
                    "log": "joiner-00.log"}],
         "full_phases": {"stopped": {"node": "joiner-00", "peer_id": ROLLED,
                                     "at": minutes(10).isoformat()}},
-        "phase_checks": {},
+        "phase_checks": {"early": FULL_CHECKS},
     }
 
 
@@ -467,15 +492,35 @@ def main():
            options(), ["paged its hints to a node of the previous release"])
     expect("pages between nodes of this tree, in a mixed run, pass",
            {**two, "new-hosts-old": result(sync=paged_sync())}, options(), [])
-    expect("the paged run is measured for new failure reasons only",
-           {**two, "paged": result({INCUMBENTS_FAIL: 90}, sync=paged_sync())},
-           options(), [])
-    expect("a new failure reason fails the paged run",
-           {**two, "paged": result(
-               {("joiner", "joiner", "dht_identity_exchange_failed"): allowance + 1},
-               sync=paged_sync())},
-           options(), ["dht_identity_exchange_failed penalties on joiners, a new failure "
-                       "reason"])
+    # The all-new and paged runs' nodes carry the bootstrap and audit seams,
+    # which the all-old runs' don't: their penalties, reasons and families
+    # differ from the all-old runs' by the seams too, so only their refused
+    # PUTs are measured.
+    seam_made = {INCUMBENTS_FAIL: 90,
+                 ("joiner", "joiner", "dht_identity_exchange_failed"): allowance + 1}
+    old_families = {"incumbent": {"fetch_request": harness.SHAPE_FLOOR}}
+    seam_two = {name: result({INCUMBENTS_FAIL: 2}, families=old_families) for name in two}
+    for name, sync in (("all-new", None), ("paged", paged_sync())):
+        expect(f"the {name} run's penalties, new failure reasons and families are not measured "
+               "against the all-old runs, which lack its seams",
+               {**seam_two, name: result(seam_made, sync=sync)}, options(), [])
+        expect(f"the {name} run's refused PUTs are measured against the all-old runs",
+               {**seam_two, name: result(refusals={"joiner": harness.PENALTY_SLACK + 1},
+                                         sync=sync)},
+               options(), [f"the joiners refused {harness.PENALTY_SLACK + 1} paid PUTs"])
+    expect("the all-new run must still show a family only this tree knows",
+           {**seam_two, "all-new": result()}, options(new_only_family=["page_request"]),
+           ["no node of this tree received page_request"])
+    expect_equal("the all-new and paged runs are measured on refused PUTs only, the mixed and "
+                 "rollback runs on everything",
+                 {name: sorted(harness.measured(name, [seam_two["all-old"]]))
+                  for name in ("all-new", "paged", "new-hosts-old", "rollback", "full")},
+                 {"all-new": ["new-only families", "refused PUTs"], "paged": ["refused PUTs"],
+                  "new-hosts-old": ["families", "new reason", "new-only families",
+                                    "penalties", "refused PUTs"],
+                  "rollback": ["families", "new reason", "new-only families", "penalties",
+                               "refused PUTs"],
+                  "full": []})
     expect("a paged run whose incumbents admit one request at once, with no page answered "
            "busy, fails",
            {"paged": result(sync=paged_sync(), paging={"busy_limit": 1})},
@@ -531,9 +576,24 @@ def main():
         for name, erased_at, failing in [
                 ("a full run with no erasure fails", (),
                  ["no node erased a record"]),
-                ("a full run with erasures only before the mark lapsed fails", (5,),
-                 ["no node erased a record after the stopped node's mark lapsed (1 before)"]),
-                ("a full run with an erasure after the mark lapsed passes", (5, lapse + 1), []),
+                ("a full run with erasures only before the mark lapsed fails",
+                 ((5, IN_GROUP),),
+                 ["no erasure after the lapse in a group that held the stopped node (0 after "
+                  "it in other groups, 1 before)"]),
+                ("a full run with an erasure after the mark lapsed, in a group that held the "
+                 "stopped node, passes", ((5, IN_GROUP), (lapse + 1, IN_GROUP)), []),
+                ("an erasure after the lapse of a record whose nearest hold the stopped node "
+                 "past its 7 not full doesn't count", ((5, IN_GROUP), (lapse + 1, PAST_GROUP)),
+                 ["no erasure after the lapse in a group that held the stopped node (1 after "
+                  "it in other groups, 1 before)"]),
+                ("an erasure after the lapse of a record whose nearest don't hold the stopped "
+                 "node doesn't count", ((lapse + 1, NOT_NEAR),),
+                 ["no erasure after the lapse in a group that held the stopped node (1 after "
+                  "it in other groups, 0 before)"]),
+                ("an erasure after the lapse of a record the harness didn't count doesn't "
+                 "count", ((lapse + 1, NOT_CHECKED),),
+                 ["no erasure after the lapse in a group that held the stopped node (1 after "
+                  "it in other groups, 0 before)"]),
         ]:
             found = harness.full_run_checks(full_run(folder, erased_at), [], [])
             if len(found["failures"]) != len(failing) or not all(

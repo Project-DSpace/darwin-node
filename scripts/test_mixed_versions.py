@@ -76,8 +76,9 @@ penalties one release's nodes charge the other's are reported by reason. And
 the message shapes: each role received every message family it received at
 least SHAPE_FLOOR times in every all-old run, and a family that only this
 tree knows (--new-only-family) reached nodes of this tree and no others. The
-paged run is measured for new failure reasons only: its pages of two keys
-send far more messages than any all-old run.
+all-new and paged runs are measured on refused PUTs only: their nodes carry
+the bootstrap and audit seams, which the all-old runs lack (below), and the
+paged run's pages of two keys send far more messages than any all-old run.
 
 The paged run must show, besides: an exchange in which each node's replica
 hints and paid hints took more than one page, both ways; every exchange's
@@ -112,7 +113,10 @@ audit seam, so every node audits every RUN_AUDIT_SECS to twice that, a key
 whose repair hint is that old (an hour otherwise, longer than any run). Such
 a run must make an audit if it has AUDIT_EXCHANGE_FLOOR exchanges or more;
 the others make none, and their audits per exchange are reported only. The
-harness refuses a run with a binary that lacks the seams it sets.
+all-old runs carry neither seam, so the all-new and paged runs are measured
+against them on refused PUTs only, which the seams don't move (see
+measured()). The harness refuses a run with a binary that lacks the seams it
+sets.
 
 The full run. Every node of it runs with short timings through the seams
 (neighbour sync every FULL_RUN_SYNC_SECS, an out-of-range wait of
@@ -341,7 +345,9 @@ FULL_RUN_FRESHNESS_SECS = 120
 #   10 to 20 minutes and an hour, which no run of minutes reaches: without
 #   it no node audits, in any release.
 # The previous release has neither seam, so the all-old and mixed runs make
-# no audits: their audits per exchange are reported, not checked.
+# no audits: their audits per exchange are reported, not checked. Nor are
+# the seamed runs' penalties, failure reasons or families compared with the
+# all-old runs': see measured().
 BOOTSTRAP_SEAM = "ANT_TEST_SEAM_BOOTSTRAP_SECS"
 AUDIT_SEAM = "ANT_TEST_SEAM_AUDIT_SECS"
 SEAMED_RUNS = ("all-new", "full", "paged")
@@ -1416,6 +1422,16 @@ def full_run_checks(run, records, end_checks):
         lapsed_at = (datetime.datetime.fromisoformat(stopped_at)
                      + datetime.timedelta(seconds=FULL_RUN_FRESHNESS_SECS))
     still_full = len(full - ({stopped} if stopped else set()))
+    # The harness's records whose group held the stopped node: its 7 nearest
+    # not full and the full nodes among them, at any of the counts. Only an
+    # erasure of one of them after the lapse tests "a lapsed mark counts as
+    # missing": in any other group the stopped node's mark played no part.
+    held_stopped = set()
+    for record in early + mid + list(end_checks):
+        nearest = record.get("nearest") or record["close_group"]
+        not_full, full_inside = window_of(nearest, full)
+        if stopped is not None and stopped in not_full + full_inside:
+            held_stopped.add(record["address"])
     for node in run["nodes"]:
         for stamp, text in read_log(run["folder"] / node["log"], run["window"]):
             if ERASED_LINE not in text:
@@ -1431,7 +1447,8 @@ def full_run_checks(run, records, end_checks):
             after_lapse = lapsed_at is not None and stamp > lapsed_at
             erasures.append({"node": node["name"], "record": found.get("erased_record"),
                              "proofs": proofs, "needed": needed, "group_full": group_full,
-                             "after_lapse": after_lapse})
+                             "after_lapse": after_lapse,
+                             "held_stopped": found.get("erased_record") in held_stopped})
             if needed < ERASE_PROOFS or proofs < needed:
                 failures.append(f"{node['name']} erased {found.get('erased_record')} with "
                                 f"{proofs} proofs, needing {needed}: fewer than "
@@ -1446,10 +1463,12 @@ def full_run_checks(run, records, end_checks):
     if not erasures:
         failures.append("no node erased a record, so \"erasure goes ahead with 6 real "
                         "proofs\" and \"a lapsed mark counts as missing\" tested nothing")
-    elif lapsed_at is not None and not any(erasure["after_lapse"] for erasure in erasures):
-        failures.append(f"no node erased a record after the stopped node's mark lapsed "
-                        f"({len(erasures)} before), so \"a lapsed mark counts as missing\" "
-                        "tested nothing")
+    elif lapsed_at is not None and not any(erasure["after_lapse"] and erasure["held_stopped"]
+                                           for erasure in erasures):
+        after = sum(1 for erasure in erasures if erasure["after_lapse"])
+        failures.append(f"no erasure after the lapse in a group that held the stopped node "
+                        f"({after} after it in other groups, {len(erasures) - after} before), "
+                        "so \"a lapsed mark counts as missing\" tested nothing")
     return {"failures": failures, "by_f": by_f, "copies": counts,
             "stand_ins_kept": stand_ins_kept, "erasures": erasures,
             "stopped": run["full_phases"].get("stopped")}
@@ -1506,14 +1525,30 @@ def measured(name, baselines):
     """What of a run is measured against the all-old runs, when there is one:
     for the mixed runs and the rollback run, everything (the penalties for
     each pair of roles and reason, new failure reasons, refused PUTs and the
-    message families); for the paged run, new failure reasons only, since its
-    pages of two keys send far more messages than any all-old run; for the
-    all-old runs and the full run, nothing."""
+    message families, and the families only this tree knows); for the
+    all-old runs and the full run, nothing.
+
+    The other runs of SEAMED_RUNS (all-new and paged) carry the bootstrap and
+    audit seams on every node, and the all-old runs, of the previous release,
+    carry neither: there the joiners stay bootstrapping and nobody audits,
+    while in a seamed run the joiners stop answering "bootstrapping" after
+    RUN_BOOTSTRAP_SECS with keys still pending and every node audits keys
+    whose repair hint is RUN_AUDIT_SECS old. Its penalties, its failure
+    reasons and the families it receives then differ from the all-old runs'
+    by the seams as well as by the release, so measuring them would fail a
+    run for a seam, or, with the slack or the allowance taking the seam's
+    share, hide a regression in the same reason. Those runs are measured on
+    the refused PUTs only, which neither seam moves (a node's PUT path reads
+    neither its bootstrap nor its audits; the paged run's pages don't touch
+    it either), and all-new, as before, on the families only this tree
+    knows, which are not counted against the all-old runs."""
     if not baselines or is_baseline(name) or name == "full":
         return set()
     if name == "paged":
-        return {"new reason"}
-    return {"penalties", "new reason", "refused PUTs", "families"}
+        return {"refused PUTs"}
+    if name in SEAMED_RUNS:
+        return {"refused PUTs", "new-only families"}
+    return {"penalties", "new reason", "refused PUTs", "families", "new-only families"}
 
 
 def sync_failures(name, result):
@@ -1723,16 +1758,18 @@ def verdicts(results, args):
             else:
                 failures.append(f"{name}: the {target}s refused {count} paid PUTs, against "
                                 f"{against(compared['all_old'])}")
-        if "families" not in kinds:
+        if "families" in kinds:
+            for role in ("incumbent", "joiner"):
+                befores = [received_families(baseline, role) for baseline in baselines]
+                now = received_families(result, role)
+                for family in sorted(set().union(*befores)):
+                    fewest = min(before.get(family, 0) for before in befores)
+                    if fewest >= SHAPE_FLOOR and now.get(family, 0) == 0:
+                        failures.append(f"{name}: the {role}s received no {family}, which "
+                                        f"they did {fewest} times or more in every all-old "
+                                        "run")
+        if "new-only families" not in kinds:
             continue
-        for role in ("incumbent", "joiner"):
-            befores = [received_families(baseline, role) for baseline in baselines]
-            now = received_families(result, role)
-            for family in sorted(set().union(*befores)):
-                fewest = min(before.get(family, 0) for before in befores)
-                if fewest >= SHAPE_FLOOR and now.get(family, 0) == 0:
-                    failures.append(f"{name}: the {role}s received no {family}, which "
-                                    f"they did {fewest} times or more in every all-old run")
         for family in args.new_only_family:
             reached_new = 0
             for node, counters in result["traffic"].items():
@@ -1829,9 +1866,12 @@ def report(results, args):
                          f"{run['stand_ins_kept']}")
             erasures = run["erasures"]
             lapsed = sum(1 for erasure in erasures if erasure["after_lapse"])
+            in_group = sum(1 for erasure in erasures
+                           if erasure["after_lapse"] and erasure["held_stopped"])
             fewest = min((erasure["proofs"] for erasure in erasures), default=0)
             lines.append(f"erasures: {len(erasures)} ({lapsed} after the stopped node's "
-                         f"mark lapsed), with {fewest} proofs or more each")
+                         f"mark lapsed, {in_group} of them in a group that held it), with "
+                         f"{fewest} proofs or more each")
             if run["stopped"]:
                 lines.append(f"stopped: {run['stopped']['node']} at {run['stopped']['at']}")
         if result["penalties_on_full"]:
