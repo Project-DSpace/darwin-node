@@ -92,8 +92,23 @@ payments are the network's only revenue**.
 
     price_per_record(n) = BASELINE + K × (n / D)²
 
-with `BASELINE = 0.00390625 ANT`, `K = 0.03515625 ANT`, `D = 6000 records`,
-computed in `u256` wei. `n` is the node's **committed** key count — the count
+computed in `u256` wei. This fork accepts two curves of that formula:
+
+- **Current curve** (Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor
+  2,000): `BASELINE = 0.1396736 DARWIN`, `K = 9 × BASELINE = 1.2570624
+  DARWIN`, `D = 2000 records`. 100 DARWIN per 10⁹ bytes × 4,190,208 bytes per
+  full chunk ÷ 3 (a chunk pays 3 × the median quote) is the baseline, so a GB
+  of full chunks costs 100 DARWIN on empty nodes.
+- **Legacy curve**, still accepted: upstream's constants × 32
+  (`BASELINE = 0.125 DARWIN`, `K = 1.125 DARWIN`, `D = 6000 records`).
+
+Nodes quote the legacy curve before `PRICE_SWITCH_AT`
+(`src/payment/pricing.rs`, by the node's wall clock when the quote is made)
+and the current curve from it; storers and clients accept a quote valid under
+either, each curve checked with the same band, size-class and 3 × median
+rules. Upstream's own curve is `BASELINE = 0.00390625 ANT`,
+`K = 0.03515625 ANT`, `D = 6000`; the table below is upstream's, kept for
+reference. `n` is the node's **committed** key count — the count
 in its signed storage commitment (ADR-0004) — not its raw on-disk count. A
 node with no live commitment can only quote the baseline.
 

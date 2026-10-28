@@ -10,7 +10,7 @@
 use crate::error::{Error, Result};
 use crate::logging::debug;
 use crate::payment::metrics::QuotingMetricsTracker;
-use crate::payment::pricing::calculate_price;
+use crate::payment::pricing::quote_price_at;
 use evmlib::merkle_payments::MerklePaymentCandidateNode;
 use evmlib::PaymentQuote;
 use evmlib::RewardsAddress;
@@ -60,7 +60,11 @@ pub const ROOT_SETTLEMENT_VERSION: u32 = 3;
 /// Which count a quote is priced at.
 ///
 /// Both carry the committed key count K and the pin; only the price differs,
-/// and both prices are in the band every quote check accepts.
+/// and both prices are in the band every quote check accepts. Each is priced
+/// on the quoting curve at the quote's timestamp (`calculate_price_legacy`
+/// before `PRICE_SWITCH_AT`, `calculate_price` from it; Dan, 2026-10-28
+/// decision: 100 DARWIN per GB, divisor 2,000): `calculate_price` below names
+/// that curve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuotePricing {
     /// `calculate_price(K)`: today's price, for unversioned clients and
@@ -200,7 +204,9 @@ impl QuoteGenerator {
     ///   and the quote pins that commitment (the ADR-0004 forced price);
     /// - with no commitment source or no live current commitment, the node
     ///   emits a true **baseline** quote: `(0, None)` priced at
-    ///   `calculate_price(0)`.
+    ///   `calculate_price(0)` (on the quoting curve at the quote's timestamp:
+    ///   `calculate_price_legacy` before `PRICE_SWITCH_AT`, `calculate_price`
+    ///   from it).
     ///
     /// Critically, the no-commitment branch prices at `0`, NOT at the on-disk
     /// record count. A `(committed_key_count = 0, commitment_pin = None)` quote
@@ -282,8 +288,9 @@ impl QuoteGenerator {
     }
 
     /// Generate a payment quote for storing data at today's price,
-    /// `calculate_price(K)`: [`Self::create_priced_quote`] with
-    /// [`QuotePricing::KeyCount`].
+    /// `calculate_price(K)` on the quoting curve at the quote's timestamp
+    /// (`calculate_price_legacy` before `PRICE_SWITCH_AT`, `calculate_price`
+    /// from it): [`Self::create_priced_quote`] with [`QuotePricing::KeyCount`].
     ///
     /// # Errors
     ///
@@ -334,10 +341,13 @@ impl QuoteGenerator {
         // — the node emits the canonical baseline quote `(0, None)` priced at
         // `calculate_price(0)`, NOT a price off the on-disk count (see
         // `resolve_quote_pricing`: an unpinned, above-baseline price would be a
-        // forgeable shape).
+        // forgeable shape). The price is on the quoting curve at the quote's
+        // own timestamp, the node's wall clock when it signs:
+        // `calculate_price_legacy` before `PRICE_SWITCH_AT`, `calculate_price`
+        // from it (Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000).
         let (committed_key_count, commitment_pin, price_count) =
             self.resolve_quote_pricing(pricing);
-        let price = calculate_price(price_count);
+        let price = quote_price_at(price_count, timestamp);
 
         // Convert XorName to xor_name::XorName
         let xor_name = xor_name::XorName(content);
@@ -436,10 +446,11 @@ impl QuoteGenerator {
         // ADR-0004 forced price for the merkle-batch candidate, mirroring the
         // single-node path: bind to the live commitment when present, else
         // baseline with no pin. Merkle batches are refused by this fork, so
-        // this unused path keeps today's price.
+        // this unused path keeps today's price: the quoting curve by the
+        // node's own clock now, never the client's merkle_payment_timestamp.
         let (committed_key_count, commitment_pin, price_count) =
             self.resolve_quote_pricing(QuotePricing::KeyCount);
-        let price = calculate_price(price_count);
+        let price = quote_price_at(price_count, SystemTime::now());
 
         // ADR-0004: sign the commitment binding into the merkle candidate
         // payload too (5-field `bytes_to_sign`), so a count/pin mismatch is
@@ -532,6 +543,9 @@ mod tests {
     use ant_protocol::payment::verify::{
         verify_merkle_candidate_signature, verify_quote_content, verify_quote_signature,
     };
+    use crate::payment::pricing::{
+        calculate_price, calculate_price_legacy, price_in_accepted_band, quotes_on_legacy_curve,
+    };
     use evmlib::common::Amount;
     use saorsa_pqc::pqc::types::MlDsaSecretKey;
 
@@ -613,8 +627,8 @@ mod tests {
 
         assert_eq!(
             quote.price,
-            calculate_price(25),
-            "price must be calculate_price(committed_key_count)"
+            quote_price_at(25, quote.timestamp),
+            "price must be calculate_price(committed_key_count) on the quoting curve"
         );
         assert_eq!(
             quote.committed_key_count, 25,
@@ -643,23 +657,21 @@ mod tests {
         let weighted = generator
             .create_priced_quote(content, 1024, 0, QuotePricing::WeightTotal)
             .expect("weighted quote");
-        assert_eq!(weighted.price, calculate_price(400));
+        assert_eq!(weighted.price, quote_price_at(400, weighted.timestamp));
         let today = generator
             .create_priced_quote(content, 1024, 0, QuotePricing::KeyCount)
             .expect("today quote");
-        assert_eq!(today.price, calculate_price(1_000));
+        assert_eq!(today.price, quote_price_at(1_000, today.timestamp));
+        let plain = generator.create_quote(content, 1024, 0).expect("quote");
         assert_eq!(
-            generator
-                .create_quote(content, 1024, 0)
-                .expect("quote")
-                .price,
-            calculate_price(1_000),
+            plain.price,
+            quote_price_at(1_000, plain.timestamp),
             "create_quote keeps today's price"
         );
         for quote in [&weighted, &today] {
             assert_eq!(quote.committed_key_count, 1_000);
             assert_eq!(quote.commitment_pin, Some([7u8; 32]));
-            assert!(crate::payment::pricing::price_in_band(&quote.price, 1_000));
+            assert!(price_in_accepted_band(&quote.price, 1_000));
         }
     }
 
@@ -671,12 +683,28 @@ mod tests {
         let quote = unknown
             .create_priced_quote([1u8; 32], 1024, 0, QuotePricing::WeightTotal)
             .expect("quote");
-        assert_eq!(quote.price, calculate_price(1_000));
+        assert_eq!(quote.price, quote_price_at(1_000, quote.timestamp));
         let above = generator_with(1_000, Some(5_000));
         let quote = above
             .create_priced_quote([1u8; 32], 1024, 0, QuotePricing::WeightTotal)
             .expect("quote");
-        assert_eq!(quote.price, calculate_price(1_000));
+        assert_eq!(quote.price, quote_price_at(1_000, quote.timestamp));
+    }
+
+    /// A quote is priced on the curve of its own timestamp: the legacy curve
+    /// before `PRICE_SWITCH_AT`, the current one from it (Dan, 2026-10-28
+    /// decision: 100 DARWIN per GB, divisor 2,000).
+    #[test]
+    fn a_quote_is_priced_on_the_curve_of_its_own_timestamp() {
+        let quote = generator_with(1_000, None)
+            .create_quote([3u8; 32], 1024, 0)
+            .expect("quote");
+        let expected = if quotes_on_legacy_curve(quote.timestamp) {
+            calculate_price_legacy(1_000)
+        } else {
+            calculate_price(1_000)
+        };
+        assert_eq!(quote.price, expected);
     }
 
     /// With no commitment both pricings give the baseline quote.
@@ -687,7 +715,7 @@ mod tests {
             let quote = generator
                 .create_priced_quote([1u8; 32], 1024, 0, pricing)
                 .expect("quote");
-            assert_eq!(quote.price, calculate_price(0));
+            assert_eq!(quote.price, quote_price_at(0, quote.timestamp));
             assert_eq!((quote.committed_key_count, quote.commitment_pin), (0, None));
         }
     }
@@ -739,7 +767,7 @@ mod tests {
 
         assert_eq!(
             quote.price,
-            calculate_price(0),
+            quote_price_at(0, quote.timestamp),
             "no commitment source must price at baseline calculate_price(0)"
         );
         assert_eq!(quote.committed_key_count, 0);
@@ -1011,7 +1039,10 @@ mod tests {
         // a baseline quote — price `calculate_price(0)`, count 0, no pin —
         // regardless of the side counter. Pricing is bound to the commitment,
         // not the metrics tracker.
-        assert_eq!(candidate.price, calculate_price(0));
+        // The node's own clock picks the curve, so either curve's baseline.
+        assert!(
+            candidate.price == calculate_price(0) || candidate.price == calculate_price_legacy(0)
+        );
         assert_eq!(candidate.committed_key_count, 0);
         assert_eq!(candidate.commitment_pin, None);
 

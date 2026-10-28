@@ -2267,11 +2267,12 @@ pub mod tests {
         protocol.quote_generator.attach_commitment_source(state);
     }
 
-    /// The price of the quote `body` was answered with.
+    /// The price of the quote `body` was answered with, and the quote's
+    /// timestamp, which picks the curve it is priced on.
     async fn quoted_price(
         protocol: &AntProtocol,
         body: ChunkMessageBody,
-    ) -> evmlib::common::Amount {
+    ) -> (evmlib::common::Amount, std::time::SystemTime) {
         let msg = ChunkMessage {
             request_id: 710,
             body,
@@ -2285,7 +2286,7 @@ pub mod tests {
             ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote, .. }) => {
                 let quote: evmlib::PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
                 assert_eq!(quote.committed_key_count, 1_000, "the count is K");
-                quote.price
+                (quote.price, quote.timestamp)
             }
             other => panic!("expected a quote, got: {other:?}"),
         }
@@ -2294,9 +2295,10 @@ pub mod tests {
     /// An unversioned client, and a client settling under version 1, are
     /// quoted at today's price, `calculate_price(K)`, whatever the node's
     /// weight total. A client paying by size is quoted at the weight total.
+    /// Each on the quoting curve at the quote's timestamp (`quote_price_at`).
     #[tokio::test]
     async fn only_a_client_paying_by_size_is_quoted_at_the_weight_total() {
-        use crate::payment::pricing::calculate_price;
+        use crate::payment::pricing::quote_price_at;
         use crate::payment::SIZE_PRICED_SETTLEMENT_VERSION;
 
         let (protocol, _temp) = create_test_protocol().await;
@@ -2304,17 +2306,13 @@ pub mod tests {
         attach_weighed_commitment(&protocol, 1_000, 253);
 
         let unversioned = ChunkMessageBody::QuoteRequest(ChunkQuoteRequest::new([0xC1; 32], 1));
-        assert_eq!(
-            quoted_price(&protocol, unversioned).await,
-            calculate_price(1_000)
-        );
+        let (price, at) = quoted_price(&protocol, unversioned).await;
+        assert_eq!(price, quote_price_at(1_000, at));
 
         let mut v1 = ChunkQuoteRequestV2::new([0xC2; 32], 1);
         v1.settlement_version = 1;
-        assert_eq!(
-            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v1)).await,
-            calculate_price(1_000)
-        );
+        let (price, at) = quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v1)).await;
+        assert_eq!(price, quote_price_at(1_000, at));
 
         // The request reaches the handler's pricing once the gate admits it.
         let request = ChunkQuoteRequest::new([0xC3; 32], 1);
@@ -2322,7 +2320,7 @@ pub mod tests {
         match protocol.handle_priced_quote(&request, pricing) {
             ChunkQuoteResponse::Success { quote, .. } => {
                 let quote: evmlib::PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
-                assert_eq!(quote.price, calculate_price(253));
+                assert_eq!(quote.price, quote_price_at(253, quote.timestamp));
                 assert_eq!(quote.committed_key_count, 1_000);
             }
             other => panic!("expected a quote, got: {other:?}"),
@@ -2333,10 +2331,8 @@ pub mod tests {
         // gate admits it rather than answering StorerUpdateRequired.
         let mut v2 = ChunkQuoteRequestV2::new([0xC4; 32], 1);
         v2.settlement_version = SIZE_PRICED_SETTLEMENT_VERSION;
-        assert_eq!(
-            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v2)).await,
-            calculate_price(253)
-        );
+        let (price, at) = quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v2)).await;
+        assert_eq!(price, quote_price_at(253, at));
     }
 
     /// A settlement version this node has never heard of is refused, because
@@ -2390,7 +2386,7 @@ pub mod tests {
     /// its version.
     #[tokio::test]
     async fn settlement_versions_one_to_three_are_quoted_alike() {
-        use crate::payment::pricing::calculate_price;
+        use crate::payment::pricing::quote_price_at;
 
         assert_eq!(CURRENT_SETTLEMENT_VERSION, 3);
         assert_eq!(ROOT_SETTLEMENT_VERSION, CURRENT_SETTLEMENT_VERSION);
@@ -2400,24 +2396,25 @@ pub mod tests {
         // 1,000 records in the smallest class: m = ceil(1,000 × 259 / 1,024).
         attach_weighed_commitment(&protocol, 1_000, 253);
 
-        for (version, price) in [
-            (1u32, calculate_price(1_000)),
-            (2, calculate_price(253)),
-            (3, calculate_price(253)),
-        ] {
+        // Each on the quoting curve at the quote's timestamp, root quotes
+        // as v1/v2 quotes (`quote_price_at`).
+        for (version, count) in [(1u32, 1_000), (2, 253), (3, 253)] {
             let counted = crate::storage::traffic::quote_versions(version);
             let mut request = ChunkQuoteRequestV2::new([0xBC; 32], 1);
             request.settlement_version = version;
-            assert_eq!(
-                quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(request)).await,
-                price,
-                "version {version}"
-            );
+            let (price, at) =
+                quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(request)).await;
+            assert_eq!(price, quote_price_at(count, at), "version {version}");
             assert!(
                 crate::storage::traffic::quote_versions(version) > counted,
                 "version {version} is counted"
             );
         }
+        // A request at its default, the current version, is a root quote.
+        let current = ChunkQuoteRequestV2::new([0xBD; 32], 1);
+        assert_eq!(current.settlement_version, CURRENT_SETTLEMENT_VERSION);
+        let (price, at) = quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(current)).await;
+        assert_eq!(price, quote_price_at(253, at));
     }
 
     /// A node that knows no root vault refuses every root proof, so it must

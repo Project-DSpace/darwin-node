@@ -2405,8 +2405,11 @@ fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
     );
 }
 
-/// Every mention of the price curve, `calculate_price`, and of a quote's
-/// committed key count in production code, at the reviewed number of sites.
+/// Every mention of the price curves, `calculate_price` and
+/// `calculate_price_legacy`, of the quoting curve's pick, `quote_price_at`,
+/// and of a quote's committed key count in production code, at the reviewed
+/// number of sites (Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor
+/// 2,000, with the legacy curve still accepted).
 /// Size pricing changed what a quote is priced at (the weight total m for a
 /// client that pays by size) and what every quote check accepts (a band, not
 /// one price), so a price computed somewhere new, or a count read somewhere
@@ -2414,14 +2417,39 @@ fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
-    const PRICING: &[(Option<&str>, &str)] =
-        &[(None, "calculate_price"), (None, "committed_key_count")];
+    const PRICING: &[(Option<&str>, &str)] = &[
+        (None, "calculate_price"),
+        (None, "calculate_price_legacy"),
+        (None, "quote_price_at"),
+        (None, "committed_key_count"),
+    ];
     const REVIEWED: &[Reviewed] = &[
         // The curve's re-exports and imports.
         ("src/payment/mod.rs", "<module>", "calculate_price", 1),
         ("src/payment/pricing.rs", "<module>", "calculate_price", 1),
-        ("src/payment/quote.rs", "<module>", "calculate_price", 1),
+        (
+            "src/payment/pricing.rs",
+            "<module>",
+            "calculate_price_legacy",
+            1,
+        ),
+        ("src/payment/quote.rs", "<module>", "quote_price_at", 1),
         ("src/payment/verifier.rs", "<module>", "calculate_price", 1),
+        (
+            "src/payment/verifier.rs",
+            "<module>",
+            "calculate_price_legacy",
+            1,
+        ),
+        // The quoting curve by the node's clock: the legacy curve before
+        // PRICE_SWITCH_AT, the current curve from it.
+        ("src/payment/pricing.rs", "quote_price_at", "calculate_price", 1),
+        (
+            "src/payment/pricing.rs",
+            "quote_price_at",
+            "calculate_price_legacy",
+            1,
+        ),
         // The fields of a quote-commitment mismatch's evidence, in the
         // verifier's event and in the replication failure it is reported as.
         (
@@ -2438,11 +2466,12 @@ fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
         ),
         // A single-node quote: priced at the count resolve_quote_pricing gives
         // (the weight total for a client that pays by size, else the key
-        // count), and carrying the key count K.
+        // count), on the quoting curve at the quote's timestamp, and carrying
+        // the key count K.
         (
             "src/payment/quote.rs",
             "QuoteGenerator::create_priced_quote",
-            "calculate_price",
+            "quote_price_at",
             1,
         ),
         (
@@ -2451,12 +2480,13 @@ fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
             "committed_key_count",
             3,
         ),
-        // A merkle candidate quote: today's price at K. This fork refuses merkle
-        // payments, so no one pays it.
+        // A merkle candidate quote: today's price at K, on the quoting curve
+        // by the node's clock. This fork refuses merkle payments, so no one
+        // pays it.
         (
             "src/payment/quote.rs",
             "QuoteGenerator::create_merkle_candidate_quote",
-            "calculate_price",
+            "quote_price_at",
             1,
         ),
         (
@@ -2518,11 +2548,24 @@ fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
             1,
         ),
         // The price floor's reference: the price at the bottom of the median
-        // count's band.
+        // count's band, on the paid quote's curve.
         (
             "src/payment/verifier.rs",
             "PaymentVerifier::group_reference_price",
             "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::group_reference_price",
+            "calculate_price_legacy",
+            1,
+        ),
+        // Which curve the paid quote is on: its price in the legacy band at K.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::priced_on_legacy_curve",
+            "committed_key_count",
             1,
         ),
         // Telemetry: whether a price is on the curve at all, at any count.
@@ -2557,9 +2600,11 @@ fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
         report.is_empty(),
         "\nThe price curve or a quote's committed key count is used somewhere new.\n\n{report}\n\
          A quote is priced at the weight total for a client that pays by size and at the key \
-         count for every other (QuoteGenerator::resolve_quote_pricing), and every quote check \
-         accepts the band from the bottom count's price to the key count's (price_in_band). \
-         Check that the new use follows both, and list it here.\n"
+         count for every other (QuoteGenerator::resolve_quote_pricing), on the quoting curve \
+         at the quote's timestamp (quote_price_at), and every quote check accepts the band \
+         from the bottom count's price to the key count's on either curve \
+         (price_in_accepted_band). Check that the new use follows all three, and list it \
+         here.\n"
     );
 }
 

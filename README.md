@@ -13,8 +13,12 @@ never ran.
 
 - **Payments are in DARWIN on Robinhood Chain** (chain ID 4663): token
   `0x511f76A3De41F000EC11EA4fD212fb3587c6cef3` through the payment vault
-  `0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B`, at prices set by
-  `PRICE_MULTIPLIER` in `vendor/ant-protocol` (32). The storage-node Docker
+  `0xE0f627986c0438De0E314B644f3C8aA21D3f4f6B`, at prices set by the
+  curve in `vendor/ant-protocol`: 100 DARWIN per GB of full chunks on empty
+  nodes, divisor 2,000 (Dan, 2026-10-28), the previous curve (Autonomi's
+  × 32) still accepted; nodes quote the new curve from
+  2026-10-29T00:00:00Z (a placeholder, set when ds.20 is tagged so it
+  falls after ds.20 is on the nodes). The storage-node Docker
   image sets this with `ANT_EVM_RPC_URL`, `ANT_EVM_PAYMENT_TOKEN` and
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
   (upstream's contracts): run it on Darwin only with those three set (see
@@ -535,8 +539,9 @@ never ran.
   seams before packaging it.
 - **Four crates are vendored**, each with a `VENDORED.md` saying what it is:
   `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
-  `VENDORED.md` lists, `PRICE_MULTIPLIER` and the functions that price a
-  record by its size, which nothing uses yet; `vendor/webrtc` is webrtc
+  `VENDORED.md` lists, the price curve and the legacy curve still
+  accepted, the functions that price a record by its size, and root
+  payment proofs (tag `0x03`, settlement version 3); `vendor/webrtc` is webrtc
   0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
   in progress; `vendor/saorsa-core` is saorsa-core 0.29.1, which dials a
   verified direct address before a relay; and `vendor/ant-listings` is

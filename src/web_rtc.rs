@@ -3845,10 +3845,11 @@ max_concurrent_requests = 12",
 
     /// An N + 1 browser quote is quoted at the node's weight total, and a
     /// plain N quote at today's price, `calculate_price(K)`, both through the
-    /// handler's own quote path.
+    /// handler's own quote path, each on the quoting curve at the quote's
+    /// timestamp (`quote_price_at`).
     #[tokio::test]
     async fn an_n_plus_1_browser_quote_is_priced_at_the_weight_total_and_n_at_todays_price() {
-        use crate::payment::pricing::calculate_price;
+        use crate::payment::pricing::quote_price_at;
         use crate::storage::handler_tests::{attach_weighed_commitment, create_test_protocol};
 
         let (protocol, _temp) = create_test_protocol().await;
@@ -3872,7 +3873,7 @@ max_concurrent_requests = 12",
                     }) => {
                         let quote: PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
                         assert_eq!(quote.committed_key_count, 1_000, "the count is K");
-                        quote.price
+                        (quote.price, quote.timestamp)
                     }
                     other => panic!("expected a quote, got: {other:?}"),
                 }
@@ -3889,11 +3890,13 @@ max_concurrent_requests = 12",
                 ..
             })
         ));
-        assert_eq!(price(size_priced).await, calculate_price(253));
+        let (quoted, at) = price(size_priced).await;
+        assert_eq!(quoted, quote_price_at(253, at));
 
         let plain = browser_quote_body([0xD2; 32], 4096, false);
         assert!(matches!(&plain, ChunkMessageBody::QuoteRequest(_)));
-        assert_eq!(price(plain).await, calculate_price(1_000));
+        let (quoted, at) = price(plain).await;
+        assert_eq!(quoted, quote_price_at(1_000, at));
     }
 
     #[test]
