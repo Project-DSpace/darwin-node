@@ -223,6 +223,8 @@ When fresh replication accepts a new key `K` with valid PoP:
 1. Sender constructs `PaidNotify(K)` containing key `K` and PoP.
 2. Sender sends `PaidNotify(K)` to every peer in `PaidCloseGroup(K)` (fire-and-forget, no ack tracking or retry).
 3. Receiver MUST validate PoP before adding `K` to local `PaidForList`; invalid PoP is silently dropped.
+4. Size pricing (ADR-0025): a `PaidNotify(K)` carries no bytes, so the receiver admits it at the smallest size class's amount and records, as `K`'s `PaidForList` value, the class its settled amount covers: one byte, only ever raised. An empty value reads as the full class, so every key admitted before size pricing, learned by sync or by the rules of Section 7.2, or admitted by an older release, covers any length. A notice is dropped as already known only when the full class is recorded. Membership, counts and key listings ignore the value.
+5. When the bytes of a fetch arrive whose only authorisation is this node's own `PaidForList` entry (no presence quorum, Section 7.2 rule 4), the receiver re-reads the recorded class; a class below the class of the bytes ends that fetch only. No other source is tried, no peer is charged, and the entry and any held copy stay.
 
 ### 7.4 Paid-List Convergence Maintenance (Ongoing)
 

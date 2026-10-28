@@ -15,10 +15,13 @@
 //!    at once, never behind back-pressure; a peer still in the close group
 //!    and not marked full is then offered the record, bounded by the
 //!    pending-offer permits so a write burst cannot pile up chunk-sized
-//!    buffers. Every close-group peer is still checked for possession: a peer
-//!    skipped from when the hold ends, a peer offered from when its offer is
-//!    dispatched. When the node stops, the open holds' notices are sent
-//!    before it does.
+//!    buffers. The close group here is the `CLOSE_GROUP_SIZE` nearest
+//!    (excluding self), one more for each peer marked full among them (at
+//!    most 20 in all): the nearest beyond stand in for a full peer. Every
+//!    peer of the unwidened close group is still checked for possession: a
+//!    peer skipped from when the hold ends, a peer offered from when its
+//!    offer is dispatched; the stand-ins are offered but not checked. When
+//!    the node stops, the open holds' notices are sent before it does.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,6 +121,10 @@ pub(crate) struct FreshOfferEvent {
     /// The close-group peers to offer the record to: those not heard from and
     /// not marked full when the hold ended.
     pub(crate) targets: Vec<PeerId>,
+    /// The targets inside the unwidened close group, whose possession is
+    /// checked once the offer is dispatched; the stand-ins for peers marked
+    /// full are offered the record but not checked ([`possession_checked`]).
+    pub(crate) checked: Vec<PeerId>,
     /// The notices with the slim proof deferred because the record was
     /// indexed but unreadable for the moment as its hold ended: sent, before
     /// any offer, once a read-back finds it ([`deferred_notices_after`]), and
@@ -197,7 +204,8 @@ pub(crate) async fn announce_paid_write(
     let close_group = send_paid_notices(key, slim_proof, recorded, p2p_node, config).await;
     Announced {
         recorded,
-        close_group,
+        close_group: close_group.peers,
+        checked: close_group.checked,
     }
 }
 
@@ -205,7 +213,10 @@ pub(crate) async fn announce_paid_write(
 /// was written, and the close group it saw.
 pub(crate) struct Announced {
     pub(crate) recorded: bool,
+    /// The close group, widened past the peers marked full ([`CloseGroup`]).
     pub(crate) close_group: Vec<PeerId>,
+    /// Its members the possession check probes ([`CloseGroup::checked`]).
+    pub(crate) checked: Vec<PeerId>,
 }
 
 /// After an "already stored" answer: send the close group holding notices,
@@ -236,19 +247,19 @@ pub(crate) async fn announce_held(
     if !held.take_turn(key, Instant::now()) {
         return;
     }
-    let close_group = close_group_peers(key, p2p_node, config).await;
+    let close_group = close_group_peers(key, p2p_node, config, &marked_full(p2p_node)).await;
     send_notice(
         key,
         Vec::new(),
-        close_group.iter(),
+        close_group.peers.iter(),
         p2p_node,
         FreshCounter::HeldAnswerNoticesSent,
     );
 }
 
 /// Rules 2-3: send fresh offers to `target_peers`, the close-group peers the
-/// hold left to offer, and schedule their delayed possession check
-/// (ADR-0003).
+/// hold left to offer, and schedule the delayed possession check (ADR-0003)
+/// of `checked_peers`, those of them inside the unwidened close group.
 ///
 /// Sends no notice: the caller sent the targets the notice with the slim
 /// proof before handing their offer here, so the permits and the send
@@ -264,8 +275,14 @@ pub(crate) async fn send_fresh_offers(
     data: Vec<u8>,
     proof_of_payment: Vec<u8>,
     target_peers: Vec<PeerId>,
+    checked_peers: Vec<PeerId>,
     pending_offer: OwnedSemaphorePermit,
 ) {
+    // The paid quotes' issuers, for the possession check: a full peer paid for
+    // the record is charged for not holding it. A slim proof keeps exactly
+    // the median-priced quotes, so it names the same issuers as the full one.
+    let paid_quote_issuers = crate::replication::full::paid_quote_issuers(&proof_of_payment);
+
     let offer = FreshReplicationOffer {
         key: *key,
         data,
@@ -343,16 +360,18 @@ pub(crate) async fn send_fresh_offers(
     );
 
     // Schedule the delayed possession check (ADR-0003) for the offered
-    // peers. A closed receiver (engine shutting down) is ignored.
-    if !target_peers.is_empty() {
+    // peers inside the unwidened close group, the stand-ins left out. A
+    // closed receiver (engine shutting down) is ignored.
+    if !checked_peers.is_empty() {
         ctx.dispatched.fetch_add(1, Ordering::Relaxed);
-        fresh_metrics::checks_scheduled(Served::Offered, target_peers.len() as u64);
+        fresh_metrics::checks_scheduled(Served::Offered, checked_peers.len() as u64);
         let _ = ctx.possession_check_tx.send(PossessionCheckEvent {
             key: *key,
-            peers: target_peers
+            peers: checked_peers
                 .into_iter()
                 .map(|peer| (peer, Served::Offered))
                 .collect(),
+            paid_quote_issuers,
         });
     }
 }
@@ -451,22 +470,55 @@ pub(crate) fn record_at_hold_end(storage: &ChunkStore, key: &XorName) -> RecordA
     }
 }
 
+/// A key's close group as notices and offers see it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CloseGroup {
+    /// The `close_group_size` nearest in this node's view, one more for each
+    /// peer marked full among them (at most 20 in all), this node left out.
+    pub(crate) peers: Vec<PeerId>,
+    /// The members the possession check probes: the unwidened close group,
+    /// this node left out ([`possession_checked`]). The stand-ins beyond it
+    /// are offered the record but not checked.
+    pub(crate) checked: Vec<PeerId>,
+}
+
+/// The peers this node marks full now, from their own "full" notices.
+fn marked_full(p2p_node: &P2PNode) -> HashSet<PeerId> {
+    crate::replication::full::view_for(p2p_node.peer_id())
+        .marks
+        .marked_set(Instant::now())
+}
+
 /// The close group offers go to: the `close_group_size` nearest in this
-/// node's view, self included in the query and then left out.
+/// node's view, widened past the peers in `marked` (marked full), self
+/// included in the query and then left out.
 async fn close_group_peers(
     key: &XorName,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-) -> Vec<PeerId> {
+    marked: &HashSet<PeerId>,
+) -> CloseGroup {
     let self_id = *p2p_node.peer_id();
-    p2p_node
-        .dht_manager()
-        .find_closest_nodes_local_with_self(key, config.close_group_size)
-        .await
+    let widened = crate::replication::full::widened_close_group_with(
+        p2p_node,
+        key,
+        config.close_group_size,
+        marked,
+    )
+    .await;
+    // The stand-ins: past the unwidened close group (the 7 nearest, the node
+    // itself counted). They take the offer, older nodes included, since a
+    // chunk receiver admits a fresh offer anywhere among the key's 20 nearest
+    // (`paid_list_close_group_size`). They are left unchecked because no peer
+    // past the close group was possession-checked before ds.17 (ds.16
+    // checks the 7 nearest): nothing is waived for them, and one that
+    // takes the record is, by intent, not recorded as seen holding it.
+    let checked = possession_checked(&widened, &self_id, config.close_group_size);
+    let peers = widened
         .into_iter()
-        .map(|n| n.peer_id)
         .filter(|peer| *peer != self_id)
-        .collect()
+        .collect();
+    CloseGroup { peers, checked }
 }
 
 /// Who gets which notice for a stored key, as (holding, with the slim proof):
@@ -497,6 +549,25 @@ fn notice_recipients(
     (holding, with_proof)
 }
 
+/// The peers of `widened`, a key's close group widened past the peers marked
+/// full (nearest first, this node included), that the possession check
+/// probes: the unwidened close group, its first `close_group_size`, this
+/// node left out, exactly the peers ds.16 checks. A peer marked
+/// full among them is still checked, through the waiver; the stand-ins
+/// beyond them are offered the record but not checked.
+fn possession_checked(
+    widened: &[PeerId],
+    self_id: &PeerId,
+    close_group_size: usize,
+) -> Vec<PeerId> {
+    widened
+        .iter()
+        .take(close_group_size)
+        .filter(|peer| *peer != self_id)
+        .copied()
+        .collect()
+}
+
 /// Send `PaidNotify(K)` to every peer in `PaidCloseGroup(K)` (fire-and-forget):
 /// holding notices and notices with the slim proof, as [`notice_recipients`]
 /// splits them.
@@ -513,7 +584,7 @@ async fn send_paid_notices(
     recorded: bool,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-) -> Vec<PeerId> {
+) -> CloseGroup {
     let self_id = *p2p_node.peer_id();
     let paid_group: Vec<PeerId> = p2p_node
         .dht_manager()
@@ -523,9 +594,13 @@ async fn send_paid_notices(
         .map(|n| n.peer_id)
         .filter(|peer| *peer != self_id)
         .collect();
-    let close_group = close_group_peers(key, p2p_node, config).await;
-    let (holding, with_proof) =
-        notice_recipients(&paid_group, &close_group, recorded, !slim_proof.is_empty());
+    let close_group = close_group_peers(key, p2p_node, config, &marked_full(p2p_node)).await;
+    let (holding, with_proof) = notice_recipients(
+        &paid_group,
+        &close_group.peers,
+        recorded,
+        !slim_proof.is_empty(),
+    );
     send_notice(
         key,
         Vec::new(),
@@ -742,17 +817,12 @@ impl Holds {
     }
 }
 
-/// Whether `peer` is marked full by its own "full" notice. Node release 1b
-/// keeps those marks; this release keeps none, so no peer is marked full and
-/// the second skip reason never applies.
-fn is_marked_full(_peer: &PeerId) -> bool {
-    false
-}
-
 /// Why each of `peers` is skipped for `key`'s offer, or `None` when it is
-/// offered. The one place the heard-from table is read.
+/// offered, with `marked` the peers marked full by their own "full" notices.
+/// The one place the heard-from table is read.
 fn skip_reasons(
     heard_from: &HeardFrom,
+    marked: &HashSet<PeerId>,
     key: &XorName,
     peers: &[PeerId],
     now: Instant,
@@ -760,7 +830,7 @@ fn skip_reasons(
     peers
         .iter()
         .map(|peer| {
-            let reason = heard_from.offer_skip_reason(key, peer, is_marked_full(peer), now);
+            let reason = heard_from.offer_skip_reason(key, peer, marked.contains(peer), now);
             (*peer, reason)
         })
         .collect()
@@ -929,14 +999,22 @@ impl HoldContext {
     /// list) while it is indexed but unreadable for the moment; and no one
     /// when it was quarantined, removed or proven wrong during the hold
     /// ([`record_at_hold_end`], no read-back).
-    async fn split(&self, hold: &Hold) -> (Vec<PeerId>, Serving, Vec<PeerId>, Vec<PeerId>) {
-        let close_group = close_group_peers(&hold.key, &self.p2p_node, &self.config).await;
+    async fn split(&self, hold: &Hold) -> (CloseGroup, Serving, Vec<PeerId>, Vec<PeerId>) {
+        let marked = marked_full(&self.p2p_node);
+        let close_group = close_group_peers(&hold.key, &self.p2p_node, &self.config, &marked).await;
         let now = Instant::now();
-        let serving = serve(skip_reasons(&self.heard_from, &hold.key, &close_group, now));
+        let serving = serve(skip_reasons(
+            &self.heard_from,
+            &marked,
+            &hold.key,
+            &close_group.peers,
+            now,
+        ));
         let left = skip_reasons(
             &self.heard_from,
+            &marked,
             &hold.key,
-            &left_close_group(&hold.close_group, &close_group),
+            &left_close_group(&hold.close_group, &close_group.peers),
             now,
         );
         let record = record_at_hold_end(&self.storage, &hold.key);
@@ -963,10 +1041,11 @@ impl HoldContext {
     /// close-group peer is heard from or marked full.
     pub(crate) async fn end_ended_holds(&self) {
         let now = Instant::now();
+        let marked = marked_full(&self.p2p_node);
         let ended = self
             .holds
             .take_ended(now, self.config.fresh_offer_hold(), |hold| {
-                skip_reasons(&self.heard_from, &hold.key, &hold.close_group, now)
+                skip_reasons(&self.heard_from, &marked, &hold.key, &hold.close_group, now)
                     .iter()
                     .all(|(_, reason)| reason.is_some())
             });
@@ -1000,7 +1079,7 @@ impl HoldContext {
             }
         }
         let (close_group, serving, proof_notices, deferred) = self.split(&hold).await;
-        let unserved = serving.unserved(close_group.len());
+        let unserved = serving.unserved(close_group.peers.len());
         if unserved > 0 {
             fresh_metrics::add(FreshCounter::PeersLeftUnserved, unserved as u64);
         }
@@ -1009,6 +1088,16 @@ impl HoldContext {
                 Served::MarkedFull => FreshCounter::OffersSkippedMarkedFull,
                 Served::HeardFrom | Served::Offered => FreshCounter::OffersSkippedHeardFrom,
             });
+        }
+        // The possession check probes the skipped peers inside the unwidened
+        // close group; a stand-in for a full peer is not checked.
+        let skipped_checked: Vec<(PeerId, Served)> = serving
+            .skipped
+            .iter()
+            .filter(|(peer, _)| close_group.checked.contains(peer))
+            .copied()
+            .collect();
+        for (_, served) in &skipped_checked {
             fresh_metrics::checks_scheduled(*served, 1);
         }
         // A storer whose own write failed sent the whole paid group the slim
@@ -1023,10 +1112,11 @@ impl HoldContext {
             FreshCounter::ProofNoticesSent,
         );
         // A closed receiver (engine shutting down) is ignored.
-        if !serving.skipped.is_empty() {
+        if !skipped_checked.is_empty() {
             let _ = self.possession_check_tx.send(PossessionCheckEvent {
                 key,
-                peers: serving.skipped,
+                peers: skipped_checked,
+                paid_quote_issuers: crate::replication::full::paid_quote_issuers(&hold.proof),
             });
         }
         // A record unreadable for the moment still goes to the dispatcher with
@@ -1036,6 +1126,12 @@ impl HoldContext {
             return;
         }
         let offered = serving.offered.len();
+        let checked = serving
+            .offered
+            .iter()
+            .filter(|peer| close_group.checked.contains(peer))
+            .copied()
+            .collect();
         if self
             .offer_tx
             .send(FreshOfferEvent {
@@ -1043,6 +1139,7 @@ impl HoldContext {
                 payment_proof: hold.proof,
                 read_attempts: 0,
                 targets: serving.offered,
+                checked,
                 proof_notices: deferred,
             })
             .is_err()
@@ -1057,6 +1154,45 @@ impl HoldContext {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Ranks 1 to 7 of the widened group, the unwidened close group, are
+    /// possession-checked, as ds.16 checks them; ranks 8 and beyond
+    /// are stand-ins, offered the record but not checked. The node itself is
+    /// never checked.
+    #[test]
+    fn only_the_close_group_is_possession_checked_and_stand_ins_are_not() {
+        let peers: Vec<PeerId> = (1..=12u8).map(|n| PeerId::from_bytes([n; 32])).collect();
+        let outside = PeerId::from_bytes([0xEE; 32]);
+        assert_eq!(possession_checked(&peers, &outside, 7), peers[..7].to_vec());
+        assert_eq!(
+            possession_checked(&peers[..5], &outside, 7),
+            peers[..5].to_vec()
+        );
+        // This node at rank 3: the other six of the close group.
+        let mut expected = peers[..7].to_vec();
+        expected.remove(2);
+        assert_eq!(possession_checked(&peers, &peers[2], 7), expected);
+    }
+
+    /// With one peer marked full inside the close group, the group widens to
+    /// 8, and the checked set is still the unwidened close group minus this
+    /// node: the full peer is checked (through the waiver), the stand-in at
+    /// rank 8 isn't.
+    #[test]
+    fn a_marked_peer_widens_the_offer_not_the_check() {
+        let peers: Vec<PeerId> = (1..=12u8).map(|n| PeerId::from_bytes([n; 32])).collect();
+        let self_id = peers[0];
+        let full = peers[3];
+        let len = crate::replication::full::widened_len(&peers, 7, |peer| *peer == full);
+        assert_eq!(len, 8);
+        let widened = &peers[..len];
+        let unwidened_minus_self: Vec<PeerId> = peers[1..7].to_vec();
+        assert_eq!(
+            possession_checked(widened, &self_id, 7),
+            unwidened_minus_self
+        );
+        assert!(possession_checked(widened, &self_id, 7).contains(&full));
+    }
 
     /// The permit is released with the last handle to the encoded offer, not
     /// the first: a slice the transport still holds keeps the offer counted.
@@ -1447,15 +1583,32 @@ mod tests {
         let p = peers(1..4);
         table.note(key, p[0], now);
         table.note([6u8; 32], p[1], now);
-        let reasons = skip_reasons(&table, &key, &p, now);
+        let none = HashSet::new();
+        let reasons = skip_reasons(&table, &none, &key, &p, now);
         assert_eq!(
             reasons,
             vec![(p[0], Some(Served::HeardFrom)), (p[1], None), (p[2], None)]
         );
         assert_eq!(serve(reasons).offered, vec![p[1], p[2]]);
         assert_eq!(
-            serve(skip_reasons(&HeardFrom::default(), &key, &p, now)).offered,
+            serve(skip_reasons(&HeardFrom::default(), &none, &key, &p, now)).offered,
             p
         );
+        // A peer marked full and not heard from is skipped as marked full,
+        // and gets the notice with the slim proof; one heard from is skipped
+        // as heard from.
+        let marked: HashSet<PeerId> = [p[0], p[2]].into_iter().collect();
+        let reasons = skip_reasons(&table, &marked, &key, &p, now);
+        assert_eq!(
+            reasons,
+            vec![
+                (p[0], Some(Served::HeardFrom)),
+                (p[1], None),
+                (p[2], Some(Served::MarkedFull)),
+            ]
+        );
+        let serving = serve(reasons);
+        assert_eq!(serving.offered, vec![p[1]]);
+        assert_eq!(serving.notified, vec![p[2]]);
     }
 }

@@ -10,4 +10,6 @@
 //! See `ant-protocol/src/payment/pricing.rs` for the formula, constants, and
 //! the full unit-test suite.
 
-pub use ant_protocol::payment::pricing::{calculate_price, derive_records_stored_from_price};
+pub use ant_protocol::payment::pricing::{
+    band_bottom_count, calculate_price, derive_records_stored_from_price, price_band, price_in_band,
+};

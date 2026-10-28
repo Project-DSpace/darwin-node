@@ -74,14 +74,14 @@ use crate::replication::admission;
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, FRESH_REPLICATION_DELIVERY_MAX_RETRIES,
-    REPLICATION_PROTOCOL_ID,
+    MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     PointerFetchRequest, PointerFetchResponse, PointerFreshOffer, PointerHints,
     PointerStateRequest, PointerStateResponse, PointerStateSummary, ReplicationMessage,
     ReplicationMessageBody, MAX_POINTER_HINTS_PER_MESSAGE, MAX_POINTER_STATE_REQUEST_ADDRESSES,
 };
-use crate::replication::pruning::prune_proofs_needed;
+use crate::replication::pruning::erase_proofs_needed;
 use crate::replication::retention::{self, DiskRetention};
 use crate::storage::{CapacityVerdict, ChunkStore};
 
@@ -234,6 +234,10 @@ pub struct PointerPruneResult {
     pub disk_pressure: bool,
     /// Candidates strictly beyond the erase floor.
     pub beyond_floor: usize,
+    /// Candidates beyond the erase floor, under disk pressure and held by no
+    /// commitment, not asked about because bootstrap hasn't drained: the
+    /// node may erase them once it has, so it isn't "full" meanwhile.
+    pub bootstrap_deferred: usize,
     /// Records erased this pass.
     pub pruned: usize,
 }
@@ -260,6 +264,10 @@ pub(crate) struct PointerEraseCheck {
     pub(crate) out_of_range_for: Option<Duration>,
     /// The out-of-range wait.
     pub(crate) hysteresis: Duration,
+    /// Whether this node answered "present" for the pointer, to a state or
+    /// fetch request, within the fetch window
+    /// ([`super::erasure::FETCH_WINDOW`]); checked in two-phase erasure only.
+    pub(crate) answered_present_lately: bool,
 }
 
 /// Whether a pointer record may be erased: every condition of
@@ -271,6 +279,7 @@ pub(crate) fn pointer_may_be_erased(check: &PointerEraseCheck) -> bool {
         && check.others_hold
         && !check.committed
         && !check.responsible
+        && !check.answered_present_lately
         && check
             .out_of_range_for
             .is_some_and(|waited| waited >= check.hysteresis)
@@ -489,7 +498,11 @@ enum Fetched {
     Record(Pointer),
     /// A record that does not, which the peer has already been penalised for.
     Invalid,
-    /// No record: no answer, an empty one, or one about another address.
+    /// An answer about the address with no record in it: the peer holds no
+    /// state of the pointer at all.
+    Absent,
+    /// No usable answer: none, one of another kind, or one about another
+    /// address.
     Nothing,
     /// A record this node could not check, or a request it never sent, for a
     /// reason of its own.
@@ -552,8 +565,37 @@ fn judge_possession(fetched: Fetched, fresh: &PointerState) -> Possession {
                 Possession::Missing
             }
         }
-        Fetched::Nothing => Possession::Missing,
+        Fetched::Absent | Fetched::Nothing => Possession::Missing,
         Fetched::Invalid | Fetched::LocalFailure => Possession::NotJudged,
+    }
+}
+
+/// The peers of `widened`, a pointer's close group widened past the peers
+/// marked full (nearest first, this node included), that the possession check
+/// asks: the close group itself, this node left out. The stand-ins beyond it
+/// are offered the state but not checked.
+fn possession_checked(
+    widened: &[PeerId],
+    self_id: &PeerId,
+    close_group_size: usize,
+) -> Vec<PeerId> {
+    widened
+        .iter()
+        .take(close_group_size)
+        .filter(|peer| *peer != self_id)
+        .copied()
+        .collect()
+}
+
+/// What a peer answered about a pointer, for the "full" waiver: absent only
+/// when it answered that it holds no state of the pointer at all, so a peer
+/// holding an older state (a pointer it held, whose updates a full node
+/// still takes) or one that didn't answer is never waived.
+fn possession_answer(fetched: &Fetched) -> super::full::UnheldAnswer {
+    if matches!(fetched, Fetched::Absent) {
+        super::full::UnheldAnswer::Absent
+    } else {
+        super::full::UnheldAnswer::Other
     }
 }
 
@@ -975,7 +1017,7 @@ impl PointerReplication {
     async fn fetch_record(&self, peer: &PeerId, address: &XorName) -> Option<Pointer> {
         match self.fetch_outcome(peer, address).await {
             Fetched::Record(record) => Some(record),
-            Fetched::Invalid | Fetched::Nothing | Fetched::LocalFailure => None,
+            Fetched::Invalid | Fetched::Absent | Fetched::Nothing | Fetched::LocalFailure => None,
         }
     }
 
@@ -1004,7 +1046,7 @@ impl PointerReplication {
             return Fetched::Nothing;
         }
         let Some(bytes) = response.record else {
-            return Fetched::Nothing;
+            return Fetched::Absent;
         };
         // Parsing verifies the ML-DSA signature, milliseconds of CPU a peer
         // can demand once per record it serves: off the async executor, as
@@ -1087,20 +1129,32 @@ impl PointerReplication {
         let self_id = *self.p2p.peer_id();
         let mut by_peer: HashMap<PeerId, Vec<PointerStateSummary>> =
             peers.iter().map(|peer| (*peer, Vec::new())).collect();
+        let gate = super::erasure::gate_for(&self_id);
+        let marked = super::full::view_for(&self_id)
+            .marks
+            .marked_set(Instant::now());
         for state in self.store.held_states() {
             if self.shutdown.is_cancelled() {
                 return;
             }
-            let group = self
-                .p2p
-                .dht_manager()
-                .find_closest_nodes_local_with_self(&state.address, self.config.close_group_size)
-                .await;
-            for node in group {
-                if node.peer_id == self_id {
+            // A pointer being erased is named in no hint (two-phase erasure).
+            if gate.is_being_erased(&state.address) {
+                continue;
+            }
+            // Hinted to the close group, one more for each peer marked full
+            // inside it.
+            let group = super::full::widened_close_group_with(
+                &self.p2p,
+                &state.address,
+                self.config.close_group_size,
+                &marked,
+            )
+            .await;
+            for peer in group {
+                if peer == self_id {
                     continue;
                 }
-                if let Some(hints) = by_peer.get_mut(&node.peer_id) {
+                if let Some(hints) = by_peer.get_mut(&peer) {
                     hints.push(state.into());
                 }
             }
@@ -1148,7 +1202,16 @@ impl PointerReplication {
                     }
                 }
                 None => {
-                    if !admission::is_responsible(&self_id, &hinted.address, &self.p2p, width).await
+                    // The storage admission width, widened past the peers
+                    // marked full, as senders widen the hint's targets: a
+                    // node standing in for a full one takes the hint.
+                    if !admission::is_responsible_widened(
+                        &self_id,
+                        &hinted.address,
+                        &self.p2p,
+                        width,
+                    )
+                    .await
                     {
                         continue;
                     }
@@ -1202,15 +1265,21 @@ impl PointerReplication {
 
     /// Whether this node should look for anything to repair now.
     async fn may_repair(&self) -> bool {
-        // As for chunks (ADR-0011): a node that cannot store what it would
-        // fetch does not spend the network's time finding it. The hints wait,
-        // and come back each round if they are dropped meanwhile.
-        if self.chunks.capacity_verdict() == CapacityVerdict::Full {
-            return false;
-        }
         // A node still bootstrapping sees too little of its close group to
         // judge what a quorum of it holds. The hints wait for it.
         !*self.is_bootstrapping.read().await
+    }
+
+    /// Whether this node may look for a newer state of the pointer at
+    /// `address` now.
+    ///
+    /// As for chunks (ADR-0011): a node that cannot store what it would fetch
+    /// does not spend the network's time finding it, so a node at the line,
+    /// or full, looks for no pointer it doesn't hold; the hints wait, and come
+    /// back each round if they are dropped meanwhile. It still repairs those
+    /// it holds: a newer state of a held pointer takes no new space.
+    fn may_repair_address(&self, address: &XorName) -> bool {
+        repairs_pointer(self.store.state(address).is_some(), &self.chunks)
     }
 
     /// Verify and fetch whatever is due now. Also the tests' way to drive it.
@@ -1224,6 +1293,7 @@ impl PointerReplication {
             .lock()
             .iter()
             .filter(|(_, entry)| entry.not_before <= now)
+            .filter(|(address, _)| self.may_repair_address(address))
             .take(MAX_VERIFICATIONS_PER_TICK)
             .map(|(address, entry)| (*address, entry.wanted))
             .collect();
@@ -1402,13 +1472,22 @@ impl PointerReplication {
         let self_id = *self.p2p.peer_id();
         let width = width.unwrap_or_else(|| storage_admission_width(self.config.close_group_size));
         let held = self.store.state(&state.address).is_some();
-        if !held && !admission::is_responsible(&self_id, &state.address, &self.p2p, width).await {
+        if !held
+            && !admission::is_responsible_widened(&self_id, &state.address, &self.p2p, width).await
+        {
             return Ok(false);
         }
         if !self.store.admits(&state) {
             return Ok(false);
         }
-        let reservation = self.chunks.reserve(POINTER_WIRE_LEN as u64)?;
+        // A newer state of a held pointer replaces a record of the same size:
+        // it needs room only for its temporary file, and is taken while the
+        // node is full. Anything else is charged above the line.
+        let reservation = if held {
+            self.chunks.reserve_replacement(POINTER_WIRE_LEN as u64)?
+        } else {
+            self.chunks.reserve(POINTER_WIRE_LEN as u64)?
+        };
         // Held now, whether this wrote it or it was already here; a commit
         // that found a state it loses to is not.
         let outcome = self.store.commit(record, Some(reservation)).await?;
@@ -1476,6 +1555,12 @@ impl PointerReplication {
                 Ok(Some(record)) => Some(record.to_bytes()),
                 Ok(None) | Err(_) => None,
             };
+            // Served: kept from erasure for the fetch window, as a chunk
+            // this node answered "present" for is.
+            if record.is_some() {
+                super::erasure::gate_for(this.p2p.peer_id())
+                    .note_answered_present(&request.address, Instant::now());
+            }
             super::send_replication_response(
                 &source,
                 &this.p2p,
@@ -1526,11 +1611,21 @@ impl PointerReplication {
                 return;
             }
             this.mark_capable(&source).await;
+            // Each state answered "present" is kept from erasure for the
+            // fetch window, so the fetch that may follow finds it.
+            let gate = super::erasure::gate_for(this.p2p.peer_id());
+            let now = Instant::now();
             let states = request
                 .addresses
                 .iter()
                 .take(MAX_POINTER_STATE_REQUEST_ADDRESSES)
-                .map(|address| this.store.state(address).map(PointerStateSummary::from))
+                .map(|address| {
+                    let state = this.store.state(address);
+                    if state.is_some() {
+                        gate.note_answered_present(address, now);
+                    }
+                    state.map(PointerStateSummary::from)
+                })
                 .collect();
             super::send_replication_response(
                 &source,
@@ -1566,23 +1661,33 @@ impl PointerReplication {
         })
     }
 
-    /// Offer a freshly paid state to the rest of its close group, and schedule
-    /// the check that they took it.
+    /// Offer a freshly paid state to the rest of its close group, widened past
+    /// the peers marked full as a chunk's offer is, and schedule the check
+    /// that the close group itself took it.
     pub async fn replicate_fresh(self: &Arc<Self>, write: PointerFreshWrite) {
         let Ok(state) = PointerState::parse(&write.record) else {
             warn!("A fresh pointer write did not parse; not replicating it");
             return;
         };
         let self_id = *self.p2p.peer_id();
-        let targets: Vec<PeerId> = self
-            .p2p
-            .dht_manager()
-            .find_closest_nodes_local_with_self(&state.address, self.config.close_group_size)
-            .await
+        // One more for each peer marked full inside the close group: the
+        // nearest beyond stand in for it, at most 20 in all.
+        let widened = super::full::widened_close_group(
+            &self.p2p,
+            &state.address,
+            self.config.close_group_size,
+        )
+        .await;
+        // The stand-ins are offered the state but not possession-checked: only
+        // the close group owes it (see `owes`).
+        let checked = possession_checked(&widened, &self_id, self.config.close_group_size);
+        let targets: Vec<PeerId> = widened
             .into_iter()
-            .map(|node| node.peer_id)
             .filter(|peer| *peer != self_id)
             .collect();
+        // The paid quotes' issuers, for the possession check: a full peer paid
+        // for the state is charged for not holding it.
+        let paid_quotes = super::full::paid_quote_issuers(&write.payment_proof);
 
         let msg = ReplicationMessage {
             request_id: rand::thread_rng().gen::<u64>(),
@@ -1628,7 +1733,7 @@ impl PointerReplication {
             hex::encode(state.address),
             targets.len()
         );
-        self.schedule_possession_check(state, targets);
+        self.schedule_possession_check(state, checked, paid_quotes);
     }
 
     /// Take a fresh offer from `source` in the background, unless too many are
@@ -1684,11 +1789,15 @@ impl PointerReplication {
         {
             return;
         }
+        // A newer state of a held pointer takes no new space, so it is taken
+        // at the line and while the node is full; a new address is not.
+        let held = self.store.state(&state.address).is_some();
         if !self.store.admits(&state)
-            || self
-                .chunks
-                .check_capacity_for(POINTER_WIRE_LEN as u64)
-                .is_err()
+            || (!held
+                && self
+                    .chunks
+                    .check_capacity_for(POINTER_WIRE_LEN as u64)
+                    .is_err())
         {
             return;
         }
@@ -1874,7 +1983,12 @@ impl PointerReplication {
     // Possession
     // -----------------------------------------------------------------------
 
-    fn schedule_possession_check(self: &Arc<Self>, fresh: PointerState, peers: Vec<PeerId>) {
+    fn schedule_possession_check(
+        self: &Arc<Self>,
+        fresh: PointerState,
+        peers: Vec<PeerId>,
+        paid_quotes: Option<Vec<PeerId>>,
+    ) {
         if peers.is_empty() {
             return;
         }
@@ -1891,13 +2005,25 @@ impl PointerReplication {
                 () = this.shutdown.cancelled() => return,
                 () = tokio::time::sleep(delay) => {}
             }
-            this.check_possession(fresh, &peers).await;
+            this.check_possession(fresh, &peers, paid_quotes.as_deref())
+                .await;
         });
     }
 
     /// Ask each peer for the record, and penalise any still responsible for it
     /// that cannot produce `fresh` or a state that replaces it.
-    pub async fn check_possession(&self, fresh: PointerState, peers: &[PeerId]) {
+    ///
+    /// Full, not faulty: a peer with a fresh "full" notice that answers it
+    /// holds no state of the pointer, was never seen holding it and was not
+    /// paid for it (its quote isn't among `paid_quotes`, the paid quotes of
+    /// the write's proof; `None` when unknown) refused a new address it
+    /// couldn't take, and is not charged.
+    pub async fn check_possession(
+        &self,
+        fresh: PointerState,
+        peers: &[PeerId],
+        paid_quotes: Option<&[PeerId]>,
+    ) {
         let self_id = *self.p2p.peer_id();
         for peer in peers {
             // A peer that has left the group owes nothing, and one that cannot
@@ -1906,6 +2032,7 @@ impl PointerReplication {
                 continue;
             }
             let fetched = self.fetch_outcome(peer, &fresh.address).await;
+            let answer = possession_answer(&fetched);
             match judge_possession(fetched, &fresh) {
                 Possession::Missing => {}
                 // Two different final states: the owner signed both and each
@@ -1930,6 +2057,17 @@ impl PointerReplication {
             // before it, and it may have left the group meanwhile. It is
             // judged on what it owes now, not on what it owed when this began.
             if !self.owes(peer, &fresh.address).await {
+                continue;
+            }
+            let case = super::full::UnheldCase {
+                lane: super::full::Lane::PointerPossession,
+                peer,
+                key: &fresh.address,
+                answer,
+                commitment_pinned: false,
+                own_quote: super::full::own_quote(peer, paid_quotes),
+            };
+            if super::full::view_for(&self_id).waives_unheld_penalty(&case, Instant::now()) {
                 continue;
             }
             warn!(
@@ -1979,6 +2117,22 @@ impl PointerReplication {
         commitment_state: Option<&ResponderCommitmentState>,
         disk_retention: &DiskRetention,
     ) -> PointerPruneResult {
+        self.prune_pass_in_epoch(allow_remote, commitment_state, disk_retention, None)
+            .await
+    }
+
+    /// [`Self::prune_pass`] in the neighbour-sync epoch `erasure_epoch`, for
+    /// erasure in two phases: a candidate selected in one epoch is erased in a
+    /// later one, and named in no hint meanwhile (see [`super::erasure`]).
+    /// `None` erases in the pass that selects, as tests drive it.
+    #[allow(clippy::too_many_lines)] // one pass's phases, in the order they run
+    pub async fn prune_pass_in_epoch(
+        &self,
+        allow_remote: bool,
+        commitment_state: Option<&ResponderCommitmentState>,
+        disk_retention: &DiskRetention,
+        erasure_epoch: Option<u64>,
+    ) -> PointerPruneResult {
         // Replaced records kept for audits go when their retention does,
         // whether or not another update comes along to drop them.
         self.store.drop_expired_superseded();
@@ -1994,12 +2148,15 @@ impl PointerReplication {
             ..PointerPruneResult::default()
         };
         let floor = disk_retention
-            .floor_from_routing_table(&self.p2p, &self_id, self.config.close_group_size)
-            .await;
+            .floors_from_routing_table(&self.p2p, &self_id, self.config.close_group_size)
+            .await
+            .erase;
 
         let mut candidates = Vec::new();
         for state in &held {
-            if admission::is_responsible(&self_id, &state.address, &self.p2p, retention).await {
+            if admission::is_responsible_widened(&self_id, &state.address, &self.p2p, retention)
+                .await
+            {
                 self.out_of_range.lock().remove(&state.address);
                 result.in_range += 1;
                 continue;
@@ -2039,6 +2196,14 @@ impl PointerReplication {
         // follow: under disk pressure, beyond the floor, once bootstrap allows
         // asking anyone.
         let may_ask = allow_remote && !*self.is_bootstrapping.read().await;
+        if !may_ask && result.disk_pressure {
+            result.bootstrap_deferred = candidates
+                .iter()
+                .filter(|state| {
+                    retention::is_beyond_floor(&self_xor, &state.address, floor.as_ref())
+                })
+                .count();
+        }
         let failures = disk_retention.failed_pointer_checks();
         let ordered = pointer_erase_candidates(
             may_ask && result.disk_pressure,
@@ -2047,24 +2212,69 @@ impl PointerReplication {
             failures,
             candidates,
         );
+        // Two phases: selected first and named in no hint, erased only in a
+        // pass of a later epoch. The ready pointers this pass then doesn't
+        // try, left when the pressure ends, are given back below.
+        let gate = erasure_epoch.map(|epoch| (super::erasure::gate_for(&self_id), epoch));
+        let ordered = match &gate {
+            Some((gate, epoch)) => {
+                let keys: Vec<XorName> = ordered.iter().map(|state| state.address).collect();
+                let ready: HashSet<XorName> = gate
+                    .select(
+                        super::erasure::ClockKind::Pointers,
+                        &keys,
+                        *epoch,
+                        MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS,
+                        Instant::now(),
+                    )
+                    .into_iter()
+                    .collect();
+                ordered
+                    .into_iter()
+                    .filter(|state| ready.contains(&state.address))
+                    .collect()
+            }
+            None => ordered,
+        };
+        let ready: Vec<XorName> = ordered.iter().map(|state| state.address).collect();
         let outcomes = retention::erase_while_under_pressure(
             disk_retention,
             ordered,
             move |state| async move {
                 let erasure = self
-                    .erase_if_proven(state, commitment_state, disk_retention)
+                    .erase_if_proven(
+                        state,
+                        commitment_state,
+                        disk_retention,
+                        erasure_epoch.is_some(),
+                    )
                     .await;
                 (state.address, erasure)
             },
         )
         .await;
+        if let Some((gate, _)) = &gate {
+            let tried: HashSet<XorName> = outcomes.iter().map(|(address, _)| *address).collect();
+            gate.release_untried(super::erasure::ClockKind::Pointers, &ready, &tried);
+        }
         for (address, erasure) in outcomes {
             match erasure {
                 PointerErasure::Erased => {
                     result.pruned += 1;
                     failures.forget(&address);
+                    if let Some((gate, _)) = &gate {
+                        gate.release(super::erasure::ClockKind::Pointers, &address);
+                    }
                 }
-                PointerErasure::Unproven => failures.record(&address),
+                PointerErasure::Unproven => {
+                    failures.record(&address);
+                    // Its close group lacks proven copies: hinted again, so
+                    // the group can fetch it from here, and tried again after
+                    // the cooldown.
+                    if let Some((gate, epoch)) = &gate {
+                        gate.fail(super::erasure::ClockKind::Pointers, &address, *epoch);
+                    }
+                }
                 PointerErasure::Kept => {}
             }
         }
@@ -2073,13 +2283,37 @@ impl PointerReplication {
         result
     }
 
+    /// The out-of-range clocks of the pointers held, for saving across a
+    /// restart (see [`super::erasure`]).
+    #[must_use]
+    pub fn out_of_range_clocks(&self) -> Vec<(XorName, Instant)> {
+        self.out_of_range
+            .lock()
+            .iter()
+            .map(|(address, since)| (*address, *since))
+            .collect()
+    }
+
+    /// Put back saved out-of-range clocks, for the pointers still held. A
+    /// clock already running keeps its own start.
+    pub fn restore_out_of_range(&self, clocks: impl IntoIterator<Item = (XorName, Instant)>) {
+        let mut out_of_range = self.out_of_range.lock();
+        for (address, since) in clocks {
+            if self.store.state(&address).is_some() {
+                out_of_range.entry(address).or_insert(since);
+            }
+        }
+    }
+
     /// Erase one candidate if all but one of its close group prove they hold
-    /// it and every check still passes just before deleting.
+    /// it and every check still passes just before deleting. `two_phase`:
+    /// the pass erases in two phases (see [`super::erasure`]).
     async fn erase_if_proven(
         &self,
         state: PointerState,
         commitment_state: Option<&ResponderCommitmentState>,
         disk_retention: &DiskRetention,
+        two_phase: bool,
     ) -> PointerErasure {
         if self.shutdown.is_cancelled() {
             return PointerErasure::Kept;
@@ -2093,15 +2327,22 @@ impl PointerReplication {
         // the disk may have room again after the time the proof took.
         let self_id = *self.p2p.peer_id();
         let floor = disk_retention
-            .floor_from_routing_table(&self.p2p, &self_id, self.config.close_group_size)
-            .await;
-        let responsible = admission::is_responsible(
+            .floors_from_routing_table(&self.p2p, &self_id, self.config.close_group_size)
+            .await
+            .erase;
+        let responsible = admission::is_responsible_widened(
             &self_id,
             &state.address,
             &self.p2p,
             storage_admission_width(self.config.close_group_size),
         )
         .await;
+        // Two-phase erasure only: as for chunks, a pointer this node answered
+        // "present" for within the fetch window is kept this pass, so a peer
+        // that just checked it here doesn't find it gone when it fetches.
+        let answered_present_lately = two_phase
+            && super::erasure::gate_for(&self_id)
+                .answered_present_lately(&state.address, Instant::now());
         let check = PointerEraseCheck {
             under_disk_pressure: disk_retention.refresh(),
             beyond_floor: retention::is_beyond_floor(
@@ -2118,6 +2359,7 @@ impl PointerReplication {
                 .get(&state.address)
                 .map(Instant::elapsed),
             hysteresis: self.config.prune_hysteresis_duration,
+            answered_present_lately,
         };
         if pointer_may_be_erased(&check) && self.delete(&state).await {
             PointerErasure::Erased
@@ -2128,16 +2370,40 @@ impl PointerReplication {
 
     /// Whether all but one of the current close group prove they hold `ours`
     /// or a newer state, by returning a valid record.
+    ///
+    /// Near peers marked full the group is the 7 nearest not marked
+    /// full, and the full ones among them: 6 proofs are needed from the 7, a
+    /// full peer that holds the record still proves it, and one that lacks it
+    /// neither proves nor vetoes. When the window's cap of 20 leaves fewer
+    /// than 7 not marked full, 6 proofs are still needed from the 20
+    /// ([`erase_proofs_needed`]). The marks are read when this runs, just
+    /// before the re-check.
     async fn others_hold(&self, ours: &PointerState) -> bool {
-        let group: Vec<PeerId> = self
+        let marked: HashSet<PeerId> = super::full::view_for(self.p2p.peer_id())
+            .marks
+            .marked(Instant::now())
+            .into_iter()
+            .collect();
+        let nearest: Vec<PeerId> = self
             .p2p
             .dht_manager()
-            .find_closest_nodes_local(&ours.address, self.config.close_group_size)
+            .find_closest_nodes_local(&ours.address, super::full::MAX_WIDENED_WIDTH)
             .await
             .into_iter()
             .map(|node| node.peer_id)
             .collect();
-        let needed = prune_proofs_needed(group.len());
+        let width = super::full::widened_len(&nearest, self.config.close_group_size, |peer| {
+            marked.contains(peer)
+        });
+        let known = nearest.len();
+        let group: Vec<PeerId> = nearest.into_iter().take(width).collect();
+        // Never fewer than 6 because the window's cap of 20 cut the group
+        // short (see `erase_proofs_needed`).
+        let needed = erase_proofs_needed(
+            group.iter().filter(|p| !marked.contains(p)).count(),
+            known,
+            self.config.close_group_size,
+        );
         if needed == 0 {
             return false;
         }
@@ -2240,6 +2506,14 @@ where
     None
 }
 
+/// Whether a node whose chunk store is `chunks` may look for a newer state of
+/// a pointer, `held` or not (see `PointerReplication::may_repair_address`):
+/// always for one it holds, and for another only while it isn't at the line
+/// or full.
+fn repairs_pointer(held: bool, chunks: &ChunkStore) -> bool {
+    held || chunks.capacity_verdict() != CapacityVerdict::Full
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -2271,6 +2545,31 @@ mod tests {
         let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[3; 32]);
         let target = PointerTarget::new(PointerTargetKind::Chunk, [target; 32]);
         Pointer::sign(&sk, &pk, counter, target).expect("sign")
+    }
+
+    /// A full node repairs a pointer it holds (a newer state takes no new
+    /// space) and doesn't fetch one it doesn't hold; once no longer full, it
+    /// fetches both.
+    #[tokio::test]
+    async fn a_full_node_repairs_a_held_pointer_and_fetches_no_unheld_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunks = ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: false,
+            disk_reserve: 0,
+        })
+        .await
+        .expect("chunk store");
+        assert!(repairs_pointer(true, &chunks));
+        assert!(repairs_pointer(false, &chunks));
+        chunks.set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+        assert!(repairs_pointer(true, &chunks), "a held pointer is repaired");
+        assert!(
+            !repairs_pointer(false, &chunks),
+            "an unheld pointer isn't fetched"
+        );
+        chunks.set_full_for_test(None);
+        assert!(repairs_pointer(false, &chunks), "no longer full");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2322,6 +2621,22 @@ mod tests {
         );
         assert_eq!(judge(Fetched::Record(record(4, 1))), Possession::Missing);
         assert_eq!(judge(Fetched::Nothing), Possession::Missing);
+        assert_eq!(judge(Fetched::Absent), Possession::Missing);
+        // The same answers, as the "full" waiver reads them: only "no state
+        // at all" is absent.
+        assert_eq!(
+            possession_answer(&Fetched::Absent),
+            super::super::full::UnheldAnswer::Absent
+        );
+        assert_eq!(
+            possession_answer(&Fetched::Nothing),
+            super::super::full::UnheldAnswer::Other
+        );
+        assert_eq!(
+            possession_answer(&Fetched::Record(record(4, 1))),
+            super::super::full::UnheldAnswer::Other,
+            "an older state of a held pointer is never waived"
+        );
         // The fetch already charged the peer for an invalid record; charging
         // it again as missing would count one bad answer twice.
         assert_eq!(judge(Fetched::Invalid), Possession::NotJudged);
@@ -2720,6 +3035,7 @@ mod tests {
             responsible: false,
             out_of_range_for: Some(WAIT),
             hysteresis: WAIT,
+            answered_present_lately: false,
         }
     }
 
@@ -2750,6 +3066,17 @@ mod tests {
         // the wait, under pressure, the proof is still required.
         let check = PointerEraseCheck {
             others_hold: false,
+            ..erasable()
+        };
+        assert!(!pointer_may_be_erased(&check));
+    }
+
+    /// As for chunks: a pointer this node answered "present" for within the
+    /// fetch window is kept, whatever else holds.
+    #[test]
+    fn a_pointer_answered_present_lately_is_not_erased() {
+        let check = PointerEraseCheck {
+            answered_present_lately: true,
             ..erasable()
         };
         assert!(!pointer_may_be_erased(&check));
@@ -2868,6 +3195,7 @@ mod tests {
             held_by_commitment: 6,
             disk_pressure: true,
             beyond_floor: 7,
+            bootstrap_deferred: 9,
             pruned: 8,
         };
         assert_eq!(

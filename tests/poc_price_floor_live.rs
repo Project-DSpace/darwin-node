@@ -25,16 +25,20 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use ant_node::payment::{
-    calculate_price, serialize_single_node_proof, EvmVerifierConfig, PaymentProof, PaymentStatus,
-    PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, VerificationContext,
+    calculate_price, serialize_single_node_proof, EvmVerifierConfig, Held, PaymentProof,
+    PaymentStatus, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, VerificationContext,
 };
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::CLOSE_GROUP_SIZE;
+use ant_protocol::chunk::MAX_CHUNK_SIZE;
 use evmlib::common::Amount;
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
+
+/// A whole chunk's bytes: its payment must cover 3 × the median quote.
+const FULL_CHUNK: Held = Held::Bytes(MAX_CHUNK_SIZE);
 
 /// Committed key count for the receiver in the floor tests. Chosen large
 /// enough that `calculate_price(count)` sits well above twice the baseline, so
@@ -180,7 +184,12 @@ async fn shadow_mode_accepts_below_floor_real_settlement() {
     let proof = pay_and_build_proof(&wallet, peer_id, quote, cheapest_of_k_settlement()).await;
 
     let status = verifier
-        .verify_payment(&xorname, Some(&proof), VerificationContext::ClientPut)
+        .verify_payment(
+            &xorname,
+            FULL_CHUNK,
+            Some(&proof),
+            VerificationContext::ClientPut,
+        )
         .await
         .expect("shadow mode must accept a real below-floor settlement");
     assert_eq!(status, PaymentStatus::PaymentVerified);
@@ -222,7 +231,12 @@ async fn enforced_floor_accepts_at_floor_real_overpayment() {
     let proof = pay_and_build_proof(&wallet, peer_id, quote, at_floor_settlement()).await;
 
     let status = verifier
-        .verify_payment(&xorname, Some(&proof), VerificationContext::ClientPut)
+        .verify_payment(
+            &xorname,
+            FULL_CHUNK,
+            Some(&proof),
+            VerificationContext::ClientPut,
+        )
         .await
         .expect("an exactly-at-floor real settlement must pass under enforcement");
     assert_eq!(status, PaymentStatus::PaymentVerified);

@@ -10,7 +10,7 @@ mod errors;
 
 use crate::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest,
-    ChunkQuoteResponse, MAX_CHUNK_SIZE,
+    ChunkQuoteRequestV2, ChunkQuoteResponse, DATA_TYPE_CHUNK, MAX_CHUNK_SIZE,
 };
 use crate::browser::{browser_payment_network, BrowserEndpoint, BrowserPaymentNetwork};
 use crate::codec::{encode_exact, ExactEncodeError};
@@ -66,6 +66,22 @@ const RPC_MULTIPLEX_CAPABILITY: &str = "rpc-multiplex-4";
 /// writes (ADR-0016), so a browser client can tell a node that would refuse
 /// them from one that failed.
 const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
+
+/// The browser protocol version after the current one, N + 1, which a
+/// browser that pays by size sends on `quote_chunk` alone. Such a quote
+/// counts as settlement version
+/// [`SIZE_PRICED_SETTLEMENT_VERSION`](crate::payment::SIZE_PRICED_SETTLEMENT_VERSION)
+/// and is quoted at the node's weight total; a plain N quote declares no
+/// settlement version and is quoted at today's price. Every other request is
+/// accepted at N only, as before. A node older than this one can't parse an
+/// N + 1 frame and closes the channel, dropping the requests in flight on it,
+/// so a browser sends one only to a node that advertises
+/// [`SIZE_PRICED_QUOTE_CAPABILITY`] in hello.
+const SIZE_PRICED_BROWSER_VERSION: u16 = BROWSER_PROTOCOL_VERSION + 1;
+
+/// Advertised in hello by a node that takes a `quote_chunk` at
+/// [`SIZE_PRICED_BROWSER_VERSION`] and quotes it at its weight total.
+const SIZE_PRICED_QUOTE_CAPABILITY: &str = "size_priced_quote";
 // Browser dials use a 10-second channel-open timeout. Give successful clients
 // modest server-side headroom while bounding associations that never open one.
 const FIRST_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1524,7 +1540,7 @@ async fn handle_webrtc_channel(
                     return Err("duplicate request ID or per-channel RPC capacity exhausted".into());
                 }
                 activity.send_replace(ids.len());
-                let error = if request.version != BROWSER_PROTOCOL_VERSION {
+                let error = if !browser_version_accepted(request) {
                     Some(Response::error(request.request_id, "unsupported_version",
                         format!("protocol version {} is unsupported; expected {BROWSER_PROTOCOL_VERSION}", request.version)))
                 } else if !hello_completed && !matches!(request.body, RequestBody::Hello) {
@@ -1774,8 +1790,9 @@ async fn read_webrtc_request(
     drop(encrypted_bytes);
     reservation.resize(frame.len())?;
 
-    let (request, content_offset) =
-        parse_request_header(&frame).map_err(|error| error.to_string())?;
+    let (request, content_offset) = parse_request_header(&frame)
+        .or_else(|error| parse_size_priced_quote_header(&frame).ok_or(error))
+        .map_err(|error| error.to_string())?;
     let content_len = frame.len() - content_offset;
     let accounted_request_bytes = frame.len();
     // serde owns the parsed header and the body copy below owns the content.
@@ -1791,6 +1808,34 @@ async fn read_webrtc_request(
         _request_permit: request_permit,
         _in_flight_bytes: reservation,
     })
+}
+
+/// Whether this node serves `request` at its declared browser protocol
+/// version: N for every request, and N + 1 for `quote_chunk` alone.
+fn browser_version_accepted(request: &Request) -> bool {
+    request.version == BROWSER_PROTOCOL_VERSION
+        || (request.version == SIZE_PRICED_BROWSER_VERSION
+            && matches!(request.body, RequestBody::QuoteChunk { .. }))
+}
+
+/// Parse `frame` as an N + 1 `quote_chunk` request
+/// ([`SIZE_PRICED_BROWSER_VERSION`]), which the transport's parser refuses as
+/// a version it doesn't know. `None` for anything else, which then fails as
+/// it did before. A quote request carries no content, so the frame must end
+/// where its header does; the header is held to the transport's own bounds.
+fn parse_size_priced_quote_header(frame: &[u8]) -> Option<(Request, usize)> {
+    if frame.len() > MAX_BROWSER_FRAME_BYTES {
+        return None;
+    }
+    let bounded = &frame[..frame.len().min(MAX_BROWSER_HEADER_BYTES)];
+    let mut stream = serde_json::Deserializer::from_slice(bounded).into_iter::<Request>();
+    let request = stream.next()?.ok()?;
+    let content_offset = stream.byte_offset();
+    (request.version == SIZE_PRICED_BROWSER_VERSION
+        && matches!(request.body, RequestBody::QuoteChunk { .. })
+        && request.content_length == 0
+        && frame.len() == content_offset)
+        .then_some((request, content_offset))
 }
 
 // Observe resets even while work is pending. Only an idle channel spends the
@@ -2055,7 +2100,8 @@ async fn process_request(
             process_get_chunk(request.request_id, address, record_len, state, resources).await
         }
         RequestBody::QuoteChunk { address, size } => {
-            Ok(process_quote_chunk(request.request_id, address, size, state).await)
+            let size_priced = request.version == SIZE_PRICED_BROWSER_VERSION;
+            Ok(process_quote_chunk(request.request_id, address, size, size_priced, state).await)
         }
         RequestBody::PutChunk {
             address,
@@ -2183,6 +2229,7 @@ fn hello_capabilities(pointers: bool) -> Vec<String> {
         ant_protocol::transport::ADDRESS_V2_CAPABILITY.into(),
         "get_chunk".into(),
         "quote_chunk".into(),
+        SIZE_PRICED_QUOTE_CAPABILITY.into(),
         "put_chunk".into(),
     ];
     if pointers {
@@ -2345,10 +2392,31 @@ async fn process_get_chunk(
     response
 }
 
+/// The chunk-protocol quote request a browser's `quote_chunk` is asked as:
+/// a settlement-version-2 request for an N + 1 request (`size_priced`),
+/// quoted at the weight total, and an unversioned one for a plain N request,
+/// quoted at today's price.
+fn browser_quote_body(address: [u8; 32], size: u64, size_priced: bool) -> ChunkMessageBody {
+    if size_priced {
+        ChunkMessageBody::QuoteRequestV2(ChunkQuoteRequestV2 {
+            address,
+            data_size: size,
+            data_type: DATA_TYPE_CHUNK,
+            settlement_version: crate::payment::SIZE_PRICED_SETTLEMENT_VERSION,
+        })
+    } else {
+        ChunkMessageBody::QuoteRequest(ChunkQuoteRequest::new(address, size))
+    }
+}
+
+/// `size_priced` for an N + 1 request ([`SIZE_PRICED_BROWSER_VERSION`]),
+/// which is asked of the chunk protocol as a settlement-version-2 quote; a
+/// plain N request is asked as an unversioned one, at today's price.
 async fn process_quote_chunk(
     request_id: u64,
     address: String,
     size: u64,
+    size_priced: bool,
     state: &ServerState,
 ) -> (Response, Option<TrackedBytes>) {
     let address_bytes = match decode_32_byte_hex(&address) {
@@ -2376,10 +2444,8 @@ async fn process_quote_chunk(
         );
     };
 
-    let message = ChunkMessage {
-        request_id,
-        body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest::new(address_bytes, size)),
-    };
+    let body = browser_quote_body(address_bytes, size, size_priced);
+    let message = ChunkMessage { request_id, body };
     let response = match handle_ant_message(ant_protocol, message).await {
         Ok(response) => response,
         Err(error) => return (error_response(request_id, "quote_failed", error), None),
@@ -3407,6 +3473,19 @@ max_concurrent_requests = 12",
         }
     }
 
+    /// Every node advertises the N + 1 `quote_chunk` it accepts, under the
+    /// name the browser core looks for, so a browser sends that frame only to
+    /// a node that parses it.
+    #[test]
+    fn hello_advertises_size_priced_quotes() {
+        assert_eq!(SIZE_PRICED_QUOTE_CAPABILITY, "size_priced_quote");
+        for pointers in [true, false] {
+            assert!(hello_capabilities(pointers)
+                .iter()
+                .any(|c| c == SIZE_PRICED_QUOTE_CAPABILITY));
+        }
+    }
+
     /// Pointers are advertised only by a node that serves them.
     #[test]
     fn only_a_node_that_serves_pointers_advertises_them() {
@@ -3700,6 +3779,121 @@ max_concurrent_requests = 12",
         assert_eq!(request.version, BROWSER_PROTOCOL_VERSION);
         assert_eq!(request.request_id, 7);
         assert!(matches!(request.body, RequestBody::FindNode { .. }));
+    }
+
+    /// N + 1 is accepted on `quote_chunk` alone; every other request, and
+    /// any other version, is refused as before. The transport's own parser
+    /// still refuses N + 1, so a transport that moves N is noticed here.
+    #[test]
+    fn a_size_priced_quote_is_the_one_request_accepted_at_the_next_version() {
+        assert_eq!(BROWSER_PROTOCOL_VERSION, 5);
+        assert_eq!(SIZE_PRICED_BROWSER_VERSION, 6);
+        let address = "ab".repeat(32);
+        let quote = |version: u16| {
+            format!(
+                r#"{{"version":{version},"request_id":9,"content_length":0,"type":"quote_chunk","address":"{address}","size":4096}}"#
+            )
+        };
+
+        let (request, offset) =
+            parse_size_priced_quote_header(quote(6).as_bytes()).expect("an N + 1 quote");
+        assert_eq!(request.version, SIZE_PRICED_BROWSER_VERSION);
+        assert_eq!(offset, quote(6).len());
+        assert!(matches!(
+            request.body,
+            RequestBody::QuoteChunk { size: 4096, .. }
+        ));
+        assert!(browser_version_accepted(&request));
+        assert!(parse_request_header(quote(6).as_bytes()).is_err());
+
+        // N is the transport's to parse, and still accepted.
+        let (plain, _) = parse_request_header(quote(5).as_bytes()).expect("an N quote");
+        assert!(browser_version_accepted(&plain));
+        assert!(parse_size_priced_quote_header(quote(5).as_bytes()).is_none());
+
+        // Any other version, content after the header, or a declared length.
+        for refused in [
+            quote(7),
+            quote(4),
+            format!("{}x", quote(6)),
+            quote(6).replace(r#""content_length":0"#, r#""content_length":1"#),
+        ] {
+            assert!(
+                parse_size_priced_quote_header(refused.as_bytes()).is_none(),
+                "{refused}"
+            );
+        }
+
+        // Every other request at N + 1 is refused.
+        for other in [
+            r#"{"version":6,"request_id":1,"content_length":0,"type":"hello"}"#.to_string(),
+            format!(
+                r#"{{"version":6,"request_id":2,"content_length":0,"type":"get_chunk","address":"{address}"}}"#
+            ),
+            format!(
+                r#"{{"version":6,"request_id":3,"content_length":0,"type":"find_node","target":"{address}"}}"#
+            ),
+        ] {
+            assert!(
+                parse_size_priced_quote_header(other.as_bytes()).is_none(),
+                "{other}"
+            );
+            let request: Request = serde_json::from_str(&other).expect("valid json");
+            assert!(!browser_version_accepted(&request), "{other}");
+        }
+    }
+
+    /// An N + 1 browser quote is quoted at the node's weight total, and a
+    /// plain N quote at today's price, `calculate_price(K)`, both through the
+    /// handler's own quote path.
+    #[tokio::test]
+    async fn an_n_plus_1_browser_quote_is_priced_at_the_weight_total_and_n_at_todays_price() {
+        use crate::payment::pricing::calculate_price;
+        use crate::storage::handler_tests::{attach_weighed_commitment, create_test_protocol};
+
+        let (protocol, _temp) = create_test_protocol().await;
+        // 1,000 records in the smallest class: m = 253.
+        attach_weighed_commitment(&protocol, 1_000, 253);
+        let price = |body| {
+            let protocol = &protocol;
+            async move {
+                let response = handle_ant_message(
+                    protocol,
+                    ChunkMessage {
+                        request_id: 11,
+                        body,
+                    },
+                )
+                .await
+                .expect("a quote response");
+                match response.body {
+                    ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                        quote, ..
+                    }) => {
+                        let quote: PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
+                        assert_eq!(quote.committed_key_count, 1_000, "the count is K");
+                        quote.price
+                    }
+                    other => panic!("expected a quote, got: {other:?}"),
+                }
+            }
+        };
+
+        let size_priced = browser_quote_body([0xD1; 32], 4096, true);
+        assert!(matches!(
+            &size_priced,
+            ChunkMessageBody::QuoteRequestV2(ChunkQuoteRequestV2 {
+                settlement_version: 2,
+                data_type: DATA_TYPE_CHUNK,
+                data_size: 4096,
+                ..
+            })
+        ));
+        assert_eq!(price(size_priced).await, calculate_price(253));
+
+        let plain = browser_quote_body([0xD2; 32], 4096, false);
+        assert!(matches!(&plain, ChunkMessageBody::QuoteRequest(_)));
+        assert_eq!(price(plain).await, calculate_price(1_000));
     }
 
     #[test]

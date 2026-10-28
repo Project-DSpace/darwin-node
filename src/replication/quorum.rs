@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::ant_protocol::XorName;
+use crate::payment::PaidClass;
 use crate::replication::config::{
     ReplicationConfig, MAX_CONCURRENT_VERIFICATION_REQUESTS, REPLICATION_PROTOCOL_ID,
 };
@@ -234,6 +235,10 @@ pub enum KeyVerificationOutcome {
         /// Peers that responded `Present` (potential fetch sources, may be
         /// empty).
         sources: Vec<PeerId>,
+        /// The largest size class the quorum's paid lists record: the class
+        /// at least `ConfirmNeeded(K)` of the confirming peers record or
+        /// exceed. A fetch this alone authorises is checked against it.
+        class: PaidClass,
     },
     /// Quorum failed definitively (both paths impossible).
     QuorumFailed,
@@ -344,6 +349,7 @@ pub fn evaluate_key_evidence_with_holder_check(
     if paid_votes.effective_group_size > 0 && paid_votes.confirmed >= confirm_needed {
         return KeyVerificationOutcome::PaidListVerified {
             sources: present_peers,
+            class: quorum_paid_class(evidence, paid_peers, confirm_needed),
         };
     }
 
@@ -363,6 +369,40 @@ pub fn evaluate_key_evidence_with_holder_check(
 
     // Step 15: Neither success nor fail-fast.
     KeyVerificationOutcome::QuorumInconclusive
+}
+
+/// The largest size class at least `confirm_needed` of the confirming paid
+/// peers record or exceed: the `confirm_needed`-th largest of their classes.
+/// A confirming peer that gave no class records the full class. The count it
+/// is measured against is the one the whole confirmation met, which counts
+/// every confirming edge peer in its group, so it is never less than the count
+/// the peers at this class alone would need.
+fn quorum_paid_class(
+    evidence: &KeyVerificationEvidence,
+    paid_peers: &[PeerId],
+    confirm_needed: usize,
+) -> PaidClass {
+    let mut classes: Vec<PaidClass> = paid_peers
+        .iter()
+        .filter(|peer| {
+            matches!(
+                evidence.paid_list.get(peer),
+                Some(PaidListEvidence::Confirmed)
+            )
+        })
+        .map(|peer| {
+            evidence
+                .paid_classes
+                .get(peer)
+                .copied()
+                .unwrap_or(PaidClass::FULL)
+        })
+        .collect();
+    classes.sort_unstable_by(|a, b| b.cmp(a));
+    classes
+        .get(confirm_needed.saturating_sub(1))
+        .copied()
+        .unwrap_or(PaidClass::SMALLEST)
 }
 
 fn summarize_paid_list_votes(
@@ -513,6 +553,7 @@ pub async fn run_verification_round(
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             )
         })
@@ -739,8 +780,14 @@ fn process_verification_response_for_keys(
         &response.results
     };
 
+    // The classes line up with the results only when there is one per
+    // result; otherwise every confirmation reads as the full class, as an
+    // older node's reply, which carries none, does.
+    let classes = (response.paid_classes.len() == response.results.len())
+        .then_some(response.paid_classes.as_slice());
+
     // Match response results to requested keys.
-    for result in results {
+    for (index, result) in results.iter().enumerate() {
         if !requested_keys_set.contains(&result.key) {
             continue; // Ignore unsolicited key results.
         }
@@ -758,8 +805,13 @@ fn process_verification_response_for_keys(
             if paid_check_keys.is_some_and(|ks| ks.contains(&result.key)) {
                 if let Some(is_paid) = result.paid {
                     let paid = if is_paid {
+                        let class = classes
+                            .and_then(|classes| classes.get(index))
+                            .map_or(PaidClass::FULL, |byte| PaidClass::from_value(&[*byte]));
+                        ev.paid_classes.insert(*peer, class);
                         PaidListEvidence::Confirmed
                     } else {
+                        ev.paid_classes.remove(peer);
                         PaidListEvidence::NotFound
                     };
                     ev.paid_list.insert(*peer, paid);
@@ -956,6 +1008,7 @@ mod tests {
         KeyVerificationEvidence {
             presence: presence.into_iter().collect(),
             paid_list: paid_list.into_iter().collect(),
+            paid_classes: HashMap::new(),
         }
     }
 
@@ -1642,7 +1695,7 @@ mod tests {
         let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
 
         assert!(
-            matches!(outcome, KeyVerificationOutcome::PaidListVerified { ref sources } if sources.len() == STORAGE_HOLDERS_BELOW_QUORUM),
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { ref sources, .. } if sources.len() == STORAGE_HOLDERS_BELOW_QUORUM),
             "11/20 paid-list confirmations must authorize repair despite only 3 storage holders, got {outcome:?}"
         );
     }
@@ -1717,6 +1770,7 @@ mod tests {
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
+                paid_classes: HashMap::new(),
             },
         ))
         .collect();
@@ -1727,6 +1781,7 @@ mod tests {
                 present: true,
                 paid: Some(true),
             }],
+            paid_classes: Vec::new(),
         };
 
         process_verification_response(&peer, &response, &targets, &mut evidence);
@@ -1756,12 +1811,16 @@ mod tests {
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
+                paid_classes: HashMap::new(),
             },
         ))
         .collect();
 
         // Empty response: peer did not include our key.
-        let response = VerificationResponse { results: vec![] };
+        let response = VerificationResponse {
+            results: vec![],
+            paid_classes: Vec::new(),
+        };
 
         process_verification_response(&peer, &response, &targets, &mut evidence);
 
@@ -1791,6 +1850,7 @@ mod tests {
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
+                paid_classes: HashMap::new(),
             },
         ))
         .collect();
@@ -1809,6 +1869,7 @@ mod tests {
                     paid: None,
                 },
             ],
+            paid_classes: Vec::new(),
         };
 
         process_verification_response(&peer, &response, &targets, &mut evidence);
@@ -1839,6 +1900,7 @@ mod tests {
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
+                paid_classes: HashMap::new(),
             },
         ))
         .collect();
@@ -1849,6 +1911,7 @@ mod tests {
                 present: true,
                 paid: Some(true),
             }],
+            paid_classes: Vec::new(),
         };
 
         process_verification_response(&peer, &response, &targets, &mut evidence);
@@ -1895,6 +1958,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             ),
             (
@@ -1902,6 +1966,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             ),
         ]
@@ -1913,6 +1978,7 @@ mod tests {
             &[key_a],
             &VerificationResponse {
                 results: Vec::new(),
+                paid_classes: Vec::new(),
             },
             &targets,
             &mut evidence,
@@ -1983,6 +2049,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             ),
             (
@@ -1990,6 +2057,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             ),
         ]
@@ -2246,6 +2314,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             ),
             (
@@ -2253,6 +2322,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             ),
         ]
@@ -2273,6 +2343,7 @@ mod tests {
                     paid: Some(false),
                 },
             ],
+            paid_classes: Vec::new(),
         };
 
         process_verification_response(&peer, &response, &targets, &mut evidence);
@@ -2308,6 +2379,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             ),
             (
@@ -2315,6 +2387,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    paid_classes: HashMap::new(),
                 },
             ),
         ]
@@ -2328,6 +2401,7 @@ mod tests {
                 present: true,
                 paid: None,
             }],
+            paid_classes: Vec::new(),
         };
 
         process_verification_response(&peer, &response, &targets, &mut evidence);
@@ -2571,5 +2645,122 @@ mod tests {
             matches!(outcome, KeyVerificationOutcome::QuorumFailed),
             "below-threshold paid confirmations with all-Absent quorum should yield QuorumFailed, got {outcome:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The class a paid-list quorum reports
+    // -----------------------------------------------------------------------
+
+    fn paid_list_quorum_class(classes: &[Option<PaidClass>]) -> PaidClass {
+        let key = xor_name_from_byte(0x5C);
+        let config = ReplicationConfig::default();
+        // 5 paid peers, confirm_needed = 3; no presence quorum.
+        let paid_peers: Vec<PeerId> = (0x60..=0x64).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, vec![], paid_peers.clone());
+        let mut evidence = build_evidence(
+            vec![],
+            paid_peers
+                .iter()
+                .map(|peer| (*peer, PaidListEvidence::Confirmed))
+                .collect(),
+        );
+        for (peer, class) in paid_peers.iter().zip(classes) {
+            if let Some(class) = class {
+                evidence.paid_classes.insert(*peer, *class);
+            }
+        }
+        match evaluate_key_evidence(&key, &evidence, &targets, &config) {
+            KeyVerificationOutcome::PaidListVerified { class, .. } => class,
+            other => panic!("expected PaidListVerified, got {other:?}"),
+        }
+    }
+
+    /// A paid-list quorum authorises a key only up to the class a quorum of
+    /// its entries record: the class `ConfirmNeeded(K)` of them record or
+    /// exceed. A peer that gave no class, an older node, records the full
+    /// class.
+    #[test]
+    fn a_paid_list_quorum_reports_the_class_a_quorum_of_its_entries_record() {
+        let small = PaidClass::SMALLEST;
+        let middle = PaidClass::of_len(256 * 1024);
+        let full = PaidClass::FULL;
+        assert_eq!(paid_list_quorum_class(&[Some(small); 5]), small);
+        assert_eq!(paid_list_quorum_class(&[None; 5]), full);
+        assert_eq!(paid_list_quorum_class(&[Some(full); 5]), full);
+        // Two full entries are short of the three needed.
+        assert_eq!(
+            paid_list_quorum_class(&[
+                Some(full),
+                Some(full),
+                Some(small),
+                Some(small),
+                Some(small)
+            ]),
+            small
+        );
+        assert_eq!(
+            paid_list_quorum_class(&[None, None, Some(middle), Some(small), Some(small)]),
+            middle
+        );
+    }
+
+    /// A reply's classes line up with its results, one byte each; a reply
+    /// without them, as an older node sends, or with a count that doesn't
+    /// match, records every confirmation at the full class.
+    #[test]
+    fn a_reply_gives_each_confirming_peer_the_class_its_entry_records() {
+        let key = xor_name_from_byte(0x5D);
+        let other = xor_name_from_byte(0x5E);
+        let peer = peer_id_from_byte(0x65);
+        let targets = {
+            let mut targets = single_key_targets(&key, vec![], vec![peer]);
+            targets.peer_to_keys.insert(peer, vec![key, other]);
+            targets
+                .peer_to_paid_keys
+                .insert(peer, [key, other].into_iter().collect());
+            targets
+        };
+        let results = vec![
+            KeyVerificationResult {
+                key: other,
+                present: false,
+                paid: Some(false),
+            },
+            KeyVerificationResult {
+                key,
+                present: false,
+                paid: Some(true),
+            },
+        ];
+        let class_of = |paid_classes: Vec<u8>| {
+            let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [key, other]
+                .into_iter()
+                .map(|k| {
+                    (
+                        k,
+                        KeyVerificationEvidence {
+                            presence: HashMap::new(),
+                            paid_list: HashMap::new(),
+                            paid_classes: HashMap::new(),
+                        },
+                    )
+                })
+                .collect();
+            let response = VerificationResponse {
+                results: results.clone(),
+                paid_classes,
+            };
+            process_verification_response(&peer, &response, &targets, &mut evidence);
+            assert_eq!(
+                evidence[&key].paid_list.get(&peer),
+                Some(&PaidListEvidence::Confirmed)
+            );
+            assert!(evidence[&other].paid_classes.is_empty());
+            evidence[&key].paid_classes.get(&peer).copied()
+        };
+        let small = PaidClass::SMALLEST.to_value()[0];
+        assert_eq!(class_of(vec![0, small]), Some(PaidClass::SMALLEST));
+        assert_eq!(class_of(Vec::new()), Some(PaidClass::FULL));
+        assert_eq!(class_of(vec![small]), Some(PaidClass::FULL));
     }
 }

@@ -463,9 +463,9 @@ def generate(args, config, github):
         by_name_version.setdefault((package["name"], package["version"]), []).append(package)
     # First-party code is the package the notices are for: --package, or the
     # workspace's root package. Other members of the workspace are vendored
-    # crates (vendor/ant-listings and vendor/ant-protocol are members only so
-    # their tests run under this lock), so they get their notices as any
-    # dependency does.
+    # crates (vendor/ant-listings, vendor/ant-protocol and vendor/saorsa-core
+    # are members only so their tests run under this lock), so they get their
+    # notices as any dependency does.
     members = set(metadata["workspace_members"])
     if args.package:
         workspace = {package["id"] for package in metadata["packages"]

@@ -40,3 +40,5 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0018: Pointer ownership transfer by final redirection](./ADR-0018-pointer-transfer-by-final-redirection.md)
 - [ADR-0019: Pointer audits serve the record round 1 bound](./ADR-0019-pointer-audits-serve-the-record-round-one-bound.md)
 - [ADR-0022: Remove the LMDB Chunk Store](./ADR-0022-remove-the-lmdb-chunk-store.md)
+- [ADR-0024: Full, not faulty, and the falling erase floor](./ADR-0024-full-not-faulty-and-the-falling-floor.md)
+- [ADR-0025: Records priced by size class](./ADR-0025-records-priced-by-size-class.md)

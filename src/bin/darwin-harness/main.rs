@@ -4,18 +4,20 @@
 //! `darwin-harness upload` joins a devnet from its manifest as a client and
 //! stores records of random bytes as a client does: for each record it asks
 //! the nodes nearest the record's address for quotes, pays the median quote 3
-//! times its price on the devnet's chain, and sends the record with its proof
-//! to every node that quoted. The nodes then pass it on to each other: fresh
-//! offers, paid-list notices, neighbour sync, audits. Some records go to one
-//! storer only, and pointers too, so the rest of the close group gets them by
-//! that storer's offers, with the slim proof. `darwin-harness faults` then
-//! runs the fault cases: repeated PUTs, and, through the faults seam of this
-//! tree's nodes, holding notices lost on the way to one storer, a failed
-//! paid-list write, and retries answered from the payment cache with a proof
-//! the slim builder declines. `darwin-harness check` later reads each record
-//! back from the nodes nearest it, and asks the paid group whether each
-//! member lists it. Each writes what it saw as JSON, for the harness to
-//! compare across runs.
+//! times its price on the devnet's chain (at `--settlement-version 2`, 3 times
+//! its price times the record's weight), and sends the record with its proof
+//! to every node that quoted. A node that answers `StorerUpdateRequired` is
+//! passed over for the next nearest, as a client passes it over. The nodes
+//! then pass it on to each other: fresh offers, paid-list notices, neighbour
+//! sync, audits. Some records go to one storer only, and pointers too, so the
+//! rest of the close group gets them by that storer's offers, with the slim
+//! proof. `darwin-harness faults` then runs the fault cases: repeated PUTs,
+//! and, through the faults seam of this tree's nodes, holding notices lost on
+//! the way to one storer, a failed paid-list write, and retries answered from
+//! the payment cache with a proof the slim builder declines. `darwin-harness
+//! check` later reads each record back from the nodes nearest it, and asks the
+//! paid group whether each member lists it. Each writes what it saw as JSON,
+//! for the harness to compare across runs.
 //!
 //! `darwin-harness browser-node` and `browser-load` measure what browser
 //! sessions cost a node (`scripts/measure_browser_sessions.py`).
@@ -47,6 +49,7 @@ use ant_node::replication::config::{PAID_LIST_CLOSE_GROUP_SIZE, REPLICATION_PROT
 use ant_node::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest,
 };
+use ant_protocol::payment::pricing::{record_weight, weighted_amount};
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use evmlib::common::Amount;
@@ -72,6 +75,22 @@ const LOOKUP_DEADLINE: Duration = Duration::from_secs(120);
 /// The multiple of the median quote's price a client pays.
 const PAYMENT_MULTIPLIER: u64 = 3;
 
+/// The settlement version the harness declares on its quotes unless told
+/// otherwise: 1, as the released client does, which pays every record as a
+/// full chunk. Every node release quotes it, so a mixed network stores each
+/// record as it does today. Not this crate's `CURRENT_SETTLEMENT_VERSION`: a
+/// node older than this tree refuses a version-2 quote with
+/// `StorerUpdateRequired`.
+const SETTLEMENT_VERSION: u32 = 1;
+
+/// What a quote refusal from a node that settles under older rules than the
+/// client's contains (`ProtocolError::StorerUpdateRequired`, as debug text).
+const STORER_UPDATE_REQUIRED: &str = "StorerUpdateRequired";
+/// How many of the nodes nearest a record `check` asks for it: the widest a
+/// key's window grows around nodes marked full (`full::MAX_WIDENED_WIDTH`),
+/// so the analysis can count copies on nodes not full and on stand-ins.
+const WIDEST: usize = ant_node::replication::full::MAX_WIDENED_WIDTH;
+
 /// The client side of the mixed-version harness.
 #[derive(Parser, Debug)]
 #[command(name = "darwin-harness", version)]
@@ -91,6 +110,12 @@ enum Command {
         /// The size of each record in bytes, one record per size.
         #[arg(long, value_delimiter = ',', required = true)]
         sizes: Vec<usize>,
+        /// The settlement version declared on the quotes: 1 pays every
+        /// record as a full chunk, 2 by its size class (3 times the median
+        /// quote's price times the record's weight).
+        #[arg(long, default_value_t = SETTLEMENT_VERSION,
+              value_parser = clap::value_parser!(u32).range(1..=2))]
+        settlement_version: u32,
         /// How many of the records, the first ones, go to one storer only:
         /// the nearest node that quoted.
         #[arg(long, default_value_t = 0)]
@@ -228,7 +253,14 @@ struct Upload {
 struct Uploads {
     /// The client's own peer id, so its traffic can be told from the nodes'.
     client: String,
+    /// The settlement version its quotes declared.
+    #[serde(default = "settlement_version_one")]
+    settlement_version: u32,
     records: Vec<Upload>,
+}
+
+const fn settlement_version_one() -> u32 {
+    SETTLEMENT_VERSION
 }
 
 /// What the nodes that stored a record, and the nodes nearest it now,
@@ -242,6 +274,10 @@ struct Check {
     storers: Vec<String>,
     /// The nodes nearest it now, nearest first.
     close_group: Vec<String>,
+    /// The nodes nearest it now, nearest first, up to [`WIDEST`] of them,
+    /// as many as the lookup found: each is asked too.
+    #[serde(default)]
+    nearest: Vec<String>,
     /// Each of those nodes' answer, once each.
     answers: Vec<Answer>,
     /// How many of the storers returned the record's bytes.
@@ -294,6 +330,7 @@ async fn main() -> Result<()> {
             one_storer,
             pointers,
             not_storers,
+            settlement_version,
             out,
         } => {
             let manifest = read_manifest(&manifest)?;
@@ -306,6 +343,7 @@ async fn main() -> Result<()> {
                 one_storer,
                 pointers,
                 &not_storers,
+                settlement_version,
             )
             .await;
             client.shutdown().await.ok();
@@ -411,6 +449,12 @@ async fn join(manifest: &DevnetManifest) -> Result<P2PNode> {
 /// network lookup, retried until it finds that many. The client itself,
 /// which a lookup can return, is left out: it stores nothing.
 async fn close_group(client: &P2PNode, address: &[u8; 32]) -> Result<Vec<PeerId>> {
+    nearest(client, address, CLOSE_GROUP_SIZE).await
+}
+
+/// Up to `count` nodes nearest `address`, nearest first, and at least
+/// `CLOSE_GROUP_SIZE`, from a network lookup retried until it finds that many.
+async fn nearest(client: &P2PNode, address: &[u8; 32], count: usize) -> Result<Vec<PeerId>> {
     let deadline = Instant::now() + LOOKUP_DEADLINE;
     loop {
         let mut found: Vec<PeerId> = client
@@ -422,8 +466,8 @@ async fn close_group(client: &P2PNode, address: &[u8; 32]) -> Result<Vec<PeerId>
         found.retain(|peer| peer != client.peer_id());
         found.sort_by_key(|peer| xor_distance(address, peer.as_bytes()));
         found.dedup();
-        found.truncate(CLOSE_GROUP_SIZE);
-        if found.len() == CLOSE_GROUP_SIZE {
+        found.truncate(count);
+        if found.len() >= CLOSE_GROUP_SIZE {
             return Ok(found);
         }
         if Instant::now() >= deadline {
@@ -451,6 +495,22 @@ async fn paid_group(client: &P2PNode, address: &[u8; 32]) -> Vec<PeerId> {
     found.sort_by_key(|peer| xor_distance(address, peer.as_bytes()));
     found.dedup();
     found.truncate(PAID_LIST_CLOSE_GROUP_SIZE);
+    found
+}
+
+/// Up to [`WIDEST`] nodes nearest `address`, nearest first, from one
+/// network lookup: as many as it finds, the client left out.
+async fn widest(client: &P2PNode, address: &[u8; 32]) -> Vec<PeerId> {
+    let mut found: Vec<PeerId> = client
+        .dht()
+        .find_closest_nodes(address, WIDEST + 1)
+        .await
+        .map(|nodes| nodes.into_iter().map(|node| node.peer_id).collect())
+        .unwrap_or_default();
+    found.retain(|peer| peer != client.peer_id());
+    found.sort_by_key(|peer| xor_distance(address, peer.as_bytes()));
+    found.dedup();
+    found.truncate(WIDEST);
     found
 }
 
@@ -492,9 +552,11 @@ async fn quote(
     content: [u8; 32],
     size: usize,
     data_type: u32,
+    settlement_version: u32,
 ) -> (PeerId, std::result::Result<Quoted, String>) {
     let mut request = ChunkQuoteRequestV2::new(content, u64::try_from(size).unwrap_or(u64::MAX));
     request.data_type = data_type;
+    request.settlement_version = settlement_version;
     let answer = ask(
         client,
         &peer,
@@ -640,6 +702,7 @@ async fn upload(
     one_storer: usize,
     pointers: usize,
     not_storers: &[PeerId],
+    settlement_version: u32,
 ) -> Result<Uploads> {
     let wallet = wallet_of(manifest)?;
     let mut records = Vec::with_capacity(sizes.len() + pointers);
@@ -660,6 +723,7 @@ async fn upload(
             &content,
             to,
             not_storers,
+            settlement_version,
             &mut record,
         )
         .await
@@ -671,7 +735,15 @@ async fn upload(
     }
     for index in 0..pointers {
         let mut record = new_record([0; 32], POINTER_WIRE_LEN, "pointer", true);
-        if let Err(e) = store_pointer(client, &wallet, not_storers, &mut record).await {
+        if let Err(e) = store_pointer(
+            client,
+            &wallet,
+            not_storers,
+            settlement_version,
+            &mut record,
+        )
+        .await
+        {
             record.error = Some(format!("{e:#}"));
         }
         print_record(index, &record);
@@ -679,6 +751,7 @@ async fn upload(
     }
     Ok(Uploads {
         client: client.peer_id().to_hex(),
+        settlement_version,
         records,
     })
 }
@@ -693,9 +766,11 @@ enum Storers {
     Nearest,
 }
 
-/// Quotes from `group` for `content`, and pays the median one as a client
-/// pays, 3 times its price, noting each step in `record`. Returns the nodes
-/// that quoted, nearest first, and the proof, every quote in it.
+/// Quotes from `group`, the nodes nearest `content` nearest first, and pays
+/// the median quote as a client pays, 3 times its price (at settlement
+/// version 2, times the record's weight too), noting each step in `record`.
+/// Returns the nodes that quoted, nearest first, and the proof, every quote
+/// in it.
 async fn pay(
     client: &P2PNode,
     wallet: &Wallet,
@@ -703,39 +778,58 @@ async fn pay(
     content: [u8; 32],
     size: usize,
     data_type: u32,
+    settlement_version: u32,
     record: &mut Upload,
 ) -> Result<(Vec<PeerId>, Vec<u8>)> {
-    let answers = futures::future::join_all(
-        group
-            .iter()
-            .map(|peer| quote(client, *peer, content, size, data_type)),
-    )
-    .await;
+    // The close group first; each node that settles under older rules than
+    // the quote declares is passed over for the next nearest, as a client
+    // passes it over. At version 1 every node quotes, so only the close group
+    // is asked.
     let mut quoted = Vec::new();
-    for (peer, answer) in answers {
-        record.quotes.push(Answer {
-            peer: peer.to_hex(),
-            outcome: answer
-                .as_ref()
-                .map_or_else(Clone::clone, |_| "quoted".into()),
-        });
-        if let Ok(answer) = answer {
-            quoted.push(answer);
+    let mut asked = 0;
+    let mut wave = CLOSE_GROUP_SIZE;
+    while wave > 0 && asked < group.len() {
+        let end = (asked + wave).min(group.len());
+        let answers = futures::future::join_all(
+            group[asked..end]
+                .iter()
+                .map(|peer| quote(client, *peer, content, size, data_type, settlement_version)),
+        )
+        .await;
+        asked = end;
+        wave = 0;
+        for (peer, answer) in answers {
+            record.quotes.push(Answer {
+                peer: peer.to_hex(),
+                outcome: answer
+                    .as_ref()
+                    .map_or_else(Clone::clone, |_| "quoted".into()),
+            });
+            match answer {
+                Ok(answer) => quoted.push(answer),
+                Err(reason) if reason.contains(STORER_UPDATE_REQUIRED) => wave += 1,
+                Err(_) => {}
+            }
         }
     }
     if quoted.len() < CLOSE_GROUP_MAJORITY {
-        return Err(eyre!("only {} of the close group quoted", quoted.len()));
+        return Err(eyre!("only {} of the nodes asked quoted", quoted.len()));
     }
     let nearest_first: Vec<PeerId> = quoted.iter().map(|quoted| quoted.peer).collect();
 
-    // Paid as a client pays: the median quote, 3 times its price.
+    // Paid as a client pays: the median quote, 3 times its price, and at
+    // version 2 times the record's weight too.
     quoted.sort_by_key(|quoted| quoted.quote.price);
     let median = &quoted[quoted.len() / 2];
-    let amount = median
-        .quote
-        .price
-        .checked_mul(Amount::from(PAYMENT_MULTIPLIER))
-        .ok_or_else(|| eyre!("the payment overflows"))?;
+    let amount = if settlement_version >= 2 {
+        weighted_amount(median.quote.price, record_weight(data_type, size))
+    } else {
+        median
+            .quote
+            .price
+            .checked_mul(Amount::from(PAYMENT_MULTIPLIER))
+    }
+    .ok_or_else(|| eyre!("the payment overflows"))?;
     let (paid, _gas) = wallet
         .pay_for_quotes(vec![(
             median.quote.hash(),
@@ -775,10 +869,17 @@ async fn pay(
 }
 
 /// Notes the close group and the paid group of `address` in `record`, and
-/// returns the close group.
+/// returns the nodes a quote may be asked of: up to twice the close group,
+/// nearest first, the close group at least, so that a node that settles under
+/// older rules than the quote declares can be passed over for the next
+/// nearest.
 async fn groups(client: &P2PNode, address: &[u8; 32], record: &mut Upload) -> Result<Vec<PeerId>> {
-    let group = close_group(client, address).await?;
-    record.close_group = group.iter().map(PeerId::to_hex).collect();
+    let group = nearest(client, address, CLOSE_GROUP_SIZE * 2).await?;
+    record.close_group = group
+        .iter()
+        .take(CLOSE_GROUP_SIZE)
+        .map(PeerId::to_hex)
+        .collect();
     record.paid_group = paid_group(client, address)
         .await
         .iter()
@@ -795,6 +896,7 @@ async fn store(
     content: &[u8],
     to: Storers,
     not_storers: &[PeerId],
+    settlement_version: u32,
     record: &mut Upload,
 ) -> Result<()> {
     let group = groups(client, &address, record).await?;
@@ -805,6 +907,7 @@ async fn store(
         address,
         content.len(),
         DATA_TYPE_CHUNK,
+        settlement_version,
         record,
     )
     .await?;
@@ -856,6 +959,7 @@ async fn store_pointer(
     client: &P2PNode,
     wallet: &Wallet,
     not_storers: &[PeerId],
+    settlement_version: u32,
     record: &mut Upload,
 ) -> Result<()> {
     let (pk, sk) = ml_dsa_65()
@@ -881,6 +985,7 @@ async fn store_pointer(
         pointer.state_id(),
         POINTER_WIRE_LEN,
         DATA_TYPE_POINTER,
+        settlement_version,
         record,
     )
     .await?;
@@ -1007,7 +1112,11 @@ async fn faults(
     {
         let (address, content, mut record) = fresh_chunk(4096);
         let group = groups(client, &address, &mut record).await?;
-        if let Some(deaf) = group.iter().find(|peer| new_peers.contains(peer)) {
+        if let Some(deaf) = group
+            .iter()
+            .take(CLOSE_GROUP_SIZE)
+            .find(|peer| new_peers.contains(peer))
+        {
             add_fault(faults_file, "drop-holding-to", deaf.as_bytes())?;
             let (quoted, proof) = pay(
                 client,
@@ -1016,6 +1125,7 @@ async fn faults(
                 address,
                 content.len(),
                 DATA_TYPE_CHUNK,
+                SETTLEMENT_VERSION,
                 &mut record,
             )
             .await?;
@@ -1048,6 +1158,7 @@ async fn faults(
             address,
             content.len(),
             DATA_TYPE_CHUNK,
+            SETTLEMENT_VERSION,
             &mut record,
         )
         .await?;
@@ -1074,7 +1185,12 @@ async fn faults(
     for (name, bad) in cache_retry_proofs() {
         let (address, content, mut record) = fresh_chunk(4096);
         let group = groups(client, &address, &mut record).await?;
-        let Some(storer) = group.iter().find(|peer| new_peers.contains(peer)).copied() else {
+        let Some(storer) = group
+            .iter()
+            .take(CLOSE_GROUP_SIZE)
+            .find(|peer| new_peers.contains(peer))
+            .copied()
+        else {
             continue;
         };
         add_fault(faults_file, "fail-store", &address)?;
@@ -1085,6 +1201,7 @@ async fn faults(
             address,
             content.len(),
             DATA_TYPE_CHUNK,
+            SETTLEMENT_VERSION,
             &mut record,
         )
         .await?;
@@ -1305,8 +1422,13 @@ async fn check(client: &P2PNode, uploads: &Uploads) -> Result<Checks> {
                 .collect::<Result<Vec<_>>>()?
         };
         let group = close_group(client, &address).await?;
+        let nearest = widest(client, &address).await;
         let mut asked = storers.clone();
-        asked.extend(group.iter().filter(|peer| !storers.contains(peer)));
+        for peer in group.iter().chain(&nearest) {
+            if !asked.contains(peer) {
+                asked.push(*peer);
+            }
+        }
         let answers =
             futures::future::join_all(asked.iter().map(|peer| read_back(client, peer, upload)))
                 .await;
@@ -1349,6 +1471,7 @@ async fn check(client: &P2PNode, uploads: &Uploads) -> Result<Checks> {
             kind: upload.kind.clone(),
             storers: storers.iter().map(PeerId::to_hex).collect(),
             close_group: group.iter().map(PeerId::to_hex).collect(),
+            nearest: nearest.iter().map(PeerId::to_hex).collect(),
             answers,
             held_by_storers,
             held_by_close_group,

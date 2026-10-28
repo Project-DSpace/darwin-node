@@ -253,6 +253,88 @@ fn the_image_scripts_run_darwin_nodes_and_never_ant() {
     );
 }
 
+/// The "Node full:" lines `nodes status` reads, and the at-start line, are
+/// logged under the target the log writer keeps first at the full line
+/// (`log_files::KEEP_FIRST_TARGETS`): a node enters "full" only at the line,
+/// where other INFO lines are dropped.
+#[test]
+fn the_full_lines_nodes_status_reads_are_kept_at_the_full_line() {
+    const TARGET: &str = "ant_node::replication::full_state";
+    assert!(ant_node::log_files::KEEP_FIRST_TARGETS.contains(&TARGET));
+    let full_rs = repo_text("src/replication/full.rs");
+    let mut lines = 0;
+    for call in full_rs.split("crate::logging::info!(").skip(1) {
+        let call = call.split(");").next().unwrap_or_default();
+        if call.contains("\"Node full: ") || call.contains("at start: the node takes no new data") {
+            lines += 1;
+            assert!(
+                call.contains(&format!("target: \"{TARGET}\"")),
+                "a \"Node full:\" line is logged under another target: {call}"
+            );
+        }
+    }
+    // Since, no longer, not at start, and at the line at start.
+    assert_eq!(
+        lines, 4,
+        "the full lines in src/replication/full.rs changed"
+    );
+}
+
+/// `nodes status` lists a node as full from the last "Node full:" line in
+/// its logs, so a node that restarts with room, and logs that it isn't full
+/// at start, is no longer listed; one whose last line is still "since" is.
+#[cfg(unix)]
+#[test]
+fn a_full_node_restarted_with_room_is_not_listed_by_nodes_status() {
+    let script = repo_text("docker/nodes");
+    let start = script
+        .find("last_full_line() {")
+        .expect("docker/nodes defines last_full_line");
+    let end = script
+        .find("if [[ $# -eq 1 && $1 == status ]]")
+        .expect("docker/nodes runs status");
+    let functions = &script[start..end];
+    // The line the node logs at start with room, as the node writes it.
+    let full_rs = repo_text("src/replication/full.rs");
+    assert!(
+        full_rs.contains("\"Node full: not at start; {} bytes free"),
+        "the node's start line changed; keep it a \"Node full:\" line that isn't \"since\""
+    );
+    let since = "INFO Node full: since 1700000000, at the full line by bytes with nothing it \
+                 may erase now.";
+    let at_start = "INFO Node full: not at start; 5000000000 bytes free, above the full line, \
+                    so it prices and takes new data";
+    let logs = tempfile::tempdir().unwrap();
+    let write = |node: &str, file: &str, lines: &[&str]| {
+        let dir = logs.path().join(node).join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), lines.join("\n") + "\n").unwrap();
+    };
+    // Restarted with room: the start line is in a newer file than "since".
+    write("node-1", "darwin.log.1", &[since]);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write("node-1", "darwin.log", &["INFO Node started", at_start]);
+    // Still full: its last "Node full:" line is "since".
+    write("node-2", "darwin.log", &[since]);
+    let code = format!(
+        "set -euo pipefail\nLOGS='{}'\n{functions}\nfull_nodes\n",
+        logs.path().display()
+    );
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&code)
+        .output()
+        .expect("run bash");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed = String::from_utf8(out.stdout).unwrap();
+    assert!(!listed.contains("node-1:"), "{listed}");
+    assert!(listed.contains("node-2: full since"), "{listed}");
+}
+
 /// darwin-nodes keeps its registry in `$XDG_DATA_HOME/ant`, as `ant` 0.3.9
 /// did (darwin-client's tests pin that), so with the image's `XDG_DATA_HOME`
 /// the registry the image before wrote is read where it is.

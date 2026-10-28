@@ -36,13 +36,18 @@ pub const DATA_TYPE_CHUNK: u32 = 0;
 /// conflating them is what made this constant necessary.
 ///
 /// Version 1 is the ADR-0008 rule set: a merkle batch settles at
-/// `3 x median16(price) x 2^depth`, matching the single-node path.
+/// `3 x median16(price) x 2^depth`, matching the single-node path. Version 2
+/// pays a single-node record by its size class: `3 x median(price) x w`, with
+/// `w` the weight of the class (`payment::pricing::weighted_amount`), and its
+/// quotes are priced at the node's weight total.
 ///
 /// **Bump this whenever a change makes an older client pay an amount storers
-/// will refuse.** The multiplier moving, the median rule changing, the payable
-/// field being redefined: all of those. A change that only alters *how much* a
-/// node quotes does not qualify, because the client pays whatever it is
-/// quoted; a change to the arithmetic *applied* to that quote does.
+/// will refuse, or quotes an older client a price it will refuse.** The
+/// multiplier moving, the median rule changing, the payable field being
+/// redefined, the weight applied to the quote: all of those. A change to how
+/// much a node quotes can qualify too, because a client checks each quote's
+/// price against the curve before it pays, so a price outside what an older
+/// client accepts goes only to clients that declare the newer version.
 ///
 /// # Why this exists
 ///
@@ -54,16 +59,16 @@ pub const DATA_TYPE_CHUNK: u32 = 0;
 ///
 /// Carrying the version in the quote request lets a storer refuse to quote a
 /// client it knows cannot pay correctly, before that client spends anything.
-pub const CURRENT_SETTLEMENT_VERSION: u32 = 1;
+pub const CURRENT_SETTLEMENT_VERSION: u32 = 2;
 
 /// Oldest settlement version this build will issue a quote for.
 ///
 /// Kept as a separate constant from [`CURRENT_SETTLEMENT_VERSION`] so a
 /// settlement change can ship without immediately locking out the previous
 /// client generation: raise `CURRENT` first, let clients adopt, raise `MIN`
-/// once the payment rule actually changes. They are equal today because
-/// version 1 is the first versioned rule set, so there is no earlier one to
-/// keep serving.
+/// once the payment rule actually changes. Version 2 pays a record by its
+/// size class; version 1 pays every record as a full chunk, which a version-2
+/// storer still accepts, so the minimum stays 1.
 pub const MIN_SUPPORTED_SETTLEMENT_VERSION: u32 = 1;
 
 /// Whether a storer on this build can promise to accept what a client

@@ -27,7 +27,12 @@ async fn check(
     context: VerificationContext,
 ) -> Result<PaymentStatus> {
     verifier
-        .verify_payment(&bundle.address, Some(&bundle.proof(tx_hashes)), context)
+        .verify_payment(
+            &bundle.address,
+            Held::Bytes(ant_protocol::chunk::MAX_CHUNK_SIZE),
+            Some(&bundle.proof(tx_hashes)),
+            context,
+        )
         .await
 }
 

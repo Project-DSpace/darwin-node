@@ -1,12 +1,18 @@
 //! The bytes of every message one node sends another, as v0.23.0+ds.15 writes
-//! and reads them, and the variants of each that it knows.
+//! and reads them, and the variants of each that it knows; and of the messages
+//! appended since, which go only to peers known to read them: paged neighbour
+//! sync's page request and its answer, and the one-way "full" notice a full
+//! node sends.
 //!
 //! A release that changes messages between nodes keeps the rule in the
 //! README's "Messages between nodes": a new message type is appended to
 //! `ReplicationMessageBody` and goes only to peers known to read it; no field
-//! is added to an existing message; no variant is added to a reply older
-//! nodes receive. An older node can't decode what breaks that rule, and an
-//! auditor that can't decode a reply fails every key it challenged.
+//! is added to an existing message, except one appended at the very end of a
+//! reply and read so that a reply without it decodes as before
+//! (`VerificationResponse::paid_classes`, pinned both ways below); no variant
+//! is added to a reply older nodes receive. An older node can't decode what
+//! breaks that rule, and an auditor that can't decode a reply fails every key
+//! it challenged.
 //!
 //! Each sample below is pinned to its bytes. A change to an existing message
 //! fails here, and so does a variant added to a message or to one of its
@@ -34,13 +40,13 @@
 use ant_node::replication::commitment::StorageCommitment;
 use ant_node::replication::protocol::{
     AuditChallenge, AuditResponse, FetchRequest, FetchResponse, FreshReplicationOffer,
-    FreshReplicationResponse, GetCommitmentByPin, GetCommitmentByPinResponse,
-    KeyVerificationResult, NeighborSyncRequest, NeighborSyncResponse, PaidNotify,
-    PointerFetchRequest, PointerFetchResponse, PointerFreshOffer, PointerHints,
-    PointerStateRequest, PointerStateResponse, PointerStateSummary, RejectKind, ReplicationMessage,
-    ReplicationMessageBody, SubtreeAuditChallenge, SubtreeAuditResponse, SubtreeSliceChallenge,
-    SubtreeSliceItem, SubtreeSliceOpening, SubtreeSliceResponse, VerificationRequest,
-    VerificationResponse,
+    FreshReplicationResponse, FullNotice, GetCommitmentByPin, GetCommitmentByPinResponse,
+    KeyVerificationResult, NeighborSyncPageRequest, NeighborSyncPageResponse, NeighborSyncRequest,
+    NeighborSyncResponse, PaidNotify, PointerFetchRequest, PointerFetchResponse, PointerFreshOffer,
+    PointerHints, PointerStateRequest, PointerStateResponse, PointerStateSummary, RejectKind,
+    ReplicationMessage, ReplicationMessageBody, SubtreeAuditChallenge, SubtreeAuditResponse,
+    SubtreeSliceChallenge, SubtreeSliceItem, SubtreeSliceOpening, SubtreeSliceResponse,
+    VerificationRequest, VerificationResponse,
 };
 use ant_node::replication::subtree::{SubtreeLeaf, SubtreeProof};
 use std::fmt::Write as _;
@@ -84,6 +90,7 @@ fn pointer_summary(byte: u8) -> PointerStateSummary {
 /// The name of a sample: its message, and the variant of a reply or a reply's
 /// part. The match is exhaustive, so a variant added to any of them doesn't
 /// compile until it is named here, and given a sample and bytes below.
+#[allow(clippy::too_many_lines)]
 fn name(body: &ReplicationMessageBody) -> String {
     use ReplicationMessageBody as B;
     let kind = |kind: &RejectKind| match kind {
@@ -176,6 +183,25 @@ fn name(body: &ReplicationMessageBody) -> String {
         ),
         B::PointerStateRequest(_) => "PointerStateRequest".into(),
         B::PointerStateResponse(_) => "PointerStateResponse".into(),
+        B::NeighborSyncPageRequest(request) => format!(
+            "NeighborSyncPageRequest, commitment {}",
+            if request.commitment.is_some() {
+                "Some"
+            } else {
+                "None"
+            }
+        ),
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Page { commitment, .. }) => {
+            format!(
+                "NeighborSyncPageResponse::Page, commitment {}",
+                if commitment.is_some() { "Some" } else { "None" }
+            )
+        }
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy { .. }) => {
+            "NeighborSyncPageResponse::Busy".into()
+        }
+        B::FullNotice(FullNotice { full: true }) => "FullNotice, full".into(),
+        B::FullNotice(FullNotice { full: false }) => "FullNotice, no longer full".into(),
     }
 }
 
@@ -261,6 +287,7 @@ fn samples() -> Vec<ReplicationMessageBody> {
                     paid: Some(false),
                 },
             ],
+            paid_classes: vec![0, 22, 0],
         }),
         B::FetchRequest(FetchRequest { key: key(0x10) }),
         B::FetchResponse(FetchResponse::Success {
@@ -367,6 +394,48 @@ fn samples() -> Vec<ReplicationMessageBody> {
         B::PointerStateResponse(PointerStateResponse {
             states: vec![Some(pointer_summary(0x2F)), None],
         }),
+        B::NeighborSyncPageRequest(NeighborSyncPageRequest {
+            cycle: 0x0102_0304_0506_0708,
+            page: 0,
+            pages: 3,
+            replica_hints: vec![key(0x32)],
+            paid_hints: vec![key(0x33)],
+            bootstrapping: true,
+            commitment: Some(commitment()),
+        }),
+        B::NeighborSyncPageRequest(NeighborSyncPageRequest {
+            cycle: 0x0102_0304_0506_0708,
+            page: 2,
+            pages: 3,
+            replica_hints: vec![],
+            paid_hints: vec![key(0x34), key(0x35)],
+            bootstrapping: false,
+            commitment: None,
+        }),
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Page {
+            cycle: 0x0102_0304_0506_0708,
+            page: 0,
+            pages: 300,
+            replica_hints: vec![key(0x36), key(0x37)],
+            paid_hints: vec![],
+            bootstrapping: false,
+            commitment: Some(commitment()),
+        }),
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Page {
+            cycle: 0x0102_0304_0506_0708,
+            page: 299,
+            pages: 300,
+            replica_hints: vec![],
+            paid_hints: vec![key(0x38)],
+            bootstrapping: true,
+            commitment: None,
+        }),
+        B::NeighborSyncPageResponse(NeighborSyncPageResponse::Busy {
+            cycle: 0x0102_0304_0506_0708,
+            page: 1,
+        }),
+        B::FullNotice(FullNotice { full: true }),
+        B::FullNotice(FullNotice { full: false }),
     ]
 }
 
@@ -410,7 +479,7 @@ const PINNED: &[(&str, &str)] = &[
     ),
     (
         "VerificationResponse",
-        "b42406030d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d01000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0001010f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f000100",
+        "b42406030d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d01000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0001010f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f00010003001600",
     ),
     (
         "FetchRequest",
@@ -532,7 +601,58 @@ const PINNED: &[(&str, &str)] = &[
         "PointerStateResponse",
         "b4241602012f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f3030303030303030303030303030303030303030303030303030303030303030ac0201313131313131313131313131313131313131313131313131313131313131313100",
     ),
+    (
+        "NeighborSyncPageRequest, commitment Some",
+        "b42417888e98a8c0e080810100030132323232323232323232323232323232323232323232323232323232323232320133333333333333333333333333333333333333333333333333333333333333330101c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c103c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c202c3c403c5c6c7",
+    ),
+    (
+        "NeighborSyncPageRequest, commitment None",
+        "b42417888e98a8c0e080810102030002343434343434343434343434343434343434343434343434343434343434343435353535353535353535353535353535353535353535353535353535353535350000",
+    ),
+    (
+        "NeighborSyncPageResponse::Page, commitment Some",
+        "b4241800888e98a8c0e080810100ac020236363636363636363636363636363636363636363636363636363636363636363737373737373737373737373737373737373737373737373737373737373737000001c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c103c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c202c3c403c5c6c7",
+    ),
+    (
+        "NeighborSyncPageResponse::Page, commitment None",
+        "b4241800888e98a8c0e0808101ab02ac02000138383838383838383838383838383838383838383838383838383838383838380100",
+    ),
+    (
+        "NeighborSyncPageResponse::Busy",
+        "b4241801888e98a8c0e080810101",
+    ),
+    // Appended since ds.15, whose message enum ends at index 22, and sent only
+    // to peers known to read them; ds.15 drops the notice (`a_node_before_the_full_notice_reads_every_earlier_body_and_drops_the_notice`
+    // in src/replication/protocol.rs).
+    // Its index byte is FULL_NOTICE_INDEX (checked below): 25, after
+    // the page messages (23, 24).
+    ("FullNotice, full", "b4241901"),
+    ("FullNotice, no longer full", "b4241900"),
 ];
+
+/// The notice's pinned bytes carry the index the protocol gives it, so a
+/// change that moves it re-pins them here.
+#[test]
+fn the_full_notice_pins_carry_its_index() {
+    use ant_node::replication::protocol::FULL_NOTICE_INDEX;
+    // After the page messages, 23 and 24 (ADR-0024).
+    assert_eq!(FULL_NOTICE_INDEX, 25);
+    for (name, flag) in [
+        ("FullNotice, full", "01"),
+        ("FullNotice, no longer full", "00"),
+    ] {
+        let pinned = PINNED
+            .iter()
+            .find(|(pinned, _)| *pinned == name)
+            .map(|(_, bytes)| *bytes)
+            .unwrap();
+        assert_eq!(
+            pinned,
+            format!("b424{FULL_NOTICE_INDEX:02x}{flag}"),
+            "{name}"
+        );
+    }
+}
 
 fn encode(body: ReplicationMessageBody) -> Vec<u8> {
     ReplicationMessage {
@@ -628,7 +748,8 @@ fn the_variants_are_the_pinned_ones() {
     let challenge = varint(9);
     // (what, the bytes up to the variant index, how many variants it has)
     let cases: Vec<(&str, Vec<u8>, u8)> = vec![
-        ("ReplicationMessageBody", frame(&[]), 23),
+        // 23 variants up to ds.15, then paged sync's two, then the "full" notice.
+        ("ReplicationMessageBody", frame(&[]), 26),
         ("FreshReplicationResponse", frame(&[&[1]]), 2),
         ("FetchResponse", frame(&[&[8]]), 3),
         ("AuditResponse", frame(&[&[10]]), 3),
@@ -650,6 +771,7 @@ fn the_variants_are_the_pinned_ones() {
             3,
         ),
         ("GetCommitmentByPinResponse", frame(&[&[16]]), 2),
+        ("NeighborSyncPageResponse", frame(&[&[24]]), 2),
     ];
     for (what, prefix, count) in cases {
         let with = |index: u8| {
@@ -718,4 +840,74 @@ fn a_holding_notice_is_a_paid_notify_ds15_reads() {
         let decoded = ReplicationMessage::decode(&encode(body.clone())).unwrap();
         assert_eq!(name(&decoded.body), name(&body));
     }
+}
+
+/// The verification reply as ds.15 writes it: the pinned sample's bytes up to
+/// the classes appended after its results.
+const DS15_VERIFICATION_RESPONSE: &str = "b42406030d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d01000e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0001010f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f000100";
+
+/// The classes appended to a verification reply are read both ways. ds.15's
+/// decoder, which knows only the results, reads this tree's reply and stops
+/// before the classes; this tree reads ds.15's reply, which ends before them,
+/// with no classes, so every confirmation in it reads as the full class.
+#[test]
+fn the_classes_appended_to_a_verification_reply_are_read_both_ways() {
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Ds15KeyVerificationResult {
+        key: [u8; 32],
+        present: bool,
+        paid: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    struct Ds15VerificationResponse {
+        results: Vec<Ds15KeyVerificationResult>,
+    }
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    enum Ds15Body {
+        NeighborSyncRequest(()),
+        NeighborSyncResponse(()),
+        FreshReplicationOffer(()),
+        FreshReplicationResponse(()),
+        PaidNotify(()),
+        VerificationRequest(()),
+        VerificationResponse(Ds15VerificationResponse),
+    }
+    #[derive(Deserialize)]
+    struct Ds15Message {
+        request_id: u64,
+        body: Ds15Body,
+    }
+
+    let sample = samples()
+        .into_iter()
+        .find(|body| name(body) == "VerificationResponse")
+        .unwrap();
+    let ReplicationMessageBody::VerificationResponse(written) = &sample else {
+        unreachable!()
+    };
+    let new_bytes = encode(sample.clone());
+    let old_bytes = hex::decode(DS15_VERIFICATION_RESPONSE).unwrap();
+    assert!(new_bytes.starts_with(&old_bytes));
+
+    let read: Ds15Message = postcard::from_bytes(&new_bytes).expect("ds.15 reads the new reply");
+    assert_eq!(read.request_id, REQUEST_ID);
+    let Ds15Body::VerificationResponse(read) = read.body else {
+        panic!("ds.15 read another message")
+    };
+    assert_eq!(read.results.len(), written.results.len());
+    for (read, written) in read.results.iter().zip(&written.results) {
+        assert_eq!(
+            (read.key, read.present, read.paid),
+            (written.key, written.present, written.paid)
+        );
+    }
+
+    let decoded = ReplicationMessage::decode(&old_bytes).expect("this tree reads ds.15's reply");
+    let ReplicationMessageBody::VerificationResponse(decoded) = decoded.body else {
+        panic!("ds.15's reply read as another message")
+    };
+    assert_eq!(decoded.results.len(), written.results.len());
+    assert!(decoded.paid_classes.is_empty());
 }

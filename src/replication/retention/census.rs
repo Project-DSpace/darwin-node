@@ -36,7 +36,8 @@
 //!
 //! The same reading of the source pins other calls to reviewed sites, each in
 //! a test of its own: the disk-pressure state's builders, the routing loop's
-//! event reader, the lanes that penalise an unheld close-group chunk, upstream's
+//! event reader, the lanes that penalise an unheld close-group chunk and the
+//! one exemption a full peer gets from it, upstream's
 //! merkle payment code (compiled, never reached), and the payment vault reads
 //! and RPC addresses behind the payment check's fallback. A last test reads
 //! the vendored protocol's wire messages and payment proof types, and the
@@ -348,9 +349,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "PointerReplication::erase_if_proven",
         "delete",
         1,
-        "Erases a pointer only under disk pressure, beyond the erase floor, farthest \
-         first, after all but one of its current close group prove they hold it and the \
-         re-check just before deleting passes.",
+        "Erases a pointer only under disk pressure, beyond the falling floor (down to the \
+         edge of the node's range, never inside the widened retention width), farthest \
+         first, in two phases (selected and named in no hint for a whole sync cycle, then \
+         tried; released and hinted again if the check fails), after 6 of the 7 nearest \
+         peers not marked full prove they hold it (a full holder's proof counting, and 6 \
+         still needed when the cap of 20 cuts the group short), never while this node \
+         answered present for it to a state or fetch request within the fetch window, \
+         and only when the re-check just before deleting passes.",
     ),
     site(
         "src/replication/possession.rs",
@@ -376,9 +382,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "erase_if_still_eligible",
         "erase_stored_record",
         1,
-        "Erases a chunk only under disk pressure, beyond the erase floor, farthest first, \
-         after all but one of its current close group prove possession and the re-check \
-         just before deleting passes.",
+        "Erases a chunk only under disk pressure, beyond the falling floor (down to the \
+         edge of the node's range, never inside the widened retention width), farthest \
+         first, in two phases (selected and named in no hint for a whole sync cycle, then \
+         tried; released and hinted again if the check fails), after 6 of the 7 nearest \
+         peers not marked full prove possession (a full holder's proof counting, and 6 \
+         still needed when the cap of 20 cuts the group short), never while this node \
+         answered present for it within the fetch window, and only when the re-check just \
+         before deleting passes.",
     ),
     site(
         "src/replication/pruning.rs",
@@ -1616,8 +1627,9 @@ fn every_call_that_can_remove_stored_data_is_reviewed() {
         "\nThe calls in src/ that can remove stored data no longer match the reviewed list.\n\n\
          {report}\n\
          A node keeps every record and pointer it holds while its disk has room. The prune \
-         passes erase one only under disk pressure, beyond the erase floor, farthest first, \
-         and only after the nodes now nearest to it prove they hold it \
+         passes erase one only under disk pressure, beyond the falling floor (never inside \
+         the node's widened retention width), farthest first, in two phases, and only after \
+         6 of the 7 nodes now nearest to it and not marked full prove they hold it \
          (src/replication/retention.rs). Every other call that can remove stored data is \
          listed, with the reason it is there, in ERASE_SITES in \
          src/replication/retention/census.rs.\n\n\
@@ -1739,11 +1751,14 @@ fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
 /// every lane that finds it out, as in upstream v0.23.0: the responsible-chunk
 /// audit, the possession check after a fresh write, the prune audit, a
 /// sole-source replica hint its sender then denies, and a fetch a verified
-/// source can't serve. Nothing can withhold it: the release switch, its
-/// environment override and the helper the lanes went through while nodes
-/// moved off the LMDB chunk store are gone, and stay gone. Each lane charges
-/// the peer's trust itself, and the functions holding the lanes keep the
-/// reviewed number of trust charges.
+/// source can't serve; and a peer that doesn't hold a pointer it was offered,
+/// on the pointer possession check after a write (charged through
+/// `PointerReplication::penalise`). Nothing can withhold it but one bounded waiver for
+/// a full peer (the next test): the release switch, its environment override
+/// and the helper the lanes went through while nodes moved off the LMDB chunk
+/// store are gone, and stay gone. Each lane charges the peer's trust itself,
+/// and the functions holding the lanes keep the reviewed number of trust
+/// charges.
 #[test]
 fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
     const SWITCH: &[(Option<&str>, &str)] = &[
@@ -1812,12 +1827,25 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
             1,
         ),
     ];
-    let found = census_counting(
+    // The pointer possession check after a write charges through the pointer
+    // service's own `penalise`, which calls report_trust_event once.
+    const POINTER_CHARGE: &[(Option<&str>, &str)] = &[(None, "penalise")];
+    const POINTER_LANES: &[Reviewed] = &[(
+        "src/replication/pointer.rs",
+        "PointerReplication::check_possession",
+        "penalise",
+        1,
+    )];
+    let mut found = census_counting(
         Path::new(env!("CARGO_MANIFEST_DIR")),
         Counting::Calls(CHARGE),
     );
+    found.extend(census_counting(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Counting::Calls(POINTER_CHARGE),
+    ));
     let mut lanes = String::new();
-    for (file, site, call, count) in LANES {
+    for (file, site, call, count) in LANES.iter().chain(POINTER_LANES) {
         let key = (
             (*file).to_string(),
             (*site).to_string(),
@@ -1838,9 +1866,265 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
         lanes.is_empty(),
         "\nThe lanes that penalise a peer for an unheld close-group chunk no longer charge \
          its trust as reviewed.\n\n{lanes}\n\
-         Each of these functions charges the peer itself with report_trust_event. If a \
-         charge moved, follow it and list where it went; if one is gone, find out why \
+         Each of these functions charges the peer itself with report_trust_event, or for \
+         the pointer lane with PointerReplication::penalise. If a charge moved, follow it and list where it went; if one is gone, find out why \
          before changing the count.\n"
+    );
+}
+
+/// No penalty spares a peer by the release it advertises (ADR-0025). A node
+/// before settlement version 2 can't verify a payment by size, so it refuses
+/// the fresh offers and drops the notices of a record paid that way, and the
+/// possession check and the audits then charge it for the record it doesn't
+/// hold, as any peer. The rollout answers that, not an exemption: clients pay
+/// by size only once the node census shows no storer before release 2. A
+/// release is the peer's own claim, so sparing peers by it would let any node
+/// escape the penalty for every record paid by size. Production code reads a
+/// peer's user agent only to choose what to send it: whether to page
+/// neighbour sync to it, whether its single answers are windowed, and whether
+/// to tell it this node is full. None of those charges or spares a penalty; a
+/// new reading is reviewed here first.
+#[test]
+fn no_penalty_spares_a_peer_by_the_release_it_advertises() {
+    const RELEASE: &[(Option<&str>, &str)] = &[(None, "peer_user_agent")];
+    const MESSAGE_FORM: &[Reviewed] = &[
+        // Whether to tell a peer this node is full.
+        (
+            "src/replication/full.rs",
+            "send_full_notice",
+            "peer_user_agent",
+            1,
+        ),
+        // Whether a requester reads a busy answer to a single request.
+        (
+            "src/replication/mod.rs",
+            "peer_reads_sync_pages",
+            "peer_user_agent",
+            1,
+        ),
+        // Whether to page an exchange with a peer.
+        (
+            "src/replication/neighbor_sync.rs",
+            "sync_form_for",
+            "peer_user_agent",
+            1,
+        ),
+        // Whether a responder windows its single answers.
+        (
+            "src/replication/neighbor_sync.rs",
+            "agent_reads_pages_now",
+            "peer_user_agent",
+            1,
+        ),
+    ];
+    let found = unreviewed(Counting::Mentions(RELEASE), MESSAGE_FORM);
+    assert!(
+        found.is_empty(),
+        "\nProduction code reads a peer's user agent at a site not reviewed.\n\n{found}\n\
+         A penalty is never spared by the release a peer advertises: the switch to paying \
+         by size waits until no storer before release 2 is left (ADR-0025). If this reading \
+         serves something else, review it and list it here.\n"
+    );
+}
+
+/// Full, not faulty: the one exemption from the unheld-chunk penalty.
+///
+/// A full peer (its own "full" notice fresh) that answered it lacks a key it
+/// was never seen proving, in a check not pinned to its commitment and, after a
+/// write, with its own quote not among the paid ones, is not charged. Every
+/// lane asks one function, `FullView::waives_unheld_penalty`
+/// (`src/replication/full.rs`), at one reviewed site, and names its own lane
+/// there. No other call can withhold the penalty: there is no switch and no
+/// environment override (the switch's names are pinned away in the test
+/// above, and in `tests/fork_pins.rs`).
+///
+/// The possession check after a write that goes unanswered asks nothing: a
+/// full node keeps answering, so only an answer that the key is absent is ever
+/// waived.
+#[test]
+fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
+    const WAIVER: &[(Option<&str>, &str)] = &[(None, "waives_unheld_penalty")];
+    const SITES: &[Reviewed] = &[
+        // A fetch a verified source answered NotFound.
+        (
+            "src/replication/mod.rs",
+            "execute_single_fetch",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A responsible-chunk audit failed only by absent keys, each asked.
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A sole-source replica hint its sender then denied.
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // The possession check after a write, answered with the absent digest.
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A prune audit answered with the absent digest.
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // The pointer possession check after a write, answered with no state
+        // of the pointer at all.
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "waives_unheld_penalty",
+            1,
+        ),
+    ];
+    // The lanes of `full::Lane` by name, not `Lane::*`: the payment reads'
+    // own `Lane` (`Lane::Put`, `Lane::Background`, node-1a's settlement
+    // reads) shares the type's last name, and isn't a lane of this penalty.
+    // The list is checked against the variants `full::Lane` declares, read
+    // from its source, and against `full::Lane::ALL`, so a new variant fails
+    // here until it is listed (the wildcard `Lane::*` did that before).
+    const LANES: &[(Option<&str>, &str)] = &[
+        (Some("Lane"), "Fetch"),
+        (Some("Lane"), "ResponsibleAudit"),
+        (Some("Lane"), "ReplicaHint"),
+        (Some("Lane"), "PossessionNoAnswer"),
+        (Some("Lane"), "PossessionFailed"),
+        (Some("Lane"), "PruneAudit"),
+        (Some("Lane"), "PointerPossession"),
+    ];
+    let every_lane: Vec<String> = crate::replication::full::Lane::ALL
+        .iter()
+        .map(|lane| format!("{lane:?}"))
+        .collect();
+    let listed: Vec<String> = LANES.iter().map(|(_, name)| (*name).to_string()).collect();
+    assert_eq!(
+        listed, every_lane,
+        "the census names every lane of full::Lane, and only those"
+    );
+    let full_rs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/replication/full.rs"),
+    )
+    .expect("read src/replication/full.rs");
+    assert_eq!(
+        listed,
+        enum_variants(&full_rs, "Lane"),
+        "full::Lane declares a lane the census and full::Lane::ALL don't list"
+    );
+    const NAMED: &[Reviewed] = &[
+        (
+            "src/replication/mod.rs",
+            "execute_single_fetch",
+            "Lane::Fetch",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "Lane::ResponsibleAudit",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "Lane::ReplicaHint",
+            1,
+        ),
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "Lane::PossessionFailed",
+            1,
+        ),
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "Lane::PruneAudit",
+            1,
+        ),
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "Lane::PointerPossession",
+            1,
+        ),
+    ];
+    let sites = unreviewed(Counting::Calls(WAIVER), SITES);
+    assert!(
+        sites.is_empty(),
+        "\nThe unheld-chunk penalty is waived somewhere other than the reviewed sites.\n\n\
+         {sites}\n\
+         A full peer's penalty is waived in one bounded case, through \
+         FullView::waives_unheld_penalty, asked once on each lane that charges it. A new \
+         site widens the exemption: review it against that case before listing it.\n"
+    );
+
+    let named = unreviewed(Counting::Mentions(LANES), NAMED);
+    assert!(
+        named.is_empty(),
+        "\nA lane asks the waiver under another lane's name, or a lane is named elsewhere.\n\n\
+         {named}\n\
+         Each lane names itself in the case it asks about, so the log says which lane \
+         waived, and the behaviour tests of each lane (src/replication/full.rs, \
+         tests/fork_pins.rs) cover what that lane asks.\n"
+    );
+}
+
+/// Each lane of the waiver reads the peer's answer through its own small mapping,
+/// whose unit tests pin what counts as "absent" on that lane.
+#[test]
+fn each_lane_reads_its_answer_through_its_tested_mapping() {
+    const ANSWERS: &[(Option<&str>, &str)] = &[
+        (None, "hint_answer"),
+        (None, "audit_answer"),
+        (None, "prune_answer"),
+        (None, "possession_answer"),
+    ];
+    const ANSWERED: &[Reviewed] = &[
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "hint_answer",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "audit_answer",
+            1,
+        ),
+        (
+            "src/replication/pruning.rs",
+            "peer_proves_records",
+            "prune_answer",
+            1,
+        ),
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "possession_answer",
+            1,
+        ),
+    ];
+    let answered = unreviewed(Counting::Calls(ANSWERS), ANSWERED);
+    assert!(
+        answered.is_empty(),
+        "\nA lane reads the peer's answer other than through its tested mapping.\n\n\
+         {answered}\n\
+         hint_answer, audit_answer, prune_answer and possession_answer say what counts as \
+         \"absent\" on their lanes, and their unit tests pin it (a digest mismatch, a \
+         rejected hint or a failed prune answer is charged). Read the answer through them.\n"
     );
 }
 
@@ -1975,6 +2259,164 @@ fn the_rpc_address_is_taken_only_where_a_fallback_list_is_built() {
          then the chain's other public RPCs, and listings' payments through \
          listings_rpc_urls. A read through the configured RPC alone fails whenever that \
          provider is busy. Build the list from it instead, and list the call here.\n"
+    );
+}
+
+/// Every mention of the price curve, `calculate_price`, and of a quote's
+/// committed key count in production code, at the reviewed number of sites.
+/// Size pricing changed what a quote is priced at (the weight total m for a
+/// client that pays by size) and what every quote check accepts (a band, not
+/// one price), so a price computed somewhere new, or a count read somewhere
+/// new, is a place the band or the weight may have been missed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
+    const PRICING: &[(Option<&str>, &str)] =
+        &[(None, "calculate_price"), (None, "committed_key_count")];
+    const REVIEWED: &[Reviewed] = &[
+        // The curve's re-exports and imports.
+        ("src/payment/mod.rs", "<module>", "calculate_price", 1),
+        ("src/payment/pricing.rs", "<module>", "calculate_price", 1),
+        ("src/payment/quote.rs", "<module>", "calculate_price", 1),
+        ("src/payment/verifier.rs", "<module>", "calculate_price", 1),
+        // The fields of a quote-commitment mismatch's evidence, in the
+        // verifier's event and in the replication failure it is reported as.
+        (
+            "src/payment/verifier.rs",
+            "<module>",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/replication/types.rs",
+            "<module>",
+            "committed_key_count",
+            1,
+        ),
+        // A single-node quote: priced at the count resolve_quote_pricing gives
+        // (the weight total for a client that pays by size, else the key
+        // count), and carrying the key count K.
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_priced_quote",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_priced_quote",
+            "committed_key_count",
+            3,
+        ),
+        // A merkle candidate quote: today's price at K. This fork refuses merkle
+        // payments, so no one pays it.
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_merkle_candidate_quote",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/quote.rs",
+            "QuoteGenerator::create_merkle_candidate_quote",
+            "committed_key_count",
+            3,
+        ),
+        // The one price check every quote goes through: the band at K, with
+        // the shape and key-cap rules.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::binding_violation",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::quote_arithmetic_violation",
+            "committed_key_count",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::validate_merkle_candidate_arithmetic",
+            "committed_key_count",
+            1,
+        ),
+        // The cross-check of a quote's K against its pinned commitment's key
+        // count, which size pricing leaves as it was, and its evidence.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_binding",
+            "committed_key_count",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_quotes",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::cross_check_merkle_candidates",
+            "committed_key_count",
+            3,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::handle_cross_check",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::emit_mismatch_evidence",
+            "committed_key_count",
+            1,
+        ),
+        // The price floor's reference: the price at the bottom of the median
+        // count's band.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::group_reference_price",
+            "calculate_price",
+            1,
+        ),
+        // Telemetry: whether a price is on the curve at all, at any count.
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::price_off_curve_diagnostics",
+            "calculate_price",
+            1,
+        ),
+        (
+            "src/payment/verifier.rs",
+            "PaymentVerifier::log_off_curve_merkle",
+            "committed_key_count",
+            1,
+        ),
+        // A browser quote carries the quote's K over unchanged, both ways.
+        (
+            "src/web_rtc.rs",
+            "browser_quote_from_quote",
+            "committed_key_count",
+            2,
+        ),
+        (
+            "src/web_rtc.rs",
+            "payment_quote_from_browser_quote",
+            "committed_key_count",
+            2,
+        ),
+    ];
+    let report = unreviewed(Counting::Mentions(PRICING), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nThe price curve or a quote's committed key count is used somewhere new.\n\n{report}\n\
+         A quote is priced at the weight total for a client that pays by size and at the key \
+         count for every other (QuoteGenerator::resolve_quote_pricing), and every quote check \
+         accepts the band from the bottom count's price to the key count's (price_in_band). \
+         Check that the new use follows both, and list it here.\n"
     );
 }
 

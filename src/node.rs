@@ -54,13 +54,17 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// `saorsa-core` admits a peer to the DHT only when its agent starts with `node/`, so a node
 /// that lost the prefix would stop being routed to. The version is this build's rather than
 /// the transport's, because it is the one a peer needs in order to tell which release it is
-/// talking to.
+/// talking to. In a `test-utils` build a test may set the release it names
+/// ([`crate::test_seams::ANNOUNCED_RELEASE`]); nothing else reads that.
 ///
 /// The image marker, when the node has one ([`image_marker`]), follows the release in the
 /// version's build metadata: `node/0.23.0+ds.16.image.<commit>`. The node census reads a node's
 /// release as the semver after `node/` and the `ds.<n>` its build metadata starts with, so it
 /// still reads the release, and can count the nodes whose image gave no marker.
 fn user_agent(image: Option<&str>) -> String {
+    #[cfg(any(test, feature = "test-utils"))]
+    let version = crate::test_seams::announced_version(env!("CARGO_PKG_VERSION"));
+    #[cfg(not(any(test, feature = "test-utils")))]
     let version = env!("CARGO_PKG_VERSION");
     image.map_or_else(
         || format!("node/{version}"),
@@ -195,6 +199,8 @@ impl NodeBuilder {
         };
 
         let repl_config = ReplicationConfig::default();
+        #[cfg(feature = "test-utils")]
+        let repl_config = crate::test_seams::replication_timing(repl_config);
 
         // Initialize ANT protocol handler for chunk storage and
         // wire the fresh-write channel so PUTs trigger replication.

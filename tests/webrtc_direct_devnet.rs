@@ -121,14 +121,14 @@ async fn blocked_put_lifecycle(probe_multiplex: bool) -> Result<(), Box<dyn Erro
 
         // Check the actual adapter and shared version gate, not only the
         // sanitizer in isolation. Both public refusal variants must survive.
-        for version in [0, 2] {
+        for version in [0, 3] {
             let mut request = ant_protocol::ChunkQuoteRequestV2::new([9; 32], 1024);
             request.settlement_version = version;
             let response = other.chunk_rpc(3, ant_protocol::ChunkMessageBody::QuoteRequestV2(request)).await?;
             let expected = if version == 0 {
                 ant_protocol::ProtocolError::ClientUpdateRequired { client_settlement_version: 0, min_settlement_version: 1 }
             } else {
-                ant_protocol::ProtocolError::StorerUpdateRequired { client_settlement_version: 2, node_settlement_version: 1 }
+                ant_protocol::ProtocolError::StorerUpdateRequired { client_settlement_version: 3, node_settlement_version: 2 }
             };
             assert!(matches!(response, ant_protocol::ChunkMessageBody::QuoteResponse(ant_protocol::ChunkQuoteResponse::Error(ref error)) if *error == expected));
         }

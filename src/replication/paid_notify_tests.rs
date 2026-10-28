@@ -1,6 +1,6 @@
 //! Paid notifies of keys this node already knows, and of keys another notify
-//! is handling: dropped only when the paid list holds the key, one handled at
-//! a time per key, and never lost to another notify's failed write. The
+//! is handling: dropped only when the paid list holds the key at the full
+//! class, one handled at a time per key, and never lost to another notify's failed write. The
 //! payment checks read a chain served over JSON-RPC on 127.0.0.1
 //! (`payment::settlement::mock`), so a test sees each chain read.
 
@@ -43,7 +43,8 @@ async fn paid_chain(bundle: &Bundle, delay: Duration) -> (mock::Provider, Arc<Pa
     (provider, verifier)
 }
 
-/// "Known" is the paid list holding the key: one local read.
+/// "Known" is the paid list holding the key at the full class: one local
+/// read.
 #[tokio::test]
 async fn a_key_is_known_only_once_the_paid_list_holds_it() {
     let (paid_list, _dir) = paid_list().await;
@@ -95,6 +96,7 @@ async fn a_notify_after_a_put_whose_store_failed_records_the_key() {
         verifier
             .verify_payment(
                 &bundle.address,
+                crate::payment::Held::Bytes(ant_protocol::chunk::MAX_CHUNK_SIZE),
                 Some(&bundle.proof(&[])),
                 VerificationContext::ClientPut
             )
@@ -229,4 +231,76 @@ async fn a_notify_dropped_mid_turn_lets_the_next_handle_the_key() {
         waiting.await.unwrap(),
         Some(PaidNotifyTurn::After)
     ));
+}
+
+/// A notify records the class its payment covers. A key recorded below the
+/// full class isn't known, so a later notify paying more raises it; once it
+/// records the full class, notifies of it are dropped as known.
+#[tokio::test]
+async fn a_notify_records_the_class_it_paid_and_a_later_one_raises_it() {
+    let small = Bundle::new([0x51; 32]);
+    let smallest = ant_protocol::payment::pricing::weighted_amount(
+        small.median.price,
+        PaidClass::SMALLEST.weight(),
+    )
+    .unwrap();
+    let chain = Chain::shared();
+    chain.lock().pay(
+        mock::tx(1),
+        vec![(
+            small.quote_hash(),
+            small.payee(),
+            u128::try_from(smallest).unwrap(),
+        )],
+    );
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let verifier = Arc::new(mock::verifier(&[&provider]));
+    let (paid_list, _dir) = paid_list().await;
+    let shutdown = CancellationToken::new();
+
+    record_paid_notify(&notify(&small), &paid_list, &verifier, &shutdown)
+        .await
+        .unwrap();
+    assert_eq!(
+        paid_list.class(&small.address).unwrap(),
+        Some(PaidClass::SMALLEST)
+    );
+    assert!(
+        !paid_notify_key_known(&paid_list, &small.address),
+        "a smaller class may still be raised"
+    );
+
+    // The same notify again leaves it as it is.
+    record_paid_notify(&notify(&small), &paid_list, &verifier, &shutdown)
+        .await
+        .unwrap();
+    assert_eq!(
+        paid_list.class(&small.address).unwrap(),
+        Some(PaidClass::SMALLEST)
+    );
+
+    // A notify of another payment for the key, paying a full chunk, raises it.
+    let full = Bundle::new([0x51; 32]);
+    assert_ne!(full.quote_hash(), small.quote_hash());
+    chain.lock().pay(mock::tx(2), vec![full.entry()]);
+    record_paid_notify(&notify(&full), &paid_list, &verifier, &shutdown)
+        .await
+        .unwrap();
+    assert_eq!(
+        paid_list.class(&small.address).unwrap(),
+        Some(PaidClass::FULL)
+    );
+    assert!(paid_notify_key_known(&paid_list, &small.address));
+}
+
+/// A key the paid list holds with no class, as every key written before
+/// notifies recorded one, or learned by a presence quorum or from paid lists
+/// that record none, is known at the full class: its notifies are dropped.
+#[tokio::test]
+async fn a_key_listed_with_no_class_is_known_at_the_full_class() {
+    let (paid_list, _dir) = paid_list().await;
+    let key = [0x61; 32];
+    paid_list.insert(&key).await.unwrap();
+    assert_eq!(paid_list.class(&key).unwrap(), Some(PaidClass::FULL));
+    assert!(paid_notify_key_known(&paid_list, &key));
 }

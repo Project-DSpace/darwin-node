@@ -40,6 +40,7 @@
 
 mod cache;
 pub mod metrics;
+mod paid_class;
 pub mod pricing;
 pub mod proof;
 pub mod quote;
@@ -52,12 +53,15 @@ pub mod wallet;
 
 pub use cache::{CacheStats, VerifiedCache};
 pub use metrics::QuotingMetricsTracker;
+pub use paid_class::PaidClass;
 pub use pricing::calculate_price;
 pub use proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, serialize_merkle_proof,
     serialize_single_node_proof, PaymentProof, ProofType,
 };
-pub use quote::{wire_ml_dsa_signer, QuoteGenerator, XorName};
+pub use quote::{
+    wire_ml_dsa_signer, QuoteGenerator, QuotePricing, XorName, SIZE_PRICED_SETTLEMENT_VERSION,
+};
 pub use settlement::{CLIENT_STORE_WAIT, PUT_PAYMENT_DEADLINE};
 // Wire-side signature verification lives in ant-protocol. Re-exported here
 // so `ant_node::payment::verify_*` keeps working for downstream callers.
@@ -66,8 +70,8 @@ pub use ant_protocol::payment::verify::{
 };
 pub use single_node::SingleNodePayment;
 pub use verifier::{
-    EvmVerifierConfig, PaymentStatus, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig,
-    VerificationContext, BATCH_PAYMENTS_REFUSED, MAX_PAYMENT_PROOF_SIZE_BYTES,
+    EvmVerifierConfig, Held, PaymentStatus, PaymentVerifier, PaymentVerifierConfig,
+    PriceFloorConfig, VerificationContext, BATCH_PAYMENTS_REFUSED, MAX_PAYMENT_PROOF_SIZE_BYTES,
     MIN_PAYMENT_PROOF_SIZE_BYTES, PRICE_FLOOR_ENFORCE_ENV, PRICE_FLOOR_TOLERANCE_ENV,
 };
 pub use wallet::{is_valid_address, parse_rewards_address, WalletConfig};

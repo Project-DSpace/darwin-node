@@ -41,8 +41,8 @@ use crate::listings::ListingService;
 use crate::logging::{debug, info, warn};
 use crate::payment::settlement::Lane;
 use crate::payment::{
-    PaymentVerifier, QuoteGenerator, VerificationContext, BATCH_PAYMENTS_REFUSED,
-    PUT_PAYMENT_DEADLINE,
+    Held, PaymentVerifier, QuoteGenerator, QuotePricing, VerificationContext,
+    BATCH_PAYMENTS_REFUSED, PUT_PAYMENT_DEADLINE,
 };
 use crate::pointer::PointerService;
 use crate::replication::admission;
@@ -297,6 +297,12 @@ static UNVERSIONED_QUOTE_REQUESTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU6
 /// different storer rather than to upgrade, because it is this node that is
 /// behind.
 fn settlement_gate(client_settlement_version: u32, path: &str) -> Option<ProtocolError> {
+    let counted = if path == "merkle" {
+        traffic::QuotePath::Merkle
+    } else {
+        traffic::QuotePath::SingleNode
+    };
+    traffic::record_declared_settlement_version(counted, client_settlement_version);
     match settlement_compatibility(client_settlement_version) {
         SettlementCompatibility::Compatible => None,
         SettlementCompatibility::ClientTooOld => {
@@ -969,6 +975,7 @@ impl AntProtocol {
             .payment_verifier
             .verify_payment(
                 address,
+                Held::Bytes(request.content.len()),
                 request.payment_proof.as_deref(),
                 VerificationContext::ClientPut,
             )
@@ -1078,8 +1085,19 @@ impl AntProtocol {
         }
     }
 
-    /// Handle a quote request.
+    /// Handle a quote request that declares no settlement version: quoted at
+    /// today's price, which every node accepts.
     fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
+        self.handle_priced_quote(request, QuotePricing::KeyCount)
+    }
+
+    /// Handle a quote request, priced by `pricing`: today's price, or the
+    /// weight total for a client that pays by size.
+    fn handle_priced_quote(
+        &self,
+        request: &ChunkQuoteRequest,
+        pricing: QuotePricing,
+    ) -> ChunkQuoteResponse {
         let addr_hex = hex::encode(request.address);
         let data_size = request.data_size;
         debug!("Handling quote request for {addr_hex} (size: {data_size})");
@@ -1126,10 +1144,22 @@ impl AntProtocol {
             });
         }
 
-        match self
-            .quote_generator
-            .create_quote(request.address, data_size_usize, request.data_type)
-        {
+        // Full, not faulty: a node at the full line, or full, prices no
+        // new data. A chunk it holds is still answered as already stored, so
+        // nobody pays for it again, and an update of a pointer it holds is
+        // still quoted, since it takes no new space.
+        if !already_stored && !self.holds_pointer_for_quote(request) {
+            if let Some(refusal) = self.full_quote_refusal(data_size_usize) {
+                return ChunkQuoteResponse::Error(refusal);
+            }
+        }
+
+        match self.quote_generator.create_priced_quote(
+            request.address,
+            data_size_usize,
+            request.data_type,
+            pricing,
+        ) {
             Ok(quote) => {
                 // ADR-0004: ship the signed commitment the price was bound to
                 // alongside the quote ("the commitment arrived with the quote"),
@@ -1157,20 +1187,64 @@ impl AntProtocol {
         }
     }
 
+    /// Whether `request` asks for a quote for an update of a pointer this
+    /// node holds.
+    fn holds_pointer_for_quote(&self, request: &ChunkQuoteRequest) -> bool {
+        request.data_type == crate::pointer::DATA_TYPE_POINTER
+            && self
+                .pointers
+                .as_ref()
+                .is_some_and(|pointers| pointers.store().state(&request.address).is_some())
+    }
+
+    /// The refusal of a quote for `data_size` bytes of new data, when this
+    /// node is full or at the full line: the existing quote failure, so
+    /// the client asks the next node. `None` when it can take the data.
+    fn full_quote_refusal(&self, data_size: usize) -> Option<ProtocolError> {
+        // One line every few minutes: at the full line every quote is refused.
+        static REFUSED: crate::logging::Repeats = crate::logging::Repeats::new();
+        let refusal = if let Some(state) = self.storage.full_state() {
+            format!(
+                "This node is full (at the full line by {}) and prices no new data",
+                state.trigger.as_str()
+            )
+        } else {
+            let bytes = u64::try_from(data_size).unwrap_or(u64::MAX);
+            let Err(e) = self.storage.check_capacity_for(bytes) else {
+                return None;
+            };
+            format!("This node prices no new data: {e}")
+        };
+        if let Some(held_back) = REFUSED.admit() {
+            info!(
+                target: "ant_node::storage::disk_precheck",
+                held_back,
+                "Refusing a quote for new data: {refusal}"
+            );
+        }
+        Some(ProtocolError::QuoteFailed(refusal))
+    }
+
     /// Handle a version-declaring storage quote request.
     ///
-    /// Refuse first, then fall through to the existing unversioned handler
-    /// with the same request. The gate is the only difference between the two
-    /// paths, so nothing else is duplicated and the two cannot drift.
+    /// Refuse first, then fall through to the handler unversioned requests
+    /// use, with the same request. The gate and the price are the only
+    /// differences between the two paths, so nothing else is duplicated and
+    /// the two cannot drift: a client settling under version 2 or later pays
+    /// by size and is quoted at the weight total; every other client at
+    /// today's price.
     fn handle_quote_v2(&self, request: &ChunkQuoteRequestV2) -> ChunkQuoteResponse {
         if let Some(refusal) = settlement_gate(request.settlement_version, "single_node") {
             return ChunkQuoteResponse::Error(refusal);
         }
-        self.handle_quote(&ChunkQuoteRequest {
-            address: request.address,
-            data_size: request.data_size,
-            data_type: request.data_type,
-        })
+        self.handle_priced_quote(
+            &ChunkQuoteRequest {
+                address: request.address,
+                data_size: request.data_size,
+                data_type: request.data_type,
+            },
+            QuotePricing::for_settlement_version(request.settlement_version),
+        )
     }
 
     /// Handle a version-declaring merkle candidate quote request.
@@ -1354,7 +1428,7 @@ mod put_deadline_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
@@ -1366,7 +1440,7 @@ mod tests {
     use saorsa_pqc::pqc::types::MlDsaSecretKey;
     use tempfile::TempDir;
 
-    async fn create_test_protocol() -> (AntProtocol, TempDir) {
+    pub async fn create_test_protocol() -> (AntProtocol, TempDir) {
         // `test_default()` sets `disk_reserve: 0`, so the disk pre-check always
         // passes for the regular tests.
         create_test_protocol_with_reserve(0).await
@@ -2095,6 +2169,113 @@ mod tests {
         }
     }
 
+    /// A commitment of `keys` chunks weighed at `weight_total`, attached to
+    /// `protocol`'s quote generator.
+    pub fn attach_weighed_commitment(protocol: &AntProtocol, keys: u32, weight_total: u64) {
+        use saorsa_pqc::api::sig::ml_dsa_65;
+        let (pk, sk) = ml_dsa_65().generate_keypair().expect("keypair");
+        let entries: Vec<([u8; 32], [u8; 32])> = (0..keys)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[..4].copy_from_slice(&i.to_le_bytes());
+                (key, key)
+            })
+            .collect();
+        let built = crate::replication::commitment_state::BuiltCommitment::build(
+            entries,
+            &[0xAB; 32],
+            &sk,
+            &pk.to_bytes(),
+        )
+        .expect("build commitment");
+        let state = Arc::new(crate::replication::commitment_state::ResponderCommitmentState::new());
+        state.rotate(built);
+        // Every chunk in the smallest class, then read back as m.
+        let lens = vec![Some(1u64); usize::try_from(keys).expect("keys")];
+        let m = state.current().expect("current").set_weight_total(&lens);
+        assert_eq!(m, weight_total, "the test's weight total");
+        protocol.quote_generator.attach_commitment_source(state);
+    }
+
+    /// The price of the quote `body` was answered with.
+    async fn quoted_price(
+        protocol: &AntProtocol,
+        body: ChunkMessageBody,
+    ) -> evmlib::common::Amount {
+        let msg = ChunkMessage {
+            request_id: 710,
+            body,
+        };
+        let response_bytes = protocol
+            .try_handle_request(&msg.encode().expect("encode request"))
+            .await
+            .expect("handle quote")
+            .expect("expected response");
+        match ChunkMessage::decode(&response_bytes).expect("decode").body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote, .. }) => {
+                let quote: evmlib::PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
+                assert_eq!(quote.committed_key_count, 1_000, "the count is K");
+                quote.price
+            }
+            other => panic!("expected a quote, got: {other:?}"),
+        }
+    }
+
+    /// An unversioned client, and a client settling under version 1, are
+    /// quoted at today's price, `calculate_price(K)`, whatever the node's
+    /// weight total. A client paying by size is quoted at the weight total.
+    #[tokio::test]
+    async fn only_a_client_paying_by_size_is_quoted_at_the_weight_total() {
+        use crate::payment::pricing::calculate_price;
+        use crate::payment::SIZE_PRICED_SETTLEMENT_VERSION;
+
+        let (protocol, _temp) = create_test_protocol().await;
+        // 1,000 records in the smallest class: m = ceil(1,000 × 259 / 1,024).
+        attach_weighed_commitment(&protocol, 1_000, 253);
+
+        let unversioned = ChunkMessageBody::QuoteRequest(ChunkQuoteRequest::new([0xC1; 32], 1));
+        assert_eq!(
+            quoted_price(&protocol, unversioned).await,
+            calculate_price(1_000)
+        );
+
+        let mut v1 = ChunkQuoteRequestV2::new([0xC2; 32], 1);
+        v1.settlement_version = 1;
+        assert_eq!(
+            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v1)).await,
+            calculate_price(1_000)
+        );
+
+        // The request reaches the handler's pricing once the gate admits it.
+        let request = ChunkQuoteRequest::new([0xC3; 32], 1);
+        let pricing = QuotePricing::for_settlement_version(SIZE_PRICED_SETTLEMENT_VERSION);
+        match protocol.handle_priced_quote(&request, pricing) {
+            ChunkQuoteResponse::Success { quote, .. } => {
+                let quote: evmlib::PaymentQuote = rmp_serde::from_slice(&quote).expect("quote");
+                assert_eq!(quote.price, calculate_price(253));
+                assert_eq!(quote.committed_key_count, 1_000);
+            }
+            other => panic!("expected a quote, got: {other:?}"),
+        }
+
+        // A settlement-2 request, which a client paying by size sends, is
+        // quoted at the weight total: release 2 settles at version 2, so the
+        // gate admits it rather than answering StorerUpdateRequired.
+        assert_eq!(CURRENT_SETTLEMENT_VERSION, SIZE_PRICED_SETTLEMENT_VERSION);
+        let mut v2 = ChunkQuoteRequestV2::new([0xC4; 32], 1);
+        v2.settlement_version = 2;
+        assert_eq!(
+            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(v2)).await,
+            calculate_price(253)
+        );
+        let current = ChunkQuoteRequestV2::new([0xC5; 32], 1);
+        assert_eq!(current.settlement_version, 2);
+        assert_eq!(
+            quoted_price(&protocol, ChunkMessageBody::QuoteRequestV2(current)).await,
+            calculate_price(253)
+        );
+    }
+
     /// A settlement version this node has never heard of is refused, because
     /// quoting it would promise to accept a payment whose rules the verifier
     /// does not know. That promise would be broken at PUT time, which is after
@@ -2320,6 +2501,130 @@ mod tests {
             }
             other => panic!("expected Success with already_stored=false, got: {other:?}"),
         }
+    }
+
+    /// Full, not faulty: a full node prices no new data, but a chunk it holds
+    /// is still answered as already stored, so with a majority of a chunk's
+    /// holders full the client is told to skip it and pays nothing.
+    #[tokio::test]
+    async fn a_full_node_prices_no_new_data_and_answers_already_stored() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let content = b"held by a node that then fills";
+        let address = ChunkStore::compute_address(content);
+        protocol.payment_verifier().cache_insert(address);
+        let put_msg = ChunkMessage {
+            request_id: 340,
+            body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(
+                address,
+                Bytes::copy_from_slice(content),
+            )),
+        };
+        let _ = protocol
+            .try_handle_request(&put_msg.encode().expect("encode put"))
+            .await
+            .expect("handle put");
+        protocol
+            .storage()
+            .set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+
+        let quote = |address: XorName| {
+            protocol.handle_quote(&ChunkQuoteRequest {
+                address,
+                data_size: 100,
+                data_type: DATA_TYPE_CHUNK,
+            })
+        };
+        assert!(
+            matches!(
+                quote(address),
+                ChunkQuoteResponse::Success {
+                    already_stored: true,
+                    ..
+                }
+            ),
+            "a chunk the full node holds is answered as already stored"
+        );
+        match quote([0xEE; 32]) {
+            ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(message)) => {
+                assert!(message.contains("full"), "{message}");
+            }
+            other => panic!("a full node prices no new data, got {other:?}"),
+        }
+
+        protocol.storage().set_full_for_test(None);
+        assert!(matches!(
+            quote([0xEE; 32]),
+            ChunkQuoteResponse::Success {
+                already_stored: false,
+                ..
+            }
+        ));
+    }
+
+    /// At the full line a node prices no new data, full or not yet.
+    #[tokio::test]
+    async fn a_node_at_the_full_line_prices_no_new_data() {
+        let (protocol, _temp) = create_test_protocol_with_reserve(u64::MAX).await;
+        let response = protocol.handle_quote(&ChunkQuoteRequest {
+            address: [0xED; 32],
+            data_size: 100,
+            data_type: DATA_TYPE_CHUNK,
+        });
+        assert!(
+            matches!(
+                response,
+                ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(_))
+            ),
+            "got {response:?}"
+        );
+    }
+
+    /// A full node still quotes an update of a pointer it holds, which takes
+    /// no new space, and refuses a quote for a pointer it doesn't hold.
+    #[tokio::test]
+    async fn a_full_node_quotes_updates_of_the_pointers_it_holds_only() {
+        use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
+        use saorsa_pqc::api::sig::ml_dsa_65;
+
+        let (protocol, temp) = create_test_protocol().await;
+        let store = crate::pointer::store::PointerStore::new(&temp.path().join("pointers"))
+            .await
+            .expect("pointer store");
+        let pointers = PointerService::new(store);
+        let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[3; 32]);
+        let target = PointerTarget::new(PointerTargetKind::Chunk, [1; 32]);
+        let record = Pointer::sign(&sk, &pk, 0, target).expect("sign");
+        assert!(matches!(
+            pointers
+                .handle_put(ant_protocol::chunk::PointerPutRequest::new(Bytes::from(
+                    record.to_bytes()
+                )))
+                .await,
+            PointerPutResponse::Success { .. }
+        ));
+        let protocol = protocol.with_pointer_service(pointers);
+        protocol
+            .storage()
+            .set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+
+        let quote = |address: XorName| {
+            protocol.handle_quote(&ChunkQuoteRequest {
+                address,
+                data_size: POINTER_WIRE_LEN as u64,
+                data_type: DATA_TYPE_POINTER,
+            })
+        };
+        assert!(
+            matches!(quote(record.address()), ChunkQuoteResponse::Success { .. }),
+            "an update of a pointer the full node holds is quoted"
+        );
+        assert!(
+            matches!(
+                quote([0xEC; 32]),
+                ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(_))
+            ),
+            "a pointer the full node doesn't hold is not"
+        );
     }
 
     /// Drive the real quote handler, then read the record count it priced on.

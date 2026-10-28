@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::REPAIR_HINT_MIN_AGE;
+use crate::payment::PaidClass;
+use crate::replication::config::repair_hint_min_age;
 use saorsa_core::identity::PeerId;
 
 // ---------------------------------------------------------------------------
@@ -202,9 +203,25 @@ impl PartialOrd for FetchOrder {
     }
 }
 
+/// What authorised a key's fetch. It decides whether the bytes that arrive
+/// are checked against the size class this node's paid list records for the
+/// key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FetchAuthority {
+    /// Majority storage: a presence quorum of the close group holding the
+    /// key. The bytes are accepted whatever this node's paid list records.
+    #[default]
+    Majority,
+    /// This node's paid-list entry: one it held already, or one written from
+    /// the class a paid-list quorum's entries record. A majority of paid lists
+    /// is not storage, so the bytes must be in the size class the entry
+    /// records, or a smaller one.
+    OwnPaidList,
+}
+
 /// The mutable half of a queued fetch, held outside the priority heap.
 ///
-/// Neither field participates in [`FetchOrder`]'s ordering, and both are read
+/// No field participates in [`FetchOrder`]'s ordering, and all are read
 /// only once the key is dequeued. Holding them in a key-indexed map is what
 /// lets a further source be merged into an already-queued key in O(1) instead
 /// of costing a full rebuild of the fetch heap.
@@ -215,6 +232,8 @@ pub struct FetchPayload {
     /// Pending-verification entry to restore if every fetch source is
     /// exhausted before the chunk is recovered.
     pub retry_verification: Option<VerificationEntry>,
+    /// What authorised the fetch.
+    pub authority: FetchAuthority,
 }
 
 /// A candidate dequeued for fetch: a [`FetchOrder`] rejoined with its
@@ -230,6 +249,8 @@ pub struct FetchCandidate {
     /// Pending-verification entry to restore if every fetch source is
     /// exhausted before the chunk is recovered.
     pub retry_verification: Option<VerificationEntry>,
+    /// What authorised the fetch.
+    pub authority: FetchAuthority,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +287,10 @@ pub struct KeyVerificationEvidence {
     pub presence: HashMap<PeerId, PresenceEvidence>,
     /// Paid-list evidence per peer (from `PaidTargets`).
     pub paid_list: HashMap<PeerId, PaidListEvidence>,
+    /// The size class each confirming peer's paid-list entry records, as its
+    /// reply gave it. A confirming peer missing here, an older node or a reply
+    /// without classes, records the full class.
+    pub paid_classes: HashMap<PeerId, PaidClass>,
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +543,9 @@ impl RepairProofs {
     /// The check invalidates proofs for peers that have left the current
     /// self-inclusive close group. A proof is mature only after at least one
     /// later local sync-cycle epoch and the repair hint is at least
-    /// [`REPAIR_HINT_MIN_AGE`] old.
+    /// [`repair_hint_min_age`] old (an hour,
+    /// [`REPAIR_HINT_MIN_AGE`](crate::replication::config::REPAIR_HINT_MIN_AGE),
+    /// in a released node).
     pub fn has_mature_replica_hint(
         &mut self,
         peer: &PeerId,
@@ -534,8 +561,18 @@ impl RepairProofs {
             .and_then(|entry| entry.peer_proofs.get(peer))
             .is_some_and(|proof| {
                 proof.hinted_at_epoch < current_epoch
-                    && now.saturating_duration_since(proof.hinted_at) >= REPAIR_HINT_MIN_AGE
+                    && now.saturating_duration_since(proof.hinted_at) >= repair_hint_min_age()
             })
+    }
+
+    /// Whether a proof that `peer` was hinted `key` is held, mature or not
+    /// (tests only).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn has_proof(&self, peer: &PeerId, key: &XorName) -> bool {
+        self.proofs_by_key
+            .get(key)
+            .is_some_and(|entry| entry.peer_proofs.contains_key(peer))
     }
 
     /// Remove all repair proofs for a key, e.g. after local deletion.
@@ -879,6 +916,7 @@ impl Default for BootstrapState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::config::REPAIR_HINT_MIN_AGE;
 
     /// Helper: build a `PeerId` from a single byte (zero-padded to 32 bytes).
     fn peer_id_from_byte(b: u8) -> PeerId {

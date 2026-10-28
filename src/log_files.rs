@@ -58,13 +58,16 @@ const TAG_DROP_FIRST: u8 = 0x02;
 
 /// The targets of the INFO summary lines kept first at the full line.
 ///
-/// A canary and an operator read them: the browser refusal counts and the
-/// hourly commitment tick. They are kept first as warnings are; a few lines
-/// an hour, so the room they take is negligible. They stay at INFO, since
-/// they report normal running.
+/// A canary and an operator read them: the browser refusal counts, the
+/// hourly commitment tick, and the lines a node logs on entering and leaving
+/// "full" and at start ("Node full: ...", which `nodes status` reads; a node
+/// enters "full" only at the line). They are kept first as warnings are; a
+/// few lines an hour, so the room they take is negligible. They stay at
+/// INFO, since they report normal running.
 pub const KEEP_FIRST_TARGETS: &[&str] = &[
     "ant_node::web_rtc::refusals",
     "ant_node::replication::commitment_tick",
+    "ant_node::replication::full_state",
 ];
 
 /// How the node's log lines are written, so the writer's own line matches.

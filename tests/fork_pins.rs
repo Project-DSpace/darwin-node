@@ -4,7 +4,10 @@
 //! allowance of new browser sessions per source, browser limits a starting
 //! node accepts and binds, within the most sessions the transport holds
 //! (`browser_listener` below), and the penalty for not holding a close-group
-//! chunk, which nothing can withhold. And how the
+//! chunk, which nothing withholds but one bounded case: a full peer (its own
+//! "full" notice fresh) answering that it lacks a key it was never seen
+//! proving, in a check not pinned to its commitment and, after a write, not
+//! paid for it ("full, not faulty", `unheld_chunk_penalty` below). And how the
 //! payment check reads the chain (`payment_reads` below), which a release
 //! that rewrites the read path must keep: the node's own RPC is read first,
 //! then, if that is one of Robinhood Chain's public RPCs, the others; a failed
@@ -22,6 +25,10 @@
 //! (`payment_encodings` below). And the census of test files, so a merge
 //! can't bring back a test this fork removed, or add one, unreviewed
 //! (`every_test_file_is_reviewed`).
+//!
+//! And the order a node dials a peer's addresses in, a verified direct address
+//! before a relay, which comes from the vendored saorsa-core, the only one this
+//! lock resolves (`direct_first` below).
 //!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes. The payment reads need the
@@ -267,12 +274,14 @@ fn rust_files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
 }
 
 /// A peer that doesn't hold a close-group chunk it should is penalised, as in
-/// upstream v0.23.0, and nothing in the node or the image can withhold it: no
-/// switch and no environment override. The census
-/// (src/replication/retention/census.rs) pins the lanes that charge it, and a
-/// build whose trust weights fall to zero doesn't compile (src/replication/mod.rs).
+/// upstream v0.23.0, and nothing in the node or the image can withhold it but
+/// the one bounded case of "full, not faulty" (`unheld_chunk_penalty` below):
+/// no switch and no environment override. The census
+/// (src/replication/retention/census.rs) pins the lanes that charge it and the
+/// one waiver each lane asks, and a build whose trust weights fall to zero
+/// doesn't compile (src/replication/mod.rs).
 #[test]
-fn nothing_withholds_the_unheld_chunk_penalty() {
+fn nothing_but_a_fresh_full_notice_withholds_the_unheld_chunk_penalty() {
     // The census names the switch's parts to pin them away, in test-only code.
     let census = repo_path("src/replication/retention/census.rs");
     let mut sources = Vec::new();
@@ -290,10 +299,323 @@ fn nothing_withholds_the_unheld_chunk_penalty() {
             assert!(
                 !text.contains(name),
                 "{} names {name}: the penalty for an unheld close-group chunk is applied \
-                 on every lane, and nothing may withhold it",
+                 on every lane, and nothing may withhold it but the waiver for a full peer",
                 path.display()
             );
         }
+    }
+}
+
+/// Every chunk payment check requires the weighted amount for the size class
+/// of the bytes the node holds: what it holds is a required argument of the
+/// check (`Held`), so a path can't leave it out. This pins what each path
+/// passes: a PUT and a fresh offer the length of the bytes they store, and
+/// only a payment notice, which carries no bytes, the smallest class. A new
+/// path fails here until it is reviewed and listed.
+#[test]
+fn every_chunk_payment_check_weighs_the_bytes_it_holds() {
+    let root = repo_path("");
+    let verifier = repo_path("src/payment/verifier.rs");
+    let mut sources = Vec::new();
+    rust_files(&repo_path("src"), &mut sources);
+    let mut found = Vec::new();
+    for path in sources {
+        let tests = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("_tests.rs"));
+        if path == verifier || tests {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let file = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        // The payment check's two variants: the listings service has a
+        // `Held` of its own, with other variants.
+        for variant in ["Held::Bytes(", "Held::Notice"] {
+            for (at, _) in text.match_indices(variant) {
+                let rest = &text[at..];
+                let end = rest.find([',', '\n']).unwrap_or(rest.len());
+                found.push((file.clone(), rest[..end].trim().to_string()));
+            }
+        }
+    }
+    found.sort();
+    let expected = [
+        ("src/replication/mod.rs", "Held::Bytes(data.len())"),
+        ("src/replication/mod.rs", "Held::Notice"),
+        (
+            "src/storage/handler.rs",
+            "Held::Bytes(request.content.len())",
+        ),
+    ]
+    .map(|(file, held)| (file.to_string(), held.to_string()));
+    assert_eq!(found, expected);
+}
+
+/// A pointer's payment is weighed by its data type alone: every pointer as
+/// one of its fixed wire size, whatever a request declares, and its checks
+/// take no length.
+#[test]
+fn a_pointer_payment_is_weighed_by_its_data_type_alone() {
+    use ant_protocol::payment::pricing::record_weight;
+    use ant_protocol::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
+
+    assert_eq!(POINTER_WIRE_LEN, 5303);
+    let weight = record_weight(DATA_TYPE_POINTER, POINTER_WIRE_LEN);
+    for declared in [0, POINTER_WIRE_LEN, 16 * 1024, 4 * 1024 * 1024] {
+        assert_eq!(record_weight(DATA_TYPE_POINTER, declared), weight);
+    }
+    let verifier = repo_text("src/payment/verifier.rs");
+    assert!(verifier.contains(
+        "fn pointer_weight() -> RecordWeight {\n    record_weight(DATA_TYPE_POINTER, POINTER_WIRE_LEN)\n}"
+    ));
+    assert!(verifier.contains(
+        ".verify_payment_inner(&target, pointer_weight(), Some(payment_proof), context)"
+    ));
+}
+
+/// The revenue floor prices the close group's median count at the bottom of
+/// its price band, so an enforced floor never refuses a node quoting by its
+/// weight total.
+#[test]
+fn the_floor_prices_the_median_count_at_the_bottom_of_its_band() {
+    let verifier = repo_text("src/payment/verifier.rs");
+    assert!(verifier.contains("let bottom = band_bottom_count(u64::from(median_key_count));"));
+    assert!(verifier.contains(
+        "let reference = calculate_price(usize::try_from(bottom).unwrap_or(usize::MAX));"
+    ));
+}
+
+/// A payment notice records the size class its settled amount covers, and a
+/// fetch whose only authority is this node's own paid-list entry is checked
+/// against it when the bytes arrive, read from the paid list, never from the
+/// payment check's cache.
+#[test]
+fn a_notice_records_its_class_and_a_fetch_on_that_entry_alone_is_checked() {
+    let replication = repo_text("src/replication/mod.rs");
+    for needle in [
+        "payment_verifier.verify_paid_class(",
+        "paid_list.insert_class(&notify.key, class)",
+        "matches!(paid_list.class(key), Ok(Some(PaidClass::FULL)))",
+        "q.promote_pending_to_fetch_by(key, distance, sources, authority)",
+        "KeyVerificationOutcome::QuorumVerified { .. } => FetchAuthority::Majority,",
+        "if let Some(recorded) = paid_class_below_held(paid_list, &key, data.len()) {",
+        "| FetchResult::PaidClassBelowHeld => {",
+    ] {
+        assert!(replication.contains(needle), "missing: {needle}");
+    }
+    // Only notices write a class: every other paid-list write is the plain
+    // insert, whose empty value reads as the full class.
+    let mut sources = Vec::new();
+    rust_files(&repo_path("src"), &mut sources);
+    let mut writers = Vec::new();
+    for path in sources {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let tests = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("_tests.rs"));
+        // Up to the test module, which starts at the first unindented
+        // `#[cfg(test)]`.
+        let body = text.split("\n#[cfg(test)]").next().unwrap_or_default();
+        if !tests && body.contains(".insert_class(") {
+            writers.push(
+                path.strip_prefix(repo_path(""))
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    assert_eq!(writers, ["src/replication/mod.rs"]);
+}
+
+/// A verified direct address is dialled before a relay (from ds.17). The node
+/// builds saorsa-core from `vendor/saorsa-core`, its 0.29.1 release with
+/// `AddressType::priority` and the dial plan
+/// (`select_dial_candidates_with_context`) putting a verified Direct address
+/// ahead of the relay, so traffic to a reachable peer doesn't pass through
+/// another peer's relay. A peer behind NAT has no verified Direct address, so
+/// its relay is still dialled first. The dial plan is private to saorsa-core:
+/// its own tests pin it there, and test.yml runs them.
+mod direct_first {
+    use super::repo_text;
+    use saorsa_core::{AddressType, DHTNode, MultiAddr, PeerId};
+
+    /// The saorsa-core release the copy is, and upstream's commit for it.
+    const SAORSA_CORE_VERSION: &str = "0.29.1";
+    const SAORSA_CORE_COMMIT: &str = "29bb069691880de59f5157c315a6233b1c57b20f";
+
+    /// The saorsa-transport release the lock holds (ds.16's bump).
+    const SAORSA_TRANSPORT_VERSION: &str = "0.38.2";
+
+    const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+    /// The vendored crate's tests of the change, by file, each of which must
+    /// stay: the dial plan, the stored order, and the tag rank that keeps
+    /// re-tagging and the lookup's tie-break as upstream's.
+    const DIRECT_FIRST_TESTS: &[(&str, &[&str])] = &[
+        (
+            "vendor/saorsa-core/src/dht_network_manager.rs",
+            &[
+                "direct_first_direct_plus_relay_dials_direct_first",
+                "direct_first_unverified_plus_relay_dials_relay_first",
+                "direct_first_unverified_alone_is_still_dialled",
+                "direct_first_full_order_direct_relay_unverified",
+                "direct_first_same_wan_lan_stays_first",
+                "direct_first_same_wan_relay_still_skipped",
+                "direct_first_home_node_behind_nat_keeps_its_relay_first",
+                "direct_first_lan_is_the_last_fallback",
+                "direct_first_lookup_order_agrees_with_dial_order",
+            ],
+        ),
+        (
+            "vendor/saorsa-core/src/dht/core_engine.rs",
+            &[
+                "address_type_priority_is_direct_relay_unverified_lan",
+                "address_type_tag_rank_is_relay_direct_unverified_lan",
+                "merge_typed_address_keeps_direct_before_relay",
+                "upgrade_only_gossip_cannot_retag_relay_as_direct",
+                "unsequenced_lookup_view_cannot_retag_relay_as_direct",
+            ],
+        ),
+        (
+            "vendor/saorsa-core/src/client_routing.rs",
+            &["direct_first_leaves_the_lookup_tie_break_as_upstream_made_it"],
+        ),
+    ];
+
+    fn toml_file(path: &str) -> toml::Value {
+        toml::from_str(&repo_text(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// Every package Cargo.lock resolves under `name`, as (version, source).
+    fn locked(name: &str) -> Vec<(String, Option<String>)> {
+        let lock = toml_file("Cargo.lock");
+        lock["package"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|package| package["name"].as_str() == Some(name))
+            .map(|package| {
+                (
+                    package["version"].as_str().unwrap().to_string(),
+                    package
+                        .get("source")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_lock_holds_one_saorsa_core_the_vendored_copy() {
+        let manifest = toml_file("Cargo.toml");
+        assert_eq!(
+            manifest["patch"]["crates-io"]["saorsa-core"]["path"].as_str(),
+            Some("vendor/saorsa-core"),
+            "[patch.crates-io] must put vendor/saorsa-core in place of the crates.io release"
+        );
+        assert_eq!(
+            manifest["dependencies"]["saorsa-core"].as_str(),
+            Some(SAORSA_CORE_VERSION)
+        );
+        let vendored = toml_file("vendor/saorsa-core/Cargo.toml");
+        assert_eq!(
+            vendored["package"]["version"].as_str(),
+            Some(SAORSA_CORE_VERSION)
+        );
+        let vcs = repo_text("vendor/saorsa-core/.cargo_vcs_info.json");
+        assert!(
+            vcs.contains(&format!("\"sha1\": \"{SAORSA_CORE_COMMIT}\"")),
+            "vendor/saorsa-core is not saorsa-core {SAORSA_CORE_VERSION}'s release: {vcs}"
+        );
+
+        // One saorsa-core, from the path (a path package has no source).
+        assert_eq!(
+            locked("saorsa-core"),
+            vec![(SAORSA_CORE_VERSION.to_string(), None)]
+        );
+        // One saorsa-transport: 0.38.2 from crates.io (ds.16's
+        // bump, Cargo.toml's direct requirement), which both this package's
+        // requirement and the vendored saorsa-core's accept.
+        let transport = locked("saorsa-transport");
+        assert_eq!(transport.len(), 1, "one saorsa-transport: {transport:?}");
+        let (version, source) = &transport[0];
+        assert_eq!(source.as_deref(), Some(CRATES_IO));
+        assert_eq!(version, SAORSA_TRANSPORT_VERSION);
+        assert_eq!(
+            manifest["dependencies"]["saorsa-transport"]["version"].as_str(),
+            Some(SAORSA_TRANSPORT_VERSION)
+        );
+        let version = semver::Version::parse(version).unwrap();
+        for (path, requirement) in [
+            (
+                "Cargo.toml",
+                &manifest["dependencies"]["saorsa-transport"]["version"],
+            ),
+            (
+                "vendor/saorsa-core/Cargo.toml",
+                &vendored["dependencies"]["saorsa-transport"]["version"],
+            ),
+        ] {
+            let requirement = semver::VersionReq::parse(requirement.as_str().unwrap()).unwrap();
+            assert!(
+                requirement.matches(&version),
+                "{path} requires saorsa-transport {requirement}; the lock has {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verified_direct_address_is_dialled_before_a_relay() {
+        assert!(AddressType::Direct.priority() < AddressType::Relay.priority());
+        assert!(AddressType::Relay.priority() < AddressType::Unverified.priority());
+        assert!(AddressType::Unverified.priority() < AddressType::Lan.priority());
+
+        // Lookups order a peer's addresses as the dial plan dials them.
+        let entries = [
+            ("/ip4/192.168.1.10/udp/9003/quic", AddressType::Lan),
+            ("/ip6/2001:db8::9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ];
+        let node = DHTNode {
+            peer_id: PeerId::from_bytes([7u8; 32]),
+            addresses: entries
+                .iter()
+                .map(|(address, _)| address.parse::<MultiAddr>().unwrap())
+                .collect(),
+            address_types: entries.iter().map(|(_, kind)| *kind).collect(),
+            distance: None,
+            reliability: 1.0,
+            address_authority: None,
+        };
+        assert_eq!(
+            node.address_type_labels_by_priority(),
+            vec!["direct", "relay", "unverified", "lan"]
+        );
+    }
+
+    #[test]
+    fn the_direct_first_tests_stay_and_run() {
+        for (path, names) in DIRECT_FIRST_TESTS {
+            let source = repo_text(path);
+            for name in *names {
+                assert!(
+                    source.contains(&format!("fn {name}()")),
+                    "{path} lost {name}, a test of direct-first dialling"
+                );
+            }
+        }
+        let test_workflow = repo_text(".github/workflows/test.yml");
+        assert!(
+            test_workflow.contains("run: cargo test --locked -p saorsa-core --lib"),
+            "test.yml no longer runs vendor/saorsa-core's own tests"
+        );
     }
 }
 
@@ -320,6 +642,7 @@ const TEST_FILES: &[&str] = &[
     "tests/e2e/settlement_version_gate.rs",
     "tests/e2e/slim_proofs.rs",
     "tests/e2e/subtree_audit_testnet.rs",
+    "tests/e2e/sync_pages.rs",
     "tests/e2e/testnet.rs",
     "tests/e2e/verify_storage_gate.rs",
     "tests/fork_pins.rs",
@@ -332,6 +655,7 @@ const TEST_FILES: &[&str] = &[
     "tests/pointer_convergence.rs",
     "tests/price_multiplier.rs",
     "tests/record_weight.rs",
+    "tests/small_disks.rs",
     "tests/storage_scale.rs",
     "tests/test_seams.rs",
     "tests/webrtc_direct_devnet.rs",
@@ -403,6 +727,121 @@ fn every_test_file_is_reviewed() {
     );
 }
 
+/// "Full, not faulty": the one case in which the unheld-chunk penalty is
+/// waived, on each lane that charges it, through the one function every lane
+/// asks (`FullView::waives_unheld_penalty`). The bound on how long a node may
+/// answer "full" without the penalty is how long one "full" notice stays
+/// fresh: a node that keeps renewing it is never charged for being full, and
+/// one that stops is charged again once its last notice is that old.
+mod unheld_chunk_penalty {
+    use ant_node::replication::full::{
+        FullView, Lane, OwnQuote, UnheldAnswer, UnheldCase, FULL_NOTICE_FRESHNESS,
+    };
+    use saorsa_core::identity::PeerId;
+    use std::time::{Duration, Instant};
+
+    /// How long one "full" notice stays fresh: 40 minutes, two of the
+    /// longest neighbour-sync intervals.
+    const FRESHNESS: Duration = Duration::from_mins(40);
+
+    fn case<'a>(lane: Lane, peer: &'a PeerId, key: &'a [u8; 32]) -> UnheldCase<'a> {
+        UnheldCase {
+            lane,
+            peer,
+            key,
+            answer: UnheldAnswer::Absent,
+            commitment_pinned: false,
+            own_quote: if matches!(
+                lane,
+                Lane::PossessionFailed | Lane::PossessionNoAnswer | Lane::PointerPossession
+            ) {
+                OwnQuote::NotPaid
+            } else {
+                OwnQuote::NoProof
+            },
+        }
+    }
+
+    #[test]
+    fn a_full_notice_stays_fresh_for_forty_minutes() {
+        assert_eq!(FULL_NOTICE_FRESHNESS, FRESHNESS);
+    }
+
+    /// On every lane: no notice, a stale notice, a check pinned to the peer's
+    /// commitment, a key the peer was seen holding, the peer's own paid quote,
+    /// and an answer other than "absent" (no answer among them) are all
+    /// charged; a fresh notice for any other key is not.
+    #[test]
+    fn only_a_fresh_notice_for_a_key_never_seen_held_and_not_paid_for_is_waived() {
+        let view = FullView::default();
+        let peer = PeerId::from_bytes([1; 32]);
+        let other = PeerId::from_bytes([2; 32]);
+        let key = [7u8; 32];
+        let held = [8u8; 32];
+        let now = Instant::now();
+        for lane in Lane::ALL {
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &peer, &key), now),
+                "{lane:?}: no notice, charged"
+            );
+        }
+        view.marks.note_notice(peer, true, now);
+        view.seen.record(&peer, &held);
+        for lane in Lane::ALL {
+            let fresh = case(lane, &peer, &key);
+            assert!(view.waives_unheld_penalty(&fresh, now), "{lane:?}: waived");
+            assert!(
+                view.waives_unheld_penalty(
+                    &fresh,
+                    now + FRESHNESS.saturating_sub(Duration::from_secs(1))
+                ),
+                "{lane:?}: still fresh"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&fresh, now + FRESHNESS),
+                "{lane:?}: a stale notice is charged"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &other, &key), now),
+                "{lane:?}: another peer's notice is no notice"
+            );
+            let pinned = UnheldCase {
+                commitment_pinned: true,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&pinned, now),
+                "{lane:?}: a commitment-pinned check is charged"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &peer, &held), now),
+                "{lane:?}: a key the peer was seen holding is charged"
+            );
+            let paid = UnheldCase {
+                own_quote: OwnQuote::PaidOrUnknown,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&paid, now),
+                "{lane:?}: a peer paid for the record is charged"
+            );
+            let unanswered = UnheldCase {
+                answer: UnheldAnswer::Other,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&unanswered, now),
+                "{lane:?}: no answer, or any answer but absent, is charged"
+            );
+        }
+        // A peer that says it has left "full" is charged at once.
+        view.marks.note_notice(peer, false, now);
+        for lane in Lane::ALL {
+            assert!(!view.waives_unheld_penalty(&case(lane, &peer, &key), now));
+        }
+    }
+}
+
 /// How the payment check reads the chain, through the path a node takes
 /// (`PaymentVerifier::verify_payment`) to a JSON-RPC provider on 127.0.0.1
 /// that answers as the vault's `completedPayments` does: no test override
@@ -420,17 +859,26 @@ fn every_test_file_is_reviewed() {
 mod payment_reads {
     use ant_node::ant_protocol::PROOF_TAG_MERKLE;
     use ant_node::payment::{
-        calculate_price, serialize_single_node_proof, EvmVerifierConfig, PaymentProof,
+        calculate_price, serialize_single_node_proof, EvmVerifierConfig, Held, PaymentProof,
         PaymentStatus, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig,
         VerificationContext, BATCH_PAYMENTS_REFUSED, MIN_PAYMENT_PROOF_SIZE_BYTES,
     };
     use ant_node::CLOSE_GROUP_SIZE;
+    use ant_protocol::chunk::MAX_CHUNK_SIZE;
+    use ant_protocol::payment::pricing::{weighted_amount, RecordWeight};
     use evmlib::common::Amount;
     use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
     use saorsa_pqc::api::sig::ml_dsa_65;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A whole chunk's bytes: its payment must cover 3 × the median quote.
+    const FULL_CHUNK: Held = Held::Bytes(MAX_CHUNK_SIZE);
+
+    /// The bytes of a chunk in the smallest size class, whose payment must
+    /// cover the least.
+    const SMALL_CHUNK: Held = Held::Bytes(1);
 
     /// A payment read that fails is made again in a second round, half a
     /// second later (`PAYMENT_READ_ROUNDS`, `PAYMENT_READ_BACKOFF` in
@@ -646,6 +1094,12 @@ mod payment_reads {
             prefix
         }
 
+        /// The amount due from a node holding `held` of the chunk: 3 × the
+        /// median price × the weight of `held`'s size class, rounded up.
+        fn due(&self, held: Held) -> u128 {
+            u128::try_from(weighted_amount(self.median.price, held.weight()).unwrap()).unwrap()
+        }
+
         /// The paid quote's rewards address.
         fn median_payee(&self) -> [u8; 20] {
             self.median.rewards_address.as_slice().try_into().unwrap()
@@ -753,7 +1207,7 @@ mod payment_reads {
         let verifier = verifier(&provider, &bundle);
         let started = Instant::now();
         let outcome = verifier
-            .verify_payment(&bundle.xorname, Some(&bundle.proof), context)
+            .verify_payment(&bundle.xorname, FULL_CHUNK, Some(&bundle.proof), context)
             .await
             .map_err(|e| e.to_string());
         let took = started.elapsed();
@@ -947,7 +1401,7 @@ mod payment_reads {
             let mut proof = vec![0u8; MIN_PAYMENT_PROOF_SIZE_BYTES.max(64)];
             proof[0] = PROOF_TAG_MERKLE;
             let err = verifier
-                .verify_payment(&bundle.xorname, Some(&proof), context)
+                .verify_payment(&bundle.xorname, FULL_CHUNK, Some(&proof), context)
                 .await
                 .expect_err("a merkle proof is refused");
             assert!(
@@ -1044,7 +1498,7 @@ mod payment_reads {
         ]);
         let started = Instant::now();
         let outcome = verifier
-            .verify_payment(&bundle.xorname, Some(&bundle.proof), context)
+            .verify_payment(&bundle.xorname, FULL_CHUNK, Some(&bundle.proof), context)
             .await
             .map_err(|e| e.to_string());
         let took = started.elapsed();
@@ -1370,6 +1824,20 @@ mod payment_reads {
         receipt: fn(&Bundle) -> Receipt,
         record: fn(&Bundle) -> Answer,
     ) -> (Result<PaymentStatus, String>, usize, usize) {
+        check_held(seed, context, FULL_CHUNK, &[[0x77; 32]], receipt, record).await
+    }
+
+    /// [`check_naming`] for a node holding `held` of the chunk, with a proof
+    /// naming `tx_hashes`: none, or the one transaction whose receipt is
+    /// `receipt`.
+    async fn check_held(
+        seed: u8,
+        context: VerificationContext,
+        held: Held,
+        tx_hashes: &[[u8; 32]],
+        receipt: impl Fn(&Bundle) -> Receipt,
+        record: impl Fn(&Bundle) -> Answer,
+    ) -> (Result<PaymentStatus, String>, usize, usize) {
         let bundle = bundle(seed);
         let (url, receipts, records) =
             chain_provider(receipt_json(&bundle, &receipt(&bundle)), record(&bundle)).await;
@@ -1384,7 +1852,8 @@ mod payment_reads {
         let outcome = verifier
             .verify_payment(
                 &bundle.xorname,
-                Some(&bundle.proof_naming(&[[0x77; 32]])),
+                held,
+                Some(&bundle.proof_naming(tx_hashes)),
                 context,
             )
             .await
@@ -1507,6 +1976,128 @@ mod payment_reads {
                 }
                 assert_eq!(receipt_reads, 1, "{case}");
                 assert_eq!(record_reads, reads, "{case}: the record read decides");
+            }
+        }
+    }
+
+    /// A case of the weighted requirement through the read path: what the
+    /// node holds, whether the proof names the transaction, its receipt,
+    /// the vault's record, whether the payment verifies, and the receipt and
+    /// record reads it takes.
+    type WeightedCase = (
+        &'static str,
+        Held,
+        bool,
+        fn(&Bundle) -> Receipt,
+        fn(&Bundle) -> Answer,
+        bool,
+        (usize, usize),
+    );
+
+    /// The weighted requirement reads the paid amount through the same path
+    /// as the full one: the payment cache's facts from the proof's receipts,
+    /// then the vault's record. A miss, no fact or one paying less than the
+    /// held class's amount, goes to the record read, and is never taken as
+    /// "zero paid": a small chunk paid at its class's amount verifies from
+    /// either, a wei less is refused only by the record, and a fact paying a
+    /// small class leaves a full chunk's check to the record.
+    #[tokio::test]
+    async fn the_weighted_requirement_reads_the_paid_amount_and_a_miss_is_never_zero_paid() {
+        fn no_receipt(_: &Bundle) -> Receipt {
+            Receipt {
+                success: true,
+                logs: Vec::new(),
+            }
+        }
+        fn receipt_paying(bundle: &Bundle, amount: u128) -> Receipt {
+            Receipt {
+                success: true,
+                logs: vec![(vault_address(), bundle.median_payee(), amount)],
+            }
+        }
+        assert!(SMALL_CHUNK.weight() < RecordWeight::FULL);
+        let cases: [WeightedCase; 7] = [
+            (
+                "no fact, the record pays the small class",
+                SMALL_CHUNK,
+                false,
+                no_receipt,
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(SMALL_CHUNK)),
+                true,
+                (0, 1),
+            ),
+            (
+                "no fact, the record a wei short of the small class",
+                SMALL_CHUNK,
+                false,
+                no_receipt,
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(SMALL_CHUNK) - 1),
+                false,
+                (0, 1),
+            ),
+            (
+                "no fact, the record empty",
+                SMALL_CHUNK,
+                false,
+                no_receipt,
+                |_| Answer::Record([0u8; 16], 0),
+                false,
+                (0, 2),
+            ),
+            (
+                "a receipt paying the small class",
+                SMALL_CHUNK,
+                true,
+                |bundle| receipt_paying(bundle, bundle.due(SMALL_CHUNK)),
+                // Read, the record would refuse: nothing is read.
+                |_| Answer::Record([0u8; 16], 0),
+                true,
+                (1, 0),
+            ),
+            (
+                "a receipt a wei short of the small class, the record paying it",
+                SMALL_CHUNK,
+                true,
+                |bundle| receipt_paying(bundle, bundle.due(SMALL_CHUNK) - 1),
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(SMALL_CHUNK)),
+                true,
+                (1, 1),
+            ),
+            (
+                "a full chunk, a receipt paying the small class, the record a full chunk",
+                FULL_CHUNK,
+                true,
+                |bundle| receipt_paying(bundle, bundle.due(SMALL_CHUNK)),
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(FULL_CHUNK)),
+                true,
+                (1, 1),
+            ),
+            (
+                "a full chunk, a receipt and the record paying the small class",
+                FULL_CHUNK,
+                true,
+                |bundle| receipt_paying(bundle, bundle.due(SMALL_CHUNK)),
+                |bundle| Answer::Record(bundle.payee_prefix(), bundle.due(SMALL_CHUNK)),
+                false,
+                (1, 1),
+            ),
+        ];
+        for (name, held, names_tx, receipt, record, verified, reads) in cases {
+            let tx_hashes: &[[u8; 32]] = if names_tx { &[[0x77; 32]] } else { &[] };
+            for context in CONTEXTS {
+                let (outcome, receipt_reads, record_reads) =
+                    check_held(0xE0, context, held, tx_hashes, receipt, record).await;
+                let case = format!("{context:?}, {name}");
+                if verified {
+                    assert_eq!(outcome, Ok(PaymentStatus::PaymentVerified), "{case}");
+                } else {
+                    let err = outcome.expect_err(&case);
+                    assert!(
+                        err.contains("not paid enough") || err.contains("read again"),
+                        "{case}: {err}"
+                    );
+                }
+                assert_eq!((receipt_reads, record_reads), reads, "{case}");
             }
         }
     }
@@ -1822,10 +2413,11 @@ fn the_fresh_replication_counters_keep_their_names() {
 
 /// The per-recipient send counters of every message between nodes keep
 /// their names and their message: `<stem>_sent_count` and `<stem>_sent_bytes`,
-/// beside the per-encoding `<stem>_tx_*` fields.
+/// beside the per-encoding `<stem>_tx_*` fields. The "full" notice's are at
+/// its own index, which the protocol names.
 #[test]
 fn the_per_recipient_send_counters_keep_their_names() {
-    const STEMS: [&str; 23] = [
+    const STEMS: [&str; 25] = [
         "fresh_offer",
         "fresh_response",
         "paid_notify",
@@ -1849,6 +2441,8 @@ fn the_per_recipient_send_counters_keep_their_names() {
         "pointer_fetch_response",
         "pointer_state_request",
         "pointer_state_response",
+        "neighbor_sync_page_request",
+        "neighbor_sync_page_response",
     ];
     let source: String = repo_text("src/replication/protocol.rs")
         .split_whitespace()
@@ -1864,5 +2458,14 @@ fn the_per_recipient_send_counters_keep_their_names() {
                 "src/replication/protocol.rs no longer logs `{field}`"
             );
         }
+    }
+    for field in [
+        "full_notice_sent_count = sc(FULL_NOTICE_INDEX)",
+        "full_notice_sent_bytes = sb(FULL_NOTICE_INDEX)",
+    ] {
+        assert!(
+            source.contains(field),
+            "src/replication/protocol.rs no longer logs `{field}`"
+        );
     }
 }

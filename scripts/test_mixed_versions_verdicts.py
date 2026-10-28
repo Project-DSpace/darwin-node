@@ -4,15 +4,31 @@ on made-up results: what a mixed run's penalties, refused PUTs and message
 families are measured against, with one all-old run and with several, and
 what counts as a new failure reason; proofs the previous release's nodes
 refused, keys missing from paid-group members' paid lists, and repeated
-PUTs not answered "already stored"; and that the report and summary.json
+PUTs not answered "already stored"; what the runs must show of their
+neighbour sync: this tree's nodes paging to each other and sending the
+previous release's nodes single messages, never pages, no penalty for a
+busy answer, and what the paged and rollback runs must show besides, with
+the releases the rolled-back node ran; and that the report and summary.json
 list every count measured, with its excess and limit, within the limit or
-not. The Test workflow runs it; run it by hand with
-`python3 scripts/test_mixed_versions_verdicts.py`. It runs no node.
+not, and the audits made per exchange, which a run with the audit seam must
+make; that the all-new and paged runs, whose nodes carry the bootstrap and
+audit seams the all-old runs lack, are measured on refused PUTs only; that
+the full run fails when no node erased a record, or none after the
+stopped node's mark lapsed of a record it was chosen for, by a node its
+fresh mark kept inside that record's retention width, and that the run's
+seams let that erasure go ahead before the stopped node drops out of its
+peers' routing tables; and what the quotes of records paid by size must
+show, and which penalties for them are reported apart. The Test workflow
+runs it; run it by hand with `python3 scripts/test_mixed_versions_verdicts.py`.
+It runs no node.
 """
 
 import argparse
+import datetime
 import importlib.util
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent / "test_mixed_versions.py"
@@ -25,13 +41,17 @@ JOINERS_TIME_OUT = ("joiner", "joiner", "connection_timeout")
 
 
 def result(penalties=None, refusals=None, families=None, proof_refusals=None,
-           unlisted=None, faults=None):
+           unlisted=None, faults=None, sync=None, single_sync=True,
+           paging=None, rollback=None, sized_quotes=None, releases=None):
     """One run's analysis as verdicts() reads it: `penalties` by (observer,
-    target, reason), `refusals` by role, and the message families each role
-    received, by role; every role gets neighbour sync."""
+    target, reason), `refusals` by role, the message families each role
+    received, by role, its neighbour sync as the logs show it, what its nodes
+    were given to page, and its rollback, if any; every role gets neighbour
+    sync, in single messages unless `single_sync` is false."""
     traffic, roles = {}, {}
     for role in ("incumbent", "joiner"):
-        received = {"neighbor_sync_request": 1, "neighbor_sync_response": 1}
+        received = ({"neighbor_sync_request": 1, "neighbor_sync_response": 1}
+                    if single_sync else {})
         received.update((families or {}).get(role, {}))
         traffic[f"{role}-00"] = {f"{family}_rx_count": count
                                  for family, count in received.items()}
@@ -39,13 +59,141 @@ def result(penalties=None, refusals=None, families=None, proof_refusals=None,
     return {
         "stalled_seconds": 0, "decode_failures": [], "audits": {}, "records": [],
         "checks": [], "full_evidence": {}, "traffic": traffic, "roles": roles,
-        "releases": {}, "ran": {}, "unanswered": {}, "penalties_on_refusals": {},
-        "penalties_on_full": {}, "between_releases": {},
+        "releases": releases or {}, "ran": {}, "unanswered": {}, "penalties_on_refusals": {},
+        "sized_quotes": sized_quotes or {}, "penalties_on_sized": {},
+        "penalties_on_full": {}, "between_releases": {}, "penalties_on_restart": {},
         "penalties": {key: (count, float(count)) for key, count in (penalties or {}).items()},
         "refusals": refusals or {},
         "proof_refusals": proof_refusals or {},
         "unlisted": unlisted or [],
         "faults": faults or [],
+        "sync": sync or {"paged": [], "single": [], "builds": {}, "served": {}, "busy": 0},
+        "paging": paging or {}, "rollback": rollback,
+    }
+
+
+T0 = datetime.datetime(2026, 10, 25, 12, 0, tzinfo=datetime.timezone.utc)
+ROLLED = "ab" * 32
+
+
+def minutes(count):
+    return T0 + datetime.timedelta(minutes=count)
+
+
+def exchange(pages=2, peer_release="new", form="paged", peer=None, start=None,
+             pages_answered=None, end="Complete", source="joiner-00"):
+    """An exchange as the requester's log shows it: paged, each list over
+    `pages` pages both ways, unless `form` is "single"."""
+    found = {"from": source, "release": "new", "peer_release": peer_release, "form": form,
+             "end": end, "start": start or minutes(1), "at": start or minutes(1)}
+    if peer is not None:
+        found["peer"] = peer
+    if form == "paged":
+        found.update({"pages_sent": pages * 2, "pages_received": pages * 2,
+                      "pages_answered": pages * 2 if pages_answered is None else pages_answered})
+        for kind in ("replica", "paid"):
+            for way in ("sent", "received"):
+                found[f"{kind}_pages_{way}"] = pages
+    return found
+
+
+def paged_sync(exchanges=None, builds=None, served=None, single=None, busy=0,
+               busy_charged=None):
+    """A run's neighbour sync: by default, one paged exchange with each list
+    over two pages, its responder's hints built once and its four pages
+    served in order."""
+    return {"paged": [exchange()] if exchanges is None else exchanges,
+            "single": single or [],
+            "builds": {"joiner-01 a 7": 1} if builds is None else builds,
+            "served": {"joiner-01 a 7": [0, 1, 2, 3]} if served is None else served,
+            "busy": busy, "busy_charged": busy_charged or []}
+
+
+# What a mixed run's nodes are given to page: this tree's nodes page to each
+# other, beside nodes of a previous release that reads no pages.
+MIXED = {"new_pages": True, "old_present": True, "old_reads_pages": False}
+
+# The rollback run: its node ran the previous release from minute 10 to 30.
+ROLLBACK = {"node": "joiner-00", "peer_id": ROLLED, "old_from": minutes(10),
+            "old_until": minutes(30),
+            "restarts": [[minutes(10), minutes(10.5)], [minutes(30), minutes(30.5)]]}
+
+
+def rolled(form="paged", peer_release="new", at=35, pages_answered=None, source="joiner-01"):
+    """An exchange of this tree's `source` with the rolled-back node that
+    started at minute `at`."""
+    return exchange(form=form, peer=ROLLED, peer_release=peer_release, start=minutes(at),
+                    pages_answered=pages_answered, source=source,
+                    end="Complete" if pages_answered != 0 else "Failed")
+
+
+def rollback_sync(extra_paged=(), single=None):
+    """The rollback run's neighbour sync: this tree's nodes paging to each
+    other, a single message to the rolled-back node while it ran the previous
+    release, and a page to it once it came back, unless told otherwise."""
+    return paged_sync(
+        exchanges=[exchange(), rolled(at=35)] + list(extra_paged),
+        single=[rolled(form="single", peer_release="old", at=15)] if single is None else single)
+
+
+# Seven nodes not full, each holding every record the full run's checks
+# count, then INSIDE and ERASER, not full, the 8th and 9th by distance from
+# the first two records; and the full run's records: in the first (the one
+# the stopped node was chosen for) and the second, the stopped node (ROLLED,
+# marked full) is among the 7 nearest not full, so its fresh mark keeps
+# ERASER, which holds both, inside their retention width, and its lapse
+# leaves ERASER outside it; in the third it is nearest after them, outside
+# the group; the fourth's nearest don't hold it.
+NOT_FULL = [f"{index:02x}" * 32 for index in range(1, 8)]
+INSIDE, ERASER = "a8" * 32, "aa" * 32
+IN_GROUP, NOT_CHOSEN, PAST_GROUP, NOT_NEAR = "cd" * 32, "cc" * 32, "ce" * 32, "cf" * 32
+NOT_CHECKED = "c0" * 32
+
+
+def full_check(address, nearest, held=()):
+    """A record as the full run's counts give it, held by every node not
+    full of the first seven and by `held`."""
+    return {"address": address, "close_group": nearest[:harness.CLOSE_GROUP],
+            "nearest": nearest,
+            "answers": [{"peer": peer, "outcome": "held"} for peer in NOT_FULL + list(held)]}
+
+
+WIDENED = NOT_FULL[:3] + [ROLLED] + NOT_FULL[3:] + [INSIDE, ERASER]
+FULL_CHECKS = [full_check(IN_GROUP, WIDENED, [ERASER]),
+               full_check(NOT_CHOSEN, WIDENED, [ERASER]),
+               full_check(PAST_GROUP, NOT_FULL + [ROLLED]),
+               full_check(NOT_NEAR, list(NOT_FULL))]
+
+
+def full_run(folder, erased_at=()):
+    """A full run's record as full_run_checks() reads it: two incumbents,
+    ERASER (incumbent-00) and INSIDE (incumbent-01), whose logs hold an
+    erasure with 6 proofs of each (minutes after T0, record[, node]) of
+    `erased_at`, by incumbent-00 unless named; the stopped node, chosen for
+    IN_GROUP, stopped at minute 10, so its mark lapses
+    FULL_RUN_FRESHNESS_SECS later; FULL_CHECKS counted early."""
+    lines = {"incumbent-00": [], "incumbent-01": []}
+    for at, record, *node in erased_at:
+        stamp = minutes(at).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+        lines[node[0] if node else "incumbent-00"].append(
+            f"{stamp}  INFO ant_node::replication::pruning: {harness.ERASED_LINE} "
+            f"with 6 proofs from peers not marked full erased_record={record} "
+            "proofs_not_full=6 proofs_full=0 proofs_needed=6 group_not_full=7 "
+            "group_full=0")
+    for name, written in lines.items():
+        (folder / f"{name}.log").write_text("\n".join(written) + "\n")
+    (folder / "joiner-00.log").write_text("")
+    return {
+        "folder": folder, "window": (T0, minutes(30)), "devnet_peers": [],
+        "nodes": [{"name": "incumbent-00", "role": "incumbent", "peer_id": ERASER,
+                   "full": False, "log": "incumbent-00.log"},
+                  {"name": "incumbent-01", "role": "incumbent", "peer_id": INSIDE,
+                   "full": False, "log": "incumbent-01.log"},
+                  {"name": "joiner-00", "role": "joiner", "peer_id": ROLLED, "full": True,
+                   "log": "joiner-00.log"}],
+        "full_phases": {"stopped": {"node": "joiner-00", "peer_id": ROLLED,
+                                    "at": minutes(10).isoformat(), "candidates": [IN_GROUP]}},
+        "phase_checks": {"early": FULL_CHECKS},
     }
 
 
@@ -162,6 +310,99 @@ def listed(args):
                   "old-hosts-new": harness.comparisons(results["old-hosts-new"], baselines, args)})
 
 
+def sized(args):
+    """The quotes of records paid by size (settlement version 2): the
+    previous release must answer every one StorerUpdateRequired, this tree
+    none, and a run with both releases must ask the previous one."""
+    mixed = {"incumbent-00": "new", "joiner-00": "old"}
+    two = {"all-old": result(), "all-old-2": result()}
+    right = {"old": {"storer_update_required": 9}, "new": {"quoted": 30}}
+    expect("records paid by size, refused by the previous release and quoted by this tree, "
+           "pass",
+           {**two, "new-hosts-old": result(sized_quotes=right, releases=mixed)}, args, [])
+    expect("a node of the previous release that quotes a version-2 request fails",
+           {**two, "new-hosts-old": result(
+               sized_quotes={"old": {"storer_update_required": 8, "quoted": 1},
+                             "new": {"quoted": 30}}, releases=mixed)},
+           args, ["nodes of the previous release quoted 1 version-2 quote(s)"])
+    expect("a node of this tree that answers StorerUpdateRequired fails",
+           {**two, "old-hosts-new": result(
+               sized_quotes={"old": {"storer_update_required": 9},
+                             "new": {"quoted": 29, "storer_update_required": 1}},
+               releases=mixed)},
+           args, ["nodes of this tree answered 1 version-2 quote(s) StorerUpdateRequired"])
+    expect("a run with both releases where the previous one was never asked fails",
+           {**two, "new-hosts-old": result(sized_quotes={"new": {"quoted": 30}},
+                                           releases=mixed)},
+           args, ["no node of the previous release answered a version-2 quote"])
+    expect("a run of this tree alone needs no refusal",
+           {"all-new": result(sized_quotes={"new": {"quoted": 30}},
+                              releases={"incumbent-00": "new", "joiner-00": "new"})},
+           args, [])
+    expect("a run with no records paid by size has nothing to show",
+           {**two, "new-hosts-old": result(releases=mixed)}, args, [])
+
+
+def sized_penalties_apart():
+    """analyze() books the possession-check and audit penalties a node of the
+    previous release takes for a record paid by size apart, reported and not
+    compared, and every other penalty as before."""
+    start = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    window = (start, start + datetime.timedelta(hours=1))
+    old_peer, new_peer = "a" * 64, "b" * 64
+    sized_key, plain_key = "c" * 64, "d" * 64
+    stamp = "2026-01-01T00:10:00.000000Z"
+
+    def trust(target):
+        return (f"{stamp} INFO peer trust score changed peer_id={target} "
+                f"reason=application_failure delta=-0.5 weight=5")
+
+    lines = [
+        f"{stamp} WARN Possession check: {old_peer} failed to prove possession for {sized_key}",
+        trust(old_peer),
+        f"{stamp} ERROR Audit failure for {old_peer}: reason=KeyAbsent, "
+        f"first_failed_key=0x{sized_key[:16]}",
+        trust(old_peer),
+        f"{stamp} WARN Possession check: {old_peer} failed to prove possession for {plain_key}",
+        trust(old_peer),
+        f"{stamp} WARN Possession check: {new_peer} failed to prove possession for {sized_key}",
+        trust(new_peer),
+    ]
+    with tempfile.TemporaryDirectory() as folder:
+        folder = Path(folder)
+        (folder / "devnet.log").write_text("")
+        (folder / "joiner-00.log").write_text("")
+        (folder / "incumbent-00.log").write_text("\n".join(lines) + "\n")
+        record = {"quotes": [{"peer": old_peer, "outcome": "QuoteError(StorerUpdateRequired)"},
+                             {"peer": new_peer, "outcome": "quoted"}],
+                  "puts": [{"peer": new_peer, "outcome": "stored"}]}
+        run = {
+            "window": window, "folder": folder, "devnet_peers": [], "network": "new",
+            "nodes": [{"name": "incumbent-00", "role": "incumbent", "release": "new",
+                       "peer_id": new_peer, "full": False, "log": "incumbent-00.log",
+                       "ran": "x"},
+                      {"name": "joiner-00", "role": "joiner", "release": "old",
+                       "peer_id": old_peer, "full": False, "log": "joiner-00.log",
+                       "ran": "x"}],
+            "uploads": [{"client": "e" * 64, "records": [{**record, "address": plain_key}]},
+                        {"client": "e" * 64, "settlement_version": 2,
+                         "records": [{**record, "address": sized_key}]}],
+            "checks": [],
+        }
+        found = harness.analyze(run)
+    expect_equal("the previous release's penalties for a record paid by size are booked apart",
+                 found["penalties_on_sized"],
+                 {("incumbent", "joiner", "application_failure"): (2, 10.0)})
+    expect_equal("every other penalty is booked as before",
+                 found["penalties"],
+                 {("incumbent", "joiner", "application_failure"): (1, 5.0),
+                  ("incumbent", "incumbent", "application_failure"): (1, 5.0)})
+    expect_equal("the quotes of records paid by size are counted by release",
+                 found["sized_quotes"],
+                 {"old": {"storer_update_required": 1}, "new": {"quoted": 1}})
+    json.dumps(harness.summary_json({"new-hosts-old": found}, [], {}, options()), default=str)
+
+
 def main():
     one = {"all-old": result({INCUMBENTS_FAIL: 5, JOINERS_TIME_OUT: 8})}
     expect("against one all-old run, a count PENALTY_SLACK above it passes",
@@ -234,7 +475,361 @@ def main():
             "full": result({INCUMBENTS_FAIL: 90})},
            options(), [])
 
+    # -- what every run's neighbour sync must show --
+    old_single = exchange(form="single", peer_release="old")
+    expect("a mixed run in which this tree's nodes page to each other and send the previous "
+           "release's single messages passes",
+           {**two, "new-hosts-old": result(sync=paged_sync(single=[old_single]), paging=MIXED)},
+           options(), [])
+    expect("a mixed run in which this tree's nodes never paged to each other fails",
+           {**two, "new-hosts-old": result(sync=paged_sync(exchanges=[], single=[old_single]),
+                                           paging=MIXED)},
+           options(), ["no node of this tree paged its hints to another"])
+    expect("a mixed run with no single message to the previous release's nodes fails",
+           {**two, "old-hosts-new": result(sync=paged_sync(), paging=MIXED)},
+           options(), ["sent its hints to a node of the previous release in a single message"])
+    reads = {**MIXED, "old_reads_pages": True}
+    expect("a previous release that reads pages is paged to",
+           {**two, "new-hosts-old": result(
+               sync=paged_sync(exchanges=[exchange(), exchange(peer_release="old")]),
+               paging=reads)},
+           options(), [])
+    expect("a previous release that reads pages, never paged to, fails",
+           {**two, "new-hosts-old": result(sync=paged_sync(single=[old_single]), paging=reads)},
+           options(), ["paged its hints to a node of the previous release, which reads pages"])
+    expect("a requester that charged its responder during an exchange answered busy fails",
+           {**two, "new-hosts-old": result(sync=paged_sync(
+               single=[old_single], busy_charged=[{"from": "joiner-00", "peer": "cd" * 32,
+                                                   "at": minutes(2),
+                                                   "reason": "connection_timeout"}]),
+               paging=MIXED)},
+           options(), ["charged cdcdcdcdcdcdcdcd (connection_timeout) during an exchange it "
+                       "answered busy"])
+
+    # -- the rollback run --
+    expect("a rollback run with a single message to its node while it ran the previous "
+           "release, and pages to it after, passes",
+           {**two, "rollback": result(sync=rollback_sync(), paging=MIXED, rollback=ROLLBACK)},
+           options(), [])
+    expect("a page to the rolled-back node left unanswered over its earlier connection, once "
+           "from a node, passes",
+           {**two, "rollback": result(
+               sync=rollback_sync([rolled(peer_release="old", at=10.2, pages_answered=0)]),
+               paging=MIXED, rollback=ROLLBACK)},
+           options(), [])
+    expect("two pages from one node to the rolled-back node while it ran the previous release "
+           "fail",
+           {**two, "rollback": result(
+               sync=rollback_sync([rolled(peer_release="old", at=10.2, pages_answered=0),
+                                   rolled(peer_release="old", at=25, pages_answered=0)]),
+               paging=MIXED, rollback=ROLLBACK)},
+           options(), ["joiner-01 paged 2 times to the rolled-back node"])
+    expect("a page the rolled-back node answered while it ran the previous release fails",
+           {**two, "rollback": result(
+               sync=rollback_sync([rolled(peer_release="old", at=20, pages_answered=1)]),
+               paging=MIXED, rollback=ROLLBACK)},
+           options(), ["paged its hints to a node of the previous release, which can't read "
+                       "pages"])
+    expect("a rollback run with no single message to its node while it ran the previous "
+           "release fails",
+           {**two, "rollback": result(sync=rollback_sync(single=[]), paging=MIXED,
+                                      rollback=ROLLBACK)},
+           options(), ["no node of this tree sent the rolled-back node a single message"])
+    expect("a rollback run with no page to its node once it came back fails",
+           {**two, "rollback": result(
+               sync=paged_sync(single=[rolled(form="single", peer_release="old", at=15)]),
+               paging=MIXED, rollback=ROLLBACK)},
+           options(), ["no node of this tree paged to the rolled-back node once it came back"])
+    expect("the rollback run is measured against the all-old runs",
+           {**two, "rollback": result({INCUMBENTS_FAIL: 10 + harness.PENALTY_SLACK},
+                                      sync=rollback_sync(), paging=MIXED, rollback=ROLLBACK)},
+           options(), ["application_failure penalties by incumbents on incumbents"])
+    seconds = datetime.timedelta(seconds=1)
+    expect_equal("the rolled-back node ran the previous release from its stop until it came "
+                 "back",
+                 [harness.release_of(ROLLBACK, {ROLLED: "new"}, ROLLED, when) for when in
+                  (minutes(10) - seconds, minutes(10), minutes(30) - seconds, minutes(30))]
+                 + [harness.release_of(ROLLBACK, {"ef": "new"}, "ef", minutes(15))],
+                 ["new", "old", "old", "new", "new"])
+    grace = datetime.timedelta(seconds=harness.RESTART_GRACE)
+    expect_equal("penalties on the rolled-back node from its stop until it has been up for "
+                 "the grace are set apart",
+                 [harness.restarting(ROLLBACK, ROLLED, when) for when in
+                  (minutes(10) - seconds, minutes(10), minutes(10.5) + grace,
+                   minutes(10.5) + grace + seconds, minutes(30.2))]
+                 + [harness.restarting(ROLLBACK, "ef", minutes(10.2)),
+                    harness.restarting(None, ROLLED, minutes(10.2))],
+                 [False, True, True, False, True, False, False])
+    busy = exchange(end="Busy", peer="cd" * 32, start=minutes(2))
+    busy["at"] = minutes(2) + datetime.timedelta(seconds=3)
+    within = minutes(2) + datetime.timedelta(seconds=2)
+    late = busy["at"] + datetime.timedelta(seconds=harness.BUSY_CHARGE_GRACE + 1)
+    expect_equal("a penalty counts as charged for a busy answer when its requester charged its "
+                 "responder during the exchange",
+                 harness.busy_charges({"paged": [busy, exchange(peer="cd" * 32)]},
+                                      [("joiner-00", "cd" * 32, within, "a"),
+                                       ("joiner-00", "cd" * 32, late, "b"),
+                                       ("joiner-01", "cd" * 32, within, "c"),
+                                       ("joiner-00", "ef" * 32, within, "d")]),
+                 [{"from": "joiner-00", "peer": "cd" * 32, "at": within, "reason": "a"}])
+    line = ("2026-10-25T12:00:10.500000Z DEBUG ant_node::replication::neighbor_sync: "
+            "Neighbor-sync paged exchange peer=" + "cd" * 32 + " cycle=7 end=Busy "
+            "pages_answered=0 elapsed_ms=1500")
+    found = harness.exchange_in(line)
+    expect_equal("an exchange's log line gives its form, its peer, how it ended and when it "
+                 "started",
+                 (found["form"], found["peer"], found["end"], found["pages_answered"],
+                  found["start"]),
+                 ("paged", "cd" * 32, "Busy", 0,
+                  T0 + datetime.timedelta(seconds=9)))
+
+    expect("a paged run with lists over more than one page, hints built once and pages in "
+           "order passes",
+           {"paged": result(sync=paged_sync())}, options(), [])
+    expect("a paged run whose nodes read only pages still received neighbour sync",
+           {"paged": result(sync=paged_sync(), single_sync=False, families={
+               role: {"neighbor_sync_page_request": 3, "neighbor_sync_page_response": 3}
+               for role in ("incumbent", "joiner")})},
+           options(), [])
+    expect("a paged run in which no exchange took more than one page for each list fails",
+           {"paged": result(sync=paged_sync(exchanges=[exchange(pages=1)]))},
+           options(), ["no exchange took more than one page for each list"])
+    expect("a responder that built its hints twice in one exchange fails the paged run",
+           {"paged": result(sync=paged_sync(builds={"joiner-01 a 7": 2}))},
+           options(), ["built its hints 2 times in one exchange",
+                       "no responder served more than one page"])
+    expect("pages served out of order fail the paged run",
+           {"paged": result(sync=paged_sync(served={"joiner-01 a 7": [0, 2, 1]}))},
+           options(), ["pages served out of order", "no responder served more than one page"])
+    expect("a paged run in which no responder served more than one page from one build fails",
+           {"paged": result(sync=paged_sync(served={"joiner-01 a 7": [0]}))},
+           options(), ["no responder served more than one page"])
+    expect("a node that paged its hints to a node of the previous release fails the run",
+           {**two, "new-hosts-old": result(sync=paged_sync(
+               exchanges=[exchange(peer_release="old")]))},
+           options(), ["paged its hints to a node of the previous release"])
+    expect("pages between nodes of this tree, in a mixed run, pass",
+           {**two, "new-hosts-old": result(sync=paged_sync())}, options(), [])
+    # The all-new and paged runs' nodes carry the bootstrap and audit seams,
+    # which the all-old runs' don't: their penalties, reasons and families
+    # differ from the all-old runs' by the seams too, so only their refused
+    # PUTs are measured.
+    seam_made = {INCUMBENTS_FAIL: 90,
+                 ("joiner", "joiner", "dht_identity_exchange_failed"): allowance + 1}
+    old_families = {"incumbent": {"fetch_request": harness.SHAPE_FLOOR}}
+    seam_two = {name: result({INCUMBENTS_FAIL: 2}, families=old_families) for name in two}
+    for name, sync in (("all-new", None), ("paged", paged_sync())):
+        expect(f"the {name} run's penalties, new failure reasons and families are not measured "
+               "against the all-old runs, which lack its seams",
+               {**seam_two, name: result(seam_made, sync=sync)}, options(), [])
+        expect(f"the {name} run's refused PUTs are measured against the all-old runs",
+               {**seam_two, name: result(refusals={"joiner": harness.PENALTY_SLACK + 1},
+                                         sync=sync)},
+               options(), [f"the joiners refused {harness.PENALTY_SLACK + 1} paid PUTs"])
+    expect("the all-new run must still show a family only this tree knows",
+           {**seam_two, "all-new": result()}, options(new_only_family=["page_request"]),
+           ["no node of this tree received page_request"])
+    expect_equal("the all-new and paged runs are measured on refused PUTs only, the mixed and "
+                 "rollback runs on everything",
+                 {name: sorted(harness.measured(name, [seam_two["all-old"]]))
+                  for name in ("all-new", "paged", "new-hosts-old", "rollback", "full")},
+                 {"all-new": ["new-only families", "refused PUTs"], "paged": ["refused PUTs"],
+                  "new-hosts-old": ["families", "new reason", "new-only families",
+                                    "penalties", "refused PUTs"],
+                  "rollback": ["families", "new reason", "new-only families", "penalties",
+                               "refused PUTs"],
+                  "full": []})
+    expect("a paged run whose incumbents admit one request at once, with no page answered "
+           "busy, fails",
+           {"paged": result(sync=paged_sync(), paging={"busy_limit": 1})},
+           options(), ["no page was answered busy"])
+    expect("a paged run with pages answered busy, none charged for, passes",
+           {"paged": result(sync=paged_sync(busy=3), paging={"busy_limit": 1})},
+           options(), [])
+    page_report = harness.report({"paged": result(sync=paged_sync())}, options())
+    expect_equal("the report gives the paged and single exchanges by release, and the most "
+                 "pages one took",
+                 [line for line in page_report.splitlines()
+                  if "new -> new" in line or "most pages" in line],
+                 ["        new -> new           1     0",
+                  "  most pages in an exchange: 4 sent, 4 received; 1 exchange(s) took more "
+                  "than one page for each list both ways"])
+
+    audited = result(sync=paged_sync(single=[exchange(form="single", peer_release="old")]))
+    audited["audits"] = {"joiner-00": {"responsible_audit_passed": 3, "subtree_audit_failed": 2,
+                                       "digest_received": 9},
+                         "incumbent-00": {"responsible_audit_passed": 2}}
+    expect_equal("the report gives the audits made per exchange, paged and single",
+                 [line for line in harness.sync_lines(audited) if "audits made" in line],
+                 ["  audits made: 7 over 2 exchange(s), per exchange: 3.500"])
+    expect_equal("the report says when there were no exchanges to give audits per",
+                 [line for line in harness.sync_lines(result(sync=paged_sync(exchanges=[])))
+                  if "audits made" in line],
+                 ["  audits made: 0 over 0 exchange(s), per exchange: no exchanges"])
+
+    seamed = result(sync=paged_sync(exchanges=[exchange(pages=1)] * harness.AUDIT_EXCHANGE_FLOOR))
+    seamed["audit_seam"] = True
+    expect("a run with the audit seam that made no audit over many exchanges fails",
+           {"all-new": seamed}, options(),
+           [f"no audit made over {harness.AUDIT_EXCHANGE_FLOOR} exchanges"])
+    seamed["audits"] = {"incumbent-00": {"responsible_audit_pass": 1}}
+    expect("a run with the audit seam that made an audit passes", {"all-new": seamed},
+           options(), [])
+    few = result(sync=paged_sync(exchanges=[exchange(pages=1)] * 3))
+    few["audit_seam"] = True
+    expect("a run with the audit seam and few exchanges need make no audit", {"all-new": few},
+           options(), [])
+    unseamed = result(sync=paged_sync(exchanges=[exchange(pages=1)] * 60))
+    expect("a run without the audit seam need make no audit",
+           {"new-hosts-old": unseamed}, options(), [])
+    expect_equal("the report says when a run had no audit seam",
+                 [line for line in harness.sync_lines(unseamed) if "audits made" in line],
+                 ["  audits made: 0 over 60 exchange(s), per exchange: 0.000; no audit seam "
+                  "in this run, so none is due: a key is audited an hour after its repair "
+                  "hint"])
+
+    with tempfile.TemporaryDirectory() as temporary:
+        folder = Path(temporary)
+        lapse = 10 + harness.FULL_RUN_FRESHNESS_SECS / 60
+        def missed(after, before):
+            return [f"no erasure after the lapse of a record the stopped node was chosen for, "
+                    f"by a node its fresh mark kept inside the record's retention width "
+                    f"({after} other erasure(s) after it, {before} before)"]
+
+        for name, erased_at, failing, candidates in [
+                ("a full run with no erasure fails", (),
+                 ["no node erased a record"], [IN_GROUP]),
+                ("a full run with erasures only before the mark lapsed fails",
+                 ((5, IN_GROUP),),
+                 missed(0, 1), [IN_GROUP]),
+                ("a full run with an erasure after the mark lapsed of a record the stopped "
+                 "node was chosen for, by a node only the lapse left outside its width, "
+                 "passes", ((5, IN_GROUP), (lapse + 1, IN_GROUP)), [], [IN_GROUP]),
+                ("a run recorded without its candidates has them worked out from its counts",
+                 ((lapse + 1, IN_GROUP),), [], None),
+                ("an erasure after the lapse by a node inside the narrowed width doesn't "
+                 "count", ((lapse + 1, IN_GROUP, "incumbent-01"),),
+                 missed(1, 0), [IN_GROUP]),
+                ("an erasure after the lapse of a record whose group held the stopped node, "
+                 "but which it wasn't chosen for, doesn't count", ((lapse + 1, NOT_CHOSEN),),
+                 missed(1, 0), [IN_GROUP]),
+                ("an erasure after the lapse of a record whose nearest hold the stopped node "
+                 "past its 7 not full doesn't count", ((5, IN_GROUP), (lapse + 1, PAST_GROUP)),
+                 missed(1, 1), [IN_GROUP]),
+                ("an erasure after the lapse of a record whose nearest don't hold the stopped "
+                 "node doesn't count", ((lapse + 1, NOT_NEAR),),
+                 missed(1, 0), [IN_GROUP]),
+                ("an erasure after the lapse of a record the harness didn't count doesn't "
+                 "count", ((lapse + 1, NOT_CHECKED),),
+                 missed(1, 0), [IN_GROUP]),
+        ]:
+            run = full_run(folder, erased_at)
+            if candidates is None:
+                del run["full_phases"]["stopped"]["candidates"]
+            else:
+                run["full_phases"]["stopped"]["candidates"] = candidates
+            found = harness.full_run_checks(run, [], [])
+            if len(found["failures"]) != len(failing) or not all(
+                    any(text in failure for failure in found["failures"]) for text in failing):
+                FAILED.append(name)
+                print(f"FAILED: {name}: {found['failures']}")
+            else:
+                print(f"ok: {name}")
+
+    # The run waits for that erasure as long as the node's constants, read
+    # from this tree's source, and the run's seams say it can take. The seam
+    # shortens the node's fetch window to one still past the verification
+    # and fetch timeouts.
+    timeouts = sum(harness.rust_const(harness.REPLICATION_CONFIG, name) for name in (
+        "VERIFICATION_REQUEST_TIMEOUT_SECS", "FETCH_REQUEST_TIMEOUT_SECS"))
+    fetch_window = timeouts + harness.rust_const(harness.REPLICATION_CONFIG,
+                                                 "VERIFICATION_RETRY_BACKOFF_MAX_SECS")
+    expect_equal("the fetch window, read from the source", fetch_window, 15 + 30 + 300)
+    expect_equal("the full run's fetch window is past the timeouts and shorter than the node's",
+                 timeouts < harness.FULL_RUN_FETCH_WINDOW_SECS < fetch_window, True)
+    expect_equal("the epochs before erasure, read from the source",
+                 harness.rust_const(harness.ERASURE_SOURCE, "EPOCHS_BEFORE_ERASURE"), 2)
+    longest = harness.lapse_erasure_seconds()
+    expect_equal("the full run observes past the lapse, the out-of-range wait and the fetch "
+                 "window", longest > harness.FULL_RUN_FRESHNESS_SECS
+                 + harness.FULL_RUN_HYSTERESIS_SECS + harness.FULL_RUN_FETCH_WINDOW_SECS
+                 + 10 * 60, True)
+    # And that erasure, in sync cycles whose rounds start at their longest
+    # wait and exchange at once, goes ahead before the stopped node drops out
+    # of its peers' routing tables, which brings the record back into the
+    # eraser's range. With 30 s syncs and the node's own fetch window it
+    # didn't: the record came back first.
+    view = harness.stopped_peer_view_seconds()
+    expect_equal("a stopped peer stays in view, read from saorsa-core's source", view, 15 * 60)
+    expect_equal("the full run's awaited erasure goes ahead while the stopped node is in view",
+                 harness.lapse_erasure_seconds(exchange=0) < view, True)
+    seams = (harness.FULL_RUN_SYNC_SECS, harness.FULL_RUN_FETCH_WINDOW_SECS)
+    harness.FULL_RUN_SYNC_SECS, harness.FULL_RUN_FETCH_WINDOW_SECS = 30, fetch_window
+    try:
+        expect_equal("with 30 s syncs and the node's fetch window it may not",
+                     harness.lapse_erasure_seconds(exchange=0) < view, False)
+    finally:
+        harness.FULL_RUN_SYNC_SECS, harness.FULL_RUN_FETCH_WINDOW_SECS = seams
+
+    # The retention width, as src/replication/full.rs counts it.
+    numbers = list(range(30))
+    expect_equal("a window widens by one for each full node inside it",
+                 [harness.widened_len(numbers, 7, {n for n in numbers if n % 2}),
+                  harness.widened_len(numbers, 9, set()),
+                  harness.widened_len(numbers, 9, {0, 1, 2}),
+                  harness.widened_len(numbers, 9, set(range(15))),
+                  harness.widened_len(numbers[:5], 7, set())],
+                 [13, 9, 12, 20, 5])
+
+    # Which records a full node's lapse lets be erased in a group holding it.
+    # Nodes by letter, nearest first: F full; D the devnet's; the 9th node
+    # not full (Y) holds the record just inside the retention width F widens.
+    peers = {name: f"{index + 0x10:02x}" * 32 for index, name in enumerate("ABCDEFGHXYZ")}
+    peer = peers.get
+
+    def layout(order, held, devnet=()):
+        nearest = [peer(name) for name in order]
+        return ({"address": "ab" * 32, "nearest": nearest,
+                 "answers": [{"peer": peer(name), "outcome": "held"} for name in held]},
+                {peer(name) for name in devnet})
+
+    full = {peer("F")}
+    pressured = {peer(name) for name in "ABCDEGHXYZ"}
+    for name, order, held, devnet, wanted in [
+            ("a full node's lapse narrows the width past a holder: erasable",
+             "ABCFDEGHXYZ", "ABCDEGY", "", ["ab" * 32]),
+            ("a devnet node among the group leaves 5 proofs: not erasable",
+             "ABCFDEGHXYZ", "ABCDEGY", "B", []),
+            ("a node of the group without the record leaves 5 proofs: not erasable",
+             "ABCFDEGHXYZ", "ABCEGY", "", []),
+            ("the node the width leaves out lacks the record: nothing to erase",
+             "ABCFDEGHXYZ", "ABCDEGHX", "", []),
+            ("a full node past the group: its lapse doesn't make the group's",
+             "ABCDEGHFXYZ", "ABCDEGHXY", "", []),
+    ]:
+        record, devnet_ids = layout(order, held, devnet)
+        found = harness.lapse_candidates([record], full, devnet_ids, pressured)
+        expect_equal(name, found, {peer("F"): wanted})
+
+    # Choosing the full joiners gives a share of records.
+    expect_equal("place_full chooses among the joiners and gives a share",
+                 isinstance(harness.place_full(
+                     {f"joiner-{index:02d}": f"{0x40 + index:02x}" * 32 for index in range(8)},
+                     [f"{0x80 + index:02x}" * 32 for index in range(8)],
+                     {"f0" * 32, "f1" * 32}, 2)[1], float), True)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        folder = Path(temporary)
+        run = full_run(folder, ())
+        run["full_phases"]["stopped"]["candidates"] = []
+        found = harness.full_run_checks(run, [], [])
+        expect_equal("a full run whose layout let no lapse matter says so",
+                     [failure for failure in found["failures"]
+                      if "no full joiner's lapse would let" in failure] != [], True)
+
     listed(options())
+    sized(options())
+    sized_penalties_apart()
 
     refused_notice = {("joiner", "old", "notice"): 3}
     expect("a proof the previous release refused in a notice, which no all-old run did, fails",
