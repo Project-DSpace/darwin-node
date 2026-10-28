@@ -634,8 +634,10 @@ impl Chain {
     /// Call `method` once with each of `params`, together in one JSON-RPC
     /// batch, on the RPC that last answered, then on the others in turn
     /// until one answers every call: the results in the order of `params`,
-    /// or every RPC's error if none does. An RPC that fails any call of the
-    /// batch counts as failing it all.
+    /// or every RPC's error if none does. An RPC that answers the batch with
+    /// anything but a list (one that takes no batches) is asked each call
+    /// alone before it counts as failing. An RPC that fails any call of the
+    /// batch, or of those single calls, counts as failing it all.
     async fn batch(&self, method: &str, params: &[Value]) -> Result<Vec<Value>> {
         #[cfg(test)]
         {
@@ -714,9 +716,14 @@ impl Chain {
             .await
             .map_err(|e| Error::Network(format!("payment chain {method} batch: {e}")))?;
         let Some(answers) = response.as_array() else {
-            // A provider that takes no batches answers with one error.
-            rpc_result(method, &response)?;
-            return Err(malformed("a batch's answer is not a list"));
+            // A provider that takes no batches answers with something else,
+            // often one error: ask it each call alone, in order, and count
+            // it as failing only if one of those fails.
+            let mut results = Vec::with_capacity(params.len());
+            for params in params {
+                results.push(self.call_rpc(rpc_url, method, params).await?);
+            }
+            return Ok(results);
         };
         let mut results: Vec<Option<Value>> = vec![None; params.len()];
         for answer in answers {
@@ -950,6 +957,9 @@ pub mod tests {
         pub refused: Vec<&'static str>,
         /// The block the chain has finalized; the latest if `None`.
         pub finalized: Option<u64>,
+        /// When served, a batch is answered with this, not a list, as by a
+        /// provider that takes no batches; single calls are answered.
+        pub no_batches: Option<Value>,
     }
 
     impl MockChain {
@@ -1067,6 +1077,9 @@ pub mod tests {
             let batch = request.as_array().cloned();
             if batch.is_some() {
                 self.batches += 1;
+                if let Some(answer) = &self.no_batches {
+                    return Some(answer.clone());
+                }
             }
             let requests = batch.unwrap_or_else(|| vec![request.clone()]);
             let methods: Vec<&str> = requests
@@ -1705,6 +1718,87 @@ pub mod tests {
             error.contains("403") && error.contains("rate limited"),
             "{error}"
         );
+    }
+
+    /// An RPC that answers a batch with something other than a list, as one
+    /// that takes no batches does, is asked each vault's query alone, in
+    /// order, before it counts as failing; if one of those fails, the batch
+    /// goes to the next RPC, which is asked the same way.
+    #[tokio::test]
+    async fn an_rpc_without_batches_is_asked_each_query_alone() {
+        let topics = [Some(DATA_PAYMENT_MADE_TOPIC), None, None, Some([5; 32])];
+        let no_batches = json!({ "jsonrpc": "2.0", "id": null,
+            "error": { "code": -32600, "message": "batch requests are not supported" } });
+        let root = json!(format!("0x{}", hex::encode(ROOT.address)));
+        let vault = json!(format!("0x{}", hex::encode(VAULT)));
+
+        // One RPC alone, without batches: both queries, one by one.
+        let mut alone = paid_by_both_vaults();
+        alone.no_batches = Some(no_batches.clone());
+        let (chain, mock) = client(alone).await;
+        let logs = chain
+            .vault_logs(&WITH_ROOT, &topics, 0, 150_000)
+            .await
+            .unwrap();
+        assert_eq!(located(&logs), vec![(50_000, 9), (100_000, 4)]);
+        assert_eq!(mock.lock().batches, 1, "the batch was tried first");
+        let addresses: Vec<Value> = mock
+            .lock()
+            .log_filters
+            .iter()
+            .map(|filter| filter["address"].clone())
+            .collect();
+        assert_eq!(addresses, vec![vault.clone(), root.clone()]);
+
+        // A batch answered with a result that is not a list counts the same.
+        let mut odd = paid_by_both_vaults();
+        odd.no_batches = Some(json!({ "jsonrpc": "2.0", "id": 0, "result": [] }));
+        let (chain, mock) = client(odd).await;
+        let logs = chain
+            .vault_logs(&WITH_ROOT, &topics, 0, 150_000)
+            .await
+            .unwrap();
+        assert_eq!(located(&logs), vec![(50_000, 9), (100_000, 4)]);
+        assert_eq!(mock.lock().log_filters.len(), 2);
+
+        // Without batches and failing the root vault's query: the next RPC,
+        // also without batches, answers both.
+        let mut failing = paid_by_both_vaults();
+        failing.no_batches = Some(no_batches.clone());
+        let failing_root = root.clone();
+        failing.fails = Some(Box::new(move |method, params| {
+            method == "eth_getLogs" && params[0]["address"] == failing_root
+        }));
+        let mut answering = paid_by_both_vaults();
+        answering.no_batches = Some(no_batches);
+        let [failing, answering] = [failing, answering].map(|chain| Arc::new(Mutex::new(chain)));
+        let chain = Chain::with_rpcs(vec![
+            MockChain::serve(Arc::clone(&failing)).await,
+            MockChain::serve(Arc::clone(&answering)).await,
+        ])
+        .unwrap();
+        let logs = chain
+            .vault_logs(&WITH_ROOT, &topics, 0, 150_000)
+            .await
+            .unwrap();
+        assert_eq!(located(&logs), vec![(50_000, 9), (100_000, 4)]);
+        assert_eq!(failing.lock().batches, 1);
+        assert_eq!(answering.lock().batches, 1);
+        // The failing RPC was asked the per-quote vault's query, then the
+        // root vault's, which failed (and so was not recorded).
+        assert_eq!(failing.lock().log_filters.len(), 1);
+        assert_eq!(
+            failing.lock().calls,
+            vec!["eth_getLogs".to_string(), "eth_getLogs".to_string()]
+        );
+        assert_eq!(answering.lock().log_filters.len(), 2);
+
+        // Through the failing one alone, its error.
+        let error = Chain::with_rpcs(vec![MockChain::serve(Arc::clone(&failing)).await])
+            .unwrap()
+            .vault_logs(&WITH_ROOT, &topics, 0, 150_000)
+            .await;
+        assert!(format!("{error:?}").contains("rate limited"), "{error:?}");
     }
 
     #[test]

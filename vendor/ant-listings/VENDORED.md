@@ -1,10 +1,10 @@
-# Vendored from Project-DSpace/darwin-listings 0.4.0, branch root-readers at commit 7e709e0f825d3650560f494f85ac6ebcbf8188ae (not yet tagged), unchanged; only .github/ is left out.
+# Vendored from Project-DSpace/darwin-listings 0.4.0, branch root-readers at commit a58de649e66584c0ed7d6e3868d79f37f3aeac40 (not yet tagged), unchanged; only .github/ is left out.
 # darwin-listings is public again; whether to return to the git dependency is open.
 
 The copy's git objects, the same as at that commit. The Build workflow
 compares them with these on every run:
 
-- src tree: 0dcd4152d34250435413865bf072360f72eb1ecf
+- src tree: a7f8449e6d9a1c810793d27e05814c98a5188928
 - Cargo.toml blob: 034b2354619768a25517638666144bf8a93653d7
 
 The crate is a member of this repository's workspace, so its own tests run

@@ -104,7 +104,7 @@ note = "its THIRD_PARTY file covers documentation adapted from Apple's Security 
 
 [remark.ant-listings]
 version = "0.4.0"
-note = "an unchanged copy of Project-DSpace/darwin-listings 0.4.0 (commit 7e709e0f825d, without its .github folder), kept in vendor/ant-listings of the repository this release is built from; its Source above is that copy (see vendor/ant-listings/VENDORED.md)."
+note = "an unchanged copy of Project-DSpace/darwin-listings 0.4.0 (commit a58de649e665, without its .github folder), kept in vendor/ant-listings of the repository this release is built from; its Source above is that copy (see vendor/ant-listings/VENDORED.md)."
 
 [remark.ant-protocol]
 version = "5.0.0"
