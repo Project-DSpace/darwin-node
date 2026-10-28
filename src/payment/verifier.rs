@@ -9895,10 +9895,14 @@ mod tests {
     /// Curve canonicality: any price produced by `calculate_price(n)` is
     /// on-curve by construction. We exercise a spread of `n` covering the
     /// baseline floor (n=0), small counts, the pricing-curve knee
-    /// (`n=PRICING_DIVISOR=6000`), and a saturating-arithmetic regime.
+    /// (`n=PRICING_DIVISOR=2000`; Dan, 2026-10-28 decision: 100 DARWIN per
+    /// GB, divisor 2,000), 6,000 as an ordinary count, and a
+    /// saturating-arithmetic regime.
     #[test]
     fn adr0004_on_curve_prices_round_trip() {
-        for &n in &[0usize, 1, 2, 100, 5999, 6000, 6001, 50_000, 1_000_000] {
+        for &n in &[
+            0usize, 1, 2, 100, 1_999, 2_000, 2_001, 5_999, 6_000, 6_001, 50_000, 1_000_000,
+        ] {
             let price = crate::payment::pricing::calculate_price(n);
             assert!(
                 PaymentVerifier::quote_price_is_on_curve(&price),

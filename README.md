@@ -17,7 +17,8 @@ never ran.
   curve in `vendor/ant-protocol`: 100 DARWIN per GB of full chunks on empty
   nodes, divisor 2,000 (Dan, 2026-10-28), the previous curve (Autonomi's
   × 32) still accepted; nodes quote the new curve from
-  2026-10-29T00:00:00Z. The storage-node Docker
+  2026-10-29T00:00:00Z (a placeholder, set when ds.20 is tagged so it
+  falls after ds.20 is on the nodes). The storage-node Docker
   image sets this with `ANT_EVM_RPC_URL`, `ANT_EVM_PAYMENT_TOKEN` and
   `ANT_EVM_PAYMENT_VAULT`. The bare binary still defaults to Arbitrum One
   (upstream's contracts): run it on Darwin only with those three set (see

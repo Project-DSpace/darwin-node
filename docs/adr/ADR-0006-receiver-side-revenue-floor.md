@@ -247,9 +247,18 @@ payment when it settles below its close group's median-priced floor.
   at-median payment (the production false-rejection shape); a cheapest-of-group
   settlement is rejected; a bundle padded with cheap quotes does not move the
   reference; thin, fully stale, no-own-commitment and over-cap views skip; a
-  mixed cache prices against the fresh entries only; three understated or three
-  overstated neighbours do not break the floor and four of either do, pinned
-  deliberately as known limits.
+  mixed cache prices against the fresh entries only. On the legacy curve
+  (upstream's × 32, D = 6,000) three understated or three overstated
+  neighbours do not break the floor and four of either do, pinned deliberately
+  as known limits. On the current curve (Dan, 2026-10-28 decision: 100 DARWIN
+  per GB, divisor 2,000), which rises faster, the margins move: three
+  overstated neighbours refuse an honest payment at the bottom of the true
+  median's band at the default 65% tolerance, and four understated ones no
+  longer disarm the floor. Both are pinned by
+  `three_overstated_commitments_grief_the_floor_on_the_current_curve` and
+  `four_understated_commitments_dont_disarm_the_floor_on_the_current_curve`;
+  whether the default tolerance is re-derived for the current curve is open
+  for Dan.
 - Shadow telemetry before any canary enforces: the distribution of
   `settled / (3 x tolerance% x reference_price)` on honest traffic, and the
   `skipped=true` rate broken down by `skip_reason` — `no_commitment_cache` and

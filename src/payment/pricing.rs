@@ -22,8 +22,20 @@ pub use ant_protocol::payment::pricing::{
 };
 
 /// Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000. Nodes quote
-/// the legacy curve before 2026-10-29T00:00:00Z and the current curve from
-/// it, by the node's wall clock when the quote is made. Unix seconds.
+/// the legacy curve before this time and the current curve from it, by the
+/// node's wall clock when the quote is made. Unix seconds.
+///
+/// RELEASE GATE: 2026-10-29T00:00:00Z is a placeholder. Dan's decisions log
+/// (2026-10-28): "PRICE_SWITCH_AT must fall after the combined release is on
+/// our nodes, so it is set when ds.20 is tagged". Re-derive it from the tag
+/// time before tagging: at least the release's publication + the staged
+/// rollout (`staged_rollout_hours`, 24 h by default) + one upgrade check
+/// (`check_interval_hours`, 1 h) + the canary period and approval gate, and
+/// after darwin-client v0.3.11+ds.5 is deployed on the gateway and CLIs. A
+/// ds.19 node refuses every payment carrying a new-curve quote, so a switch
+/// before ds.20 is on the nodes fails uploads and replication to them. Change
+/// this constant, `the_switch_is_the_tagged_time`, README.md and the release
+/// notes together.
 pub const PRICE_SWITCH_AT: u64 = 1_793_232_000;
 
 /// Whether a quote made at `at` is priced on the legacy curve
@@ -52,8 +64,11 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
 
+    /// Pins the switch time. 1_793_232_000 (2026-10-29T00:00:00Z) is a
+    /// placeholder: re-derive it from ds.20's tag time (see the release gate
+    /// on [`PRICE_SWITCH_AT`]) and change this pin with it.
     #[test]
-    fn the_switch_is_2026_10_29_midnight_utc() {
+    fn the_switch_is_the_tagged_time() {
         assert_eq!(PRICE_SWITCH_AT, 1_793_232_000);
     }
 
