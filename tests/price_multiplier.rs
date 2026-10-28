@@ -51,7 +51,10 @@ fn a_gb_costs(price: Amount, darwin_per_gb: u128) -> bool {
 
 #[test]
 fn a_gb_costs_100_darwin_on_empty_nodes() {
-    assert_eq!(calculate_price(0), Amount::from(139_673_600_000_000_000u128));
+    assert_eq!(
+        calculate_price(0),
+        Amount::from(139_673_600_000_000_000u128)
+    );
     assert!(a_gb_costs(calculate_price(0), 100));
 }
 

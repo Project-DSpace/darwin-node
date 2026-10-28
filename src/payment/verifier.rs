@@ -1875,8 +1875,7 @@ impl PaymentVerifier {
                             hex::encode(xorname),
                             EMPTY_PAYMENT_RECHECK_DELAY
                         );
-                        verified_paid_quote =
-                            Some((paid_price, paid_on_legacy, settled_amount));
+                        verified_paid_quote = Some((paid_price, paid_on_legacy, settled_amount));
                         paid_peer = Some(candidate_peer);
                         break;
                     }
@@ -10480,7 +10479,10 @@ mod tests {
             );
         }
         assert_eq!(PaymentVerifier::binding_violation(0, None, &cp(0)), None);
-        assert_eq!(PaymentVerifier::binding_violation(0, None, &legacy(0)), None);
+        assert_eq!(
+            PaymentVerifier::binding_violation(0, None, &legacy(0)),
+            None
+        );
     }
 
     #[test]

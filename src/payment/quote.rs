@@ -540,11 +540,11 @@ mod tests {
     // long-standing node-side negative tests (tampered keys, swapped
     // pub keys, wrong timestamp, etc.) keep running against the canonical
     // wire-side implementation.
-    use ant_protocol::payment::verify::{
-        verify_merkle_candidate_signature, verify_quote_content, verify_quote_signature,
-    };
     use crate::payment::pricing::{
         calculate_price, calculate_price_legacy, price_in_accepted_band, quotes_on_legacy_curve,
+    };
+    use ant_protocol::payment::verify::{
+        verify_merkle_candidate_signature, verify_quote_content, verify_quote_signature,
     };
     use evmlib::common::Amount;
     use saorsa_pqc::pqc::types::MlDsaSecretKey;

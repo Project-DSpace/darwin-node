@@ -2443,7 +2443,12 @@ fn every_price_on_the_curve_and_every_quoted_count_is_reviewed() {
         ),
         // The quoting curve by the node's clock: the legacy curve before
         // PRICE_SWITCH_AT, the current curve from it.
-        ("src/payment/pricing.rs", "quote_price_at", "calculate_price", 1),
+        (
+            "src/payment/pricing.rs",
+            "quote_price_at",
+            "calculate_price",
+            1,
+        ),
         (
             "src/payment/pricing.rs",
             "quote_price_at",
