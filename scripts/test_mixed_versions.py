@@ -1627,7 +1627,7 @@ def analyze(run):
         "decode_failures": decode_failures,
         "proof_refusals": proof_refusals,
         "unlisted": unlisted,
-        "faults": run["faults"]["cases"],
+        "faults": run.get("faults", {"cases": []})["cases"],
         "penalties": penalties,
         "penalties_on_full": penalties_on_full,
         "penalties_on_refusals": penalties_on_refusals,
