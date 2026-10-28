@@ -9,7 +9,7 @@ use crate::logging::{debug, info, warn};
 use crate::payment::cache::{CacheStats, PaidKey, VerifiedCache, XorName};
 use crate::payment::paid_class::PaidClass;
 use crate::payment::pricing::{
-    band_bottom_count, calculate_price, derive_records_stored_from_price,
+    band_bottom_count, calculate_price, calculate_price_legacy, derive_records_stored_from_price,
 };
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type, ProofType,
@@ -1745,12 +1745,16 @@ impl PaymentVerifier {
         // being the one price `calculate_price(0)`), and the committed responsible count
         // legitimately differs from the on-disk count, so the old gate would
         // FALSE-REJECT healthy ADR quotes. The binding gate supersedes it.
+        // The band is either curve's (`price_in_accepted_band`): the current
+        // curve's or the legacy curve's, each as before (Dan, 2026-10-28
+        // decision: 100 DARWIN per GB, divisor 2,000).
         Self::validate_quote_arithmetic(payment)?;
         let candidates = Self::legacy_median_candidates(payment, weight)?;
         let mut failures = Vec::with_capacity(candidates.len());
-        // The paid (median) price and settled on-chain amount of the winning
-        // candidate, kept for the receiver-side price-floor policy below.
-        let mut verified_paid_quote: Option<(Amount, Amount)> = None;
+        // The paid (median) price, whether it is on the legacy curve, and the
+        // settled on-chain amount of the winning candidate, kept for the
+        // receiver-side price-floor policy below.
+        let mut verified_paid_quote: Option<(Amount, bool, Amount)> = None;
         // ADR-0004 Amendment 2: remember WHICH candidate's on-chain settlement
         // verified — only that peer's commitment actually earned money, so only
         // its pin is nominated for a deterministic first audit below. The
@@ -1766,13 +1770,14 @@ impl PaymentVerifier {
 
         for candidate in candidates {
             let paid_price = candidate.quote.price;
+            let paid_on_legacy = Self::priced_on_legacy_curve(&candidate.quote);
             let candidate_peer = *candidate.encoded_peer_id.as_bytes();
             match self
                 .verify_legacy_median_candidate(target, candidate, &mut receipts, lane)
                 .await
             {
                 Ok(CandidateSettlement::Paid(settled_amount)) => {
-                    verified_paid_quote = Some((paid_price, settled_amount));
+                    verified_paid_quote = Some((paid_price, paid_on_legacy, settled_amount));
                     // First settlement-verified median candidate wins the paid
                     // slot and the sole first-audit nomination. If a client
                     // settled several TIED-median candidates, only this one is
@@ -1821,6 +1826,7 @@ impl PaymentVerifier {
                     .settlements_again_later(quotes, lane, EMPTY_PAYMENT_RECHECK_DELAY);
             for (candidate, _) in read_empty {
                 let paid_price = candidate.quote.price;
+                let paid_on_legacy = Self::priced_on_legacy_curve(&candidate.quote);
                 let candidate_peer = *candidate.encoded_peer_id.as_bytes();
                 let read = again.recv().await.flatten();
                 let settled = self
@@ -1833,7 +1839,8 @@ impl PaymentVerifier {
                             hex::encode(xorname),
                             EMPTY_PAYMENT_RECHECK_DELAY
                         );
-                        verified_paid_quote = Some((paid_price, settled_amount));
+                        verified_paid_quote =
+                            Some((paid_price, paid_on_legacy, settled_amount));
                         paid_peer = Some(candidate_peer);
                         break;
                     }
@@ -1844,7 +1851,7 @@ impl PaymentVerifier {
             }
         }
 
-        let Some((paid_price, settled_amount)) = verified_paid_quote else {
+        let Some((paid_price, paid_on_legacy, settled_amount)) = verified_paid_quote else {
             let xorname_hex = hex::encode(xorname);
             let details = if failures.is_empty() {
                 "no median-priced candidates were available".to_string()
@@ -1869,6 +1876,7 @@ impl PaymentVerifier {
             target.routing(),
             weight,
             paid_price,
+            paid_on_legacy,
             settled_amount,
             context,
         )
@@ -2296,8 +2304,18 @@ impl PaymentVerifier {
     /// sample size either way, so the caller can log how close it came. A `None`
     /// price means "do not evaluate".
     ///
+    /// The reference is priced on the curve the paid quote is on: with
+    /// `legacy_curve` on [`calculate_price_legacy`], else on
+    /// [`calculate_price`] (Dan, 2026-10-28 decision: 100 DARWIN per GB,
+    /// divisor 2,000, with the legacy curve still accepted). A legacy payment
+    /// is never held to the higher current curve.
+    ///
     /// [`GOSSIP_ANSWERABILITY_TTL`]: crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
-    async fn group_reference_price(&self, xorname: &XorName) -> (Option<Amount>, GroupSample) {
+    async fn group_reference_price(
+        &self,
+        xorname: &XorName,
+        legacy_curve: bool,
+    ) -> (Option<Amount>, GroupSample) {
         // This node's own live commitment. It is in the group whenever it is
         // being asked to store the chunk, so it belongs in the sample. Bound to
         // a local first so the source lock is released before the awaits below.
@@ -2390,7 +2408,12 @@ impl PaymentVerifier {
         // honest payment to any of them already settled clears this
         // reference, whatever the sizes of the records the group holds.
         let bottom = band_bottom_count(u64::from(median_key_count));
-        let reference = calculate_price(usize::try_from(bottom).unwrap_or(usize::MAX));
+        let bottom = usize::try_from(bottom).unwrap_or(usize::MAX);
+        let reference = if legacy_curve {
+            calculate_price_legacy(bottom)
+        } else {
+            calculate_price(bottom)
+        };
         (Some(reference), sample)
     }
 
@@ -2400,7 +2423,9 @@ impl PaymentVerifier {
     /// `PAID_QUOTE_PAYMENT_MULTIPLIER × tolerance% ×` the close group's median
     /// commitment-bound price at the bottom of its band (see
     /// [`Self::group_reference_price`]) × `weight`, the record's size class,
-    /// rounded up as the per-quote requirement is.
+    /// rounded up as the per-quote requirement is. The reference is priced on
+    /// the paid quote's curve, `paid_on_legacy` from
+    /// [`Self::priced_on_legacy_curve`].
     /// Together with the per-quote check above, the effective rule is
     /// `settled >= 3 × max(paid_price, tolerated_floor) × weight`, so the
     /// floor never asks a small record for a full chunk's amount.
@@ -2423,6 +2448,7 @@ impl PaymentVerifier {
         xorname: &XorName,
         weight: RecordWeight,
         paid_price: Amount,
+        paid_on_legacy: bool,
         settled_amount: Amount,
         context: VerificationContext,
     ) -> Result<()> {
@@ -2433,7 +2459,7 @@ impl PaymentVerifier {
         let floor = *self.price_floor.read();
         let tolerance_percent = floor.tolerance_percent.min(100);
 
-        let (reference, group_sample) = self.group_reference_price(xorname).await;
+        let (reference, group_sample) = self.group_reference_price(xorname, paid_on_legacy).await;
         let Some(reference_price) = reference else {
             // Not enough of the close group is known to price anything. Skip
             // rather than guess: see `group_reference_price`. The reason and
@@ -2470,7 +2496,8 @@ impl PaymentVerifier {
              settled={settled_amount}, neighbours={}, group_sample={}, \
              reference_price={reference_price}, tolerance_percent={tolerance_percent}, \
              required={required_amount}, below_floor={below_floor}, skipped=false, \
-             skip_reason=none, enforce={}, weight={}/{WEIGHT_DENOMINATOR}",
+             skip_reason=none, enforce={}, weight={}/{WEIGHT_DENOMINATOR}, \
+             legacy_curve={paid_on_legacy}",
             hex::encode(xorname),
             group_sample.neighbours,
             group_sample.total,
@@ -2703,6 +2730,10 @@ impl PaymentVerifier {
     /// ADR-0004: enforce that every quoted price lies in the band its signed
     /// count allows.
     ///
+    /// The band is either curve's (`price_in_accepted_band`): a price valid on
+    /// the current curve or on the legacy curve, each band as below (Dan,
+    /// 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000).
+    ///
     /// **Scope**: the price is bound by the quote's own signed
     /// `committed_key_count`, not merely required to be *somewhere* on the
     /// curve. A node quotes at its weight total, so the price may be anywhere
@@ -2773,7 +2804,10 @@ impl PaymentVerifier {
     /// at the *wire-decode* layer, where they decode as `(0, None)` and are then
     /// held to the same baseline rule; an explicit version negotiation, not
     /// field inference, is the sanctioned path if non-baseline legacy quotes
-    /// must ever be accepted.
+    /// must ever be accepted. Every `calculate_price` here also stands for
+    /// `calculate_price_legacy`: a price in either curve's band passes, and
+    /// the baseline is either curve's `calculate_price(0)` (Dan, 2026-10-28
+    /// decision: 100 DARWIN per GB, divisor 2,000).
     fn quote_arithmetic_violation(quote: &evmlib::PaymentQuote) -> Option<String> {
         Self::binding_violation(
             quote.committed_key_count,
@@ -2798,7 +2832,11 @@ impl PaymentVerifier {
     ///    record a full chunk. Both ends are exact forward computations, never
     ///    an inversion of the price, and the ceiling is today's exact price, so
     ///    no quote is ever above what its count allows. With K = 0 the band is
-    ///    the one baseline price.
+    ///    the one baseline price. The band of either curve is accepted
+    ///    (`price_in_accepted_band`): the current curve's or the legacy
+    ///    curve's, each computed as above (Dan, 2026-10-28 decision: 100
+    ///    DARWIN per GB, divisor 2,000), so the baseline is either curve's
+    ///    `calculate_price(0)`.
     fn binding_violation(
         committed_key_count: u32,
         commitment_pin: Option<[u8; 32]>,
@@ -2827,16 +2865,34 @@ impl PaymentVerifier {
             ));
         }
         let key_count = u64::from(committed_key_count);
-        if crate::payment::pricing::price_in_band(price, key_count) {
+        if crate::payment::pricing::price_in_accepted_band(price, key_count) {
             None
         } else {
             let (bottom, top) = crate::payment::pricing::price_band(key_count);
+            let (legacy_bottom, legacy_top) = crate::payment::pricing::price_band_legacy(key_count);
+            let bottom_count = crate::payment::pricing::band_bottom_count(key_count);
             Some(format!(
                 "price {price} is outside the band for committed_key_count={committed_key_count}: \
-                 calculate_price({}) = {bottom} to calculate_price({committed_key_count}) = {top}",
-                crate::payment::pricing::band_bottom_count(key_count)
+                 calculate_price({bottom_count}) = {bottom} to \
+                 calculate_price({committed_key_count}) = {top}, and \
+                 calculate_price_legacy({bottom_count}) = {legacy_bottom} to \
+                 calculate_price_legacy({committed_key_count}) = {legacy_top}"
             ))
         }
+    }
+
+    /// Whether the paid quote is priced on the legacy curve: its price is in
+    /// the legacy band for its committed count. This picks the curve the
+    /// revenue floor's reference is priced on
+    /// ([`Self::group_reference_price`]). Where the two bands overlap (K above
+    /// about 1,150) the legacy curve, the lower one, wins, so an honest
+    /// payment is never refused (Dan, 2026-10-28 decision: 100 DARWIN per GB,
+    /// divisor 2,000).
+    fn priced_on_legacy_curve(quote: &evmlib::PaymentQuote) -> bool {
+        crate::payment::pricing::price_in_band_legacy(
+            &quote.price,
+            u64::from(quote.committed_key_count),
+        )
     }
 
     /// Pure ADR-0004 cross-check: compare a quote's claimed `(key_count, pin)`
@@ -5291,10 +5347,6 @@ mod tests {
         price: Amount,
         rewards_seed: u8,
     ) -> (evmlib::EncodedPeerId, PaymentQuote) {
-        let ml_dsa = MlDsa65::new();
-        let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-        let pub_key_bytes = public_key.as_bytes().to_vec();
-        let peer_id = encoded_peer_id_for_pub_key(&pub_key_bytes);
         // Derive the ADR-0004 binding from the price rather than hardcoding
         // `(0, None)`: a quote priced at `calculate_price(n)` must also claim
         // `committed_key_count = n`, or it charges as though it stored `n` keys
@@ -5302,16 +5354,31 @@ mod tests {
         // before the test's own assertion is reached. Prices that are not on
         // the curve at all (`ZERO`, small literals) keep the baseline shape and
         // stay off-curve, which is what the tests exercising bad prices want.
-        let (committed_key_count, commitment_pin) =
-            match PaymentVerifier::price_off_curve_diagnostics(&price) {
-                None => {
-                    let records = derive_records_stored_from_price(price);
-                    let count = u32::try_from(records).unwrap_or(u32::MAX);
-                    let pin = if count == 0 { None } else { Some([0xA5u8; 32]) };
-                    (count, pin)
-                }
-                Some(_) => (0, None),
-            };
+        let committed_key_count = match PaymentVerifier::price_off_curve_diagnostics(&price) {
+            None => u32::try_from(derive_records_stored_from_price(price)).unwrap_or(u32::MAX),
+            Some(_) => 0,
+        };
+        make_signed_quote_at_count(xorname, price, rewards_seed, committed_key_count)
+    }
+
+    /// [`make_signed_quote`] with the committed key count given rather than
+    /// derived from the price, for a price on the legacy curve, which the
+    /// current curve's inverse can't read.
+    fn make_signed_quote_at_count(
+        xorname: XorName,
+        price: Amount,
+        rewards_seed: u8,
+        committed_key_count: u32,
+    ) -> (evmlib::EncodedPeerId, PaymentQuote) {
+        let ml_dsa = MlDsa65::new();
+        let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+        let peer_id = encoded_peer_id_for_pub_key(&pub_key_bytes);
+        let commitment_pin = if committed_key_count == 0 {
+            None
+        } else {
+            Some([0xA5u8; 32])
+        };
         let mut quote = PaymentQuote {
             content: xor_name::XorName(xorname),
             timestamp: SystemTime::now(),
@@ -5956,6 +6023,27 @@ mod tests {
         serialize_proof(peer_quotes)
     }
 
+    /// [`group_floor_proof`] with the paid quote on the legacy curve:
+    /// `calculate_price_legacy(quote_records)` at `quote_records` keys.
+    fn group_floor_proof_legacy(
+        verifier: &PaymentVerifier,
+        xorname: XorName,
+        quote_records: usize,
+        settled: Amount,
+        neighbours: &[[u8; 32]],
+    ) -> Vec<u8> {
+        let count = u32::try_from(quote_records).expect("a test count");
+        let (peer_id, quote) =
+            make_signed_quote_at_count(xorname, calculate_price_legacy(quote_records), 1, count);
+        assert!(PaymentVerifier::priced_on_legacy_curve(&quote));
+        let mut k_closest: Vec<[u8; 32]> = neighbours.to_vec();
+        k_closest.push(*peer_id.as_bytes());
+        let peer_quotes = vec![(peer_id, quote.clone())];
+        verifier.set_paid_quote_k_closest_for_tests(k_closest);
+        mark_candidate_paid(verifier, &quote, settled);
+        serialize_proof(peer_quotes)
+    }
+
     fn three_times(price: Amount) -> Amount {
         price * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER)
     }
@@ -6023,7 +6111,7 @@ mod tests {
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
         verifier.set_paid_quote_k_closest_for_tests(neighbours);
 
-        let (reference, sample) = verifier.group_reference_price(&xorname).await;
+        let (reference, sample) = verifier.group_reference_price(&xorname, false).await;
         let reference = reference.expect("a fully populated group must produce a reference");
 
         assert_eq!(
@@ -6048,6 +6136,16 @@ mod tests {
         assert!(
             reference < price_at_records(FLOOR_TEST_LOCAL_KEY_COUNT as usize),
             "this node's own price is far above the median and must not be the reference"
+        );
+        // A legacy-curve payment's reference is the same band bottom on the
+        // legacy curve (Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor
+        // 2,000, with the legacy curve still accepted).
+        let (legacy_reference, _) = verifier.group_reference_price(&xorname, true).await;
+        assert_eq!(
+            legacy_reference,
+            Some(crate::payment::pricing::calculate_price_legacy(
+                GROUP_TEST_MEDIAN_BAND_BOTTOM as usize
+            ))
         );
     }
 
@@ -6430,6 +6528,12 @@ mod tests {
     /// This test asserts a weakness on purpose. It is the concrete reason
     /// enforcement stays off, and if a future change improves the bound this
     /// test will fail and must be re-derived rather than quietly deleted.
+    ///
+    /// Derived on the legacy curve, so it pins a payment on that curve, whose
+    /// floor is priced on it ([`PaymentVerifier::group_reference_price`]). On
+    /// the current curve (Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor
+    /// 2,000) the same four don't disarm it:
+    /// `four_understated_commitments_dont_disarm_the_floor_on_the_current_curve`.
     #[tokio::test]
     async fn group_median_is_disarmed_by_four_understated_commitments() {
         let verifier = floor_test_verifier(true);
@@ -6440,11 +6544,11 @@ mod tests {
         }
         let neighbours = attach_group_commitments(&verifier, &counts, std::time::Duration::ZERO);
 
-        let proof_bytes = group_floor_proof(
+        let proof_bytes = group_floor_proof_legacy(
             &verifier,
             xorname,
             0,
-            three_times(price_at_records(0)),
+            three_times(calculate_price_legacy(0)),
             &neighbours,
         );
 
@@ -6464,6 +6568,42 @@ mod tests {
             ),
             PaymentStatus::PaymentVerified
         );
+    }
+
+    /// On the current curve (Dan, 2026-10-28 decision: 100 DARWIN per GB,
+    /// divisor 2,000) the baseline is a smaller share of the price at the
+    /// lowered median, so the four understated neighbours of
+    /// `group_median_is_disarmed_by_four_understated_commitments` no longer
+    /// disarm the floor: the baseline payment is refused. If this now
+    /// succeeds, re-derive it and update the docs.
+    #[tokio::test]
+    async fn four_understated_commitments_dont_disarm_the_floor_on_the_current_curve() {
+        let verifier = floor_test_verifier(true);
+        let xorname = [0xDEu8; 32];
+        let mut counts: Vec<u32> = GROUP_TEST_KEY_COUNTS.to_vec();
+        for slot in counts.iter_mut().rev().take(4) {
+            *slot = 1;
+        }
+        let neighbours = attach_group_commitments(&verifier, &counts, std::time::Duration::ZERO);
+
+        let proof_bytes = group_floor_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &neighbours,
+        );
+
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
+            .await
+            .expect_err("on the current curve four understated neighbours don't disarm the floor");
+        assert!(format!("{err}").contains("below the close-group price floor"));
     }
 
     /// The griefing direction: a small minority gossiping OVERSTATED
@@ -6489,6 +6629,12 @@ mod tests {
     /// Estimator coverage: this case fails under a 25th percentile, and its
     /// disarming sibling fails under a mean and under the upper median, so the
     /// pair pins the estimator jointly. Neither does so alone.
+    ///
+    /// The 1.9% is on the legacy curve, so this pins a payment on that curve,
+    /// whose floor is priced on it. On the current curve (Dan, 2026-10-28
+    /// decision: 100 DARWIN per GB, divisor 2,000) three are enough to refuse
+    /// the same payment:
+    /// `three_overstated_commitments_grief_the_floor_on_the_current_curve`.
     #[tokio::test]
     async fn group_median_resists_three_overstated_commitments() {
         let verifier = floor_test_verifier(true);
@@ -6502,8 +6648,10 @@ mod tests {
 
         // An honest payment at the bottom of the TRUE group median's band must
         // still be admitted.
-        let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize));
-        let proof_bytes = group_floor_proof(
+        let honest = three_times(calculate_price_legacy(
+            GROUP_TEST_MEDIAN_BAND_BOTTOM as usize,
+        ));
+        let proof_bytes = group_floor_proof_legacy(
             &verifier,
             xorname,
             GROUP_TEST_MEDIAN_BAND_BOTTOM as usize,
@@ -6524,6 +6672,46 @@ mod tests {
             result.expect("a minority of overstated commitments must not reject honest payments"),
             PaymentStatus::PaymentVerified
         );
+    }
+
+    /// KNOWN LIMIT on the current curve (Dan, 2026-10-28 decision: 100 DARWIN
+    /// per GB, divisor 2,000): it rises faster than the legacy curve, so the
+    /// three overstated neighbours that
+    /// `group_median_resists_three_overstated_commitments` survives move the
+    /// reference's band bottom `2_600` -> `3_500` and refuse an honest payment
+    /// at the bottom of the true median's band, at the default 65% tolerance.
+    /// The floor is enforced only with `ANT_PRICE_FLOOR_ENFORCE`. If this now
+    /// succeeds, the bound improved: re-derive it and update the docs.
+    #[tokio::test]
+    async fn three_overstated_commitments_grief_the_floor_on_the_current_curve() {
+        let verifier = floor_test_verifier(true);
+        let xorname = [0xDCu8; 32];
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
+        forge_key_counts(&verifier, neighbours.get(..3), MAX_COMMITMENT_KEY_COUNT).await;
+
+        let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize));
+        let proof_bytes = group_floor_proof(
+            &verifier,
+            xorname,
+            GROUP_TEST_MEDIAN_BAND_BOTTOM as usize,
+            honest,
+            &neighbours,
+        );
+
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                FULL_CHUNK,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
+            .await
+            .expect_err(
+                "KNOWN LIMIT: on the current curve three overstated neighbours refuse an \
+                 honest at-band-bottom payment",
+            );
+        assert!(format!("{err}").contains("below the close-group price floor"));
     }
 
     /// Stale gossip is treated as unknown rather than as a low price, so a peer
@@ -6618,7 +6806,7 @@ mod tests {
         }
         verifier.set_paid_quote_k_closest_for_tests(all);
 
-        let (reference, sample) = verifier.group_reference_price(&xorname).await;
+        let (reference, sample) = verifier.group_reference_price(&xorname, false).await;
 
         assert_eq!(
             sample.neighbours,
@@ -10048,6 +10236,84 @@ mod tests {
         assert!(PaymentVerifier::binding_violation(over, Some(pin), &cp(over as usize)).is_some());
     }
 
+    use crate::payment::pricing::calculate_price_legacy as legacy;
+
+    /// Dan, 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000, with the
+    /// legacy curve still accepted. A price in either curve's band passes,
+    /// each band checked as before.
+    #[test]
+    fn binding_accepts_a_price_in_either_curves_band() {
+        let pin = [9u8; 32];
+        for price in [cp(126), cp(500), legacy(126), legacy(300), legacy(500)] {
+            assert_eq!(
+                PaymentVerifier::binding_violation(500, Some(pin), &price),
+                None,
+                "{price}"
+            );
+        }
+        assert_eq!(PaymentVerifier::binding_violation(0, None, &cp(0)), None);
+        assert_eq!(PaymentVerifier::binding_violation(0, None, &legacy(0)), None);
+    }
+
+    #[test]
+    fn binding_refuses_a_price_on_neither_curve() {
+        let pin = [9u8; 32];
+        let one = Amount::from(1u64);
+        for price in [
+            legacy(500) + one,
+            legacy(126) - one,
+            legacy(501),
+            cp(126) - one,
+            cp(500) + one,
+        ] {
+            let detail = PaymentVerifier::binding_violation(500, Some(pin), &price)
+                .expect("a price outside both bands is refused");
+            assert!(detail.contains("outside the band"), "{detail}");
+        }
+        assert!(PaymentVerifier::binding_violation(0, None, &(legacy(0) + one)).is_some());
+        assert!(PaymentVerifier::binding_violation(0, None, &(legacy(0) - one)).is_some());
+    }
+
+    /// A bundle whose quotes are on different curves, as during the switch,
+    /// passes the arithmetic gate.
+    #[test]
+    fn a_bundle_mixing_legacy_and_current_quotes_passes_the_arithmetic_gate() {
+        let payment = ProofOfPayment {
+            peer_quotes: (0..crate::ant_protocol::CLOSE_GROUP_SIZE)
+                .map(|i| {
+                    let id: [u8; 32] = rand::random();
+                    let byte = u8::try_from(i & 0xFF).unwrap_or(0);
+                    let records = 100 * (i + 1);
+                    let mut quote = make_fake_quote_at_records(
+                        [0xC1u8; 32],
+                        SystemTime::now(),
+                        RewardsAddress::new([byte; 20]),
+                        records,
+                    );
+                    if i % 2 == 1 {
+                        quote.price = legacy(records);
+                    }
+                    (evmlib::EncodedPeerId::new(id), quote)
+                })
+                .collect(),
+        };
+        PaymentVerifier::validate_quote_arithmetic(&payment)
+            .expect("a bundle mixing both curves passes the gate");
+    }
+
+    #[test]
+    fn priced_on_legacy_curve_picks_the_paid_quotes_curve() {
+        let mut quote = make_fake_quote_at_records(
+            [0xC2u8; 32],
+            SystemTime::now(),
+            RewardsAddress::new([1u8; 20]),
+            500,
+        );
+        assert!(!PaymentVerifier::priced_on_legacy_curve(&quote));
+        quote.price = legacy(500);
+        assert!(PaymentVerifier::priced_on_legacy_curve(&quote));
+    }
+
     #[test]
     fn cross_check_match_when_pin_and_count_agree() {
         let built = test_built_commitment(12);
@@ -10437,7 +10703,7 @@ mod tests {
         let neighbours =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
         verifier.set_paid_quote_k_closest_for_tests(neighbours.clone());
-        let (reference, _) = verifier.group_reference_price(&xorname).await;
+        let (reference, _) = verifier.group_reference_price(&xorname, false).await;
         assert_eq!(
             reference,
             Some(price_at_records(GROUP_TEST_MEDIAN_BAND_BOTTOM as usize))

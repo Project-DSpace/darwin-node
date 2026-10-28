@@ -379,14 +379,18 @@ fn a_pointer_payment_is_weighed_by_its_data_type_alone() {
 
 /// The revenue floor prices the close group's median count at the bottom of
 /// its price band, so an enforced floor never refuses a node quoting by its
-/// weight total.
+/// weight total. The reference is priced on the paid quote's curve, the
+/// legacy curve for a legacy payment (Dan, 2026-10-28 decision: 100 DARWIN per
+/// GB, divisor 2,000, with the legacy curve still accepted).
 #[test]
 fn the_floor_prices_the_median_count_at_the_bottom_of_its_band() {
     let verifier = repo_text("src/payment/verifier.rs");
     assert!(verifier.contains("let bottom = band_bottom_count(u64::from(median_key_count));"));
+    assert!(verifier.contains("let bottom = usize::try_from(bottom).unwrap_or(usize::MAX);"));
     assert!(verifier.contains(
-        "let reference = calculate_price(usize::try_from(bottom).unwrap_or(usize::MAX));"
+        "let reference = if legacy_curve {\n            calculate_price_legacy(bottom)\n        } else {\n            calculate_price(bottom)\n        };"
     ));
+    assert!(verifier.contains("fn priced_on_legacy_curve("));
 }
 
 /// A payment notice records the size class its settled amount covers, and a
@@ -2221,12 +2225,14 @@ mod payment_encodings {
 
     /// A quote the slim builder keeps or drops: on the pricing curve at its
     /// key count, naming `SLIM_CONTENT`, with the rest of its fields from
-    /// `byte` as in `quote`.
+    /// `byte` as in `quote`. The legacy curve, still accepted (Dan,
+    /// 2026-10-28 decision: 100 DARWIN per GB, divisor 2,000), so the pinned
+    /// bytes stay those ds.15 decodes.
     fn on_curve_quote(byte: u8, committed: bool) -> PaymentQuote {
         let count: usize = if committed { 70_000 } else { 0 };
         PaymentQuote {
             content: xor_name::XorName(SLIM_CONTENT),
-            price: ant_node::payment::calculate_price(count),
+            price: ant_node::payment::pricing::calculate_price_legacy(count),
             committed_key_count: u32::try_from(count).unwrap(),
             ..quote(byte, committed)
         }
