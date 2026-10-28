@@ -49,6 +49,11 @@ mod integration_tests;
 #[cfg(test)]
 mod listings;
 
+// Slim proofs checked by receivers against a real chain: chunk and pointer
+// writes PUT to one storer, an "already stored" answer, a declined proof.
+#[cfg(test)]
+mod slim_proofs;
+
 #[cfg(test)]
 mod replication;
 
@@ -72,6 +77,10 @@ mod verify_storage_gate;
 
 #[cfg(test)]
 mod settlement_version_gate;
+
+// Paged neighbour sync between real nodes.
+#[cfg(test)]
+mod sync_pages;
 
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;

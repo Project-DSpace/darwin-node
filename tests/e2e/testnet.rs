@@ -79,6 +79,11 @@ pub const MAX_TEST_NODE_COUNT: usize = 1000;
 /// Default delay between spawning nodes (milliseconds).
 const DEFAULT_SPAWN_DELAY_MS: u64 = 200;
 
+/// How long a storer holds its offers on the test network, through the
+/// test-only seam: short, so tests that wait for a record to spread don't each
+/// wait the production hold. Tests of the hold set their own.
+pub const E2E_FRESH_OFFER_HOLD: Duration = Duration::from_secs(1);
+
 /// Default timeout for network stabilization (seconds).
 const DEFAULT_STABILIZATION_TIMEOUT_SECS: u64 = 120;
 
@@ -230,6 +235,11 @@ pub struct TestNetworkConfig {
     /// use this to shorten timers — e.g. the ADR-0003 possession-check delay.
     pub replication_config: Option<ReplicationConfig>,
 
+    /// How long each node's storer holds its offers, set on whatever
+    /// replication config the node gets ([`E2E_FRESH_OFFER_HOLD`] unless a
+    /// test sets it).
+    pub fresh_offer_hold: Duration,
+
     /// Optional per-node storage disk-reserve overrides.
     ///
     /// Tests can set a node's reserve above available disk space to make its
@@ -283,6 +293,7 @@ impl Default for TestNetworkConfig {
             payment_enforcement: false,
             evm_network: None,
             replication_config: None,
+            fresh_offer_hold: E2E_FRESH_OFFER_HOLD,
             storage_disk_reserve_overrides: HashMap::new(),
         }
     }
@@ -1276,6 +1287,13 @@ impl TestNetwork {
                 .bootstrap_peers
                 .clone_from(&node.bootstrap_addrs);
             core_config.diversity_config = Some(CoreDiversityConfig::permissive());
+            // The user agent a node announces (src/node.rs), which names its
+            // release: peers read from it which messages it reads. A test may
+            // set the release it names (ANT_TEST_SEAM_ANNOUNCED_RELEASE).
+            core_config.custom_user_agent = Some(format!(
+                "node/{}",
+                ant_node::test_seams::announced_version(env!("CARGO_PKG_VERSION"))
+            ));
             // Inject the ML-DSA identity so the P2PNode's transport peer ID
             // matches the pub_key embedded in payment quotes.
             core_config.node_identity.clone_from(&node.node_identity);
@@ -1425,7 +1443,8 @@ impl TestNetwork {
             fresh_write_rx,
         ) {
             let shutdown = CancellationToken::new();
-            let repl_config = self.config.replication_config.clone().unwrap_or_default();
+            let mut repl_config = self.config.replication_config.clone().unwrap_or_default();
+            repl_config.fresh_offer_hold = self.config.fresh_offer_hold;
             let node_identity = Arc::clone(id);
             match ReplicationEngine::new(
                 repl_config,

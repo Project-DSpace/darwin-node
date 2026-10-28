@@ -192,6 +192,29 @@ impl PointerService {
         &self.store
     }
 
+    /// The proof this node forwards in a pointer's offers: the slim form of
+    /// the PUT's proof (`crate::payment::slim`), or none. A proof that fails
+    /// the slim builder's local checks (possible only when the payment was
+    /// answered from the payment cache, unread) is not forwarded, and
+    /// receivers penalise an offer without one, so no offer goes out; the
+    /// close group's sync covers it. A pointer's payment names its
+    /// `state_id`, so a proof none of whose median-priced quotes names
+    /// `state_id` is one for another record, and is not forwarded either.
+    fn forwarded_proof(
+        address: &[u8; 32],
+        state_id: &[u8; 32],
+        proof: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        crate::payment::slim::forwardable_slim_proof(proof?, state_id)
+            .map_err(|declined| {
+                debug!(
+                    "Not offering pointer {} on: {declined}",
+                    hex::encode(address)
+                );
+            })
+            .ok()
+    }
+
     /// Handle a pointer PUT.
     ///
     /// Never returns `Err`: a rejection is a response the peer should see, so
@@ -266,8 +289,16 @@ impl PointerService {
         // before any of them has written a byte, and cross the reserve
         // together. A record is a fixed `POINTER_WIRE_LEN`, so that is the
         // whole charge.
+        // A newer state of a pointer this node holds replaces a record of the
+        // same size: it needs room only for its temporary file, and is taken
+        // while the node is full.
+        let held = self.store.state(&address).is_some();
         let reservation = match &self.chunks {
-            Some(chunks) => match chunks.reserve(POINTER_WIRE_LEN as u64) {
+            Some(chunks) => match if held {
+                chunks.reserve_replacement(POINTER_WIRE_LEN as u64)
+            } else {
+                chunks.reserve(POINTER_WIRE_LEN as u64)
+            } {
                 Ok(reservation) => Some(reservation),
                 Err(e) => {
                     debug!("Rejecting pointer PUT for {}: {e}", hex::encode(address));
@@ -283,10 +314,13 @@ impl PointerService {
         let record_bytes = request.record.to_vec();
         let response = match self.store.commit(record, reservation).await {
             Ok(PutOutcome::Changed) => {
-                // Offer it to the rest of the close group, proof included, so
-                // every member holds it whichever of them the client reached.
+                // Offer it to the rest of the close group, with the slim form
+                // of the proof, so every member holds it whichever of them
+                // the client reached.
                 let writes = self.fresh_writes.read().clone();
-                if let (Some(writes), Some(proof)) = (writes, request.payment_proof) {
+                let proof =
+                    Self::forwarded_proof(&address, &state_id, request.payment_proof.as_deref());
+                if let (Some(writes), Some(proof)) = (writes, proof) {
                     if writes
                         .send(PointerFreshWrite {
                             record: record_bytes,
@@ -375,8 +409,15 @@ impl PointerService {
             // Capacity before payment, as the chunk path does, and for the
             // size a record actually is rather than for nothing. The binding
             // charge is taken at the commit; this only avoids paying to find
-            // out the disk is full.
-            if let Err(e) = chunks.check_capacity_for(POINTER_WIRE_LEN as u64) {
+            // out the disk is full. An update of a pointer this node holds
+            // takes no new space, so it is taken at the line and while the
+            // node is full.
+            let capacity = if self.store.state(&address).is_some() {
+                Ok(())
+            } else {
+                chunks.check_capacity_for(POINTER_WIRE_LEN as u64)
+            };
+            if let Err(e) = capacity {
                 // One line every few minutes: at the full line every PUT is
                 // refused.
                 static REFUSED: crate::logging::Repeats = crate::logging::Repeats::new();
@@ -705,6 +746,58 @@ mod tests {
 
     fn put(record: &Pointer) -> PointerPutRequest {
         PointerPutRequest::new(Bytes::from(record.to_bytes()))
+    }
+
+    /// Full, not faulty: a full node keeps what it holds, and an update of a
+    /// pointer it holds takes no new space, so it is taken; a new pointer is
+    /// refused before payment.
+    #[tokio::test]
+    async fn a_full_node_takes_an_update_of_a_pointer_it_holds_and_refuses_a_new_one() {
+        let (service, dir) = service().await;
+        let chunks = Arc::new(
+            ChunkStore::new(crate::storage::ChunkStoreConfig {
+                root_dir: dir.path().to_path_buf(),
+                verify_on_read: false,
+                disk_reserve: 0,
+            })
+            .await
+            .expect("chunk store"),
+        );
+        let service = service.with_chunk_store(Arc::clone(&chunks));
+        let first = signed(1, 0, 1);
+        assert!(matches!(
+            service.handle_put(put(&first)).await,
+            PointerPutResponse::Success { .. }
+        ));
+
+        chunks.set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+        let update = signed(1, 1, 2);
+        assert!(
+            matches!(
+                service.handle_put(put(&update)).await,
+                PointerPutResponse::Success { .. }
+            ),
+            "a full node takes an update of a pointer it holds"
+        );
+        assert_eq!(
+            service.store().state_id(&first.address()),
+            Some(update.state_id())
+        );
+
+        let new = signed(2, 0, 1);
+        match service.handle_put(put(&new)).await {
+            PointerPutResponse::Error(ProtocolError::StorageFailed(message)) => {
+                assert!(message.contains("full"), "says the node is full: {message}");
+            }
+            other => panic!("a full node refuses a new pointer, got {other:?}"),
+        }
+        assert!(service.store().state(&new.address()).is_none());
+
+        chunks.set_full_for_test(None);
+        assert!(matches!(
+            service.handle_put(put(&new)).await,
+            PointerPutResponse::Success { .. }
+        ));
     }
 
     #[tokio::test]

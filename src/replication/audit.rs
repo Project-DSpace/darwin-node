@@ -246,6 +246,7 @@ pub async fn audit_tick_with_repair_proofs(
         "Outbound audit request started"
     );
     let audit_started = Instant::now();
+    crate::replication::protocol::record_sent(&encoded);
     let response = match p2p_node
         .send_request(
             &challenged_peer,
@@ -570,7 +571,14 @@ async fn verify_digests(
     let DigestComparison {
         failed_keys,
         verified,
+        verified_keys,
     } = compare_with_local_copies(storage, nonce, challenged_peer.as_bytes(), keys, digests).await;
+
+    // Each key whose digest matched: the peer was seen holding it.
+    let seen = &crate::replication::full::view_for(p2p_node.peer_id()).seen;
+    for key in &verified_keys {
+        seen.record(challenged_peer, key);
+    }
 
     if failed_keys.is_empty() {
         return unfailed_audit_verdict(challenged_peer, keys.len(), verified);
@@ -596,6 +604,8 @@ struct DigestComparison {
     failed_keys: Vec<AuditKeyFailure>,
     /// Keys whose digest matched one recomputed from a good local copy.
     verified: usize,
+    /// Those keys.
+    verified_keys: Vec<XorName>,
 }
 
 /// Compare per-key digests with ones recomputed from this node's own copies.
@@ -614,6 +624,7 @@ async fn compare_with_local_copies(
 ) -> DigestComparison {
     let mut failed_keys = Vec::new();
     let mut verified = 0usize;
+    let mut verified_keys = Vec::new();
 
     for (key, received_digest) in keys.iter().zip(digests) {
         // Check for absent sentinel.
@@ -641,6 +652,7 @@ async fn compare_with_local_copies(
         let expected = compute_audit_digest(nonce, challenged_peer_bytes, key, &local_bytes);
         if *received_digest == expected {
             verified += 1;
+            verified_keys.push(*key);
         } else {
             failed_keys.push(AuditKeyFailure::digest_mismatch(*key));
         }
@@ -649,6 +661,7 @@ async fn compare_with_local_copies(
     DigestComparison {
         failed_keys,
         verified,
+        verified_keys,
     }
 }
 

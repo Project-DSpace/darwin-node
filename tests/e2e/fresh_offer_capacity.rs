@@ -21,6 +21,21 @@
 //! `per_peer_share` refusal means one sender outran its allotment — which for
 //! fresh offers, whose legitimate traffic is bulk from the single node handling
 //! a client's PUT, usually indicts the share's size rather than the sender.
+//!
+//! The same upload drives the paid-notify admission path: the source sends each
+//! receiver at most one notice with a proof per record, so the record count is
+//! sized from the per-sender paid-notify share, several times over, and each
+//! receiver's peak per-sender in-flight count is printed and must stay below
+//! the share. A pass then shows the share was reachable and not reached, and
+//! the peaks show how much headroom was left.
+//!
+//! The fleet runs on a multi-threaded runtime because each production node
+//! runs on its own (`ant-node` uses four worker threads). On the single thread
+//! of a plain `#[tokio::test]`, five nodes and the upload share one thread, the
+//! receivers fall behind the sender, and their notice queues grow with the
+//! upload (at 48, 144 and 288 records every receiver's peak reached the
+//! share), which measures the test's runtime rather than the node. On a
+//! multi-threaded runtime the same three sizes peaked at 5 to 12 per sender.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -30,17 +45,26 @@ use ant_node::replication::fresh::FreshWriteEvent;
 use ant_node::replication::{
     fresh_offer_admission_refusals, fresh_offer_refusals_global_pool,
     fresh_offer_refusals_per_peer_share, paid_notify_admission_refusals,
+    paid_notify_per_peer_share, ReplicationEngine,
 };
 use serial_test::serial;
 use std::time::{Duration, Instant};
 
-/// Chunks in the simulated upload.
+/// How many times over the per-sender paid-notify share the upload is.
 ///
-/// Sized to exceed every admission ceiling on the path several times over —
-/// the 16-slot global fresh-offer pool and, more importantly, the much smaller
-/// per-source share — so the burst genuinely exercises admission rather than
+/// One storer sends a receiver at most one notice with a proof per record, so
+/// an upload no larger than the share could never reach it, however slowly
+/// the receiver drained. Three times over also exceeds the 16-slot global
+/// fresh-offer pool and its smaller per-source share many times, so the burst
+/// genuinely exercises every admission ceiling on the path rather than
 /// trickling under it.
-const UPLOAD_CHUNKS: usize = 48;
+const UPLOAD_SHARE_MULTIPLE: usize = 3;
+
+/// Chunks in the simulated upload: [`UPLOAD_SHARE_MULTIPLE`] times the
+/// per-sender paid-notify share.
+fn upload_chunks() -> usize {
+    usize::try_from(paid_notify_per_peer_share()).unwrap_or(usize::MAX) * UPLOAD_SHARE_MULTIPLE
+}
 
 /// Bytes per chunk.
 ///
@@ -56,8 +80,9 @@ const CHUNK_BYTES: usize = 64 * 1024;
 /// PUT and is fanning the file out to its close group.
 const UPLOAD_SOURCE_INDEX: usize = 3;
 
-/// How long to let replication settle before reading the counters.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long to let replication, and the receivers' paid notifies, settle
+/// before reading the counters.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Poll interval while waiting for propagation.
 const SETTLE_POLL: Duration = Duration::from_millis(200);
@@ -76,13 +101,14 @@ fn chunk_content(index: usize) -> Vec<u8> {
 }
 
 /// A healthy node must not refuse fresh offers during a normal upload.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn normal_upload_never_reaches_fresh_offer_capacity() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
-    let chunks: Vec<(Vec<u8>, [u8; 32])> = (0..UPLOAD_CHUNKS)
+    let upload_chunks = upload_chunks();
+    let chunks: Vec<(Vec<u8>, [u8; 32])> = (0..upload_chunks)
         .map(|index| {
             let content = chunk_content(index);
             let address = compute_address(&content);
@@ -123,6 +149,7 @@ async fn normal_upload_never_reaches_fresh_offer_capacity() {
             .send(FreshWriteEvent {
                 key: *address,
                 payment_proof: DUMMY_POP.to_vec(),
+                stored: true,
             })
             .expect("queue fresh write");
     }
@@ -152,21 +179,50 @@ async fn normal_upload_never_reaches_fresh_offer_capacity() {
         tokio::time::sleep(SETTLE_POLL).await;
     }
 
+    // Notices are sent as holds end and handled after the offers that follow
+    // them, so let every receiver finish its admitted notices too: the peaks
+    // and drop counters below are then final.
+    let notifies_in_flight = || -> usize {
+        (0..harness.node_count())
+            .filter_map(|index| harness.test_node(index))
+            .filter_map(|node| node.replication_engine.as_ref())
+            .map(ReplicationEngine::paid_notifies_in_flight)
+            .sum()
+    };
+    while tokio::time::Instant::now() < deadline && notifies_in_flight() > 0 {
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+    let notifies_left = notifies_in_flight();
+    let share = paid_notify_per_peer_share();
+    let peaks: Vec<(usize, u32)> = (0..harness.node_count())
+        .filter(|index| *index != UPLOAD_SOURCE_INDEX)
+        .filter_map(|index| {
+            let engine = harness.test_node(index)?.replication_engine.as_ref()?;
+            Some((index, engine.paid_notify_peak_peer_inflight()))
+        })
+        .collect();
+    let peaks_shown: Vec<String> = peaks
+        .iter()
+        .map(|(index, peak)| format!("node{index}={peak}"))
+        .collect();
+
     let fresh_refusals = fresh_offer_admission_refusals().saturating_sub(fresh_before);
     let notify_refusals = paid_notify_admission_refusals().saturating_sub(notify_before);
     let by_global = fresh_offer_refusals_global_pool().saturating_sub(global_before);
     let by_share = fresh_offer_refusals_per_peer_share().saturating_sub(share_before);
-    let chunks_per_sec = f64::from(u32::try_from(UPLOAD_CHUNKS).unwrap_or(u32::MAX))
+    let chunks_per_sec = f64::from(u32::try_from(upload_chunks).unwrap_or(u32::MAX))
         / dispatch_elapsed.as_secs_f64();
 
     println!(
-        "CAPACITY-RESULT chunks={UPLOAD_CHUNKS} chunk_bytes={CHUNK_BYTES} \
+        "CAPACITY-RESULT chunks={upload_chunks} chunk_bytes={CHUNK_BYTES} \
          dispatch_ms={} dispatch_chunks_per_sec={chunks_per_sec:.1} \
          replicated={replicated}/{} fresh_offer_refusals={fresh_refusals} \
          (global_pool={by_global} per_peer_share={by_share}) \
-         paid_notify_refusals={notify_refusals}",
+         paid_notify_refusals={notify_refusals} paid_notifies_left={notifies_left} \
+         paid_notify_share={share} paid_notify_peak_per_sender=[{}]",
         dispatch_elapsed.as_millis(),
         chunks.len(),
+        peaks_shown.join(" "),
     );
 
     // Ordered so a failure reads correctly: without propagation the refusal
@@ -179,7 +235,7 @@ async fn normal_upload_never_reaches_fresh_offer_capacity() {
     assert_eq!(
         fresh_refusals, 0,
         "a node refused {fresh_refusals} fresh offer(s) during a normal \
-         {UPLOAD_CHUNKS}-chunk upload. Refusals are not free backpressure: the \
+         {upload_chunks}-chunk upload. Refusals are not free backpressure: the \
          sender never reads them, so each one returns as a missing key at the \
          delayed possession check and is charged to the refusing node at audit \
          severity. Check which ceiling bound — a per-peer-share refusal means \
@@ -192,6 +248,18 @@ async fn normal_upload_never_reaches_fresh_offer_capacity() {
          normal upload. PaidNotify is one-way with no retry, so each drop \
          discards durable paid-list evidence until a verification cycle \
          re-derives it."
+    );
+    assert!(
+        !peaks.is_empty(),
+        "no receiver's engine was readable, so the headroom check below would \
+         be vacuous"
+    );
+    assert!(
+        peaks.iter().all(|(_, peak)| *peak < share),
+        "a receiver's paid notifies from one sender reached the per-sender \
+         share of {share} during a {upload_chunks}-chunk upload \
+         ({}): no headroom was left, so a longer upload would drop notices.",
+        peaks_shown.join(" ")
     );
 
     harness.teardown().await.expect("teardown");

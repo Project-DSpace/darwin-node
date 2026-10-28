@@ -27,20 +27,70 @@ The runs (`--runs`):
   old-hosts-new  the previous release's devnet and incumbents; this tree joins
   all-new        this tree throughout (not run unless asked for)
   full           this tree throughout, with --full joiners whose disk reads as
-                 full through the free-space seam (run when --full is given)
+                 full through the free-space seam (run when --full is given),
+                 and every other node under disk pressure once the records are
+                 stored, so they erase what they may (see "The full run")
+  paged          this tree throughout, its incumbents admitting --busy-limit
+                 sync requests at once through the admission seam, so that
+                 joiners syncing with them together are answered busy (run
+                 when --paged is given)
+  rollback       this tree throughout, but one joiner, started again part way
+                 on the previous release's binary with its data folder, then
+                 on this tree's again (run when --rollback is given)
+
+In the runs that page (every run but the all-old and full ones), this tree's
+nodes cut their neighbour-sync hints into pages of --page-bytes of keys,
+through the page-size seam, so that the few records of a run take more than
+one page. And until the release that reads pages is cut, they announce that
+release (NEIGHBOR_SYNC_PAGES_FROM_RELEASE, read from src/replication/config.rs)
+through the announced-release seam: nodes built between releases announce
+the last release's version, the version the previous release's nodes
+announce too, so without it they would page to no one, and no lower paging
+release could tell them from the previous release's nodes.
+
+Each upload sends the first half of its records, and its pointers, to one
+storer only, so the rest of the close group gets them by that storer's
+offers and the paid group by its notices, with the slim proof. After the
+last upload, `darwin-harness faults` runs the fault cases: every stored
+record PUT again (answered "already stored"), and, through the faults seam
+(ANT_TEST_SEAM_FAULTS_FILE) of this tree's nodes, holding notices lost on the
+way to one storer, a failed paid-list write, and retries answered from the
+payment cache with an empty, 16-byte, merkle-tagged or garbled proof.
 
 Every run must show, over the time from the joiners' start to the last read:
 no message that failed to decode, in any node's log; no audit failed for a
 reply that didn't decode; every record stored by a majority of its close
 group, and still held at the end by a majority of the nodes that stored it
 (a node that joins later gets a record only by repair, which waits for the
-record to age, so the nodes nearest it now are counted but not required);
-and every standalone node received neighbour sync. Where records were paid
-by size: no node of the previous release quoted one, and none of this tree's
-answered StorerUpdateRequired; and in a run with nodes of both, nodes of the
-previous release answered StorerUpdateRequired.
+record to age, so the nodes nearest it now are counted but not required; a
+record PUT to one storer is held instead by a majority of the nodes asked for
+it, its close group at upload and the nodes nearest it now, the devnet's
+nodes left out: those never get it by an offer, and its first holders hand
+it to joiners nearer to it and drop it);
+every repeated PUT answered "already stored"; and every standalone node
+received neighbour sync, in single messages or in pages. A record's one
+storer is never one of the devnet's nodes, which run no replication. And of
+neighbour sync, as the requesters' logs show it, with the releases the two
+nodes ran when each exchange started: no node paged its hints to a node of
+the previous release, which can't read pages; in a run that pages, this
+tree's nodes paged to each other; with nodes of the previous release beside
+them, they sent those nodes single messages (pages, if that release reads
+them); and no requester charged its responder anything during an exchange
+the responder answered busy.
+Where records were paid by size: no node of the previous release quoted
+one, and none of this tree's answered StorerUpdateRequired; and in a run
+with nodes of both, nodes of the previous release answered
+StorerUpdateRequired.
 
-Each mixed run must also show no penalty heavier than the all-old runs': the
+Each mixed run must also show no proof refused by a node of the previous
+release in a notice, an offer or a pointer offer (each kind counted for each
+role) where no all-old run had one; and, for each role, no more keys missing
+from the paid lists of the members of their paid group at upload (the
+devnet's nodes left out), read at the end, than the all-old runs' highest
+count plus --penalty-slack: each release lists what the previous one does.
+
+Each mixed run, and the rollback run, must also show no penalty heavier than
+the all-old runs': the
 penalties (saorsa-core's trust events that lower a peer's score) that the
 devnet's nodes, the incumbents and the joiners charge the incumbents and the
 joiners, counted for each pair of roles and each reason, may exceed the
@@ -60,11 +110,96 @@ within the limit or not, so a small excess shows before the canary. The
 penalties one release's nodes charge the other's are reported by reason. And
 the message shapes: each role received every message family it received at
 least SHAPE_FLOOR times in every all-old run, and a family that only this
-tree knows (--new-only-family) reached nodes of this tree and no others.
+tree knows (--new-only-family) reached nodes of this tree and no others. The
+all-new and paged runs are measured on refused PUTs only: their nodes carry
+the bootstrap and audit seams, which the all-old runs lack (below), and the
+paged run's pages of two keys send far more messages than any all-old run.
+
+The paged run must show, besides: an exchange in which each node's replica
+hints and paid hints took more than one page, both ways; every exchange's
+pages served from the hints its responder built at the first page, built
+once; each exchange's pages served in order, the next only after the
+last; and pages answered busy, with no penalty for them.
+
+The rollback run must show, besides: the rolled-back node starting on the
+previous release's binary with the data folder this tree's binary wrote, and
+on this tree's again; while it ran the previous release, a single message to
+it from a node of this tree, no page reaching it (no message that failed to
+decode), and from each node at most one page, left unanswered, over the
+connection its earlier process left; and once it came back, a page to it
+from a node of this tree, answered. Each of the run's three phases (before,
+during and after) lasts --rollback-minutes, and the last two go on, up to
+ROLLBACK_WAIT_LIMIT minutes, until they show their exchange: a node syncs with
+a peer at most once an hour. Penalties on the node from each of its stops
+until RESTART_GRACE seconds after it is up again, for requests it couldn't
+answer while it restarted, are reported, not compared.
 
 The test-only seams (src/test_seams.rs) are compiled only into builds with the
 `test-utils` feature, which both releases are built with here. The free-space
-seam makes a node's disk read as full (the `full` run).
+seam makes a node's disk read as full (the `full` run), and in that run the
+full-notice seam lets a full node of this tree tell the others that it is
+full, which they read from the release that brings the notice on; the
+page-size, announced-release and admission seams are the ones above. In
+the runs in which every node is of this tree (all-new, full and paged), this
+tree's nodes also get the bootstrap seam, so a joiner stops answering
+"bootstrapping" RUN_BOOTSTRAP_SECS after it starts (in this network it
+otherwise never does: the devnet's nodes answer no replication), and the
+audit seam, so every node audits every RUN_AUDIT_SECS to twice that, a key
+whose repair hint is that old (an hour otherwise, longer than any run). Such
+a run must make an audit if it has AUDIT_EXCHANGE_FLOOR exchanges or more;
+the others make none, and their audits per exchange are reported only. The
+all-old runs carry neither seam, so the all-new and paged runs are measured
+against them on refused PUTs only, which the seams don't move (see
+measured()). The harness refuses a run with a binary that lacks the seams it
+sets.
+
+The full run. Every node of it runs with short timings through the seams
+(neighbour sync every FULL_RUN_SYNC_SECS, an out-of-range wait of
+FULL_RUN_HYSTERESIS_SECS, a "full" mark fresh for FULL_RUN_FRESHNESS_SECS, a
+fetch window of FULL_RUN_FETCH_WINDOW_SECS), so erasure in two phases goes
+ahead within the run, and the erasure a stopped node's lapse allows goes
+ahead before that node drops out of its peers' routing tables (see
+lapse_erasure_seconds()). The joiners' identities
+are drawn before they join, and --full of them, chosen so that a full node's
+lapse can let records be erased in a group that holds it (place_full: the
+devnet's nodes, which answer no possession check, are often among a record's
+7 nearest not full in a network this small), read a full disk from the
+start. After the uploads, and a few sync cycles, the
+harness asks each record's nearest nodes (up to 20) for it: the early count.
+It then puts every node not full under pressure at the falling floor's last
+step, above the full line, so each may erase the copies it holds out of its
+range, and asks again halfway through the observation (the mid count). It
+stops the full joiner whose mark's lapse lets the most counted records be
+erased (see lapse_candidates()), uploading and counting FULL_RUN_EXTRA_BATCHES
+more batches of records at most while no full joiner's would; its mark then
+lapses at its peers. It observes on until, after the lapse, a node the
+stopped node's fresh mark kept inside a record's retention width (see
+lapse_erasers()) erases that record, one of those the stopped node was
+chosen for, up to the longest such an erasure can take
+(lapse_erasure_seconds(), from the node's timing constants and the run's
+seams), and asks
+again at the end. It must show, beyond what every run shows:
+
+- copies stay at 7: at each count, every record is held by at least 7 nodes
+  not full, less the devnet's nodes among its 7 nearest not full (they take no
+  replicas), and, at the end, less the stopped node where it is among them;
+- stand-ins aren't erased: a node not full that holds a record at the early
+  count from beyond the 9 nearest it, while full nodes widen its window, still
+  holds it at the mid count, before any mark lapses;
+- erasure goes ahead with 6 real proofs: every erasure a node logs needed at
+  least 6 proofs, and had them;
+- a lapsed mark counts as missing: once the stopped node's mark has
+  lapsed, no erasure counts more members marked full than full nodes still
+  run, and a node the stopped node's fresh mark kept inside a record's
+  retention width erases that record, one the stopped node was chosen for:
+  only a width narrowed by the lapse leaves that node outside it;
+- and neither passes for want of an erasure: the run fails if no node
+  erased a record, or none erased such a record after the lapse.
+
+The report lists, for each count, the records by how many of their 7 + f
+nearest are full (f), so runs with --full 1, 2, 3 and 4 show which f each
+reached. Run them one at a time (--work naming a folder for each), so a
+failure names its f.
 
 Usage, from the repository root (needs cargo, git, Python 3.8+, and Foundry's
 `anvil` on PATH):
@@ -72,6 +207,8 @@ Usage, from the repository root (needs cargo, git, Python 3.8+, and Foundry's
   python3 scripts/test_mixed_versions.py
   python3 scripts/test_mixed_versions.py --old-ref v0.23.0+ds.15 --observe-minutes 25
   python3 scripts/test_mixed_versions.py --old-bin path/to/old --new-bin path/to/new
+  python3 scripts/test_mixed_versions.py --runs paged --observe-minutes 10
+  python3 scripts/test_mixed_versions.py --paged --rollback
 
 The previous release is the newest v*+ds.* tag before HEAD, built from an
 export of the tree at that tag under target/mv/ with its own target folder,
@@ -82,7 +219,8 @@ under the work folder (target/mv/runs/<time> unless --work names one); the
 summary is summary.json there. Exits 0 when every run passes.
 
 With the defaults a run takes about 30 minutes, most of it --observe-minutes,
-and the harness makes four: two all-old runs, then the two mixed ones.
+and the harness makes four: two all-old runs, then the two mixed ones. The
+rollback run takes 40 minutes or more, up to about two and a half hours.
 The standalone nodes run in testnet mode, which binds every interface; on a
 desktop whose firewall asks about that, --network-mode development keeps them
 on loopback. A run during which the machine stood still (asleep, say) fails
@@ -94,9 +232,11 @@ removing its own folder there: the verdict reads every run the folder holds.
 import argparse
 import datetime
 import io
+import itertools
 import json
 import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -163,6 +303,191 @@ CLIENT_TIMEOUT = 1800
 # The seam whose name, found in a binary, shows it was built with test-utils.
 FREE_SPACE_SEAM = "ANT_TEST_SEAM_FREE_SPACE_FILE"
 
+# The faults seam (src/test_seams.rs): faults this tree's nodes inject.
+FAULTS_SEAM = "ANT_TEST_SEAM_FAULTS_FILE"
+
+# How many pointers each upload stores, each at one storer.
+POINTERS_PER_UPLOAD = 2
+
+# A proof refused by a node: in a notice, an offer or a pointer offer. The
+# lines every release since ds.15 logs when it refuses one (a notice's at
+# WARN; an offer's at WARN or DEBUG; a pointer offer's at INFO).
+PROOF_REFUSED = (
+    ("notice", re.compile(r"PoP verification error for paid notify key|"
+                          r"Paid notify rejected: payment required")),
+    ("offer", re.compile(r"PoP verification error for key |"
+                         r"Fresh offer for \S+ from \S+: no payment found for this proof")),
+    ("pointer offer", re.compile(r"Fresh pointer offer for \S+ from \S+ is not paid for")),
+)
+
+# The seams this tree's nodes are given in the runs that page: the bytes of
+# keys on one neighbour-sync page; the release they announce in their user
+# agent, as its +ds number; and, for the paged run's incumbents, the sync
+# requests a node admits at once.
+PAGE_SEAM = "ANT_TEST_SEAM_SYNC_PAGE_BYTES"
+ANNOUNCED_SEAM = "ANT_TEST_SEAM_ANNOUNCED_RELEASE"
+ADMISSION_SEAM = "ANT_TEST_SEAM_SYNC_ADMISSION_LIMIT"
+
+# The runs in which this tree's nodes page, and those with nodes of the
+# previous release beside them.
+PAGING_RUNS = ("new-hosts-old", "old-hosts-new", "all-new", "paged", "rollback")
+OLD_RUNS = ("new-hosts-old", "old-hosts-new", "rollback")
+
+# The family of a sync page request: a binary that names it reads pages,
+# whatever features it was built with.
+PAGE_REQUEST_FAMILY = "neighbor_sync_page_request"
+
+# Where this tree sets the first release whose nodes read pages.
+PAGING_RELEASE = re.compile(r"pub const NEIGHBOR_SYNC_PAGES_FROM_RELEASE: u64 = (\d+);")
+# A version's release: n of <version>+ds.<n>.
+RELEASE_NUMBER = re.compile(r"\+ds\.(\d+)")
+
+# Bytes of keys on a page in the runs that page: two keys, so that each list
+# of a run's records takes more than one page.
+PAGE_BYTES = 64
+
+# Sync requests the paged run's incumbents admit at once (8 without the
+# seam), so that joiners syncing with them together are answered busy.
+BUSY_LIMIT = 1
+
+# The rollback run: each of its three phases lasts --rollback-minutes, and the
+# last two go on, up to ROLLBACK_WAIT_LIMIT minutes, until they show the
+# exchange they must: a node syncs with a peer at most once an hour, so a
+# phase may wait out that hour for the nodes that synced with the rolled-back
+# node last.
+ROLLBACK_MINUTES = 10
+ROLLBACK_WAIT_LIMIT = 70
+
+# Penalties on the rolled-back node from each of its stops until this many
+# seconds after it is up again, for requests it couldn't answer while it
+# restarted (a request waits 30 seconds at most): reported, not compared, as
+# no all-old run restarts a node.
+RESTART_GRACE = 60
+
+# A penalty a requester charges its responder up to this many seconds after
+# an exchange the responder answered busy is charged for that exchange.
+BUSY_CHARGE_GRACE = 1.0
+
+# The message families of paged neighbour sync, and the single-message family
+# each takes the place of between two nodes that read pages.
+PAGE_FAMILIES = {"neighbor_sync_page_request": "neighbor_sync_request",
+                 "neighbor_sync_page_response": "neighbor_sync_response"}
+
+# The lines a node logs for each exchange it starts, paged or single; for the
+# hints it builds as a responder at an exchange's first page; for each page
+# it serves; and for each page it answers busy.
+PAGED_EXCHANGE_LINE = "Neighbor-sync paged exchange"
+SINGLE_EXCHANGE_LINE = "Neighbor-sync single exchange"
+HINT_SET_LINE = "Neighbor-sync hint set built"
+PAGE_SERVED_LINE = "Neighbor-sync page served"
+BUSY_LINE = "Neighbor-sync page answered busy"
+
+# The seam naming the first release whose nodes a full node tells it is full
+# (src/test_seams.rs). This tree's nodes announce the last release's version
+# until the release that brings the notice is cut, so in the `full` run, where
+# every node is of this tree, it is set to 0 on each node whose binary has it:
+# a full node then tells the others, as it will once released.
+FULL_NOTICE_SEAM = "ANT_TEST_SEAM_FULL_NOTICE_FROM_RELEASE"
+
+# The full run's timing seams (src/test_seams.rs), set on every node of the
+# run, so that the several sync cycles an erasure takes, the out-of-range
+# wait and a mark's lapse all fall within it. A mark fresh for 120 s, renewed
+# every 30 s, lapses two minutes after its node stops. The erasure that
+# lapse allows then takes about four sync cycles (one to start the record's
+# out-of-range clock, one past the out-of-range wait to select it, two more
+# before it is tried) and the fetch window, and must go ahead before the
+# stopped node drops out of its peers' routing tables, about a quarter of an
+# hour after they last heard from it (STOPPED_PEER_VIEW): the record is then
+# back in the eraser's range, and kept. A round of a sync cycle every 10 to
+# 20 s, the cycle's few rounds taking a minute or two, and a fetch window of
+# a minute, past the verification and fetch timeouts, in place of the five
+# minutes of the retry wait, have it go ahead within ten minutes of the stop.
+NEIGHBOR_SYNC_SEAM = "ANT_TEST_SEAM_NEIGHBOR_SYNC_SECS"
+HYSTERESIS_SEAM = "ANT_TEST_SEAM_PRUNE_HYSTERESIS_SECS"
+FRESHNESS_SEAM = "ANT_TEST_SEAM_FULL_FRESHNESS_SECS"
+FETCH_WINDOW_SEAM = "ANT_TEST_SEAM_FETCH_WINDOW_SECS"
+FULL_RUN_SYNC_SECS = 10
+FULL_RUN_HYSTERESIS_SECS = 60
+FULL_RUN_FRESHNESS_SECS = 120
+FULL_RUN_FETCH_WINDOW_SECS = 60
+# How long the full run waits for the fresh offers and the full nodes'
+# notices to land before it counts copies, and for an extra batch's.
+FULL_RUN_COUNT_WAIT_SECS = 120
+# How long a node keeps a peer it no longer hears from in its routing table:
+# saorsa-core's live threshold, read from the vendored copy's source. Its
+# periodic self-lookup then evicts the peer if a ping goes unanswered.
+STOPPED_PEER_VIEW = ("vendor/saorsa-core/src/dht/core_engine.rs", "LIVE_THRESHOLD")
+# When no full joiner's lapse would let a counted record be erased (the
+# devnet's nodes, which answer no possession check, or joiners that never
+# got a record, among its 7 nearest not full), the full run uploads and
+# counts another batch of --records-after records, at most this many times.
+FULL_RUN_EXTRA_BATCHES = 3
+# The full run draws its joiners' identities before they join, and chooses
+# which are full so that the best one's lapse would let at least this share
+# of records be erased in a group that holds it (place_full), drawing again,
+# at most FULL_RUN_LAYOUT_TRIES times in all, while no choice reaches it.
+# With a quarter, the --records-after records give about nine runs in ten
+# such a record before any extra batch. The share is estimated over
+# FULL_RUN_LAYOUT_SAMPLE addresses, for at most FULL_RUN_LAYOUT_CHOICES
+# choices of the full joiners.
+FULL_RUN_LAYOUT_SHARE = 0.25
+FULL_RUN_LAYOUT_TRIES = 10
+FULL_RUN_LAYOUT_SAMPLE = 500
+FULL_RUN_LAYOUT_CHOICES = 100
+# A bootstrap address no node answers, for a node started only to draw its
+# identity; and the file its identity is kept in (src/config.rs).
+UNANSWERED_BOOTSTRAP = "127.0.0.1:9"
+IDENTITY_FILE = "node_identity.key"
+
+# The node's timing constants an erasure after a lapse waits on, read from
+# this tree's source (rust_const), so the full run observes as long as they
+# say.
+REPLICATION_CONFIG = "src/replication/config.rs"
+ERASURE_SOURCE = "src/replication/erasure.rs"
+
+# The seams (src/test_seams.rs) set on this tree's nodes in the runs in which
+# every node is of this tree (SEAMED_RUNS), so that within a run the joiners
+# answer challenges and every node audits:
+# - a node stays bootstrapping at most RUN_BOOTSTRAP_SECS. Without the bound
+#   a joiner here never finishes bootstrapping: the devnet's nodes answer no
+#   replication, so keys near them stay unsettled for the half hour before
+#   they are evicted, and in the full run every 30 s sync brings them back.
+#   A joiner bootstrapping answers every possession check "bootstrapping",
+#   which blocks every erasure whose close group holds it, and doesn't audit;
+# - the responsible-chunk audit ticks every RUN_AUDIT_SECS to twice that,
+#   and audits a key once its repair hint is RUN_AUDIT_SECS old, in place of
+#   10 to 20 minutes and an hour, which no run of minutes reaches: without
+#   it no node audits, in any release.
+# The previous release has neither seam, so the all-old and mixed runs make
+# no audits: their audits per exchange are reported, not checked. Nor are
+# the seamed runs' penalties, failure reasons or families compared with the
+# all-old runs': see measured().
+BOOTSTRAP_SEAM = "ANT_TEST_SEAM_BOOTSTRAP_SECS"
+AUDIT_SEAM = "ANT_TEST_SEAM_AUDIT_SECS"
+SEAMED_RUNS = ("all-new", "full", "paged")
+RUN_BOOTSTRAP_SECS = 180
+RUN_AUDIT_SECS = 180
+# A run with the audit seam must audit: over at least this many exchanges,
+# none is a failure.
+AUDIT_EXCHANGE_FLOOR = 50
+
+# The disk of every node not full in the full run, under pressure: 2 GiB free of a 1 TB
+# partition, under the falling floor's last step (2.5%), so a node may erase
+# anything out of its range, and above the full line (1 GiB), so it isn't
+# full.
+PRESSURED_FREE = 2 * 1024 ** 3
+PRESSURED_TOTAL = 10 ** 12
+
+# A key's close group, the storage admission width, the proofs an erasure
+# needs from the 7 nearest not full, and the widest a window grows.
+CLOSE_GROUP = 7
+ADMISSION_WIDTH = 9
+ERASE_PROOFS = 6
+WIDEST = 20
+
+# The line a node logs for each record it erases, with its proofs.
+ERASED_LINE = "Erased an out-of-range record under disk pressure"
+
 # What each node logs: info, and debug for the code whose debug lines name
 # messages that didn't decode (src/replication, the chunk handler, listings).
 LOG_FILTER = ("info,ant_node::replication=debug,ant_node::storage::handler=debug,"
@@ -201,7 +526,7 @@ POSSESSION_FAILED = re.compile(r"Possession check: ([0-9a-f]{64}) failed to prov
 AUDIT_FAILED = re.compile(r"Audit failure for ([0-9a-f]{64}): .*first_failed_key=0x([0-9a-f]{16})")
 # What a node that settles under older rules than a quote declares answers it.
 STORER_UPDATE_REQUIRED = "StorerUpdateRequired"
-RUNS = ("all-old", "new-hosts-old", "old-hosts-new", "all-new", "full")
+RUNS = ("all-old", "new-hosts-old", "old-hosts-new", "all-new", "full", "paged", "rollback")
 # The all-old runs: all-old, and all-old-2 on when there are more.
 BASELINE_RUN = re.compile(r"all-old(?:-([2-9]|[1-9][0-9]+))?")
 
@@ -273,6 +598,17 @@ def previous_release():
     return git("describe", "--tags", "--abbrev=0", "--match", "v*+ds.*", "HEAD^")
 
 
+def paging_release():
+    """The first release whose nodes read paged sync, as this tree sets it, or
+    None for a tree without pages."""
+    try:
+        found = PAGING_RELEASE.search(
+            (REPO / "src" / "replication" / "config.rs").read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return int(found.group(1)) if found else None
+
+
 def cargo_build(root, bins, profile, cargo_args, env=None):
     command = ["cargo", "build", "--locked", "--profile", profile, "--features", "test-utils"]
     for name in bins:
@@ -288,7 +624,9 @@ def build_new(args):
     if args.new_bin:
         return Path(args.new_bin)
     cargo_build(REPO, ["ant-node", "ant-devnet", "darwin-harness"], args.profile, args.cargo_arg)
-    return REPO / "target" / profile_dir(args.profile)
+    # Where cargo put them: CARGO_TARGET_DIR when set, as on a build machine.
+    target = Path(os.environ.get("CARGO_TARGET_DIR") or REPO / "target")
+    return target / profile_dir(args.profile)
 
 
 def build_old(args, cache):
@@ -340,7 +678,20 @@ class Release:
                 raise HarnessError(f"{binary} is missing")
         self.version = subprocess.run([str(self.node), "--version"], capture_output=True,
                                       text=True).stdout.strip()
-        self.seams = FREE_SPACE_SEAM.encode() in self.node.read_bytes()
+        binary = self.node.read_bytes()
+        self.seams = FREE_SPACE_SEAM.encode() in binary
+        self.page_seams = PAGE_SEAM.encode() in binary
+        self.announce_seam = ANNOUNCED_SEAM.encode() in binary
+        self.admission_seam = ADMISSION_SEAM.encode() in binary
+        self.reads_pages = PAGE_REQUEST_FAMILY.encode() in binary
+        number = RELEASE_NUMBER.search(self.version)
+        self.number = int(number.group(1)) if number else None
+        self.full_notice_seam = FULL_NOTICE_SEAM.encode() in binary
+        self.timing_seams = all(seam.encode() in binary for seam in
+                                (NEIGHBOR_SYNC_SEAM, HYSTERESIS_SEAM, FRESHNESS_SEAM,
+                                 FETCH_WINDOW_SEAM))
+        self.audit_seams = all(seam.encode() in binary for seam in (BOOTSTRAP_SEAM, AUDIT_SEAM))
+        self.faults = FAULTS_SEAM.encode() in binary
 
     def __str__(self):
         return f"{self.name}: {self.version}, {self.label}"
@@ -440,19 +791,156 @@ def socket_address(multiaddr):
 # --------------------------------------------------------------------------
 
 class Node:
-    def __init__(self, name, role, release, process, root, full):
+    def __init__(self, name, role, release, root, full, rewards):
         self.name = name
         self.role = role
         self.release = release
-        self.process = process
+        self.process = None
         self.root = root
         self.full = full
+        self.rewards = rewards
         self.peer_id = None
 
 
-def run_one(name, network_release, joiner_release, args, harness, folder):
+class ExchangeWatch:
+    """Follows logs for the neighbour-sync exchanges their nodes start with
+    one peer, as they are written."""
+
+    def __init__(self, logs, peer_id):
+        self.offsets = {path: 0 for path in logs}
+        self.peer_id = peer_id
+        self.exchanges = []
+
+    def poll(self):
+        """Reads what the logs gained since the last poll; returns every
+        exchange with the peer seen so far."""
+        for path, offset in self.offsets.items():
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(offset)
+                    data = handle.read()
+            except OSError:
+                continue
+            whole = data.rfind(b"\n") + 1
+            self.offsets[path] = offset + whole
+            for raw in data[:whole].splitlines():
+                text = ANSI.sub("", raw.decode("utf-8", "replace"))
+                exchange = exchange_in(text)
+                if exchange and exchange.get("peer") == self.peer_id:
+                    self.exchanges.append(exchange)
+        return self.exchanges
+
+    def seen(self, form, since, answered=False):
+        """The exchanges in `form` ("paged" or "single") that started at
+        `since` or later, with a page answered if `answered`."""
+        return [exchange for exchange in self.poll()
+                if exchange["form"] == form and exchange["start"] >= since
+                and (not answered or exchange.get("pages_answered", 0) >= 1)]
+
+
+class ErasureWatch:
+    """Follows logs for the erasures their nodes log, as they are written."""
+
+    def __init__(self, records, since):
+        self.records = records
+        self.offsets = {path: 0 for path in records}
+        self.since = since
+        self.erasures = []
+
+    def seen(self):
+        """Reads what the logs gained since the last call; returns every
+        erasure seen so far after `since`, by the node of a log of
+        `records` (log path: the records that count from it), of one of
+        that log's records, as (time, record)."""
+        for path, offset in self.offsets.items():
+            try:
+                with open(path, "rb") as handle:
+                    handle.seek(offset)
+                    data = handle.read()
+            except OSError:
+                continue
+            whole = data.rfind(b"\n") + 1
+            self.offsets[path] = offset + whole
+            for raw in data[:whole].splitlines():
+                text = ANSI.sub("", raw.decode("utf-8", "replace"))
+                if ERASED_LINE not in text:
+                    continue
+                stamp = parse_time(text)
+                record = fields(text).get("erased_record")
+                if stamp is not None and stamp > self.since and record in self.records[path]:
+                    self.erasures.append((stamp, record))
+        return self.erasures
+
+
+def rust_const(path, name):
+    """The integer constant `name` of this tree's Rust source `path` (from the
+    repository root): its literal or product or sum of literals."""
+    text = (REPO / path).read_text(encoding="utf-8")
+    match = re.search(rf"\bconst {name}: \w+ = ([0-9_ *+]+);", text)
+    if not match:
+        raise HarnessError(f"{path} has no integer constant {name}")
+    return eval(match.group(1), {"__builtins__": {}})  # digits, *, + only
+
+
+def lapse_erasure_seconds(exchange=None):
+    """The longest from a full node's stop to an erasure its mark's lapse
+    allows, in the full run, by the node's constants and the run's seams:
+    the mark lapses (FULL_RUN_FRESHNESS_SECS); a prune pass, at most a sync
+    cycle later, starts the record's out-of-range clock; one at most a cycle
+    after the out-of-range wait (FULL_RUN_HYSTERESIS_SECS) selects it; and
+    one erases it at most a cycle after both EPOCHS_BEFORE_ERASURE cycles
+    and the fetch window (FULL_RUN_FETCH_WINDOW_SECS) have passed. A prune
+    pass runs once a sync cycle completes: NEIGHBOR_SYNC_SCOPE peers in
+    rounds of NEIGHBOR_SYNC_PEER_COUNT, each round started at most twice
+    FULL_RUN_SYNC_SECS after the last ended and its exchanges over within
+    `exchange` seconds, by default the exchange deadline."""
+    rounds = math.ceil(rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_SCOPE")
+                       / rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_PEER_COUNT"))
+    if exchange is None:
+        exchange = rust_const(REPLICATION_CONFIG, "NEIGHBOR_SYNC_EXCHANGE_DEADLINE_SECS")
+    cycle = rounds * (2 * FULL_RUN_SYNC_SECS + exchange)
+    epochs = rust_const(ERASURE_SOURCE, "EPOCHS_BEFORE_ERASURE")
+    return (FULL_RUN_FRESHNESS_SECS + cycle + FULL_RUN_HYSTERESIS_SECS + cycle
+            + max(epochs * cycle, FULL_RUN_FETCH_WINDOW_SECS + cycle))
+
+
+def stopped_peer_view_seconds():
+    """How long, in seconds, a node keeps a peer it no longer hears from in
+    its routing table (STOPPED_PEER_VIEW)."""
+    path, name = STOPPED_PEER_VIEW
+    text = (REPO / path).read_text(encoding="utf-8")
+    match = re.search(rf"\bconst {name}: Duration = Duration::from_secs\(([0-9_]+)\);", text)
+    if not match:
+        raise HarnessError(f"{path} has no constant {name} of whole seconds")
+    return int(match.group(1).replace("_", ""))
+
+
+def paging_plan(name, new, old, paging_from, args):
+    """What this tree's nodes are given in run `name` so that they page, and
+    what its neighbour sync must then show. Until the release that reads
+    pages is cut, this tree's nodes announce the last release's version, as
+    the previous release's nodes do: without the announced-release seam they
+    would page to no one, and no lower paging release would tell them from
+    the previous release's nodes."""
+    pages = bool(new.reads_pages and paging_from is not None)
+    native = pages and new.number is not None and new.number >= paging_from
+    announced = paging_from if pages and not native and name in PAGING_RUNS else None
+    return {
+        "announced": announced,
+        "page_bytes": args.page_bytes if pages and name in PAGING_RUNS else None,
+        "busy_limit": args.busy_limit if name == "paged" and args.busy_limit else None,
+        "new_pages": bool(native or announced) and not is_baseline(name),
+        "old_present": name in OLD_RUNS,
+        "old_reads_pages": bool(old is not None and old.reads_pages),
+    }
+
+
+def run_one(name, network_release, joiner_release, args, harness, folder, old=None,
+            paging=None):
     """Runs one scenario under `folder`, and records there (run.json) what the
-    analysis needs."""
+    analysis needs. `old` is the previous release, which the rollback run
+    starts one of this tree's nodes on part way; `paging` is what this tree's
+    nodes are given to page (paging_plan)."""
     folder.mkdir(parents=True)
     env = dict(os.environ, RUST_LOG=LOG_FILTER, NO_COLOR="1",
                XDG_DATA_HOME=str(folder / "xdg"))
@@ -471,6 +959,11 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
     timeline = {"started": utc_now().isoformat()}
     stall = StallWatch()
     full_count = args.full if name == "full" else 0
+    faults_file = folder / "seams" / "faults"
+    faults_file.parent.mkdir(exist_ok=True)
+    faults_file.write_text("")
+    paging = paging or {}
+    rolled = None
     try:
         manifest_path = folder / "manifest.json"
         devnet_data = folder / "devnet"
@@ -487,34 +980,74 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         bootstrap = [socket_address(address) for address in manifest["bootstrap"]]
         log(f"{name}: devnet up ({network_release.name}), bootstrap {', '.join(bootstrap)}")
 
-        def start(role, index, release, full):
-            node_name = f"{role}-{index:02d}"
-            root = folder / "nodes" / node_name
-            root.mkdir(parents=True)
-            node_env = dict(env)
-            if full:
-                seam = folder / "seams" / f"{node_name}.free"
-                seam.parent.mkdir(exist_ok=True)
-                total = shutil.disk_usage(folder).total
-                seam.write_text(f"0 {total}\n")
-                node_env[FREE_SPACE_SEAM] = str(seam)
+        def node_env(node, release):
+            """The environment `node` runs `release`'s binary with."""
+            values = dict(env)
+            if release.faults:
+                values[FAULTS_SEAM] = str(faults_file)
+            if release.name == "new":
+                # Small sync pages, and the release that reads pages
+                # announced until it is cut: see paging_plan.
+                if paging.get("page_bytes"):
+                    values[PAGE_SEAM] = str(paging["page_bytes"])
+                if paging.get("announced"):
+                    values[ANNOUNCED_SEAM] = str(paging["announced"])
+                if paging.get("busy_limit") and node.role == "incumbent":
+                    values[ADMISSION_SEAM] = str(paging["busy_limit"])
+            if name == "full" and release.full_notice_seam:
+                values[FULL_NOTICE_SEAM] = "0"
+            if name in SEAMED_RUNS and release.name == "new":
+                values[BOOTSTRAP_SEAM] = str(RUN_BOOTSTRAP_SECS)
+                values[AUDIT_SEAM] = str(RUN_AUDIT_SECS)
+            if name == "full":
+                values[NEIGHBOR_SYNC_SEAM] = str(FULL_RUN_SYNC_SECS)
+                values[HYSTERESIS_SEAM] = str(FULL_RUN_HYSTERESIS_SECS)
+                values[FRESHNESS_SEAM] = str(FULL_RUN_FRESHNESS_SECS)
+                values[FETCH_WINDOW_SEAM] = str(FULL_RUN_FETCH_WINDOW_SECS)
+            if node.full or name == "full":
+                values[FREE_SPACE_SEAM] = str(folder / "seams" / f"{node.name}.free")
+            return values
+
+        def command_for(release, root, rewards, bootstraps):
+            """`release`'s node binary run on the data folder `root`."""
             command = [
                 str(release.node), "--root-dir", str(root), "--port", "0", "--ipv4-only",
                 "--network-mode", args.network_mode, "--metrics-port", "0",
                 "--evm-rpc-url", evm["rpc_url"],
                 "--evm-payment-token", evm["payment_token_address"],
                 "--evm-payment-vault", evm["payment_vault_address"],
-                "--rewards-address", "0x" + "d1" * 18 + f"{len(nodes) + 1:04x}",
+                "--rewards-address", rewards,
                 "--config", str(node_config), "--enable-logging", "--log-level", "info",
             ]
             if args.network_mode == "development":
                 command += ["--webrtc-direct-bind", "127.0.0.1:0"]
-            for address in bootstrap:
+            for address in bootstraps:
                 command += ["--bootstrap", address]
-            process = Process(node_name, command, folder / f"{node_name}.log", node_env)
-            processes.append(process)
-            node = Node(node_name, role, release, process, root, full)
+            return command
+
+        def launch(node, release):
+            """Starts `release`'s binary as `node`, on its data folder."""
+            command = command_for(release, node.root, node.rewards, bootstrap)
+            node.process = Process(node.name, command, folder / f"{node.name}.log",
+                                   node_env(node, release))
+            processes.append(node.process)
+
+        def start(role, index, release, full):
+            node_name = f"{role}-{index:02d}"
+            root = folder / "nodes" / node_name
+            root.mkdir(parents=True, exist_ok=True)
+            if full or name == "full":
+                # A full joiner reads no free space; every other node of the
+                # full run reads the host's own until it is put under
+                # pressure.
+                seam = folder / "seams" / f"{node_name}.free"
+                seam.parent.mkdir(exist_ok=True)
+                disk = shutil.disk_usage(folder)
+                seam.write_text(f"0 {disk.total}\n" if full else f"{disk.free} {disk.total}\n")
+            node = Node(node_name, role, release, root, full,
+                        "0x" + "d1" * 18 + f"{len(nodes) + 1:04x}")
             nodes.append(node)
+            launch(node, release)
             return node
 
         def started(group):
@@ -523,38 +1056,245 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
                     f"{node.name}'s identity",
                     lambda node=node: peer_id_in(node.process.log_path), 120, node.process)
 
+        # Nodes the full run stops on purpose.
+        stopped = set()
+
+        def observe(minutes, until=None, most=None):
+            """Lets the nodes run for `minutes`, and then, while `until` finds
+            nothing, on up to `most` minutes in all; fails when a node stops
+            but one stopped on purpose. Returns what `until` found last."""
+            began = time.monotonic()
+            found = None
+            while True:
+                for process in processes:
+                    if process.name not in stopped and not process.alive():
+                        raise HarnessError(f"{process.name} exited; see {process.log_path}")
+                passed = (time.monotonic() - began) / 60
+                if passed >= minutes:
+                    if until is None:
+                        return None
+                    found = until()
+                    if found or passed >= most:
+                        return found
+                time.sleep(5)
+
+        def restart(node, release):
+            """Stops `node` and starts `release`'s binary as it, on its data
+            folder; returns when the new process has logged its identity,
+            with the times the node stopped and came up."""
+            offset = node.process.log_path.stat().st_size
+            stopped = utc_now()
+            node.process.signal()
+            node.process.stop()
+            processes.remove(node.process)
+            launch(node, release)
+            wait_for(f"{node.name}'s identity on {release.name}",
+                     lambda: peer_id_in(node.process.log_path, offset), 120, node.process)
+            return stopped, utc_now()
+
+        def roll_back(node):
+            """The rollback run's three phases: `node` on this tree's binary,
+            then on the previous release's, then on this tree's again, each
+            until the nodes of this tree show what they must of it."""
+            new = node.release
+            watch = ExchangeWatch([folder / f"{other.name}.log" for other in nodes
+                                   if other.release.name == "new" and other is not node],
+                                  node.peer_id)
+            log(f"{name}: observing for {args.rollback_minutes} min before rolling back")
+            observe(args.rollback_minutes)
+            log(f"{name}: {node.name} started again on {old.name} ({old.version}), its data "
+                "folder kept")
+            stopped_old, up_old = restart(node, old)
+            found = observe(args.rollback_minutes, lambda: watch.seen("single", up_old),
+                            ROLLBACK_WAIT_LIMIT)
+            log(f"{name}: {len(found or [])} single exchange(s) to {node.name} from this "
+                "tree's nodes while it ran the previous release")
+            stopped_new, up_new = restart(node, new)
+            log(f"{name}: {node.name} back on this tree's binary")
+            found = observe(args.rollback_minutes,
+                            lambda: watch.seen("paged", up_new, answered=True),
+                            ROLLBACK_WAIT_LIMIT)
+            log(f"{name}: {len(found or [])} paged exchange(s) to {node.name} since it came "
+                "back")
+            return {"node": node.name, "peer_id": node.peer_id,
+                    "old_from": stopped_old.isoformat(), "old_until": stopped_new.isoformat(),
+                    "restarts": [[stopped_old.isoformat(), up_old.isoformat()],
+                                 [stopped_new.isoformat(), up_new.isoformat()]]}
+
+        def identities(release, count):
+            """Gives the data folders of `count` joiners an identity each:
+            `release`'s binary started on each, its bootstrap an address no
+            node answers (so no node learns of it), until it logs its
+            identity, and nothing but the identity kept. Returns the peer ids,
+            by joiner name."""
+            starting = []
+            for index in range(count):
+                node_name = f"joiner-{index:02d}"
+                root = folder / "nodes" / node_name
+                shutil.rmtree(root, ignore_errors=True)
+                root.mkdir(parents=True)
+                log_path = folder / "identities" / f"{node_name}.log"
+                log_path.parent.mkdir(exist_ok=True)
+                log_path.unlink(missing_ok=True)
+                starting.append((node_name, root, Process(
+                    f"{node_name} (identity)",
+                    command_for(release, root, "0x" + "d1" * 20, [UNANSWERED_BOOTSTRAP]),
+                    log_path, env)))
+            found = {}
+            try:
+                for node_name, _, process in starting:
+                    found[node_name] = wait_for(
+                        f"{node_name}'s identity",
+                        lambda process=process: peer_id_in(process.log_path), 120, process)
+            finally:
+                for _, _, process in starting:
+                    process.signal()
+                    process.stop()
+            for _, root, _ in starting:
+                for entry in root.iterdir():
+                    if entry.name != IDENTITY_FILE:
+                        if entry.is_dir():
+                            shutil.rmtree(entry)
+                        else:
+                            entry.unlink()
+            return found
+
         incumbents = [start("incumbent", index, network_release, False)
                       for index in range(args.incumbents)]
         started(incumbents)
+        full_names = {f"joiner-{index:02d}" for index in range(full_count)}
+        if name == "full":
+            # Which joiners are full: those whose lapse lets the most records
+            # be erased in a group that holds them, in the layout their
+            # identities and the others' make (place_full).
+            devnet_ids = {path.name for path in (devnet_data / "nodes").iterdir()
+                          if path.is_dir()}
+            for attempt in range(1, FULL_RUN_LAYOUT_TRIES + 1):
+                ids = identities(joiner_release, args.joiners)
+                chosen, share = place_full(ids, [node.peer_id for node in incumbents],
+                                           devnet_ids, full_count)
+                if share >= FULL_RUN_LAYOUT_SHARE or attempt == FULL_RUN_LAYOUT_TRIES:
+                    break
+            full_names = set(chosen)
+            log(f"{name}: full joiners {', '.join(sorted(full_names))}: the best one's lapse "
+                f"would let {share:.0%} of records be erased in its group "
+                f"(identities drawn {attempt} time(s))")
+            timeline["layout"] = {"full": sorted(full_names), "share": share,
+                                  "attempts": attempt}
         log(f"{name}: {len(incumbents)} incumbents up; settling {args.settle_seconds} s")
         time.sleep(args.settle_seconds)
 
+        # The devnet's nodes run no replication: never a record's one storer.
+        devnet_ids = sorted(path.name for path in (devnet_data / "nodes").iterdir()
+                            if path.is_dir())
         uploads = []
         uploads.append(upload(harness, manifest_path, folder / "uploads-before.json",
-                              args.records_before))
+                              args.records_before, devnet_ids))
         timeline["joiners"] = utc_now().isoformat()
-        joiners = [start("joiner", index, joiner_release, index < full_count)
+        joiners = [start("joiner", index, joiner_release, f"joiner-{index:02d}" in full_names)
                    for index in range(args.joiners)]
         started(joiners)
         log(f"{name}: {len(joiners)} joiners up ({joiner_release.name}); settling "
             f"{args.join_seconds} s")
         time.sleep(args.join_seconds)
         uploads.append(upload(harness, manifest_path, folder / "uploads-after.json",
-                              args.records_after))
+                              args.records_after, devnet_ids))
+        # The fault cases take the records of the last upload at settlement
+        # version 1, which every release in the run stores.
+        faults_upload = uploads[-1]
         if args.settlement_version >= 2 and "new" in (network_release.name,
                                                       joiner_release.name):
             uploads.append(upload(harness, manifest_path, folder / "uploads-by-size.json",
-                                  args.records_after, args.settlement_version))
+                                  args.records_after, devnet_ids, args.settlement_version))
+        new_peers = [node.peer_id for node in nodes if node.release.faults]
+        faults = run_faults(harness, manifest_path, faults_upload, faults_file, new_peers,
+                            folder / "faults.json")
 
-        log(f"{name}: observing for {args.observe_minutes} min")
-        deadline = time.monotonic() + args.observe_minutes * 60
-        while time.monotonic() < deadline:
-            for process in processes:
-                if not process.alive():
-                    raise HarnessError(f"{process.name} exited; see {process.log_path}")
-            time.sleep(5)
-        checks = [check(harness, manifest_path, path, folder / f"check-{path.stem}.json")
-                  for path in uploads]
+        def check_all(phase):
+            suffix = f"-{phase}" if phase else ""
+            return [check(harness, manifest_path, path,
+                          folder / f"check{suffix}-{path.stem}.json") for path in uploads]
+
+        phases = {}
+        if name == "rollback":
+            rolled = roll_back(joiners[0] if joiners else incumbents[0])
+        elif name == "full":
+            # A few sync cycles for the fresh offers and the full nodes'
+            # notices to land, then the early count.
+            log(f"{name}: waiting {FULL_RUN_COUNT_WAIT_SECS} s, then counting copies")
+            observe(FULL_RUN_COUNT_WAIT_SECS / 60)
+            phases["early"] = [path.name for path in check_all("early")]
+            for node in nodes:
+                if not node.full:
+                    (folder / "seams" / f"{node.name}.free").write_text(
+                        f"{PRESSURED_FREE} {PRESSURED_TOTAL}\n")
+            timeline["pressure"] = utc_now().isoformat()
+            first_half = args.observe_minutes / 2
+            log(f"{name}: every node not full under pressure; observing for {first_half:g} min")
+            observe(first_half)
+            mid = check_all("mid")
+            full_joiners = [node for node in joiners if node.full]
+            pressured = {node.peer_id for node in nodes if not node.full}
+
+            def counted(paths):
+                return [found for path in paths
+                        for found in json.loads(path.read_text())["records"]]
+
+            for batch in range(FULL_RUN_EXTRA_BATCHES + 1):
+                candidates = lapse_candidates(counted(mid),
+                                              {node.peer_id for node in full_joiners},
+                                              devnet_ids, pressured)
+                victim = max(full_joiners, key=lambda node: len(candidates[node.peer_id]))
+                if candidates[victim.peer_id] or batch == FULL_RUN_EXTRA_BATCHES:
+                    break
+                log(f"{name}: no full joiner's lapse would let a counted record be erased; "
+                    f"uploading more ({batch + 1} of {FULL_RUN_EXTRA_BATCHES})")
+                extra = upload(harness, manifest_path, folder / f"uploads-extra-{batch + 1}.json",
+                               args.records_after, devnet_ids)
+                uploads.append(extra)
+                observe(FULL_RUN_COUNT_WAIT_SECS / 60)
+                mid.append(check(harness, manifest_path, extra,
+                                 folder / f"check-mid-{extra.stem}.json"))
+            phases["mid"] = [path.name for path in mid]
+            # What the run waits for, as the verdict reads it: an erasure
+            # after the lapse of one of the victim's candidates, by a node
+            # the victim's fresh mark kept inside that record's width.
+            awaited = {folder / f"{node.name}.log": set() for node in nodes}
+            log_of = {node.peer_id: folder / f"{node.name}.log" for node in nodes}
+            for address, nearest in lapse_records(counted(mid),
+                                                  candidates[victim.peer_id]).items():
+                for peer in lapse_erasers(nearest, {node.peer_id for node in full_joiners},
+                                          victim.peer_id):
+                    if peer in log_of:
+                        awaited[log_of[peer]].add(address)
+            victim.process.signal()
+            victim.process.stop()
+            stopped.add(victim.process.name)
+            stopped_at = utc_now()
+            timeline["stopped"] = {"node": victim.name, "peer_id": victim.peer_id,
+                                   "at": stopped_at.isoformat(),
+                                   "candidates": candidates[victim.peer_id]}
+            second_half = max(args.observe_minutes / 2,
+                              (FULL_RUN_FRESHNESS_SECS + 6 * FULL_RUN_SYNC_SECS) / 60)
+            if candidates[victim.peer_id]:
+                longest = lapse_erasure_seconds() / 60
+                log(f"{name}: stopped {victim.name}, whose mark lapses in "
+                    f"{FULL_RUN_FRESHNESS_SECS} s and then lets "
+                    f"{len(candidates[victim.peer_id])} counted record(s) be erased; observing "
+                    f"for {second_half:g} min, and on until one is, up to {longest:g} min")
+                watch = ErasureWatch(awaited, stopped_at + datetime.timedelta(
+                    seconds=FULL_RUN_FRESHNESS_SECS))
+                found = observe(second_half, watch.seen, max(second_half, longest))
+                log(f"{name}: {len(found or [])} erasure(s) after the lapse of a record "
+                    f"only {victim.name}'s lapse let be erased")
+            else:
+                log(f"{name}: stopped {victim.name}; no full joiner's lapse would let a "
+                    f"counted record be erased; observing for {second_half:g} min")
+                observe(second_half)
+        else:
+            log(f"{name}: observing for {args.observe_minutes} min")
+            observe(args.observe_minutes)
+        checks = check_all(None)
         timeline["ended"] = utc_now().isoformat()
         devnet_peers = sorted(path.name for path in (devnet_data / "nodes").iterdir()
                               if path.is_dir())
@@ -571,10 +1311,18 @@ def run_one(name, network_release, joiner_release, args, harness, folder):
         "stalled_seconds": stalled,
         "devnet_peers": devnet_peers,
         "nodes": [{"name": node.name, "role": node.role, "release": node.release.name,
-                   "ran": started_as(node.process.log_path), "peer_id": node.peer_id,
-                   "full": node.full, "log": node.process.log_path.name} for node in nodes],
+                   "ran": started_as(folder / f"{node.name}.log"), "peer_id": node.peer_id,
+                   "full": node.full, "log": f"{node.name}.log"} for node in nodes],
         "uploads": [path.name for path in uploads],
         "checks": [path.name for path in checks],
+        "faults": faults.name,
+        "page_bytes": paging.get("page_bytes"),
+        "paging": paging,
+        "audit_seam": name in SEAMED_RUNS,
+        "rollback": rolled,
+        "phase_checks": phases,
+        "full_phases": {key: timeline[key] for key in ("layout", "pressure", "stopped")
+                        if key in timeline},
     }
     (folder / "run.json").write_text(json.dumps(record, indent=2))
     return folder
@@ -588,6 +1336,18 @@ def load_run(folder):
                              for stamp in record["window"])
     record["uploads"] = [json.loads((folder / name).read_text()) for name in record["uploads"]]
     record["checks"] = [json.loads((folder / name).read_text()) for name in record["checks"]]
+    record["faults"] = (json.loads((folder / record["faults"]).read_text())
+                        if record.get("faults") else {"cases": []})
+    rollback = record.get("rollback")
+    if rollback:
+        for key in ("old_from", "old_until"):
+            rollback[key] = datetime.datetime.fromisoformat(rollback[key])
+        rollback["restarts"] = [[datetime.datetime.fromisoformat(stamp) for stamp in pair]
+                                for pair in rollback["restarts"]]
+    record["phase_checks"] = {
+        phase: [found for name in names
+                for found in json.loads((folder / name).read_text())["records"]]
+        for phase, names in record.get("phase_checks", {}).items()}
     return record
 
 
@@ -602,9 +1362,11 @@ def started_as(log_path):
     return "unknown"
 
 
-def peer_id_in(log_path):
+def peer_id_in(log_path, offset=0):
+    """The peer id a node's log names, from `offset` on."""
     try:
         with open(log_path, "rb") as handle:
+            handle.seek(offset)
             for raw in handle:
                 match = PEER_ID_LINE.search(ANSI.sub("", raw.decode("utf-8", "replace")))
                 if match:
@@ -628,11 +1390,23 @@ def client(harness, arguments, out):
     return out
 
 
-def upload(harness, manifest, out, records, settlement_version=1):
+def upload(harness, manifest, out, records, not_storers, settlement_version=1):
     sizes = ",".join(str(RECORD_SIZES[index % len(RECORD_SIZES)]) for index in range(records))
-    log(f"uploading {records} records at settlement version {settlement_version}")
+    log(f"uploading {records} records ({records // 2} to one storer) and "
+        f"{POINTERS_PER_UPLOAD} pointers at settlement version {settlement_version}")
     return client(harness, ["upload", "--manifest", str(manifest), "--sizes", sizes,
+                            "--one-storer", str(records // 2),
+                            "--pointers", str(POINTERS_PER_UPLOAD),
+                            "--not-storers", ",".join(not_storers),
                             "--settlement-version", str(settlement_version)], out)
+
+
+def run_faults(harness, manifest, uploads, faults_file, new_peers, out):
+    log(f"fault cases ({len(new_peers)} nodes of this tree take the seam's faults)")
+    return client(harness, ["faults", "--manifest", str(manifest), "--uploads", str(uploads),
+                            "--faults-file", str(faults_file),
+                            "--new-peers", ",".join(peer for peer in new_peers if peer)],
+                  out)
 
 
 def check(harness, manifest, uploads, out):
@@ -694,6 +1468,11 @@ def analyze(run):
         releases[node["peer_id"]] = node["release"]
     for uploads in run["uploads"]:
         roles.setdefault(uploads["client"], "client")
+    rollback = run.get("rollback")
+
+    def release_at(peer, when):
+        return release_of(rollback, releases, peer, when)
+
     full_peers = {node["peer_id"] for node in run["nodes"] if node["full"]}
     # A node that refused a record's PUT doesn't hold it, and its close group's
     # possession checks then charge it: those penalties follow the refusal,
@@ -723,24 +1502,31 @@ def analyze(run):
                 counts = sized_quotes.setdefault(releases.get(answer["peer"], "other"), {})
                 counts[kind] = counts.get(kind, 0) + 1
 
-    sources = [("devnet", "devnet", run["network"], folder / "devnet.log")]
-    sources += [(node["name"], node["role"], node["release"], folder / node["log"])
+    sources = [("devnet", "devnet", None, folder / "devnet.log")]
+    sources += [(node["name"], node["role"], node["peer_id"], folder / node["log"])
                 for node in run["nodes"]]
     decode_failures = []
+    proof_refusals = {}
     unanswered = {}
     penalties = {}
     penalties_on_full = {}
     penalties_on_refusals = {}
     penalties_on_sized = {}
+    penalties_on_restart = {}
     between_releases = {}
     traffic = {}
     audits = {}
-    for source, role, release, path in sources:
+    charges = []
+    sync = {"paged": [], "single": [], "builds": {}, "served": {}, "busy": 0}
+    for source, role, source_peer, path in sources:
         traffic_groups = {}
         audit_groups = {}
         possession_failed = None
         audit_failed = None
-        for _, text in read_log(path, window):
+        for stamp, text in read_log(path, window):
+            own_release = (run["network"] if source_peer is None
+                           else release_at(source_peer, stamp))
+            note_sync(sync, source, own_release, stamp, text, release_at)
             failed = POSSESSION_FAILED.search(text)
             if failed:
                 possession_failed = (failed.group(1), failed.group(2))
@@ -758,6 +1544,10 @@ def analyze(run):
                 unanswered[key] = unanswered.get(key, 0) + 1
             if DECODE_FAILURE.search(text):
                 decode_failures.append(f"{source}: {text[:400]}")
+            for kind, pattern in PROOF_REFUSED:
+                if pattern.search(text):
+                    key = (role, release, kind)
+                    proof_refusals[key] = proof_refusals.get(key, 0) + 1
             if TRUST_LINE in text:
                 found = fields(text)
                 try:
@@ -769,13 +1559,16 @@ def analyze(run):
                 reason = found.get("reason", "")
                 target = found.get("peer_id", "")
                 weight = float(found.get("weight", "1") or 1)
+                charges.append((source, target, stamp, reason))
                 if target in full_peers:
                     book = penalties_on_full
+                elif restarting(rollback, target, stamp):
+                    book = penalties_on_restart
                 elif (possession_failed and possession_failed[0] == target
                       and possession_failed in refused):
                     book = penalties_on_refusals
                     possession_failed = None
-                elif releases.get(target) == "old" and (
+                elif release_at(target, stamp) == "old" and (
                         (possession_failed and possession_failed[0] == target
                          and possession_failed[1] in by_size)
                         or (audit_failed and audit_failed[0] == target
@@ -789,31 +1582,58 @@ def analyze(run):
                 book[key] = (count + 1, total + weight)
                 # One release's nodes charging the other's, whatever the
                 # book: what the rule for messages between nodes governs.
+                target_release = release_at(target, stamp)
                 if (roles.get(target) in ("incumbent", "joiner")
-                        and releases.get(target, release) != release):
-                    key = (release, releases[target], reason)
+                        and target_release != own_release):
+                    key = (own_release, target_release, reason)
                     count, total = between_releases.get(key, (0, 0.0))
                     between_releases[key] = (count + 1, total + weight)
         if source != "devnet":
             traffic[source] = merge_counters(traffic_groups)
             audits[source] = merge_counters(audit_groups)
+    sync["busy_charged"] = busy_charges(sync, charges)
 
     records = [record for uploads in run["uploads"] for record in uploads["records"]]
     checks = [record for checks in run["checks"] for record in checks["records"]]
+    # A record PUT to one storer: held by how many of the nodes asked for it
+    # that the devnet doesn't run.
+    one_storer = {record["address"] for record in records if record.get("one_storer")}
+    for record in checks:
+        record["one_storer"] = record["address"] in one_storer
+        record["held_outside_devnet"] = sum(
+            1 for answer in record["answers"]
+            if answer["outcome"] == "held" and answer["peer"] not in run["devnet_peers"])
     full_evidence = {}
     for node in run["nodes"]:
         if node["full"]:
             text = (folder / node["log"]).read_bytes().decode("utf-8", "replace")
-            # A refusal for lack of space: the seam's 0 free bytes are under
-            # any reserve, where the host's own disk has room.
-            full_evidence[node["name"]] = "Insufficient disk space" in text
+            # A refusal for lack of space (the seam's 0 free bytes are under
+            # any reserve, where the host's own disk has room), or the node's
+            # own line on entering "full": a full node no PUT reached logs
+            # only the latter.
+            full_evidence[node["name"]] = ("Insufficient disk space" in text
+                                           or "Node full: since" in text)
+    devnet = set(run["devnet_peers"])
+    unlisted = []
+    for record in checks:
+        for answer in record.get("paid_listed", []):
+            if answer["peer"] in devnet or answer["outcome"] == "listed":
+                continue
+            unlisted.append((record["address"], roles.get(answer["peer"], "other"),
+                             releases.get(answer["peer"], "?"), answer["outcome"]))
+    full_run = full_run_checks(run, records, checks) if run.get("full_phases") else None
     return {
+        "full_run": full_run,
         "decode_failures": decode_failures,
+        "proof_refusals": proof_refusals,
+        "unlisted": unlisted,
+        "faults": run.get("faults", {"cases": []})["cases"],
         "penalties": penalties,
         "penalties_on_full": penalties_on_full,
         "penalties_on_refusals": penalties_on_refusals,
         "penalties_on_sized": penalties_on_sized,
         "sized_quotes": sized_quotes,
+        "penalties_on_restart": penalties_on_restart,
         "between_releases": between_releases,
         "refusals": refusals,
         "traffic": traffic,
@@ -822,6 +1642,10 @@ def analyze(run):
         "checks": checks,
         "full_evidence": full_evidence,
         "unanswered": unanswered,
+        "sync": sync,
+        "paging": run.get("paging") or {},
+        "audit_seam": run.get("audit_seam", False),
+        "rollback": rollback,
         "stalled_seconds": run.get("stalled_seconds", 0),
         "roles": {node["name"]: node["role"] for node in run["nodes"]},
         "ran": {role: sorted({node.get("ran") or started_as(folder / node["log"])
@@ -831,8 +1655,337 @@ def analyze(run):
     }
 
 
+def release_of(rollback, releases, peer, when):
+    """The release `peer` ran at `when`: the one it was started on, but for
+    the rollback run's node from its stop until it came back, when it was
+    the previous release's."""
+    if (rollback and peer == rollback["peer_id"] and when is not None
+            and rollback["old_from"] <= when < rollback["old_until"]):
+        return "old"
+    return releases.get(peer, "other")
+
+
+def restarting(rollback, peer, when):
+    """Whether `when` falls in one of the rollback run's restarts of `peer`:
+    from its stop until RESTART_GRACE seconds after it was up again, when
+    requests sent to it before or during the restart still fail."""
+    if not rollback or peer != rollback["peer_id"]:
+        return False
+    grace = datetime.timedelta(seconds=RESTART_GRACE)
+    return any(stopped <= when <= up + grace for stopped, up in rollback["restarts"])
+
+
+def busy_charges(sync, charges):
+    """The penalties a requester charged its responder during a paged exchange
+    the responder answered busy, up to BUSY_CHARGE_GRACE after it ended."""
+    grace = datetime.timedelta(seconds=BUSY_CHARGE_GRACE)
+    found = []
+    for exchange in sync.get("paged", []):
+        if exchange.get("end") != "Busy" or "start" not in exchange:
+            continue
+        for observer, target, stamp, reason in charges:
+            if (observer == exchange["from"] and target == exchange.get("peer")
+                    and exchange["start"] <= stamp <= exchange["at"] + grace):
+                found.append({"from": observer, "peer": target, "at": stamp,
+                              "reason": reason})
+    return found
+
+
+def exchange_in(text):
+    """The neighbour-sync exchange a log line ends, with the time it started,
+    or None: the requester logs one line for each exchange it starts, paged or
+    single, when it ends, with how long it took."""
+    if PAGED_EXCHANGE_LINE in text:
+        form = "paged"
+    elif SINGLE_EXCHANGE_LINE in text:
+        form = "single"
+    else:
+        return None
+    at = parse_time(text)
+    if at is None:
+        return None
+    exchange = {key: int(value) if value.isdigit() else value
+                for key, value in fields(text).items()}
+    exchange["form"] = form
+    exchange["at"] = at
+    elapsed = exchange.get("elapsed_ms", 0)
+    exchange["start"] = at - datetime.timedelta(
+        milliseconds=elapsed if isinstance(elapsed, int) else 0)
+    return exchange
+
+
+def note_sync(sync, source, release, stamp, text, release_at):
+    """Notes a neighbour-sync line of `source`'s log in `sync`: an exchange it
+    started, paged or single, with the releases of the two nodes when it
+    started; a hint set it built, and a page it served, as a responder, by
+    the requester and the exchange's number; or a page it answered busy."""
+    exchange = exchange_in(text)
+    if exchange is not None:
+        exchange.update({"from": source, "release": release,
+                         "peer_release": release_at(exchange.get("peer", ""),
+                                                    exchange["start"])})
+        sync[exchange["form"]].append(exchange)
+    elif HINT_SET_LINE in text:
+        found = fields(text)
+        key = f"{source} {found.get('source', '?')} {found.get('cycle', '?')}"
+        sync["builds"][key] = sync["builds"].get(key, 0) + 1
+    elif PAGE_SERVED_LINE in text:
+        found = fields(text)
+        key = f"{source} {found.get('source', '?')} {found.get('cycle', '?')}"
+        page = found.get("page", "")
+        sync["served"].setdefault(key, []).append(int(page) if page.isdigit() else -1)
+    elif BUSY_LINE in text:
+        sync["busy"] += 1
+
+
+def multi_page(exchange):
+    """Whether an exchange took more than one page for each list, both ways."""
+    return all(exchange.get(f"{kind}_pages_{way}", 0) >= 2
+               for kind in ("replica", "paid") for way in ("sent", "received"))
+
+
+def window_of(nearest, full):
+    """A record's 7 nearest not full, and its full nodes among them: walking
+    its nearest nodes, nearest first, until 7 not full are passed (at most
+    WIDEST)."""
+    not_full, full_inside = [], []
+    for peer in nearest[:WIDEST]:
+        if len(not_full) == CLOSE_GROUP:
+            break
+        (full_inside if peer in full else not_full).append(peer)
+    return not_full, full_inside
+
+
+def holders(record):
+    return {answer["peer"] for answer in record["answers"] if answer["outcome"] == "held"}
+
+
+def widened_len(nearest, base, full):
+    """How many of `nearest` a window of `base` nodes holds once widened past
+    the nodes marked full (`full`): the nearest prefix holding `base` nodes
+    not full, at most WIDEST (as src/replication/full.rs counts it)."""
+    not_full = 0
+    for index, peer in enumerate(nearest):
+        if index >= WIDEST or not_full >= base:
+            return index
+        if peer not in full:
+            not_full += 1
+    return min(len(nearest), WIDEST)
+
+
+def place_full(joiners, others, devnet, count):
+    """Which `count` of `joiners` (peer ids by name) to make full, and the
+    share of records the best one's lapse would then let be erased in a group
+    that holds it (lapse_candidates), over FULL_RUN_LAYOUT_SAMPLE addresses
+    drawn the same way each time: a record at each held by every node not
+    full in its retention width, as the full run's records just stored are,
+    its nearest the nodes by XOR distance from it. `others` are the
+    incumbents' peer ids, `devnet` the devnet's; every node of ours not full
+    is under pressure. At most FULL_RUN_LAYOUT_CHOICES choices are tried,
+    drawn the same way each time when there are more."""
+    draw = random.Random(0)
+    names = sorted(joiners)
+    choices = list(itertools.combinations(names, count))
+    if len(choices) > FULL_RUN_LAYOUT_CHOICES:
+        choices = draw.sample(choices, FULL_RUN_LAYOUT_CHOICES)
+    peers = [joiners[name] for name in names] + list(others) + sorted(devnet)
+    records = []
+    for _ in range(FULL_RUN_LAYOUT_SAMPLE):
+        address = draw.getrandbits(256)
+        nearest = sorted(peers, key=lambda peer: int(peer, 16) ^ address)[:WIDEST]
+        records.append((f"{address:064x}", nearest))
+    best, best_share = choices[0], -1.0
+    for chosen in choices:
+        full = {joiners[name] for name in chosen}
+        pressured = set(peers) - full - set(devnet)
+        found = {peer: 0 for peer in full}
+        for address, nearest in records:
+            width = widened_len(nearest, ADMISSION_WIDTH, full)
+            record = {"address": address, "nearest": nearest,
+                      "answers": [{"peer": peer, "outcome": "held"}
+                                  for peer in nearest[:width] if peer not in full]}
+            for peer, erasable in lapse_candidates([record], full, devnet, pressured).items():
+                found[peer] += bool(erasable)
+        share = max(found.values()) / len(records)
+        if share > best_share:
+            best, best_share = chosen, share
+    return list(best), best_share
+
+
+def lapse_erasers(nearest, full, peer):
+    """Those of a record's `nearest` that the lapse of full node `peer`'s
+    mark alone leaves outside the retention width (ADMISSION_WIDTH nodes not
+    full and the full ones among them, `full` marked full): inside it while
+    the mark is fresh, past it once `peer` counts as not full."""
+    nearest = nearest[:WIDEST]
+    width = widened_len(nearest, ADMISSION_WIDTH, full)
+    narrower = widened_len(nearest, ADMISSION_WIDTH, full - {peer})
+    return nearest[narrower:width]
+
+
+def lapse_records(records, addresses):
+    """The nearest nodes (up to WIDEST) of those of `records` whose address
+    is among `addresses`, by address, as the last of them to count it gave
+    them."""
+    return {record["address"]: (record.get("nearest") or record["close_group"])[:WIDEST]
+            for record in records if record["address"] in addresses}
+
+
+def lapse_candidates(records, full, devnet, pressured):
+    """For each full node, the counted `records` an erasure could take once
+    its mark lapses, in a group that holds it: those whose window holds it
+    (window_of: the group an erasure takes its proofs from), so that, counted
+    not full, it narrows the retention width (ADMISSION_WIDTH nodes not full
+    and the full ones among them) by one. A holder under pressure
+    (`pressured`) left outside that width may then erase the record, with
+    ERASE_PROOFS proofs from the group, the stopped node aside: from holders,
+    none of them the devnet's nodes, which answer no possession check."""
+    found = {peer: [] for peer in full}
+    for record in records:
+        nearest = (record.get("nearest") or record["close_group"])[:WIDEST]
+        held = holders(record)
+        _, full_inside = window_of(nearest, full)
+        for peer in full_inside:
+            not_full, still_full = window_of(nearest, full - {peer})
+            erasers = [other for other in lapse_erasers(nearest, full, peer)
+                       if other in held and other in pressured]
+            proofs = [other for other in not_full + still_full
+                      if other != peer and other in held and other not in devnet]
+            if erasers and len(proofs) >= ERASE_PROOFS:
+                found[peer].append(record["address"])
+    return found
+
+
+def full_run_checks(run, records, end_checks):
+    """The full run's checks: copies at each count, stand-ins kept, the
+    erasures' proofs, and a lapsed mark counted as missing."""
+    full = {node["peer_id"] for node in run["nodes"] if node["full"]}
+    devnet = set(run["devnet_peers"])
+    stopped = (run["full_phases"].get("stopped") or {}).get("peer_id")
+    failures = []
+    by_f = {}
+    counts = {}
+
+    def copies(phase, phase_checks, full_now, gone):
+        for record in phase_checks:
+            nearest = record.get("nearest") or record["close_group"]
+            not_full, full_inside = window_of(nearest, full_now)
+            f = len(full_inside)
+            by_f.setdefault(phase, {}).setdefault(f, 0)
+            by_f[phase][f] += 1
+            held = holders(record) - full_now - gone
+            missing = sum(1 for peer in not_full if peer in devnet or peer in gone)
+            needed = CLOSE_GROUP - missing
+            counts.setdefault(phase, []).append(len(held))
+            if len(held) < needed:
+                failures.append(f"{phase}: record {record['address']} (f = {f}) is held by "
+                                f"{len(held)} nodes not full, fewer than {needed}")
+
+    early = run["phase_checks"].get("early", [])
+    mid = run["phase_checks"].get("mid", [])
+    copies("early", early, full, set())
+    copies("mid", mid, full, set())
+    gone = {stopped} if stopped else set()
+    copies("end", end_checks, full - gone, gone)
+
+    # Stand-ins: held at the early count from beyond the 9 nearest, inside
+    # the window full nodes widen, and still held at the mid count.
+    mid_by_address = {record["address"]: record for record in mid}
+    stand_ins_kept = 0
+    for record in early:
+        nearest = record.get("nearest") or []
+        _, full_inside = window_of(nearest, full)
+        width = ADMISSION_WIDTH + len(full_inside)
+        stand_ins = {peer for peer in nearest[ADMISSION_WIDTH:width] if peer not in full}
+        later = mid_by_address.get(record["address"])
+        if later is None:
+            continue
+        for peer in stand_ins & holders(record):
+            if peer in holders(later):
+                stand_ins_kept += 1
+            else:
+                failures.append(f"mid: stand-in {peer[:16]} no longer holds record "
+                                f"{record['address']}, while the marks are fresh")
+
+    # The erasures' proofs, from every node's log.
+    erasures = []
+    stopped_at = (run["full_phases"].get("stopped") or {}).get("at")
+    lapsed_at = None
+    if stopped_at:
+        lapsed_at = (datetime.datetime.fromisoformat(stopped_at)
+                     + datetime.timedelta(seconds=FULL_RUN_FRESHNESS_SECS))
+    still_full = len(full - ({stopped} if stopped else set()))
+    # The records the stopped node was chosen for (lapse_candidates: its
+    # lapse narrows their retention width past a holder), and for each the
+    # nodes its fresh mark kept inside that width. Only an erasure of one of
+    # them, by one of those nodes, after the lapse tests "a lapsed mark
+    # counts as missing": with the mark still counted, that node is inside
+    # the width and erases nothing. A record already outside a node's width
+    # when the pressure began may be erased after the lapse too, without the
+    # lapse playing any part.
+    chosen = (run["full_phases"].get("stopped") or {}).get("candidates")
+    # A run recorded before the harness kept them: work them out the same way.
+    if chosen is None and stopped is not None:
+        pressured = {node["peer_id"] for node in run["nodes"] if not node["full"]}
+        chosen = lapse_candidates(mid or early, full, devnet, pressured).get(stopped, [])
+    erasers = {address: set(lapse_erasers(nearest, full, stopped))
+               for address, nearest in lapse_records(early + mid, set(chosen or [])).items()}
+    peer_of = {node["name"]: node["peer_id"] for node in run["nodes"]}
+    for node in run["nodes"]:
+        for stamp, text in read_log(run["folder"] / node["log"], run["window"]):
+            if ERASED_LINE not in text:
+                continue
+            found = fields(text)
+            try:
+                proofs = int(found.get("proofs_not_full", "0")) + int(found.get("proofs_full", "0"))
+                needed = int(found.get("proofs_needed", "0"))
+                group_full = int(found.get("group_full", "0"))
+            except ValueError:
+                failures.append(f"{node['name']}: an erasure line that doesn't parse: {text}")
+                continue
+            after_lapse = lapsed_at is not None and stamp > lapsed_at
+            erasures.append({"node": node["name"], "record": found.get("erased_record"),
+                             "proofs": proofs, "needed": needed, "group_full": group_full,
+                             "after_lapse": after_lapse,
+                             "by_lapse": peer_of.get(node["name"]) in erasers.get(
+                                 found.get("erased_record"), ())})
+            if needed < ERASE_PROOFS or proofs < needed:
+                failures.append(f"{node['name']} erased {found.get('erased_record')} with "
+                                f"{proofs} proofs, needing {needed}: fewer than "
+                                f"{ERASE_PROOFS} real proofs")
+            if after_lapse and group_full > still_full:
+                failures.append(f"{node['name']} erased {found.get('erased_record')} after "
+                                f"the stopped node's mark lapsed counting {group_full} "
+                                f"members marked full, more than the {still_full} still "
+                                "running: a lapsed mark wasn't counted as missing")
+    # The run puts its nodes not full under pressure so that they erase:
+    # with no erasure, the two checks above tested nothing. The harness stops
+    # the full joiner whose lapse lets the most counted records be erased;
+    # none at all means the layout gave the run nothing to show.
+    layout = ("; in this layout no full joiner's lapse would let a counted record be "
+              "erased (the devnet's nodes, or nodes without the record, among its 7 "
+              "nearest not full): run again"
+              if (run["full_phases"].get("stopped") or {}).get("candidates") == [] else "")
+    if not erasures:
+        failures.append("no node erased a record, so \"erasure goes ahead with 6 real "
+                        f"proofs\" and \"a lapsed mark counts as missing\" tested nothing{layout}")
+    elif lapsed_at is not None and not any(erasure["after_lapse"] and erasure["by_lapse"]
+                                           for erasure in erasures):
+        after = sum(1 for erasure in erasures if erasure["after_lapse"])
+        failures.append(f"no erasure after the lapse of a record the stopped node was chosen "
+                        f"for, by a node its fresh mark kept inside the record's retention "
+                        f"width ({after} other erasure(s) after it, {len(erasures) - after} "
+                        f"before), so \"a lapsed mark counts as missing\" tested "
+                        f"nothing{layout}")
+    return {"failures": failures, "by_f": by_f, "copies": counts,
+            "stand_ins_kept": stand_ins_kept, "erasures": erasures,
+            "stopped": run["full_phases"].get("stopped")}
+
+
 def received_families(result, role):
-    """The message families the nodes of `role` received, with counts."""
+    """The message families the nodes of `role` received, with counts. A page
+    family counts towards the single-message family it takes the place of
+    too, so a node that read pages from its peers received neighbour sync."""
     families = {}
     for name, counters in result["traffic"].items():
         if result["roles"].get(name) != role:
@@ -841,6 +1994,9 @@ def received_families(result, role):
             if key.endswith("_rx_count"):
                 family = key[:-len("_rx_count")]
                 families[family] = families.get(family, 0) + value
+                if family in PAGE_FAMILIES:
+                    single = PAGE_FAMILIES[family]
+                    families[single] = families.get(single, 0) + value
     return families
 
 
@@ -873,10 +2029,135 @@ def against(bases):
     return f"at most {max(bases)} in the {len(bases)} all-old runs ({', '.join(map(str, bases))})"
 
 
-def is_measured(name, baselines):
-    """Whether a run is measured against the all-old runs: when there is
-    one, every run but those and the full run."""
-    return bool(baselines) and not is_baseline(name) and name != "full"
+def measured(name, baselines):
+    """What of a run is measured against the all-old runs, when there is one:
+    for the mixed runs and the rollback run, everything (the penalties for
+    each pair of roles and reason, new failure reasons, refused PUTs and the
+    message families, and the families only this tree knows); for the
+    all-old runs and the full run, nothing.
+
+    The other runs of SEAMED_RUNS (all-new and paged) carry the bootstrap and
+    audit seams on every node, and the all-old runs, of the previous release,
+    carry neither: there the joiners stay bootstrapping and nobody audits,
+    while in a seamed run the joiners stop answering "bootstrapping" after
+    RUN_BOOTSTRAP_SECS with keys still pending and every node audits keys
+    whose repair hint is RUN_AUDIT_SECS old. Its penalties, its failure
+    reasons and the families it receives then differ from the all-old runs'
+    by the seams as well as by the release, so measuring them would fail a
+    run for a seam, or, with the slack or the allowance taking the seam's
+    share, hide a regression in the same reason. Those runs are measured on
+    the refused PUTs only, which neither seam moves (a node's PUT path reads
+    neither its bootstrap nor its audits; the paged run's pages don't touch
+    it either), and all-new, as before, on the families only this tree
+    knows, which are not counted against the all-old runs."""
+    if not baselines or is_baseline(name) or name == "full":
+        return set()
+    if name == "paged":
+        return {"refused PUTs"}
+    if name in SEAMED_RUNS:
+        return {"refused PUTs", "new-only families"}
+    return {"penalties", "new reason", "refused PUTs", "families", "new-only families"}
+
+
+def sync_failures(name, result):
+    """What fails a run in its neighbour sync.
+
+    In every run: a node paging to a node that can't read pages; this tree's
+    nodes, in a run in which they page, not paging to each other; with the
+    previous release's nodes beside them, no single message to those nodes
+    (or, if they read pages, no page); and a requester charging its responder
+    during an exchange the responder answered busy. In the rollback run: no
+    single message to the rolled-back node while it ran the previous release,
+    more than one page from a node left unanswered over the connection its
+    earlier process left, and no page to it once it came back. In the paged
+    run: no exchange taking more than one page for each list both ways,
+    hints built more than once in an exchange, an exchange's pages served
+    out of order, and, with the incumbents' admission limit lowered, no page
+    answered busy."""
+    failures = []
+    sync = result.get("sync") or {}
+    paging = result.get("paging") or {}
+    rollback = result.get("rollback")
+    rolled = rollback["peer_id"] if rollback else None
+    paged = sync.get("paged", [])
+    single = sync.get("single", [])
+
+    def between(exchanges, release, peer_release):
+        return [exchange for exchange in exchanges if exchange.get("release") == release
+                and exchange.get("peer_release") == peer_release]
+
+    # Pages to nodes that can't read them. Over a connection the rolled-back
+    # node's earlier process left, a page may go out once from each node
+    # before the node's agent shows its release, and is never answered.
+    left_over = {}
+    if not paging.get("old_reads_pages"):
+        for exchange in between(paged, "new", "old"):
+            if (rolled is not None and exchange.get("peer") == rolled
+                    and exchange.get("pages_answered", 0) == 0):
+                left_over[exchange["from"]] = left_over.get(exchange["from"], 0) + 1
+                continue
+            failures.append(f"{name}: {exchange['from']} paged its hints to a node of the "
+                            "previous release, which can't read pages")
+    for requester, count in sorted(left_over.items()):
+        if count > 1:
+            failures.append(f"{name}: {requester} paged {count} times to the rolled-back node "
+                            "while it ran the previous release: a first page left unanswered "
+                            "should make the next exchange a single message")
+
+    if paging.get("new_pages") and not between(paged, "new", "new"):
+        failures.append(f"{name}: no node of this tree paged its hints to another")
+    # The rollback run's previous release is its one node, checked below.
+    if paging.get("old_present") and not rollback:
+        if paging.get("old_reads_pages"):
+            if not between(paged, "new", "old"):
+                failures.append(f"{name}: no node of this tree paged its hints to a node of "
+                                "the previous release, which reads pages")
+        elif not between(single, "new", "old"):
+            failures.append(f"{name}: no node of this tree sent its hints to a node of the "
+                            "previous release in a single message")
+
+    for charged in sync.get("busy_charged", []):
+        failures.append(f"{name}: {charged['from']} charged {charged['peer'][:16]} "
+                        f"({charged['reason']}) during an exchange it answered busy")
+
+    if rollback:
+        if paging.get("old_reads_pages"):
+            if not any(exchange.get("peer") == rolled and exchange.get("pages_answered", 0) >= 1
+                       for exchange in between(paged, "new", "old")):
+                failures.append(f"{name}: no node of this tree paged to the rolled-back node "
+                                "while it ran the previous release: observe for longer")
+        elif not any(exchange.get("peer") == rolled
+                     for exchange in between(single, "new", "old")):
+            failures.append(f"{name}: no node of this tree sent the rolled-back node a single "
+                            "message while it ran the previous release: observe for longer")
+        if not any(exchange.get("peer") == rolled and exchange.get("pages_answered", 0) >= 1
+                   and exchange.get("start", rollback["old_until"]) >= rollback["old_until"]
+                   for exchange in between(paged, "new", "new")):
+            failures.append(f"{name}: no node of this tree paged to the rolled-back node once "
+                            "it came back: observe for longer")
+
+    if name != "paged":
+        return failures
+    if not any(multi_page(exchange) for exchange in paged):
+        failures.append(f"{name}: no exchange took more than one page for each list, both "
+                        "ways: no paging happened at this page size")
+    for key, count in sorted(sync.get("builds", {}).items()):
+        if count > 1:
+            failures.append(f"{name}: {key}: the responder built its hints {count} times in "
+                            "one exchange, not once")
+    served_from_one = 0
+    for key, pages in sorted(sync.get("served", {}).items()):
+        if pages != list(range(len(pages))):
+            failures.append(f"{name}: {key}: pages served out of order: {pages[:20]}")
+        elif len(pages) > 1 and sync.get("builds", {}).get(key) == 1:
+            served_from_one += 1
+    if served_from_one == 0:
+        failures.append(f"{name}: no responder served more than one page from hints built "
+                        "once")
+    if paging.get("busy_limit") and sync.get("busy", 0) == 0:
+        failures.append(f"{name}: no page was answered busy, with the incumbents admitting "
+                        f"{paging['busy_limit']} sync request(s) at once")
+    return failures
 
 
 def comparisons(result, baselines, args):
@@ -922,6 +2203,29 @@ def comparisons(result, baselines, args):
     return entries
 
 
+def unlisted_count(result, role):
+    """How many keys the nodes of `role` miss from their paid lists, each
+    counted once for each member of the key's paid group at upload."""
+    return sum(1 for _, found, _, _ in result.get("unlisted", []) if found == role)
+
+
+def old_proof_refusals(result, baselines):
+    """The proofs nodes of the previous release refused in a run, by role
+    and kind, where no all-old run had one of that role and kind: as (role,
+    kind, count)."""
+    found = []
+    seen = {}
+    for (role, release, kind), count in result.get("proof_refusals", {}).items():
+        if release == "old" and count:
+            seen[(role, kind)] = seen.get((role, kind), 0) + count
+    for (role, kind), count in sorted(seen.items()):
+        before = sum(baseline.get("proof_refusals", {}).get((role, "old", kind), 0)
+                     for baseline in baselines)
+        if before == 0:
+            found.append((role, kind, count))
+    return found
+
+
 def verdicts(results, args):
     """Every failure, as text; empty when every run passed."""
     failures = []
@@ -942,15 +2246,31 @@ def verdicts(results, args):
             if not record.get("stored"):
                 failures.append(f"{name}: record {record['address']} wasn't stored: "
                                 f"{record.get('error')}")
+        if result.get("full_run"):
+            failures.extend(f"{name}: {failure}" for failure in result["full_run"]["failures"])
         for record in result["checks"]:
-            if record["held_by_storers"] < MAJORITY:
+            # In the full run the incumbents may erase what they stored out
+            # of their range: the copies counted there stand in for this.
+            if result.get("full_run"):
+                break
+            if record.get("one_storer"):
+                if record["held_outside_devnet"] < MAJORITY:
+                    failures.append(f"{name}: record {record['address']}, PUT to one storer, "
+                                    f"is held at the end by {record['held_outside_devnet']} "
+                                    f"of the nodes asked for it")
+            elif record["held_by_storers"] < MAJORITY:
                 failures.append(f"{name}: record {record['address']} is held at the end by "
                                 f"{record['held_by_storers']} of the "
                                 f"{len(record['storers'])} nodes that stored it")
+        for case in result.get("faults", []):
+            if case["case"] == "repeated PUT" and any(
+                    answer["outcome"] != "already_stored" for answer in case["answers"]):
+                failures.append(f"{name}: a repeated PUT of {case['address']} was answered "
+                                f"{[answer['outcome'] for answer in case['answers']]}")
         for node, ok in result["full_evidence"].items():
             if not ok:
-                failures.append(f"{name}: {node} never refused for lack of space: the "
-                                "free-space seam didn't reach it")
+                failures.append(f"{name}: {node} never refused for lack of space nor "
+                                "entered full: the free-space seam didn't reach it")
         for node, counters in sorted(result["traffic"].items()):
             if not counters:
                 failures.append(f"{name}: {node} logged no traffic summary in the window "
@@ -961,11 +2281,23 @@ def verdicts(results, args):
                 if families.get(family, 0) == 0:
                     failures.append(f"{name}: the {role}s received no {family}")
         failures += sized_verdicts(name, result)
-        if not is_measured(name, baselines):
+        failures += sync_failures(name, result)
+        failures += audit_failures(name, result)
+        kinds = measured(name, baselines)
+        if not kinds:
             continue
+        for role in ("incumbent", "joiner"):
+            bases = [unlisted_count(baseline, role) for baseline in baselines]
+            count = unlisted_count(result, role)
+            if count > limit(bases, args):
+                failures.append(f"{name}: the {role}s in a paid group at upload miss {count} "
+                                f"keys from their paid lists, against {against(bases)}")
+        for role, kind, count in old_proof_refusals(result, baselines):
+            failures.append(f"{name}: the {role}s of the previous release refused {count} "
+                            f"proofs in a {kind}, which no all-old run did")
         for compared in comparisons(result, baselines, args):
             count, target, reason = compared["count"], compared["target"], compared["reason"]
-            if count <= compared["limit"]:
+            if compared["kind"] not in kinds or count <= compared["limit"]:
                 continue
             if compared["kind"] == "penalties":
                 failures.append(f"{name}: {count} {reason} penalties by "
@@ -977,14 +2309,18 @@ def verdicts(results, args):
             else:
                 failures.append(f"{name}: the {target}s refused {count} paid PUTs, against "
                                 f"{against(compared['all_old'])}")
-        for role in ("incumbent", "joiner"):
-            befores = [received_families(baseline, role) for baseline in baselines]
-            now = received_families(result, role)
-            for family in sorted(set().union(*befores)):
-                fewest = min(before.get(family, 0) for before in befores)
-                if fewest >= SHAPE_FLOOR and now.get(family, 0) == 0:
-                    failures.append(f"{name}: the {role}s received no {family}, which "
-                                    f"they did {fewest} times or more in every all-old run")
+        if "families" in kinds:
+            for role in ("incumbent", "joiner"):
+                befores = [received_families(baseline, role) for baseline in baselines]
+                now = received_families(result, role)
+                for family in sorted(set().union(*befores)):
+                    fewest = min(before.get(family, 0) for before in befores)
+                    if fewest >= SHAPE_FLOOR and now.get(family, 0) == 0:
+                        failures.append(f"{name}: the {role}s received no {family}, which "
+                                        f"they did {fewest} times or more in every all-old "
+                                        "run")
+        if "new-only families" not in kinds:
+            continue
         for family in args.new_only_family:
             reached_new = 0
             for node, counters in result["traffic"].items():
@@ -1048,6 +2384,19 @@ def report(results, args):
         for role, ran in result["ran"].items():
             lines.append(f"{role}s ran: {', '.join(ran)}")
         lines.append(f"decode failures: {len(result['decode_failures'])}")
+        refused = ", ".join(f"{role} ({release}) {kind} {count}" for (role, release, kind), count
+                            in sorted(result.get("proof_refusals", {}).items()))
+        lines.append(f"proofs refused (role, release, kind): {refused or 'none'}")
+        missing = {}
+        for _, role, release, _ in result.get("unlisted", []):
+            missing[(role, release)] = missing.get((role, release), 0) + 1
+        shown = ", ".join(f"{role}s ({release}) {count}"
+                          for (role, release), count in sorted(missing.items()))
+        lines.append(f"keys missing from paid-group members' paid lists: {shown or 'none'}")
+        for case in result.get("faults", []):
+            answers = ", ".join(answer["outcome"][:60] for answer in case["answers"])
+            lines.append(f"fault case: {case['case']} at {case['address'][:16]}: "
+                         f"{case['note']} ({answers})")
         lines.append("requests not answered in time (sender -> target, kind: count):")
         for (sender, target, kind), count in sorted(result["unanswered"].items()):
             lines.append(f"  {sender:>9} -> {target:<9} {kind:<19} {count:>5}")
@@ -1057,10 +2406,13 @@ def report(results, args):
         refusals = ", ".join(f"{role}s {count}" for role, count in
                              sorted(result["refusals"].items()))
         lines.append(f"paid PUTs refused: {refusals or 'none'}")
-        if is_measured(name, baseline_results):
+        kinds = measured(name, baseline_results)
+        if kinds:
             lines.append("measured against the all-old runs (observer -> target, reason: "
                          "count, highest all-old, excess, limit):")
             for compared in comparisons(result, baseline_results, args):
+                if compared["kind"] not in kinds:
+                    continue
                 if compared["kind"] == "penalties":
                     what = (f"{compared['observer']:>9} -> {compared['target']:<9} "
                             f"{compared['reason']:<19}")
@@ -1095,6 +2447,32 @@ def report(results, args):
                     result["between_releases"].items()):
                 lines.append(f"  {observer:>9} -> {target:<9} {reason:<19} {count:>5} "
                              f"{weight:8.2f}")
+        if result.get("penalties_on_restart"):
+            lines.append("penalties on the rolled-back node while it restarted:")
+            for key, (count, weight) in sorted(result["penalties_on_restart"].items()):
+                lines.append(f"  {key[0]:>9} -> {key[1]:<9} {key[2]:<19} {count:>5} "
+                             f"{weight:8.2f}")
+        if result.get("full_run"):
+            run = result["full_run"]
+            for phase in ("early", "mid", "end"):
+                by_f = ", ".join(f"f = {f}: {count}" for f, count in
+                                 sorted(run["by_f"].get(phase, {}).items()))
+                held = run["copies"].get(phase, [])
+                lines.append(f"{phase} count: records by full nodes in their window: "
+                             f"{by_f or 'none'}; held by {min(held, default=0)} to "
+                             f"{max(held, default=0)} nodes not full")
+            lines.append(f"stand-in copies kept while the marks were fresh: "
+                         f"{run['stand_ins_kept']}")
+            erasures = run["erasures"]
+            lapsed = sum(1 for erasure in erasures if erasure["after_lapse"])
+            by_lapse = sum(1 for erasure in erasures
+                           if erasure["after_lapse"] and erasure["by_lapse"])
+            fewest = min((erasure["proofs"] for erasure in erasures), default=0)
+            lines.append(f"erasures: {len(erasures)} ({lapsed} after the stopped node's "
+                         f"mark lapsed, {by_lapse} of them only its lapse allowed), with "
+                         f"{fewest} proofs or more each")
+            if run["stopped"]:
+                lines.append(f"stopped: {run['stopped']['node']} at {run['stopped']['at']}")
         if result["penalties_on_full"]:
             lines.append("penalties on full nodes:")
             for key, (count, weight) in sorted(result["penalties_on_full"].items()):
@@ -1104,6 +2482,7 @@ def report(results, args):
             shown = ", ".join(f"{family} {count}" for family, count in sorted(families.items())
                               if count)
             lines.append(f"{role}s received: {shown}")
+        lines.extend(sync_lines(result))
         kept = [record["held_by_storers"] for record in result["checks"]]
         near = [record["held_by_close_group"] for record in result["checks"]]
         stored = sum(1 for record in result["records"] if record.get("stored"))
@@ -1120,10 +2499,95 @@ def report(results, args):
     return "\n".join(lines)
 
 
+def audits_made(result):
+    """The audits a run's nodes made, passed or failed, responsible-chunk and
+    subtree, from the last audit summary each logged in the window, and the
+    neighbour-sync exchanges, paged and single, the requesters logged."""
+    sync = result.get("sync") or {}
+    audits = sum(value for counters in (result.get("audits") or {}).values()
+                 for key, value in counters.items()
+                 if key.startswith(("responsible_audit_", "subtree_audit_")))
+    return audits, len(sync.get("paged", [])) + len(sync.get("single", []))
+
+
+def audit_failures(name, result):
+    """A run whose nodes all carry the audit seam must audit: none over
+    AUDIT_EXCHANGE_FLOOR exchanges or more fails it, since audits per
+    exchange then measure nothing."""
+    if not result.get("audit_seam"):
+        return []
+    audits, exchanges = audits_made(result)
+    if audits == 0 and exchanges >= AUDIT_EXCHANGE_FLOOR:
+        return [f"{name}: no audit made over {exchanges} exchanges, with the audit seam "
+                f"set: audits per exchange measure nothing"]
+    return []
+
+
+def sync_lines(result):
+    """The report's lines on neighbour sync: exchanges paged and single, by the
+    releases of the two nodes, the most pages one took, busy answers, and how
+    many times a responder built its hints in one exchange."""
+    sync = result.get("sync") or {}
+    lines = ["neighbour-sync exchanges (requester's release -> peer's: paged, single):"]
+    pairs = {}
+    for form in ("paged", "single"):
+        for exchange in sync.get(form, []):
+            pair = (exchange["release"], exchange["peer_release"])
+            counts = pairs.setdefault(pair, [0, 0])
+            counts[0 if form == "paged" else 1] += 1
+    for (release, peer_release), (paged, single) in sorted(pairs.items()):
+        lines.append(f"  {release:>9} -> {peer_release:<9} {paged:>5} {single:>5}")
+    paged = sync.get("paged", [])
+    if paged:
+        sent = max(exchange.get("pages_sent", 0) for exchange in paged)
+        received = max(exchange.get("pages_received", 0) for exchange in paged)
+        lines.append(f"  most pages in an exchange: {sent} sent, {received} received; "
+                     f"{sum(1 for exchange in paged if multi_page(exchange))} exchange(s) "
+                     "took more than one page for each list both ways")
+    builds = sync.get("builds", {})
+    busy = sum(1 for exchange in paged if exchange.get("end") == "Busy")
+    lines.append(f"  pages answered busy: {sync.get('busy', 0)}; exchanges ended busy: {busy}, "
+                 f"charged for: {len(sync.get('busy_charged', []))}; hint sets built: "
+                 f"{sum(builds.values())}, at most {max(builds.values(), default=0)} in one "
+                 "exchange")
+    # A responder keeps repair proofs only for pages a later request showed
+    # arrived, so its one-page exchanges give it none: audits per exchange
+    # measure what that costs, run against run.
+    audits, exchanges = audits_made(result)
+    per_exchange = f"{audits / exchanges:.3f}" if exchanges else "no exchanges"
+    unseamed = ("; no audit seam in this run, so none is due: a key is audited an hour "
+                "after its repair hint"
+                if exchanges and not audits and not result.get("audit_seam") else "")
+    lines.append(f"  audits made: {audits} over {exchanges} exchange(s), per exchange: "
+                 f"{per_exchange}{unseamed}")
+    rollback = result.get("rollback")
+    if rollback:
+        rolled = rollback["peer_id"]
+        to_rolled = [exchange for form in ("paged", "single") for exchange in sync.get(form, [])
+                     if exchange.get("peer") == rolled and exchange.get("release") == "new"]
+        while_old = [exchange for exchange in to_rolled if exchange["peer_release"] == "old"]
+        after = [exchange for exchange in to_rolled
+                 if exchange.get("start", rollback["old_until"]) >= rollback["old_until"]]
+        lines.append(
+            f"  rolled back: {rollback['node']} ran the previous release from "
+            f"{rollback['old_from']:%H:%M:%S} to {rollback['old_until']:%H:%M:%S}; this tree's "
+            f"nodes sent it {sum(1 for e in while_old if e['form'] == 'single')} single and "
+            f"{sum(1 for e in while_old if e['form'] == 'paged')} paged exchange(s) then, and "
+            f"{sum(1 for e in after if e['form'] == 'paged')} paged and "
+            f"{sum(1 for e in after if e['form'] == 'single')} single after it came back")
+    return lines
+
+
 def summary_json(results, failures, releases, args):
     def plain(result):
         return {
             "decode_failures": result["decode_failures"],
+            "proof_refusals": [{"role": r, "release": v, "kind": k, "count": c}
+                               for (r, v, k), c in
+                               sorted(result.get("proof_refusals", {}).items())],
+            "unlisted": [{"address": a, "role": r, "release": v, "outcome": o}
+                         for a, r, v, o in result.get("unlisted", [])],
+            "faults": result.get("faults", []),
             "unanswered": [{"sender": s, "target": t, "kind": k, "count": c}
                            for (s, t, k), c in sorted(result["unanswered"].items())],
             "penalties": [{"observer": o, "target": t, "reason": r, "count": c, "weight": w}
@@ -1142,6 +2606,10 @@ def summary_json(results, failures, releases, args):
                                    for (o, t, r), (c, w) in
                                    sorted((result.get("penalties_on_sized") or {}).items())],
             "sized_quotes": result.get("sized_quotes") or {},
+            "penalties_on_restart": [{"observer": o, "target": t, "reason": r, "count": c,
+                                      "weight": w}
+                                     for (o, t, r), (c, w) in
+                                     sorted(result.get("penalties_on_restart", {}).items())],
             "between_releases": [{"observer_release": o, "target_release": t, "reason": r,
                                   "count": c, "weight": w}
                                  for (o, t, r), (c, w) in
@@ -1153,6 +2621,10 @@ def summary_json(results, failures, releases, args):
                                     for record in result["checks"]],
             "stored": [bool(record.get("stored")) for record in result["records"]],
             "full_evidence": result["full_evidence"],
+            "sync": result.get("sync"),
+            "paging": result.get("paging"),
+            "rollback": result.get("rollback"),
+            "full_run": result.get("full_run"),
         }
     baselines = [result for name, result in results.items() if is_baseline(name)]
     runs = {}
@@ -1160,8 +2632,11 @@ def summary_json(results, failures, releases, args):
         runs[name] = plain(result)
         # Every count measured against the all-old runs, within its limit or
         # not, so a small excess shows before the canary.
-        if is_measured(name, baselines):
-            runs[name]["comparisons"] = comparisons(result, baselines, args)
+        kinds = measured(name, baselines)
+        if kinds:
+            runs[name]["comparisons"] = [compared for compared in
+                                         comparisons(result, baselines, args)
+                                         if compared["kind"] in kinds]
     return {
         "releases": releases,
         "measured_against": [name for name in results if is_baseline(name)],
@@ -1217,6 +2692,23 @@ def main():
                         "every node's audit and neighbour sync tick once in 10 to 20)")
     parser.add_argument("--full", type=int, default=0,
                         help="joiners of the full run whose disk reads as full (adds the run)")
+    parser.add_argument("--paged", action="store_true",
+                        help="add the paged run, its incumbents admitting --busy-limit sync "
+                        "requests at once")
+    parser.add_argument("--page-bytes", type=int, default=PAGE_BYTES,
+                        help="bytes of keys on a sync page in the runs that page, at least "
+                        f"one key's 32 (default {PAGE_BYTES}: two keys)")
+    parser.add_argument("--busy-limit", type=int, default=BUSY_LIMIT,
+                        help="sync requests the paged run's incumbents admit at once, through "
+                        f"the admission seam; 0 leaves their limit as it is (default "
+                        f"{BUSY_LIMIT})")
+    parser.add_argument("--rollback", action="store_true",
+                        help="add the rollback run: a joiner started again on the previous "
+                        "release's binary, then on this tree's")
+    parser.add_argument("--rollback-minutes", type=float, default=ROLLBACK_MINUTES,
+                        help="the least each phase of the rollback run lasts (default "
+                        f"{ROLLBACK_MINUTES}); the last two go on, up to "
+                        f"{ROLLBACK_WAIT_LIMIT} minutes, until they show their exchange")
     parser.add_argument("--penalty-slack", type=int, default=PENALTY_SLACK,
                         help="penalties a mixed run may count above the highest all-old "
                         f"count, for each pair of roles and reason (default {PENALTY_SLACK})")
@@ -1247,6 +2739,16 @@ def main():
     runs = [run.strip() for run in args.runs.split(",") if run.strip()]
     if args.full and "full" not in runs:
         runs.append("full")
+    if args.paged and "paged" not in runs:
+        runs.append("paged")
+    if args.rollback and "rollback" not in runs:
+        runs.append("rollback")
+    if args.page_bytes < 32:
+        parser.error("--page-bytes must be at least one key's 32 bytes")
+    if args.busy_limit < 0:
+        parser.error("--busy-limit must be 0 or more")
+    if args.rollback_minutes < 5:
+        parser.error("--rollback-minutes must be 5 or more: nodes log their traffic every 5")
     unknown = [run for run in runs if run not in RUNS]
     if unknown:
         parser.error(f"unknown runs: {', '.join(unknown)}")
@@ -1268,7 +2770,7 @@ def main():
     harness = new_folder / f"darwin-harness{EXE}"
     if not harness.exists():
         raise HarnessError(f"{harness} is missing")
-    needs_old = any(run in ("all-old", "new-hosts-old", "old-hosts-new") for run in runs)
+    needs_old = any(run in ("all-old",) + OLD_RUNS for run in runs)
     releases = [new]
     old = None
     if needs_old:
@@ -1280,6 +2782,35 @@ def main():
     if "full" in runs and not new.seams:
         raise HarnessError("this tree's ant-node has no free-space seam: build it with "
                            "--features test-utils")
+    if "paged" in runs and not new.reads_pages:
+        raise HarnessError("this tree's ant-node reads no sync pages: the paged run needs a "
+                           "release that pages")
+    # The rollback run sets no seam on the previous release's binary, so it
+    # needs none: a release before the seams, ds.15 among them, runs as it is.
+    paging_from = paging_release()
+    plans_paging = {name: paging_plan(name, new, old, paging_from, args) for name in runs}
+    for name, paging in plans_paging.items():
+        needed = []
+        if paging["page_bytes"] and not new.page_seams:
+            needed.append(PAGE_SEAM)
+        if paging["announced"] and not new.announce_seam:
+            needed.append(ANNOUNCED_SEAM)
+        if paging["busy_limit"] and not new.admission_seam:
+            needed.append(ADMISSION_SEAM)
+        if needed:
+            raise HarnessError(f"this tree's ant-node lacks the seam(s) the {name} run sets "
+                               f"({', '.join(needed)}): build it with --features test-utils")
+        if paging["announced"]:
+            log(f"{name}: this tree's nodes announce release {paging['announced']}, the first "
+                "that reads pages")
+    if "full" in runs and not new.timing_seams:
+        raise HarnessError("this tree's ant-node lacks the sync, out-of-range wait, "
+                           "freshness or fetch-window seam the full run needs")
+    seamed = [name for name in runs if name in SEAMED_RUNS]
+    if seamed and not new.audit_seams:
+        raise HarnessError(f"this tree's ant-node lacks the bootstrap or audit seam the "
+                           f"{', '.join(seamed)} run(s) set: build it with --features "
+                           "test-utils")
 
     work = Path(args.work) if args.work else (
         cache / "runs" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -1297,15 +2828,23 @@ def main():
         "old-hosts-new": (old, new),
         "all-new": (new, new),
         "full": (new, new),
+        "paged": (new, new),
+        "rollback": (new, new),
     }
     keep_awake()
     for name in runs:
         network_release, joiner_release = plans["all-old" if is_baseline(name) else name]
-        run_one(name, network_release, joiner_release, args, harness, work / name)
+        run_one(name, network_release, joiner_release, args, harness, work / name, old=old,
+                paging=plans_paging[name])
         log(f"{name}: done")
     (work / "releases.json").write_text(json.dumps(
         {release.name: {"version": release.version, "from": release.label,
-                        "seams": release.seams} for release in releases}, indent=2))
+                        "seams": release.seams, "faults": release.faults,
+                        "page_seams": release.page_seams,
+                        "announce_seam": release.announce_seam,
+                        "admission_seam": release.admission_seam,
+                        "reads_pages": release.reads_pages}
+         for release in releases}, indent=2))
     # Every run in the work folder: one run again into a folder whose other
     # runs passed is measured against the same all-old runs.
     return conclude(work, runs_in(work), args)

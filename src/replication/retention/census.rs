@@ -36,7 +36,8 @@
 //!
 //! The same reading of the source pins other calls to reviewed sites, each in
 //! a test of its own: the disk-pressure state's builders, the routing loop's
-//! event reader, the lanes that penalise an unheld close-group chunk, upstream's
+//! event reader, the lanes that penalise an unheld close-group chunk and the
+//! one exemption a full peer gets from it, upstream's
 //! merkle payment code (compiled, never reached), and the payment vault reads
 //! and RPC addresses behind the payment check's fallback. A last test reads
 //! the vendored protocol's wire messages and payment proof types, and the
@@ -348,9 +349,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "PointerReplication::erase_if_proven",
         "delete",
         1,
-        "Erases a pointer only under disk pressure, beyond the erase floor, farthest \
-         first, after all but one of its current close group prove they hold it and the \
-         re-check just before deleting passes.",
+        "Erases a pointer only under disk pressure, beyond the falling floor (down to the \
+         edge of the node's range, never inside the widened retention width), farthest \
+         first, in two phases (selected and named in no hint for a whole sync cycle, then \
+         tried; released and hinted again if the check fails), after 6 of the 7 nearest \
+         peers not marked full prove they hold it (a full holder's proof counting, and 6 \
+         still needed when the cap of 20 cuts the group short), never while this node \
+         answered present for it to a state or fetch request within the fetch window, \
+         and only when the re-check just before deleting passes.",
     ),
     site(
         "src/replication/possession.rs",
@@ -376,9 +382,14 @@ const ERASE_SITES: &[EraseSite] = &[
         "erase_if_still_eligible",
         "erase_stored_record",
         1,
-        "Erases a chunk only under disk pressure, beyond the erase floor, farthest first, \
-         after all but one of its current close group prove possession and the re-check \
-         just before deleting passes.",
+        "Erases a chunk only under disk pressure, beyond the falling floor (down to the \
+         edge of the node's range, never inside the widened retention width), farthest \
+         first, in two phases (selected and named in no hint for a whole sync cycle, then \
+         tried; released and hinted again if the check fails), after 6 of the 7 nearest \
+         peers not marked full prove possession (a full holder's proof counting, and 6 \
+         still needed when the cap of 20 cuts the group short), never while this node \
+         answered present for it within the fetch window, and only when the re-check just \
+         before deleting passes.",
     ),
     site(
         "src/replication/pruning.rs",
@@ -1616,8 +1627,9 @@ fn every_call_that_can_remove_stored_data_is_reviewed() {
         "\nThe calls in src/ that can remove stored data no longer match the reviewed list.\n\n\
          {report}\n\
          A node keeps every record and pointer it holds while its disk has room. The prune \
-         passes erase one only under disk pressure, beyond the erase floor, farthest first, \
-         and only after the nodes now nearest to it prove they hold it \
+         passes erase one only under disk pressure, beyond the falling floor (never inside \
+         the node's widened retention width), farthest first, in two phases, and only after \
+         6 of the 7 nodes now nearest to it and not marked full prove they hold it \
          (src/replication/retention.rs). Every other call that can remove stored data is \
          listed, with the reason it is there, in ERASE_SITES in \
          src/replication/retention/census.rs.\n\n\
@@ -1739,11 +1751,14 @@ fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
 /// every lane that finds it out, as in upstream v0.23.0: the responsible-chunk
 /// audit, the possession check after a fresh write, the prune audit, a
 /// sole-source replica hint its sender then denies, and a fetch a verified
-/// source can't serve. Nothing can withhold it: the release switch, its
-/// environment override and the helper the lanes went through while nodes
-/// moved off the LMDB chunk store are gone, and stay gone. Each lane charges
-/// the peer's trust itself, and the functions holding the lanes keep the
-/// reviewed number of trust charges.
+/// source can't serve; and a peer that doesn't hold a pointer it was offered,
+/// on the pointer possession check after a write (charged through
+/// `PointerReplication::penalise`). Nothing can withhold it but one bounded waiver for
+/// a full peer (the next test): the release switch, its environment override
+/// and the helper the lanes went through while nodes moved off the LMDB chunk
+/// store are gone, and stay gone. Each lane charges the peer's trust itself,
+/// and the functions holding the lanes keep the reviewed number of trust
+/// charges.
 #[test]
 fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
     const SWITCH: &[(Option<&str>, &str)] = &[
@@ -1812,12 +1827,25 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
             1,
         ),
     ];
-    let found = census_counting(
+    // The pointer possession check after a write charges through the pointer
+    // service's own `penalise`, which calls report_trust_event once.
+    const POINTER_CHARGE: &[(Option<&str>, &str)] = &[(None, "penalise")];
+    const POINTER_LANES: &[Reviewed] = &[(
+        "src/replication/pointer.rs",
+        "PointerReplication::check_possession",
+        "penalise",
+        1,
+    )];
+    let mut found = census_counting(
         Path::new(env!("CARGO_MANIFEST_DIR")),
         Counting::Calls(CHARGE),
     );
+    found.extend(census_counting(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Counting::Calls(POINTER_CHARGE),
+    ));
     let mut lanes = String::new();
-    for (file, site, call, count) in LANES {
+    for (file, site, call, count) in LANES.iter().chain(POINTER_LANES) {
         let key = (
             (*file).to_string(),
             (*site).to_string(),
@@ -1838,8 +1866,8 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
         lanes.is_empty(),
         "\nThe lanes that penalise a peer for an unheld close-group chunk no longer charge \
          its trust as reviewed.\n\n{lanes}\n\
-         Each of these functions charges the peer itself with report_trust_event. If a \
-         charge moved, follow it and list where it went; if one is gone, find out why \
+         Each of these functions charges the peer itself with report_trust_event, or for \
+         the pointer lane with PointerReplication::penalise. If a charge moved, follow it and list where it went; if one is gone, find out why \
          before changing the count.\n"
     );
 }
@@ -1851,18 +1879,252 @@ fn the_unheld_chunk_penalty_is_charged_on_every_lane() {
 /// hold, as any peer. The rollout answers that, not an exemption: clients pay
 /// by size only once the node census shows no storer before release 2. A
 /// release is the peer's own claim, so sparing peers by it would let any node
-/// escape the penalty for every record paid by size. Production code reads no
-/// peer's user agent; a new reading is reviewed here first.
+/// escape the penalty for every record paid by size. Production code reads a
+/// peer's user agent only to choose what to send it: whether to page
+/// neighbour sync to it, whether its single answers are windowed, and whether
+/// to tell it this node is full. None of those charges or spares a penalty; a
+/// new reading is reviewed here first.
 #[test]
 fn no_penalty_spares_a_peer_by_the_release_it_advertises() {
     const RELEASE: &[(Option<&str>, &str)] = &[(None, "peer_user_agent")];
-    let found = unreviewed(Counting::Mentions(RELEASE), &[]);
+    const MESSAGE_FORM: &[Reviewed] = &[
+        // Whether to tell a peer this node is full.
+        (
+            "src/replication/full.rs",
+            "send_full_notice",
+            "peer_user_agent",
+            1,
+        ),
+        // Whether a requester reads a busy answer to a single request.
+        (
+            "src/replication/mod.rs",
+            "peer_reads_sync_pages",
+            "peer_user_agent",
+            1,
+        ),
+        // Whether to page an exchange with a peer.
+        (
+            "src/replication/neighbor_sync.rs",
+            "sync_form_for",
+            "peer_user_agent",
+            1,
+        ),
+        // Whether a responder windows its single answers.
+        (
+            "src/replication/neighbor_sync.rs",
+            "agent_reads_pages_now",
+            "peer_user_agent",
+            1,
+        ),
+    ];
+    let found = unreviewed(Counting::Mentions(RELEASE), MESSAGE_FORM);
     assert!(
         found.is_empty(),
-        "\nProduction code reads a peer's user agent.\n\n{found}\n\
+        "\nProduction code reads a peer's user agent at a site not reviewed.\n\n{found}\n\
          A penalty is never spared by the release a peer advertises: the switch to paying \
          by size waits until no storer before release 2 is left (ADR-0025). If this reading \
          serves something else, review it and list it here.\n"
+    );
+}
+
+/// Full, not faulty: the one exemption from the unheld-chunk penalty.
+///
+/// A full peer (its own "full" notice fresh) that answered it lacks a key it
+/// was never seen proving, in a check not pinned to its commitment and, after a
+/// write, with its own quote not among the paid ones, is not charged. Every
+/// lane asks one function, `FullView::waives_unheld_penalty`
+/// (`src/replication/full.rs`), at one reviewed site, and names its own lane
+/// there. No other call can withhold the penalty: there is no switch and no
+/// environment override (the switch's names are pinned away in the test
+/// above, and in `tests/fork_pins.rs`).
+///
+/// The possession check after a write that goes unanswered asks nothing: a
+/// full node keeps answering, so only an answer that the key is absent is ever
+/// waived.
+#[test]
+fn the_unheld_chunk_penalty_is_waived_only_through_one_function() {
+    const WAIVER: &[(Option<&str>, &str)] = &[(None, "waives_unheld_penalty")];
+    const SITES: &[Reviewed] = &[
+        // A fetch a verified source answered NotFound.
+        (
+            "src/replication/mod.rs",
+            "execute_single_fetch",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A responsible-chunk audit failed only by absent keys, each asked.
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A sole-source replica hint its sender then denied.
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // The possession check after a write, answered with the absent digest.
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // A prune audit answered with the absent digest.
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "waives_unheld_penalty",
+            1,
+        ),
+        // The pointer possession check after a write, answered with no state
+        // of the pointer at all.
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "waives_unheld_penalty",
+            1,
+        ),
+    ];
+    // The lanes of `full::Lane` by name, not `Lane::*`: the payment reads'
+    // own `Lane` (`Lane::Put`, `Lane::Background`, node-1a's settlement
+    // reads) shares the type's last name, and isn't a lane of this penalty.
+    // The list is checked against the variants `full::Lane` declares, read
+    // from its source, and against `full::Lane::ALL`, so a new variant fails
+    // here until it is listed (the wildcard `Lane::*` did that before).
+    const LANES: &[(Option<&str>, &str)] = &[
+        (Some("Lane"), "Fetch"),
+        (Some("Lane"), "ResponsibleAudit"),
+        (Some("Lane"), "ReplicaHint"),
+        (Some("Lane"), "PossessionNoAnswer"),
+        (Some("Lane"), "PossessionFailed"),
+        (Some("Lane"), "PruneAudit"),
+        (Some("Lane"), "PointerPossession"),
+    ];
+    let every_lane: Vec<String> = crate::replication::full::Lane::ALL
+        .iter()
+        .map(|lane| format!("{lane:?}"))
+        .collect();
+    let listed: Vec<String> = LANES.iter().map(|(_, name)| (*name).to_string()).collect();
+    assert_eq!(
+        listed, every_lane,
+        "the census names every lane of full::Lane, and only those"
+    );
+    let full_rs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/replication/full.rs"),
+    )
+    .expect("read src/replication/full.rs");
+    assert_eq!(
+        listed,
+        enum_variants(&full_rs, "Lane"),
+        "full::Lane declares a lane the census and full::Lane::ALL don't list"
+    );
+    const NAMED: &[Reviewed] = &[
+        (
+            "src/replication/mod.rs",
+            "execute_single_fetch",
+            "Lane::Fetch",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "Lane::ResponsibleAudit",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "Lane::ReplicaHint",
+            1,
+        ),
+        (
+            "src/replication/possession.rs",
+            "report_possession_confirmed_failure",
+            "Lane::PossessionFailed",
+            1,
+        ),
+        (
+            "src/replication/pruning.rs",
+            "report_prune_audit_failure_once",
+            "Lane::PruneAudit",
+            1,
+        ),
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "Lane::PointerPossession",
+            1,
+        ),
+    ];
+    let sites = unreviewed(Counting::Calls(WAIVER), SITES);
+    assert!(
+        sites.is_empty(),
+        "\nThe unheld-chunk penalty is waived somewhere other than the reviewed sites.\n\n\
+         {sites}\n\
+         A full peer's penalty is waived in one bounded case, through \
+         FullView::waives_unheld_penalty, asked once on each lane that charges it. A new \
+         site widens the exemption: review it against that case before listing it.\n"
+    );
+
+    let named = unreviewed(Counting::Mentions(LANES), NAMED);
+    assert!(
+        named.is_empty(),
+        "\nA lane asks the waiver under another lane's name, or a lane is named elsewhere.\n\n\
+         {named}\n\
+         Each lane names itself in the case it asks about, so the log says which lane \
+         waived, and the behaviour tests of each lane (src/replication/full.rs, \
+         tests/fork_pins.rs) cover what that lane asks.\n"
+    );
+}
+
+/// Each lane of the waiver reads the peer's answer through its own small mapping,
+/// whose unit tests pin what counts as "absent" on that lane.
+#[test]
+fn each_lane_reads_its_answer_through_its_tested_mapping() {
+    const ANSWERS: &[(Option<&str>, &str)] = &[
+        (None, "hint_answer"),
+        (None, "audit_answer"),
+        (None, "prune_answer"),
+        (None, "possession_answer"),
+    ];
+    const ANSWERED: &[Reviewed] = &[
+        (
+            "src/replication/mod.rs",
+            "run_verification_cycle",
+            "hint_answer",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "handle_audit_result",
+            "audit_answer",
+            1,
+        ),
+        (
+            "src/replication/pruning.rs",
+            "peer_proves_records",
+            "prune_answer",
+            1,
+        ),
+        (
+            "src/replication/pointer.rs",
+            "PointerReplication::check_possession",
+            "possession_answer",
+            1,
+        ),
+    ];
+    let answered = unreviewed(Counting::Calls(ANSWERS), ANSWERED);
+    assert!(
+        answered.is_empty(),
+        "\nA lane reads the peer's answer other than through its tested mapping.\n\n\
+         {answered}\n\
+         hint_answer, audit_answer, prune_answer and possession_answer say what counts as \
+         \"absent\" on their lanes, and their unit tests pin it (a digest mismatch, a \
+         rejected hint or a failed prune answer is charged). Read the answer through them.\n"
     );
 }
 
@@ -2364,17 +2626,20 @@ const LISTINGS_MESSAGES: &[(&str, &str)] = &[
 const PROOF_TYPES: &[(&str, &str)] = &[
     (
         "SingleNode",
-        "Verified: the median quote, its issuer's closeness and its settlement on chain.",
+        "Verified: the median quote, its issuer's closeness and its settlement on chain. \
+         Forwarded to other nodes only in its slim form (src/payment/slim.rs).",
     ),
     (
         "Merkle",
-        "Refused in every context, for chunks and pointers alike.",
+        "Refused in every context, for chunks and pointers alike, and never forwarded: \
+         the slim builder declines its tag.",
     ),
     (
         "Root",
         "Verified: the median quote, its issuer's closeness, and its leaf's place in a wave \
          the root vault recorded, read by the wave's key; refused where the node knows no \
-         root vault.",
+         root vault. Forwarded to other nodes only in its slim form (src/payment/slim.rs), \
+         its leaf kept whole.",
     ),
 ];
 
@@ -2490,32 +2755,68 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
         "deserialize_single_node_proof",
         1,
     ),
-    // The sidecar strip before a stored chunk is offered to its close
-    // group: single-node, merkle and root proofs alike lose their sidecars;
-    // an unknown tag is forwarded unchanged.
+    // The slim builder, the one source of every proof forwarded to another
+    // node: single-node and root proofs are slimmed; merkle proofs and
+    // unknown tags are declined, so not forwarded.
     (
-        "src/storage/handler.rs",
-        "AntProtocol::strip_commitment_sidecars",
+        "src/payment/slim.rs",
+        "parse_forwardable",
+        "detect_proof_type",
+        1,
+    ),
+    (
+        "src/payment/slim.rs",
+        "parse_forwardable",
+        "deserialize_single_node_proof",
+        1,
+    ),
+    (
+        "src/payment/slim.rs",
+        "parse_forwardable",
+        "deserialize_root_proof",
+        1,
+    ),
+    ("src/payment/slim.rs", "<module>", "detect_proof_type", 1),
+    (
+        "src/payment/slim.rs",
+        "<module>",
+        "deserialize_single_node_proof",
+        1,
+    ),
+    (
+        "src/payment/slim.rs",
+        "<module>",
+        "deserialize_root_proof",
+        1,
+    ),
+    // The paid quotes' issuers, for the possession check's charge of a full
+    // peer: a single-node proof's median-priced quotes, a root proof's paid
+    // quote; merkle proofs and unknown tags read as unknown.
+    (
+        "src/replication/full.rs",
+        "paid_quote_issuers",
         "detect_proof_type",
         2,
     ),
     (
-        "src/storage/handler.rs",
-        "AntProtocol::strip_commitment_sidecars",
+        "src/replication/full.rs",
+        "paid_quote_issuers",
         "deserialize_single_node_proof",
         2,
     ),
     (
-        "src/storage/handler.rs",
-        "AntProtocol::strip_commitment_sidecars",
-        "deserialize_merkle_proof",
-        2,
-    ),
-    (
-        "src/storage/handler.rs",
-        "AntProtocol::strip_commitment_sidecars",
+        "src/replication/full.rs",
+        "paid_quote_issuers",
         "deserialize_root_proof",
         2,
+    ),
+    // Whether a refused fresh offer is answered though it came one-way:
+    // root proofs only.
+    (
+        "src/replication/fresh.rs",
+        "is_root_paid",
+        "detect_proof_type",
+        1,
     ),
     // Whether a fresh offer is root-paid, which peers its proof holds a quote
     // from and whose quote it paid, so a refusing peer the proof holds no
@@ -2625,33 +2926,226 @@ fn enum_variants(source: &str, name: &str) -> Vec<String> {
     variants
 }
 
-/// Every message the chunk protocol carries, and every kind of payment proof,
-/// is one whose handling has been reviewed. The chunk messages are
-/// `#[non_exhaustive]` in the vendored protocol, so the compiler says nothing
-/// when a new version of it adds a variant, or when a merge adds the handling
-/// of one; this does. The proof types are not, so every `match` on them names
-/// each one; this keeps their list reviewed all the same.
+/// Every place that puts a payment proof into a message to another node
+/// takes it from the slim builder (src/payment/slim.rs): a chunk's notices
+/// and offers from the PUT handler, and from the engine's direct entry point,
+/// and a pointer's offers from its write path. A new path that forwards a
+/// proof is reviewed here before it ships, so none forwards a whole one.
+#[test]
+fn every_forwarded_proof_comes_from_the_slim_builder() {
+    const BUILDER: &[(Option<&str>, &str)] = &[(None, "forwardable_slim_proof")];
+    const REVIEWED: &[Reviewed] = &[
+        (
+            "src/pointer/service.rs",
+            "PointerService::forwarded_proof",
+            "forwardable_slim_proof",
+            1,
+        ),
+        (
+            "src/replication/mod.rs",
+            "ReplicationEngine::replicate_fresh",
+            "forwardable_slim_proof",
+            1,
+        ),
+        (
+            "src/storage/handler.rs",
+            "AntProtocol::forwarded_proof",
+            "forwardable_slim_proof",
+            1,
+        ),
+    ];
+    // The functions that put a proof into a message and send it: a chunk's
+    // notices, a chunk's offers, a pointer's offers. Each is reached only
+    // with a slim proof, or an empty one.
+    const SENDERS: &[(Option<&str>, &str)] = &[
+        (None, "send_notice"),
+        (None, "send_fresh_offers"),
+        (None, "replicate_fresh"),
+    ];
+    let builder = unreviewed(Counting::Calls(BUILDER), REVIEWED);
+    let messages = unreviewed(Counting::Calls(SENDERS), PROOF_SENDERS);
+    assert!(
+        builder.is_empty() && messages.is_empty(),
+        "\nThe places that put a payment proof into a message to another node are no \
+         longer the reviewed ones.\n\n{builder}{messages}\n\
+         A node forwards a proof only in its slim form, built by \
+         crate::payment::slim::forwardable_slim_proof: the median-priced quotes and the \
+         transaction hashes, as byte strings, with no sidecars. A proof the builder \
+         declines goes into no notice and no offer; the storer then sends holding notices \
+         only. Feed a new path from the builder, or review why it forwards something \
+         else, then list it here.\n"
+    );
+}
+
+/// Where production code calls a function that puts a payment proof into a
+/// message to another node, each reviewed: fed by the slim builder, or with
+/// an empty proof (a holding notice).
+const PROOF_SENDERS: &[Reviewed] = &[
+    // Holding notices only: an empty proof.
+    (
+        "src/replication/fresh.rs",
+        "announce_held",
+        "send_notice",
+        1,
+    ),
+    // A holding notice, and the notice with the slim proof the PUT handler
+    // or the engine's entry point built.
+    (
+        "src/replication/fresh.rs",
+        "send_paid_notices",
+        "send_notice",
+        2,
+    ),
+    // When a hold ends: the notice with the slim proof the PUT handler
+    // built, to every peer of the close group, as announced or as it is now,
+    // not heard from, while the store still holds the record. Sent before
+    // any offer is queued: an offer, and the dispatcher that drops one, send
+    // no notice.
+    (
+        "src/replication/fresh.rs",
+        "HoldContext::end_hold",
+        "send_notice",
+        1,
+    ),
+    // The same notices, deferred because the record was indexed but
+    // unreadable for the moment as its hold ended: sent by the dispatcher
+    // with the proof the hold carried, once a read-back finds the record,
+    // before its offers.
+    (
+        "src/replication/mod.rs",
+        "ReplicationEngine::start_fresh_offer_dispatcher",
+        "send_notice",
+        1,
+    ),
+    // When the node stops: the same notices for the holds still open.
+    (
+        "src/replication/fresh.rs",
+        "HoldContext::flush_on_shutdown",
+        "send_notice",
+        1,
+    ),
+    // The engine's entry point: the notice with the slim proof it built, to
+    // the close group, before its offers.
+    (
+        "src/replication/mod.rs",
+        "ReplicationEngine::replicate_fresh",
+        "send_notice",
+        1,
+    ),
+    // Offers, with the slim proof the engine's entry point built.
+    (
+        "src/replication/mod.rs",
+        "ReplicationEngine::replicate_fresh",
+        "send_fresh_offers",
+        1,
+    ),
+    // Offers, with the slim proof the PUT handler built; never for an empty one.
+    (
+        "src/replication/mod.rs",
+        "ReplicationEngine::start_fresh_offer_dispatcher",
+        "send_fresh_offers",
+        1,
+    ),
+    // A pointer's offers, with the slim proof its write path built.
+    (
+        "src/replication/pointer.rs",
+        "PointerReplication::start_fresh_drainer",
+        "replicate_fresh",
+        1,
+    ),
+];
+
+/// Every message nodes exchange between themselves, the replication
+/// protocol's, with what each release does with it. A new one is reviewed
+/// here before it ships: F1 added none, and sends only messages every release
+/// from ds.1 handles (a holding notice is a `PaidNotify` with an empty proof,
+/// which every release drops before any work).
+const REPLICATION_MESSAGES: &[(&str, &str)] = &[
+    (
+        "FreshReplicationOffer",
+        "A record with its proof, sent one-way only to close-group peers not heard from and not marked full when the storer's hold ends; the proof is slim.",
+    ),
+    (
+        "FreshReplicationResponse",
+        "Sent to an offer that came as a request, and to a one-way offer only to refuse one whose proof is a root proof (tag 0x03), as every release before ds.19 answered one-way offers. A sender of the root release reads that refusal alone, to leave an excused peer out of the key's possession check; no sender reads any other.",
+    ),
+    (
+        "PaidNotify",
+        "A notice with the slim proof, or a holding notice with an empty proof, which adds nothing to the paid list and is only noted as heard from.",
+    ),
+    ("NeighborSyncRequest", "Neighbour sync: hints, answered."),
+    ("NeighborSyncResponse", "Neighbour sync's answer."),
+    ("VerificationRequest", "Presence and paid-list questions."),
+    ("VerificationResponse", "Their answer."),
+    ("FetchRequest", "A record asked for by key."),
+    ("FetchResponse", "The record."),
+    (
+        "AuditChallenge",
+        "Per-key digests: audits, possession checks and prune confirmations.",
+    ),
+    ("AuditResponse", "Their digests."),
+    ("SubtreeAuditChallenge", "The storage-bound audit, round 1."),
+    ("SubtreeAuditResponse", "Its proof."),
+    ("SubtreeSliceChallenge", "The storage-bound audit, round 2."),
+    ("SubtreeSliceResponse", "Its slices."),
+    ("GetCommitmentByPin", "A commitment asked for by its pin."),
+    ("GetCommitmentByPinResponse", "The commitment, or that it isn't kept."),
+    (
+        "PointerFreshOffer",
+        "A pointer state with its slim proof, sent one-way.",
+    ),
+    ("PointerHints", "Pointer states the receiver should hold."),
+    ("PointerFetchRequest", "A pointer record asked for."),
+    ("PointerFetchResponse", "The pointer record."),
+    ("PointerStateRequest", "Which pointer states a peer holds."),
+    ("PointerStateResponse", "Its answer."),
+    (
+        "NeighborSyncPageRequest",
+        "One page of a paged neighbour-sync exchange, sent only to a peer known to read pages.",
+    ),
+    (
+        "NeighborSyncPageResponse",
+        "The responder's page, or busy, sent only to a peer that sent a page.",
+    ),
+    (
+        "FullNotice",
+        "The sender is full, or has left full: one-way, sent only to a peer known to read it.",
+    ),
+];
+
+/// Every message the chunk protocol carries, every kind of payment proof, and
+/// every message nodes exchange is one whose handling has been reviewed. The
+/// chunk messages are `#[non_exhaustive]` in the vendored protocol, so the
+/// compiler says nothing when a new version of it adds a variant, or when a
+/// merge adds the handling of one; this does. The proof types are not, so
+/// every `match` on them names each one; this keeps their list reviewed all
+/// the same.
 #[test]
 fn the_wire_messages_are_the_reviewed_ones() {
-    let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for (file, name, reviewed) in [
         (
-            "ant-protocol/src/chunk.rs",
+            "vendor/ant-protocol/src/chunk.rs",
             "ChunkMessageBody",
             CHUNK_MESSAGES,
         ),
         (
-            "ant-protocol/src/payment/proof.rs",
+            "vendor/ant-protocol/src/payment/proof.rs",
             "ProofType",
             PROOF_TYPES,
         ),
         (
-            "ant-listings/src/message.rs",
+            "vendor/ant-listings/src/message.rs",
             "ListingsBody",
             LISTINGS_MESSAGES,
         ),
+        (
+            "src/replication/protocol.rs",
+            "ReplicationMessageBody",
+            REPLICATION_MESSAGES,
+        ),
     ] {
-        let source = std::fs::read_to_string(vendor.join(file)).unwrap_or_default();
+        let source = std::fs::read_to_string(root.join(file)).unwrap_or_default();
         let declared = enum_variants(&source, name);
         let declared_set: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
         let listed: BTreeSet<&str> = reviewed.iter().map(|(variant, _)| *variant).collect();
@@ -2667,7 +3161,7 @@ fn the_wire_messages_are_the_reviewed_ones() {
                 && not_reviewed.is_empty()
                 && gone.is_empty()
                 && without_reason.is_empty(),
-            "\n{name} in vendor/{file} no longer matches the reviewed list \
+            "\n{name} in {file} no longer matches the reviewed list \
              in src/replication/retention/census.rs.\n\n  declared: {declared:?}\n  \
              not reviewed: {not_reviewed:?}\n  listed but gone: {gone:?}\n  \
              listed without a reason: {without_reason:?}\n\n\
@@ -2676,9 +3170,36 @@ fn the_wire_messages_are_the_reviewed_ones() {
              sure the node's handler (src/storage/handler.rs) and payment check \
              (src/payment/verifier.rs) take it through those rules, with tests that pin it; \
              until then, refuse it. A listings message is answered, or dropped, by \
-             src/listings/service.rs: list what it does there.\n"
+             src/listings/service.rs: list what it does there. A replication message \
+             goes to nodes of every release: one older nodes can't decode is lost, so \
+             review what each release does with it first.\n"
         );
     }
+}
+
+/// The heard-from table has one reader: the hold's skip function in
+/// src/replication/fresh.rs. A holding notice is the sender's own claim,
+/// never checked against bytes, so it may only save an offer.
+#[test]
+fn the_heard_from_table_has_one_reader() {
+    const READ: &[(Option<&str>, &str)] = &[(None, "offer_skip_reason")];
+    const REVIEWED: &[Reviewed] = &[(
+        "src/replication/fresh.rs",
+        "skip_reasons",
+        "offer_skip_reason",
+        1,
+    )];
+    let found = unreviewed(Counting::Calls(READ), REVIEWED);
+    assert!(
+        found.is_empty(),
+        "\nThe heard-from table is read somewhere other than the hold's skip function.\n\n\
+         {found}\n\
+         A holding notice is not possession evidence: it is the sender's own claim, never \
+         checked against bytes. Erasure (6 real proofs near a full node), repair, the \
+         paid-list quorum and audits rest on possession proofs, and a sender's claim never \
+         adds a key to the paid list by itself. The table may only skip an offer; read it \
+         nowhere else.\n"
+    );
 }
 
 #[cfg(test)]

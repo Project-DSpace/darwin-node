@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.23.0+ds.16"
+version = "0.23.0+ds.20"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Darwin decentralized network"
@@ -216,6 +216,20 @@ name = "test_seams"
 path = "tests/test_seams.rs"
 required-features = ["test-utils"]
 
+# Two nodes at the full line on one small partition. Alone in its process, as
+# it sets the free-space seam.
+[[test]]
+name = "full_line"
+path = "tests/full_line.rs"
+required-features = ["test-utils"]
+
+# The falling floor and "full, not faulty" on simulated small partitions, with
+# the shipped full line. Alone in its process, as it sets the free-space seam.
+[[test]]
+name = "small_disks"
+path = "tests/small_disks.rs"
+required-features = ["test-utils"]
+
 [[test]]
 name = "webrtc_direct_devnet"
 path = "tests/webrtc_direct_devnet.rs"
@@ -238,20 +252,23 @@ webrtc-direct = [
     "saorsa-transport/webrtc-direct",
 ]
 
-# The vendored ant-listings and ant-protocol are members so their own tests run
-# under this lock (`cargo test --locked -p ant-listings` and
-# `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml`, in
-# test.yml): the code the node is built from is tested with the dependencies
-# the node is built with. Commands run here without -p still build and test
-# ant-node alone.
+# The vendored ant-listings, ant-protocol and saorsa-core are members so their
+# own tests run under this lock (`cargo test --locked -p ant-listings`,
+# `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml` and
+# `cargo test --locked -p saorsa-core`, in test.yml): the code the node is built
+# from is tested with the dependencies the node is built with. Commands run here
+# without -p still build and test ant-node alone.
 [workspace]
-members = [".", "vendor/ant-listings", "vendor/ant-protocol"]
+members = [".", "vendor/ant-listings", "vendor/ant-protocol", "vendor/saorsa-core"]
 
 [patch.crates-io]
 ant-protocol = { path = "vendor/ant-protocol" }
 # Closing a browser session cancels a DTLS handshake still in progress
 # (vendor/webrtc/VENDORED.md).
 webrtc = { path = "vendor/webrtc" }
+# A verified direct address is dialled before a relay
+# (vendor/saorsa-core/VENDORED.md).
+saorsa-core = { path = "vendor/saorsa-core" }
 
 [profile.release]
 lto = true

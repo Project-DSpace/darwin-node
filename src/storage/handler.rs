@@ -546,42 +546,30 @@ impl AntProtocol {
         self.payment_verifier.attach_local_commitment_source(source);
     }
 
-    /// ADR-0004: return the proof with any commitment sidecars stripped, so a
-    /// replicated/persisted receipt carries only the pin and count (stored
-    /// proofs do not grow). Handles every proof type — single-node,
-    /// merkle-batch and root — since each carries sidecars. An unknown-tagged
-    /// or unparseable proof is returned unchanged. Best-effort: any
-    /// deserialize/reserialize failure returns the original bytes rather than
-    /// corrupting the proof.
-    fn strip_commitment_sidecars(proof: Vec<u8>) -> Vec<u8> {
-        use crate::payment::proof::{
-            deserialize_merkle_proof, deserialize_root_proof, deserialize_single_node_proof,
-            detect_proof_type, serialize_merkle_proof, serialize_root_proof,
-            serialize_single_node_proof, ProofType,
+    /// The proof this node forwards for a stored chunk: the slim form of the
+    /// PUT's proof (`crate::payment::slim`), or empty when there is none to
+    /// forward. Empty when the PUT carried no proof, or when its proof fails
+    /// the slim builder's local checks; that happens only for a PUT accepted
+    /// from the payment cache, whose proof the verifier never read. An empty
+    /// proof sends holding notices only: no notice and no offer carrying a
+    /// proof, since receivers penalise an offer whose proof is empty or short.
+    /// The slim proof keeps no sidecars (ADR-0004: replicated receipts keep
+    /// only the pin and count), as the stripped proof did before. A proof
+    /// none of whose median-priced quotes names `address` is a proof for
+    /// another chunk, refused by every receiver, and is not forwarded either.
+    fn forwarded_proof(address: &XorName, proof: Option<&[u8]>) -> Vec<u8> {
+        let Some(proof) = proof else {
+            return Vec::new();
         };
-        match detect_proof_type(&proof) {
-            Some(ProofType::SingleNode) => match deserialize_single_node_proof(&proof) {
-                Ok(mut parsed) if !parsed.commitment_sidecars.is_empty() => {
-                    parsed.commitment_sidecars.clear();
-                    serialize_single_node_proof(&parsed).unwrap_or(proof)
-                }
-                _ => proof, // already sidecar-free, or unparseable: leave as-is
-            },
-            Some(ProofType::Merkle) => match deserialize_merkle_proof(&proof) {
-                Ok(mut parsed) if !parsed.commitment_sidecars.is_empty() => {
-                    parsed.commitment_sidecars.clear();
-                    serialize_merkle_proof(&parsed).unwrap_or(proof)
-                }
-                _ => proof,
-            },
-            Some(ProofType::Root) => match deserialize_root_proof(&proof) {
-                Ok(mut parsed) if !parsed.payment.commitment_sidecars.is_empty() => {
-                    parsed.payment.commitment_sidecars.clear();
-                    serialize_root_proof(&parsed).unwrap_or(proof)
-                }
-                _ => proof,
-            },
-            None => proof, // unknown tag: nothing to strip
+        match crate::payment::slim::forwardable_slim_proof(proof, address) {
+            Ok(slim) => slim,
+            Err(declined) => {
+                debug!(
+                    "Not forwarding the proof for {}: {declined}; holding notices only",
+                    hex::encode(address)
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -851,6 +839,18 @@ impl AntProtocol {
             .await
         {
             debug!("Chunk {addr_hex} already exists");
+            // The node may tell its close group it holds the chunk, with
+            // holding notices, so their offers skip it. The drainer decides:
+            // only for a key in this node's paid list, inside its own close
+            // view, at most once per key in a while. Queued, never awaited,
+            // so the answer is not held up.
+            if let Some(ref tx) = self.fresh_write_tx {
+                let _ = tx.send(FreshWriteEvent {
+                    key: address,
+                    payment_proof: Vec::new(),
+                    stored: false,
+                });
+            }
             return ChunkPutResponse::AlreadyExists { address };
         }
 
@@ -924,6 +924,17 @@ impl AntProtocol {
             }
         };
 
+        // A store that fails after its payment check passed, in a test-utils
+        // build when the harness asks (`crate::test_seams::FAULTS_FILE`), so
+        // the client's next try is answered from the payment cache.
+        #[cfg(any(test, feature = "test-utils"))]
+        if crate::test_seams::fault_fires(crate::test_seams::Fault::FailStore, &address) {
+            warn!("Test seam: failing the store of {addr_hex} after its payment check");
+            return ChunkPutResponse::Error(ProtocolError::StorageFailed(
+                "test seam: the store failed".to_string(),
+            ));
+        }
+
         // 6. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
@@ -940,27 +951,22 @@ impl AntProtocol {
                 // startup).
                 self.quote_generator.record_store();
 
-                // 7. Notify replication engine for fresh fan-out.
-                //    Only emit when a real proof is present — cached-as-verified
-                //    PUTs have no proof to forward, and the chunk would have
-                //    already replicated on the original write that carried one.
-                if let (Some(ref tx), Some(proof)) = (&self.fresh_write_tx, request.payment_proof) {
-                    // ADR-0004: strip any commitment sidecars before forwarding
-                    // to replication — the ADR specifies persisted/replicated
-                    // receipts "keep only the pin and count, so stored proofs do
-                    // not grow." The sidecars were already consumed by this
-                    // node's client-put cross-check; replicas resolve pins via
-                    // gossip/fetch (their context is Replication, which skips the
-                    // cross-check anyway). Best-effort: if sanitisation fails,
-                    // fall back to the original proof rather than dropping the
-                    // replication entirely.
-                    let proof = Self::strip_commitment_sidecars(proof);
+                // 7. Notify replication engine for fresh fan-out, with the slim
+                //    form of the proof. A PUT accepted from the payment cache
+                //    (the payment was verified on an earlier try, which did not
+                //    store) still carries the client's bytes, but the verifier
+                //    never read them: the slim builder's local checks stand in,
+                //    and a PUT with no proof, or one that fails them, is
+                //    announced with holding notices only.
+                if let Some(ref tx) = self.fresh_write_tx {
+                    let proof = Self::forwarded_proof(&address, request.payment_proof.as_deref());
                     // Storage has already accepted the chunk on this path, so
                     // the event carries only the key; the offer dispatcher
                     // reads the chunk back when it is ready to send it.
                     let event = FreshWriteEvent {
                         key: address,
                         payment_proof: proof,
+                        stored: true,
                     };
                     if tx.send(event).is_err() {
                         debug!("Fresh-write channel closed, skipping replication for {addr_hex}");
@@ -1165,6 +1171,16 @@ impl AntProtocol {
             });
         }
 
+        // Full, not faulty: a node at the full line, or full, prices no
+        // new data. A chunk it holds is still answered as already stored, so
+        // nobody pays for it again, and an update of a pointer it holds is
+        // still quoted, since it takes no new space.
+        if !already_stored && !self.holds_pointer_for_quote(request) {
+            if let Some(refusal) = self.full_quote_refusal(data_size_usize) {
+                return ChunkQuoteResponse::Error(refusal);
+            }
+        }
+
         match self.quote_generator.create_priced_quote(
             request.address,
             data_size_usize,
@@ -1208,6 +1224,44 @@ impl AntProtocol {
         } else {
             ROOT_SETTLEMENT_VERSION.saturating_sub(1)
         }
+    }
+
+    /// Whether `request` asks for a quote for an update of a pointer this
+    /// node holds.
+    fn holds_pointer_for_quote(&self, request: &ChunkQuoteRequest) -> bool {
+        request.data_type == crate::pointer::DATA_TYPE_POINTER
+            && self
+                .pointers
+                .as_ref()
+                .is_some_and(|pointers| pointers.store().state(&request.address).is_some())
+    }
+
+    /// The refusal of a quote for `data_size` bytes of new data, when this
+    /// node is full or at the full line: the existing quote failure, so
+    /// the client asks the next node. `None` when it can take the data.
+    fn full_quote_refusal(&self, data_size: usize) -> Option<ProtocolError> {
+        // One line every few minutes: at the full line every quote is refused.
+        static REFUSED: crate::logging::Repeats = crate::logging::Repeats::new();
+        let refusal = if let Some(state) = self.storage.full_state() {
+            format!(
+                "This node is full (at the full line by {}) and prices no new data",
+                state.trigger.as_str()
+            )
+        } else {
+            let bytes = u64::try_from(data_size).unwrap_or(u64::MAX);
+            let Err(e) = self.storage.check_capacity_for(bytes) else {
+                return None;
+            };
+            format!("This node prices no new data: {e}")
+        };
+        if let Some(held_back) = REFUSED.admit() {
+            info!(
+                target: "ant_node::storage::disk_precheck",
+                held_back,
+                "Refusing a quote for new data: {refusal}"
+            );
+        }
+        Some(ProtocolError::QuoteFailed(refusal))
     }
 
     /// Handle a version-declaring storage quote request.
@@ -2614,6 +2668,130 @@ pub mod tests {
         }
     }
 
+    /// Full, not faulty: a full node prices no new data, but a chunk it holds
+    /// is still answered as already stored, so with a majority of a chunk's
+    /// holders full the client is told to skip it and pays nothing.
+    #[tokio::test]
+    async fn a_full_node_prices_no_new_data_and_answers_already_stored() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let content = b"held by a node that then fills";
+        let address = ChunkStore::compute_address(content);
+        protocol.payment_verifier().cache_insert(address);
+        let put_msg = ChunkMessage {
+            request_id: 340,
+            body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(
+                address,
+                Bytes::copy_from_slice(content),
+            )),
+        };
+        let _ = protocol
+            .try_handle_request(&put_msg.encode().expect("encode put"))
+            .await
+            .expect("handle put");
+        protocol
+            .storage()
+            .set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+
+        let quote = |address: XorName| {
+            protocol.handle_quote(&ChunkQuoteRequest {
+                address,
+                data_size: 100,
+                data_type: DATA_TYPE_CHUNK,
+            })
+        };
+        assert!(
+            matches!(
+                quote(address),
+                ChunkQuoteResponse::Success {
+                    already_stored: true,
+                    ..
+                }
+            ),
+            "a chunk the full node holds is answered as already stored"
+        );
+        match quote([0xEE; 32]) {
+            ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(message)) => {
+                assert!(message.contains("full"), "{message}");
+            }
+            other => panic!("a full node prices no new data, got {other:?}"),
+        }
+
+        protocol.storage().set_full_for_test(None);
+        assert!(matches!(
+            quote([0xEE; 32]),
+            ChunkQuoteResponse::Success {
+                already_stored: false,
+                ..
+            }
+        ));
+    }
+
+    /// At the full line a node prices no new data, full or not yet.
+    #[tokio::test]
+    async fn a_node_at_the_full_line_prices_no_new_data() {
+        let (protocol, _temp) = create_test_protocol_with_reserve(u64::MAX).await;
+        let response = protocol.handle_quote(&ChunkQuoteRequest {
+            address: [0xED; 32],
+            data_size: 100,
+            data_type: DATA_TYPE_CHUNK,
+        });
+        assert!(
+            matches!(
+                response,
+                ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(_))
+            ),
+            "got {response:?}"
+        );
+    }
+
+    /// A full node still quotes an update of a pointer it holds, which takes
+    /// no new space, and refuses a quote for a pointer it doesn't hold.
+    #[tokio::test]
+    async fn a_full_node_quotes_updates_of_the_pointers_it_holds_only() {
+        use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
+        use saorsa_pqc::api::sig::ml_dsa_65;
+
+        let (protocol, temp) = create_test_protocol().await;
+        let store = crate::pointer::store::PointerStore::new(&temp.path().join("pointers"))
+            .await
+            .expect("pointer store");
+        let pointers = PointerService::new(store);
+        let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[3; 32]);
+        let target = PointerTarget::new(PointerTargetKind::Chunk, [1; 32]);
+        let record = Pointer::sign(&sk, &pk, 0, target).expect("sign");
+        assert!(matches!(
+            pointers
+                .handle_put(ant_protocol::chunk::PointerPutRequest::new(Bytes::from(
+                    record.to_bytes()
+                )))
+                .await,
+            PointerPutResponse::Success { .. }
+        ));
+        let protocol = protocol.with_pointer_service(pointers);
+        protocol
+            .storage()
+            .set_full_for_test(Some(crate::storage::FullTrigger::Bytes));
+
+        let quote = |address: XorName| {
+            protocol.handle_quote(&ChunkQuoteRequest {
+                address,
+                data_size: POINTER_WIRE_LEN as u64,
+                data_type: DATA_TYPE_POINTER,
+            })
+        };
+        assert!(
+            matches!(quote(record.address()), ChunkQuoteResponse::Success { .. }),
+            "an update of a pointer the full node holds is quoted"
+        );
+        assert!(
+            matches!(
+                quote([0xEC; 32]),
+                ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(_))
+            ),
+            "a pointer the full node doesn't hold is not"
+        );
+    }
+
     /// Drive the real quote handler, then read the record count it priced on.
     /// The handler calls `resync_quote_metric` first, so this reflects records
     /// ACTUALLY HELD.
@@ -2700,93 +2878,121 @@ pub mod tests {
         );
     }
 
-    /// ADR-0004: `strip_commitment_sidecars` removes sidecars from a single-node
-    /// proof before replication/persistence (stored proofs do not grow), and is
-    /// a no-op on a sidecar-free proof.
+    /// The forwarded proof is the slim one: no sidecars (ADR-0004, stored
+    /// proofs do not grow). A PUT with no proof, or with one that fails the
+    /// slim builder's local checks (a PUT accepted from the payment cache),
+    /// forwards nothing, so the storer sends holding notices only.
     #[test]
-    fn strip_commitment_sidecars_clears_single_node_sidecars() {
+    fn the_forwarded_proof_is_slim_or_nothing() {
         use crate::payment::proof::{
             deserialize_single_node_proof, serialize_single_node_proof, PaymentProof,
         };
-        use evmlib::ProofOfPayment;
+        use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 
+        let quote = PaymentQuote {
+            content: xor_name::XorName([3u8; 32]),
+            timestamp: std::time::SystemTime::now(),
+            price: crate::payment::pricing::calculate_price(0),
+            rewards_address: RewardsAddress::new([1u8; 20]),
+            committed_key_count: 0,
+            commitment_pin: None,
+            pub_key: vec![0u8; 64],
+            signature: vec![0u8; 64],
+        };
         let with_sidecars = PaymentProof {
             proof_of_payment: ProofOfPayment {
-                peer_quotes: vec![],
+                peer_quotes: vec![(EncodedPeerId::new(rand::random()), quote)],
             },
             tx_hashes: vec![],
-            commitment_sidecars: vec![vec![1u8; 16], vec![2u8; 16]],
+            commitment_sidecars: vec![vec![1u8; 16]],
         };
         let bytes = serialize_single_node_proof(&with_sidecars).expect("serialize");
-        let stripped = AntProtocol::strip_commitment_sidecars(bytes);
-        let parsed = deserialize_single_node_proof(&stripped).expect("deserialize stripped");
-        assert!(
-            parsed.commitment_sidecars.is_empty(),
-            "sidecars must be stripped before replication"
-        );
+        let forwarded = AntProtocol::forwarded_proof(&[3u8; 32], Some(&bytes));
+        let parsed = deserialize_single_node_proof(&forwarded).expect("deserialize slim");
+        assert!(parsed.commitment_sidecars.is_empty());
+        assert_eq!(parsed.proof_of_payment.peer_quotes.len(), 1);
 
-        // Idempotent: stripping an already-sidecar-free proof returns it intact.
-        let again = AntProtocol::strip_commitment_sidecars(stripped.clone());
-        assert_eq!(again, stripped, "stripping a sidecar-free proof is a no-op");
+        let key = [3u8; 32];
+        assert!(AntProtocol::forwarded_proof(&key, None).is_empty());
+        assert!(AntProtocol::forwarded_proof(&key, Some(&[0x01; 16])).is_empty());
+        // Well formed, but for another chunk.
+        assert!(AntProtocol::forwarded_proof(&[4u8; 32], Some(&bytes)).is_empty());
+        let mut merkle = bytes;
+        merkle[0] = crate::ant_protocol::PROOF_TAG_MERKLE;
+        assert!(AntProtocol::forwarded_proof(&key, Some(&merkle)).is_empty());
+        assert!(AntProtocol::forwarded_proof(&key, Some(&[0x01; 64])).is_empty());
     }
 
-    /// A root proof forwarded to the close group goes without its commitment
-    /// sidecars, as a single-node proof does, and keeps its leaf whole.
+    /// A root proof is forwarded in its slim form, as a single-node proof
+    /// is: no commitment sidecars, only the median-priced quotes, and its
+    /// leaf whole (the paid quote's hash, the amount, the leaf's place, the
+    /// wave's size and the path). A root proof for another chunk is not
+    /// forwarded.
     #[test]
-    fn strip_commitment_sidecars_clears_root_sidecars() {
+    fn a_root_proof_is_forwarded_slim_with_its_leaf_whole() {
         use crate::payment::proof::{
-            deserialize_root_proof, detect_proof_type, serialize_root_proof, PaymentProof,
-            ProofType, RootPaymentProof,
+            deserialize_root_proof, detect_proof_type, serialize_root_proof, ProofType,
         };
-        use alloy::primitives::FixedBytes;
-        use evmlib::common::Amount;
-        use evmlib::ProofOfPayment;
+        use crate::payment::settlement::mock;
 
-        let with_sidecars = RootPaymentProof {
-            payment: PaymentProof {
-                proof_of_payment: ProofOfPayment {
-                    peer_quotes: vec![],
-                },
-                tx_hashes: vec![FixedBytes::from([9u8; 32])],
-                commitment_sidecars: vec![vec![1u8; 16], vec![2u8; 16]],
-            },
-            quote_hash: FixedBytes::from([3u8; 32]),
-            amount: Amount::from(77u64),
-            index: 2,
-            leaf_count: 5,
-            path: vec![FixedBytes::from([4u8; 32]); 3],
-        };
-        let bytes = serialize_root_proof(&with_sidecars).expect("serialize");
-        let stripped = AntProtocol::strip_commitment_sidecars(bytes);
-        assert_eq!(detect_proof_type(&stripped), Some(ProofType::Root));
-        let parsed = deserialize_root_proof(&stripped).expect("deserialize stripped");
+        let key = [0x5C; 32];
+        let bundle = mock::Bundle::new(key);
+        let named = [mock::tx(0xAA)];
+        let path = vec![[0x77u8; 32]; 3];
+        let bare = bundle.root_proof(
+            evmlib::common::Amount::from(bundle.amount()),
+            2,
+            5,
+            &path,
+            &named,
+        );
+        let mut with_sidecars = deserialize_root_proof(&bare).expect("deserialize");
+        with_sidecars.payment.commitment_sidecars =
+            vec![vec![1u8; 16]; with_sidecars.payment.proof_of_payment.peer_quotes.len()];
+        let sent = serialize_root_proof(&with_sidecars).expect("serialize");
+
+        let forwarded = AntProtocol::forwarded_proof(&key, Some(&sent));
+        assert_eq!(detect_proof_type(&forwarded), Some(ProofType::Root));
+        let parsed = deserialize_root_proof(&forwarded).expect("deserialize slim");
         assert!(
             parsed.payment.commitment_sidecars.is_empty(),
-            "a root proof's sidecars must be stripped before it is offered"
+            "a root proof's sidecars are dropped before it is forwarded"
+        );
+        assert!(parsed
+            .payment
+            .proof_of_payment
+            .peer_quotes
+            .iter()
+            .any(|(_, quote)| quote.hash() == with_sidecars.quote_hash));
+        assert!(
+            parsed.payment.proof_of_payment.peer_quotes.len()
+                <= with_sidecars.payment.proof_of_payment.peer_quotes.len()
         );
         assert_eq!(parsed.payment.tx_hashes, with_sidecars.payment.tx_hashes);
         assert_eq!(parsed.quote_hash, with_sidecars.quote_hash);
         assert_eq!(parsed.amount, with_sidecars.amount);
-        assert_eq!(
-            (parsed.index, parsed.leaf_count),
-            (with_sidecars.index, with_sidecars.leaf_count)
-        );
+        assert_eq!((parsed.index, parsed.leaf_count), (2, 5));
         assert_eq!(parsed.path, with_sidecars.path);
 
-        let again = AntProtocol::strip_commitment_sidecars(stripped.clone());
-        assert_eq!(again, stripped, "stripping a sidecar-free proof is a no-op");
+        // The slim form of a slim proof is itself.
+        assert_eq!(
+            AntProtocol::forwarded_proof(&key, Some(&forwarded)),
+            forwarded
+        );
+        // Well formed, but for another chunk.
+        assert!(AntProtocol::forwarded_proof(&[0x5D; 32], Some(&sent)).is_empty());
     }
 
-    /// A forwarded root proof is the client's proof without its sidecars,
-    /// byte for byte, and within about 1 KB of the matching single-node proof
-    /// stripped: a wave of the leaf limit adds a path of 9 hashes, the leaf's
-    /// amount, place and count, and its quote hash.
+    /// A forwarded root proof is within about 1 KB of the matching
+    /// single-node proof forwarded: a wave of the leaf limit adds a path of 9
+    /// hashes, the leaf's amount, place and count, and its quote hash.
     #[test]
     fn a_forwarded_root_proof_is_about_a_single_node_proofs_size() {
         use crate::payment::proof::{deserialize_root_proof, serialize_root_proof};
         use crate::payment::settlement::mock;
 
-        let bundle = mock::Bundle::new([0x5C; 32]);
+        let key = [0x5C; 32];
+        let bundle = mock::Bundle::new(key);
         let named = [mock::tx(0xAA)];
         let path = vec![[0x77u8; 32]; 9];
         let bare = bundle.root_proof(
@@ -2801,9 +3007,11 @@ pub mod tests {
         let sent = serialize_root_proof(&with_sidecars).expect("serialize");
         assert!(sent.len() > bare.len());
 
-        let forwarded = AntProtocol::strip_commitment_sidecars(sent);
-        assert_eq!(forwarded, bare, "the forwarded proof is the bare proof");
-        let single = AntProtocol::strip_commitment_sidecars(bundle.proof(&named));
+        let forwarded = AntProtocol::forwarded_proof(&key, Some(&sent));
+        assert!(!forwarded.is_empty());
+        assert!(forwarded.len() <= bare.len());
+        let single = AntProtocol::forwarded_proof(&key, Some(&bundle.proof(&named)));
+        assert!(!single.is_empty());
         assert!(
             forwarded.len() > single.len() && forwarded.len() - single.len() <= 1024,
             "root {} bytes, single-node {} bytes",

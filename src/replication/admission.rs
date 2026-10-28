@@ -16,8 +16,14 @@ use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::ReplicationConfig;
+use crate::replication::neighbor_sync::RoutingSnapshot;
 use crate::replication::paid_list::PaidList;
 use crate::storage::ChunkStore;
+
+/// Keys admitted between yields to the async runtime: with no routing-table
+/// lookup per key, a large batch would otherwise hold its worker thread for
+/// the whole of it.
+const KEYS_BETWEEN_YIELDS: usize = 1024;
 
 /// Result of admitting a set of hints from a neighbor sync.
 #[derive(Debug)]
@@ -49,6 +55,35 @@ pub async fn is_responsible(
     closest.iter().any(|n| n.peer_id == *self_id)
 }
 
+/// Check if this node is within `base_width` nearest to `key`, the width
+/// widened by one for each peer marked full inside it (see
+/// [`crate::replication::full`]), at most 20.
+///
+/// The storage admission and retention width: a node standing in for a full
+/// one takes and keeps the key. With no peer marked full this is
+/// [`is_responsible`] at `base_width`.
+pub async fn is_responsible_widened(
+    self_id: &PeerId,
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    base_width: usize,
+) -> bool {
+    let view = crate::replication::full::view_for(self_id);
+    let now = std::time::Instant::now();
+    let marked = view.marks.marked(now);
+    if marked.is_empty() {
+        return is_responsible(self_id, key, p2p_node, base_width).await;
+    }
+    let nearest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local_with_self(key, crate::replication::full::MAX_WIDENED_WIDTH)
+        .await;
+    let width = crate::replication::full::widened_len(&nearest, base_width, |node| {
+        marked.contains(&node.peer_id)
+    });
+    nearest.iter().take(width).any(|n| n.peer_id == *self_id)
+}
+
 /// Check if this node is in the `PaidCloseGroup` for key `K`.
 ///
 /// `PaidCloseGroup` = `paid_list_close_group_size` nearest peers to `K` in
@@ -77,10 +112,13 @@ pub async fn is_in_paid_close_group(
 /// Storage responsibility is a *different* question, asked later against live
 /// routing state at the point of download. Keeping the two apart is what makes
 /// the sender's replica/paid labelling unable to influence what we store.
-async fn is_relevant(
+///
+/// The `PaidCloseGroup(K)` question is answered from `routing`, one snapshot of
+/// the routing table for a whole batch of hints, with no lookup per key.
+fn is_relevant(
     self_id: &PeerId,
     key: &XorName,
-    p2p_node: &Arc<P2PNode>,
+    routing: &RoutingSnapshot,
     config: &ReplicationConfig,
     storage: &Arc<ChunkStore>,
     paid_list: &Arc<PaidList>,
@@ -92,7 +130,7 @@ async fn is_relevant(
     storage.exists(key).unwrap_or(false)
         || pending_keys.contains(key)
         || paid_list.contains(key).unwrap_or(false)
-        || is_in_paid_close_group(self_id, key, p2p_node, config.paid_list_close_group_size).await
+        || routing.is_within(self_id, key, config.paid_list_close_group_size)
 }
 
 /// Admit neighbor-sync hints per Section 7.1 rules.
@@ -104,6 +142,9 @@ async fn is_relevant(
 ///
 /// - **Cross-set precedence**: a key in both sets is settled by the replica
 ///   pass, so the paid pass skips it.
+///
+/// Every key is weighed against one snapshot of the routing table, taken
+/// once for the batch.
 ///
 /// Returns an [`AdmissionResult`] with keys sorted into pipelines.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
@@ -122,23 +163,25 @@ pub async fn admit_hints(
         paid_only_keys: Vec::new(),
         rejected_keys: Vec::new(),
     };
+    let routing = RoutingSnapshot::take(p2p_node).await;
 
     let mut seen_replica = HashSet::new();
-    for &key in replica_hints {
+    for (index, &key) in replica_hints.iter().enumerate() {
+        if index % KEYS_BETWEEN_YIELDS == KEYS_BETWEEN_YIELDS - 1 {
+            tokio::task::yield_now().await;
+        }
         if !seen_replica.insert(key) {
             continue;
         }
         if is_relevant(
             self_id,
             &key,
-            p2p_node,
+            &routing,
             config,
             storage,
             paid_list,
             pending_keys,
-        )
-        .await
-        {
+        ) {
             result.replica_keys.push(key);
         } else {
             result.rejected_keys.push(key);
@@ -146,7 +189,10 @@ pub async fn admit_hints(
     }
 
     let mut seen_paid = HashSet::new();
-    for &key in paid_hints {
+    for (index, &key) in paid_hints.iter().enumerate() {
+        if index % KEYS_BETWEEN_YIELDS == KEYS_BETWEEN_YIELDS - 1 {
+            tokio::task::yield_now().await;
+        }
         if !seen_paid.insert(key) {
             continue;
         }
@@ -159,14 +205,12 @@ pub async fn admit_hints(
         if is_relevant(
             self_id,
             &key,
-            p2p_node,
+            &routing,
             config,
             storage,
             paid_list,
             pending_keys,
-        )
-        .await
-        {
+        ) {
             result.paid_only_keys.push(key);
         } else {
             result.rejected_keys.push(key);

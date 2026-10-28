@@ -22,7 +22,7 @@ use ant_node::replication::protocol::{
     ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
 };
 use ant_node::replication::pruning;
-use ant_node::replication::retention::{erase_floor, DiskRetention, DiskSpace};
+use ant_node::replication::retention::{erase_floor, DiskRetention, DiskSpace, Floors};
 use ant_node::replication::types::{NeighborSyncState, RepairProofs};
 use ant_node::storage::{ChunkStore, XorName};
 use ant_node::ReplicationConfig;
@@ -239,6 +239,7 @@ async fn fresh_write_pipeline_replicates_a_put_and_skips_missing_chunks() {
         .send(FreshWriteEvent {
             key: missing,
             payment_proof: dummy_payment_proof(),
+            stored: true,
         })
         .expect("queue missing write");
     let address = put_paid_chunk(
@@ -355,7 +356,11 @@ async fn fresh_write_pipeline_holds_a_burst_at_the_offer_budget() {
 #[tokio::test]
 #[serial]
 async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
+    // No hold: this test times the dispatcher in half a second, which a hold
+    // in front of it would only shift.
+    let mut config = TestNetworkConfig::minimal();
+    config.fresh_offer_hold = Duration::ZERO;
+    let harness = TestHarness::setup_with_config(config).await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
     let source = harness
@@ -391,6 +396,7 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
         .send(FreshWriteEvent {
             key: faulty,
             payment_proof: dummy_payment_proof(),
+            stored: true,
         })
         .expect("queue write");
     // A failed read marks the chunk suspect, which hides it from `exists`:
@@ -423,6 +429,7 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
         .send(FreshWriteEvent {
             key: healthy,
             payment_proof: dummy_payment_proof(),
+            stored: true,
         })
         .expect("queue healthy write");
     let window = (FRESH_READ_RETRY_DELAY / 2).saturating_sub(fault_seen.elapsed());
@@ -496,6 +503,7 @@ async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
         .send(FreshWriteEvent {
             key: address,
             payment_proof: dummy_payment_proof(),
+            stored: true,
         })
         .expect("queue write");
     assert!(
@@ -518,9 +526,148 @@ async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
     harness.teardown().await.expect("teardown");
 }
 
+/// The hold set for [`a_put_to_the_whole_close_group_sends_holding_notices_and_no_offers`]:
+/// long enough that a hold ending at its time, not early, shows.
+const HOLD_UNDER_TEST: Duration = Duration::from_secs(8);
+
+/// A client PUT that reaches every close-group node: each storer sends the
+/// others holding notices, each hold ends early once every peer is heard
+/// from, and no offer goes out. Every peer is still served: skipped, and its
+/// possession check scheduled when the hold ends.
+#[tokio::test]
+#[serial]
+async fn a_put_to_the_whole_close_group_sends_holding_notices_and_no_offers() {
+    use ant_node::replication::fresh_metrics::{read, FreshCounter};
+
+    let mut config = TestNetworkConfig::minimal();
+    config.fresh_offer_hold = HOLD_UNDER_TEST;
+    let harness = TestHarness::setup_with_config(config).await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let nodes = harness.node_count();
+    let dispatched = || -> u64 {
+        (0..nodes)
+            .map(|i| {
+                harness
+                    .test_node(i)
+                    .and_then(|n| n.replication_engine.as_ref())
+                    .map_or(0, |e| e.fresh_offers_dispatched())
+            })
+            .sum()
+    };
+    // The counters are process-wide: read deltas.
+    let offers_before = dispatched();
+    let early_before = read(FreshCounter::HoldsEndedEarly);
+    let skipped_before = read(FreshCounter::OffersSkippedHeardFrom);
+    let holding_before = read(FreshCounter::HoldingNoticesReceived);
+    let checks_before = read(FreshCounter::PossessionChecksHeardFrom);
+    let unserved_before = read(FreshCounter::PeersLeftUnserved);
+
+    let content = b"a chunk every close-group node is sent";
+    for index in 0..nodes {
+        put_paid_chunk(&harness, index, content).await;
+    }
+    let nodes_u64 = u64::try_from(nodes).expect("node count");
+
+    // Every hold ends early, well before the hold time.
+    assert!(
+        wait_until(
+            || read(FreshCounter::HoldsEndedEarly) - early_before >= nodes_u64,
+            HOLD_UNDER_TEST / 2
+        )
+        .await,
+        "only {} of {nodes} holds ended early",
+        read(FreshCounter::HoldsEndedEarly) - early_before
+    );
+    // Past the hold time, nothing was offered.
+    tokio::time::sleep(HOLD_UNDER_TEST).await;
+    assert_eq!(
+        dispatched(),
+        offers_before,
+        "an offer went to a peer heard from"
+    );
+    let pairs = nodes_u64 * (nodes_u64 - 1);
+    assert!(read(FreshCounter::HoldingNoticesReceived) - holding_before >= pairs);
+    assert!(read(FreshCounter::OffersSkippedHeardFrom) - skipped_before >= pairs);
+    assert!(read(FreshCounter::PossessionChecksHeardFrom) - checks_before >= pairs);
+    assert_eq!(read(FreshCounter::PeersLeftUnserved), unserved_before);
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A PUT that reached one storer only: no peer is heard from, so the hold
+/// ends at its time and the storer offers the record to every peer.
+#[tokio::test]
+#[serial]
+async fn a_put_to_one_storer_is_offered_to_the_rest_when_its_hold_ends() {
+    use ant_node::replication::fresh_metrics::{read, FreshCounter};
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let engine = harness
+        .test_node(FRESH_PIPELINE_SOURCE_INDEX)
+        .and_then(|n| n.replication_engine.as_ref())
+        .expect("replication engine");
+    let at_hold_before = read(FreshCounter::HoldsEndedAtHold);
+    let offers_before = engine.fresh_offers_dispatched();
+
+    let address = put_paid_chunk(
+        &harness,
+        FRESH_PIPELINE_SOURCE_INDEX,
+        b"a chunk only one storer is sent",
+    )
+    .await;
+    assert!(
+        wait_until_replicated(
+            &harness,
+            FRESH_PIPELINE_SOURCE_INDEX,
+            &address,
+            PROPAGATION_TIMEOUT
+        )
+        .await,
+        "the record never reached the peers the storer did not hear from"
+    );
+    assert_eq!(engine.fresh_offers_dispatched(), offers_before + 1);
+    assert!(read(FreshCounter::HoldsEndedAtHold) > at_hold_before);
+
+    harness.teardown().await.expect("teardown");
+}
+
 /// Proof bytes for tests that only need to reach the pre-payment gates.
 fn dummy_payment_proof() -> Vec<u8> {
     vec![DUMMY_PAYMENT_PROOF_BYTE; DUMMY_PAYMENT_PROOF_LEN]
+}
+
+/// A single-node proof that passes the slim builder's local checks (one
+/// quote on the pricing curve, at the baseline count), so a storer forwards
+/// it. Its signature is a stand-in and it pays nothing on chain: receivers
+/// accept it only from the payment cache, which the tests fill.
+fn well_formed_payment_proof(address: &XorName) -> Vec<u8> {
+    well_formed_payment_proof_from(address, [0x5D; 32])
+}
+
+/// [`well_formed_payment_proof`], its one quote issued by `issuer`.
+fn well_formed_payment_proof_from(address: &XorName, issuer: [u8; 32]) -> Vec<u8> {
+    use ant_node::payment::{calculate_price, serialize_single_node_proof, PaymentProof};
+    use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
+
+    let quote = PaymentQuote {
+        content: xor_name::XorName(*address),
+        timestamp: std::time::SystemTime::now(),
+        price: calculate_price(0),
+        rewards_address: RewardsAddress::new([0x5A; 20]),
+        committed_key_count: 0,
+        commitment_pin: None,
+        pub_key: vec![0x5B; 64],
+        signature: vec![0x5C; 64],
+    };
+    serialize_single_node_proof(&PaymentProof {
+        proof_of_payment: ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new(issuer), quote)],
+        },
+        tx_hashes: vec![],
+        commitment_sidecars: vec![],
+    })
+    .expect("serialize the proof")
 }
 
 /// Store a chunk on the source directly, bypassing the handler, so no
@@ -543,7 +690,8 @@ async fn store_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u
 
 /// PUT a chunk through the source node's handler, as a client would. The
 /// handler stores it and emits the fresh-write event itself, carrying the
-/// dummy proof it was paid with.
+/// slim form of the well-formed proof it was sent. The PUT is accepted from
+/// the payment cache, so the proof meets only the slim builder's local checks.
 async fn put_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]) -> XorName {
     let address = compute_address(content);
     harness.prepopulate_payment_cache_everywhere(&address);
@@ -552,7 +700,7 @@ async fn put_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]
         body: ChunkMessageBody::PutRequest(ChunkPutRequest::with_payment(
             address,
             Bytes::copy_from_slice(content),
-            dummy_payment_proof(),
+            well_formed_payment_proof(&address),
         )),
     };
     let protocol = harness
@@ -883,10 +1031,10 @@ async fn possession_scheduler_penalises_absent_close_peer_after_delay() {
 
     // Trigger fresh replication; the engine enqueues the possession check, which
     // fires ~200-500 ms later and penalises the absent close peers.
-    let dummy_pop = dummy_payment_proof();
-    engine_a
-        .replicate_fresh(&address, content, &dummy_pop)
-        .await;
+    // A proof the slim builder forwards: a declined one sends no offer and
+    // schedules no check.
+    let pop = well_formed_payment_proof(&address);
+    engine_a.replicate_fresh(&address, content, &pop).await;
 
     // Poll until at least one absent close peer is penalised (trust drops).
     let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
@@ -977,11 +1125,10 @@ async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
 
     harness.prepopulate_payment_cache_everywhere(&address);
 
-    let dummy_proof = dummy_payment_proof();
     let offer = FreshReplicationOffer {
         key: address,
         data: content.clone(),
-        proof_of_payment: dummy_proof.clone(),
+        proof_of_payment: dummy_payment_proof(),
     };
     let response = send_replication_request(
         checker_p2p,
@@ -1030,9 +1177,15 @@ async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
         .await
         .expect("put on checker");
 
+    // A proof the slim builder forwards, so the checker offers the record and
+    // checks its close group (a proof it can't slim sends holding notices
+    // only). Its paid quote is the full node's own, so the full node is
+    // charged for not holding the record whether or not the checker marks it
+    // full.
     let trust_before = checker_p2p.peer_trust(&full_peer);
+    let pop = well_formed_payment_proof_from(&address, *full_peer.as_bytes());
     checker_engine
-        .replicate_fresh(&address, &content, &dummy_proof)
+        .replicate_fresh(&address, &content, &pop)
         .await;
 
     let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
@@ -1501,10 +1654,7 @@ async fn replication_protocol_answers() {
 fn test_retention(storage: &ChunkStore, under_pressure: bool) -> DiskRetention {
     let retention = DiskRetention::for_store(storage);
     let available = if under_pressure { 5 } else { 50 };
-    retention.set_space_for_test(Some(DiskSpace {
-        available,
-        total: 100,
-    }));
+    retention.set_space_for_test(Some(DiskSpace::bytes(available, 100)));
     retention.set_floor_for_test(Some([0u8; 32]));
     retention
 }
@@ -1570,6 +1720,7 @@ impl Pruner {
             commitment_state: None,
             audit_challenge_coordinator: &self.audit_challenge_coordinator,
             disk_retention,
+            erasure_epoch: None,
         })
         .await
     }
@@ -1641,6 +1792,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(blocked.records_pruned, 0);
@@ -1670,6 +1822,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(blocked_again.records_pruned, 0);
@@ -1693,6 +1846,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &roomy,
+        erasure_epoch: None,
     })
     .await;
     assert!(!kept.disk_pressure);
@@ -1727,6 +1881,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
             commitment_state: None,
             audit_challenge_coordinator: &audit_challenge_coordinator,
             disk_retention: &within_floor,
+            erasure_epoch: None,
         })
         .await;
         assert!(floored.disk_pressure);
@@ -1753,6 +1908,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &just_beyond,
+        erasure_epoch: None,
     })
     .await;
     assert!(confirmed.disk_pressure);
@@ -1792,6 +1948,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(incomplete.records_pruned, 0);
@@ -1824,6 +1981,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(complete.records_pruned, 1);
@@ -1938,10 +2096,7 @@ async fn chunk_erasure_goes_farthest_first_and_stops_once_fifteen_percent_is_fre
         } else {
             15
         };
-        Some(DiskSpace {
-            available,
-            total: 100,
-        })
+        Some(DiskSpace::bytes(available, 100))
     });
 
     let result = pruner.pass(&config, &disk).await;
@@ -2003,19 +2158,31 @@ async fn the_erase_floor_is_read_from_the_routing_table() {
     let peer = *p2p.peer_id();
 
     let disk = DiskRetention::new(std::env::temp_dir());
-    let floor = disk
-        .floor_from_routing_table(p2p, &peer, close_group_size)
+    let floors = disk
+        .floors_from_routing_table(p2p, &peer, close_group_size)
         .await;
-    assert!(floor.is_some());
+    assert!(floors.penalty.is_some());
     assert_eq!(
-        floor,
+        floors.penalty,
         erase_floor(&id, &known, close_group_size),
         "ten times the distance to the node's second-nearest peer"
     );
     assert_eq!(
-        disk.floor_from_routing_table(p2p, &peer, known.len() + 1)
+        floors.erase, None,
+        "nothing is erased without disk pressure"
+    );
+
+    // 9% free: the falling floor's first step, ten times the distance.
+    disk.set_space_for_test(Some(DiskSpace::bytes(9, 100)));
+    assert!(disk.refresh());
+    let floors = disk
+        .floors_from_routing_table(p2p, &peer, close_group_size)
+        .await;
+    assert_eq!(floors.erase, floors.penalty);
+    assert_eq!(
+        disk.floors_from_routing_table(p2p, &peer, known.len() + 1)
             .await,
-        None,
+        Floors::default(),
         "no floor with fewer peers known than the group"
     );
 
@@ -2102,6 +2269,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         commitment_state: Some(&committed),
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2135,6 +2303,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2239,6 +2408,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
             commitment_state: None,
             audit_challenge_coordinator: &audit_challenge_coordinator,
             disk_retention: &pressured,
+            erasure_epoch: None,
         })
         .await;
         assert_eq!(
@@ -2283,6 +2453,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2355,6 +2526,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(marked.records_marked_out_of_range, 1);
@@ -2378,6 +2550,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(pending.records_marked_out_of_range, 0);
@@ -2404,6 +2577,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &pressured,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(matured.records_candidates, 1);
@@ -2483,6 +2657,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &roomy,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2519,6 +2694,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
         disk_retention: &roomy,
+        erasure_epoch: None,
     })
     .await;
     assert_eq!(
@@ -2561,10 +2737,11 @@ async fn scenario_1_and_24_fresh_replication_stores_and_propagates_paid_list() {
     // (bypasses EVM verification, which is unavailable without Anvil).
     harness.prepopulate_payment_cache_everywhere(&address);
 
-    // Trigger fresh replication (sends FreshReplicationOffer + PaidNotify)
-    let dummy_pop = dummy_payment_proof();
+    // Trigger fresh replication (sends FreshReplicationOffer + PaidNotify),
+    // with a proof the slim builder forwards.
+    let pop = well_formed_payment_proof(&address);
     if let Some(ref engine) = source.replication_engine {
-        engine.replicate_fresh(&address, content, &dummy_pop).await;
+        engine.replicate_fresh(&address, content, &pop).await;
     }
 
     // Poll until replication propagates (or timeout).
@@ -2931,12 +3108,12 @@ async fn test_late_joiner_replicates_responsible_chunks() {
     }
 
     // Trigger fresh replication for each chunk so they spread to close groups.
-    let dummy_pop = dummy_payment_proof();
     {
         let source = harness.test_node(source_idx).expect("source node");
         if let Some(ref engine) = source.replication_engine {
             for (address, content) in &chunks {
-                engine.replicate_fresh(address, content, &dummy_pop).await;
+                let pop = well_formed_payment_proof(address);
+                engine.replicate_fresh(address, content, &pop).await;
             }
         }
     }
@@ -3039,6 +3216,326 @@ async fn test_late_joiner_replicates_responsible_chunks() {
                 hex::encode(address),
             );
         }
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Full, not faulty: a node standing in for a peer marked full keeps the
+/// record it would otherwise give up, and is in range for it, not an erase
+/// candidate; once the mark lapses, the record is out of range again.
+///
+/// Five nodes and a close group of two, so the storage-retention width is
+/// four: the pruner is the fifth nearest to the record, just outside it. With
+/// the nearest peer marked full in the pruner's own view, the width is five.
+#[tokio::test]
+#[serial]
+async fn a_stand_in_for_a_full_peer_keeps_the_record_until_the_mark_lapses() {
+    use ant_node::replication::full::{self, FULL_NOTICE_FRESHNESS};
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let pruner_idx = 3;
+    let close_group_size = 2;
+    let config = prune_test_config(close_group_size);
+    let pruner = Pruner::new(&harness, pruner_idx);
+    let (content, address, targets) =
+        find_remote_prune_candidate(&harness, pruner_idx, close_group_size, "stand-in").await;
+    pruner
+        .storage
+        .put(&address, &content)
+        .await
+        .expect("put the record on the pruner");
+    let roomy = test_retention(&pruner.storage, false);
+
+    // The nearest peer is marked full: the pruner stands in for it.
+    let nearest = targets[0];
+    let view = full::view_for(&pruner.peer);
+    view.marks.mark_for_test(nearest, std::time::Instant::now());
+    let kept = pruner.pass(&config, &roomy).await;
+    assert_eq!(kept.records_candidates, 0, "a stand-in is in range");
+    assert!(kept.records_near_full_peers >= 1);
+    assert!(
+        pruner
+            .paid_list
+            .record_out_of_range_since(&address)
+            .is_none(),
+        "no out-of-range clock starts for a record the node stands in for"
+    );
+
+    // The mark lapses: the record is out of range again, its clock started.
+    let lapsed = std::time::Instant::now()
+        .checked_sub(FULL_NOTICE_FRESHNESS + Duration::from_secs(1))
+        .expect("an instant that long ago");
+    view.marks.mark_for_test(nearest, lapsed);
+    let out = pruner.pass(&config, &roomy).await;
+    assert_eq!(out.records_near_full_peers, 0, "a lapsed mark is no mark");
+    assert!(
+        pruner
+            .paid_list
+            .record_out_of_range_since(&address)
+            .is_some(),
+        "the record is out of range once the mark has lapsed"
+    );
+    assert_eq!(out.records_pruned, 0, "and kept while the disk has room");
+    assert!(pruner.holds(&address));
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Whether `peer` lost trust with `checker` over one possession check of
+/// `address` against it alone, run through the lane's own code.
+async fn possession_check_charges(
+    checker: &super::testnet::TestNode,
+    peer: PeerId,
+    address: XorName,
+    paid_quote_issuers: Option<Vec<PeerId>>,
+) -> bool {
+    let p2p = checker.p2p_node.as_ref().expect("p2p");
+    let before = p2p.peer_trust(&peer);
+    checker
+        .replication_engine
+        .as_ref()
+        .expect("engine")
+        .run_possession_check_now_paid(address, vec![peer], paid_quote_issuers)
+        .await;
+    p2p.peer_trust(&peer) < before
+}
+
+/// The possession check after a write, driven through its own code with a
+/// peer that lacks the record (stand-ins beyond the 7 nearest are not
+/// possession-checked at all, see `fresh::possession_checked`):
+///
+/// - a peer not marked full is charged for answering it lacks the record;
+/// - with a fresh "full" mark, the peer is not charged when its own quote is
+///   not among the proof's paid quotes, and is charged when it is, when the
+///   proof can't be read, once the mark has lapsed, and once it was seen
+///   proving it holds the record.
+#[tokio::test]
+#[serial]
+async fn the_possession_check_spares_only_unpaid_full_peers() {
+    use ant_node::replication::full::{self, FULL_NOTICE_FRESHNESS};
+
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let a = harness.test_node(3).expect("node a");
+    let b = harness.test_node(4).expect("node b");
+    let c = harness.test_node(5).expect("node c");
+    let checker = *a.p2p_node.as_ref().expect("p2p a").peer_id();
+    let peer_b = *b.p2p_node.as_ref().expect("p2p b").peer_id();
+    let peer_c = *c.p2p_node.as_ref().expect("p2p c").peer_id();
+
+    let content = b"possession-check lanes: full peers";
+    let address = compute_address(content);
+    a.ant_protocol
+        .as_ref()
+        .expect("proto a")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on the checker");
+
+    // The cases not charged first, so a charge can't change how B answers
+    // them. B lacks the record throughout.
+    // Full peers: B marked full in the checker's view, from a fresh notice.
+    let view = full::view_for(&checker);
+    view.marks
+        .note_notice(peer_b, true, std::time::Instant::now());
+    assert!(
+        !possession_check_charges(a, peer_b, address, Some(vec![peer_c])).await,
+        "a full peer whose quote wasn't paid is not charged"
+    );
+    assert!(
+        possession_check_charges(a, peer_b, address, Some(vec![peer_b])).await,
+        "a full peer paid for the record is charged"
+    );
+    assert!(
+        possession_check_charges(a, peer_b, address, None).await,
+        "an unreadable proof charges"
+    );
+    let lapsed = std::time::Instant::now()
+        .checked_sub(FULL_NOTICE_FRESHNESS + Duration::from_secs(1))
+        .expect("an instant that long ago");
+    view.marks.mark_for_test(peer_b, lapsed);
+    assert!(
+        possession_check_charges(a, peer_b, address, Some(vec![peer_c])).await,
+        "a lapsed mark is no mark"
+    );
+    view.marks
+        .note_notice(peer_b, true, std::time::Instant::now());
+    view.seen.record(&peer_b, &address);
+    assert!(
+        possession_check_charges(a, peer_b, address, Some(vec![peer_c])).await,
+        "a full peer once seen holding the record is charged"
+    );
+    // No longer full: charged as before.
+    view.marks
+        .note_notice(peer_b, false, std::time::Instant::now());
+    assert!(
+        possession_check_charges(a, peer_b, address, None).await,
+        "a peer not marked full answering absent is charged"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Whether `source` lost trust with `target` over one fetch of `key` from it
+/// alone, run through the fetch lane's own code.
+async fn fetch_charges(target: &super::testnet::TestNode, key: XorName, source: PeerId) -> bool {
+    let p2p = target.p2p_node.as_ref().expect("p2p");
+    let engine = target.replication_engine.as_ref().expect("engine");
+    let before = p2p.peer_trust(&source);
+    assert!(engine.enqueue_fetch_for_test(key, vec![source]).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    while engine.fetch_queued_or_in_flight_for_test(&key).await {
+        assert!(tokio::time::Instant::now() < deadline, "the fetch resolves");
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    p2p.peer_trust(&source) < before
+}
+
+/// The fetch lane, driven through its own code with a source that answers
+/// "not found": a source with a fresh "full" mark is not charged, one once
+/// seen proving it holds the key is, and so is one no longer marked.
+#[tokio::test]
+#[serial]
+async fn the_fetch_lane_spares_only_a_fresh_full_source_that_never_held_the_key() {
+    use super::verify_storage_gate::find_key_for_target;
+    use ant_node::replication::full;
+
+    const TARGET: usize = 5;
+    const SOURCE: usize = 6;
+    let harness = TestHarness::setup_with_config(TestNetworkConfig {
+        node_count: 12,
+        replication_config: Some(ReplicationConfig {
+            close_group_size: 7,
+            ..ReplicationConfig::default()
+        }),
+        ..TestNetworkConfig::default()
+    })
+    .await
+    .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let width = storage_admission_width(7);
+    let target = harness.test_node(TARGET).expect("target");
+    let target_peer = *target.p2p_node.as_ref().expect("p2p").peer_id();
+    let source = *harness
+        .test_node(SOURCE)
+        .expect("source")
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .peer_id();
+    let view = full::view_for(&target_peer);
+
+    // The source holds none of these keys; the target is responsible for each.
+    let (_, waived) = find_key_for_target(&harness, TARGET, width, true, "fetch-waived").await;
+    let (_, seen) = find_key_for_target(&harness, TARGET, width, true, "fetch-seen").await;
+    let (_, unmarked) = find_key_for_target(&harness, TARGET, width, true, "fetch-unmarked").await;
+
+    view.marks
+        .note_notice(source, true, std::time::Instant::now());
+    assert!(
+        !fetch_charges(target, waived, source).await,
+        "a full source that lacks the key, never seen holding it, is not charged"
+    );
+    view.seen.record(&source, &seen);
+    assert!(
+        fetch_charges(target, seen, source).await,
+        "a full source once seen holding the key is charged"
+    );
+    view.marks
+        .note_notice(source, false, std::time::Instant::now());
+    assert!(
+        fetch_charges(target, unmarked, source).await,
+        "a source no longer full is charged"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Full, not faulty, over each node's real quote path: with 4 of a chunk's 7
+/// nearest holding it and full, those 4 answer that it is already stored (a
+/// majority, so a client skips the chunk and pays nothing; the client's side
+/// is darwin-client's), and the 3 not full quote as before.
+#[tokio::test]
+#[serial]
+async fn four_full_holders_of_seven_answer_that_the_chunk_is_already_stored() {
+    use ant_node::ant_protocol::{ChunkQuoteRequest, ChunkQuoteResponse, DATA_TYPE_CHUNK};
+    use ant_node::storage::FullTrigger;
+
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let content = b"held by four full nodes of its seven nearest";
+    let address = compute_address(content);
+    let nearest: Vec<PeerId> = harness
+        .test_node(0)
+        .expect("node")
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&address, 7)
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .collect();
+    assert_eq!(nearest.len(), 7);
+    let group: Vec<usize> = nearest
+        .iter()
+        .map(|peer| node_index_for_peer(&harness, peer).expect("a node of the harness"))
+        .collect();
+    let protocol = |index: usize| {
+        harness
+            .test_node(index)
+            .expect("node")
+            .ant_protocol
+            .as_ref()
+            .expect("protocol")
+    };
+    for index in &group[..4] {
+        protocol(*index)
+            .storage()
+            .put(&address, content)
+            .await
+            .expect("put");
+        protocol(*index)
+            .storage()
+            .set_full_for_test(Some(FullTrigger::Bytes));
+    }
+
+    let mut already = 0;
+    for (rank, index) in group.iter().enumerate() {
+        let message = ChunkMessage {
+            request_id: 9,
+            body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+                address,
+                data_size: content.len() as u64,
+                data_type: DATA_TYPE_CHUNK,
+            }),
+        };
+        let reply = protocol(*index)
+            .try_handle_request(&message.encode().expect("encode"))
+            .await
+            .expect("handle")
+            .expect("answered");
+        match ChunkMessage::decode(&reply).expect("decode").body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                already_stored, ..
+            }) => {
+                assert_eq!(already_stored, rank < 4, "rank {rank}");
+                already += usize::from(already_stored);
+            }
+            other => panic!("rank {rank}: expected a quote, got {other:?}"),
+        }
+    }
+    assert_eq!(already, 4, "a majority of the 7 answer already stored");
+    for index in &group[..4] {
+        protocol(*index).storage().set_full_for_test(None);
     }
 
     harness.teardown().await.expect("teardown");

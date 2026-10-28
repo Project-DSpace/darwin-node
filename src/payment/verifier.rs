@@ -67,7 +67,10 @@ pub const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 
 /// Maximum allowed size for a payment proof in bytes (512 KB).
 ///
-/// Single-node proofs with 7 ML-DSA-65 quotes reach ~40 KB; with ADR-0004
+/// Single-node proofs with 7 ML-DSA-65 quotes reach ~57 KB, their byte fields
+/// written as msgpack integer arrays (the slim form a node forwards to other
+/// nodes, `crate::payment::slim`, keeps only the median-priced quotes, as
+/// byte strings: ~5.5 KB for one); with ADR-0004
 /// commitment sidecars (one ~5.3 KB commitment per bound quote, ~13 KB each
 /// after rmp encoding) they reach ~150 KB.
 /// Merkle proofs include 16 candidate nodes (each with ~1,952-byte ML-DSA pub
@@ -2108,6 +2111,20 @@ impl PaymentVerifier {
         Ok(())
     }
 
+    /// The price every median candidate of a single-node bundle shares, by
+    /// the rule the payment check itself uses: sort by price, take the quote
+    /// at index n / 2, refuse a zero price. The slim builder keeps exactly the
+    /// quotes at this price, so a forwarded proof holds the same candidates
+    /// every receiver checks. The median price doesn't depend on the record's
+    /// weight; the full weight's amount, 3 times the price, is the one checked
+    /// here for overflow and zero.
+    pub(crate) fn single_node_median_price(payment: &ProofOfPayment) -> Result<Amount> {
+        Self::legacy_median_candidates(payment, RecordWeight::FULL)?
+            .first()
+            .map(|candidate| candidate.quote.price)
+            .ok_or_else(|| Error::Payment("no median-priced candidates".to_string()))
+    }
+
     /// The median-priced quotes of `payment`, each needing
     /// `weighted_amount(median, weight)`: 3 × the median price × the weight
     /// of the record's size class, rounded up.
@@ -2868,7 +2885,7 @@ impl PaymentVerifier {
     }
 
     /// Validate quote count, uniqueness, and basic structure.
-    fn validate_quote_structure(payment: &ProofOfPayment) -> Result<()> {
+    pub(crate) fn validate_quote_structure(payment: &ProofOfPayment) -> Result<()> {
         if payment.peer_quotes.is_empty() {
             return Err(Error::Payment("Payment has no quotes".to_string()));
         }
@@ -2917,7 +2934,7 @@ impl PaymentVerifier {
     /// itself off one count while committing to another.
     ///
     /// **Where it runs**: in every [`VerificationContext`] over **every**
-    /// quote in **both** quote types — all 7 single-node quotes
+    /// quote in **both** quote types — every quote the received single-node bundle holds (one to seven)
     /// ([`Self::validate_quote_arithmetic`]) and all 16 merkle candidates
     /// ([`Self::validate_merkle_candidate_arithmetic`]) — because the rule
     /// "every storer re-runs the price-in-the-band-of-count check on every
@@ -2935,7 +2952,7 @@ impl PaymentVerifier {
     /// rollout. Telemetry is invoked **after** ML-DSA-65 signature
     /// verification so unauthenticated senders cannot poison the rollout
     /// logs.
-    fn validate_quote_arithmetic(payment: &ProofOfPayment) -> Result<()> {
+    pub(crate) fn validate_quote_arithmetic(payment: &ProofOfPayment) -> Result<()> {
         if !crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
             return Ok(());
         }

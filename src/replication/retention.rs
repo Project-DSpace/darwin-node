@@ -6,29 +6,51 @@
 //! passes ([`super::pruning`] for chunks, [`super::pointer`] for pointers)
 //! erase only under disk pressure, and then only records far from the node:
 //!
-//! - **Disk pressure** starts when free space on the partition holding the
-//!   record store falls below [`DISK_PRESSURE_START_PERCENT`] (10%) of that
-//!   partition's size, and lasts until free space is back to at least
-//!   [`DISK_PRESSURE_END_PERCENT`] (15%). Free space is measured as the chunk
-//!   store's capacity guard measures it: the space available on the partition
-//!   holding the chunk directory. A measurement that fails counts as no
-//!   pressure. The state lives in memory, is shared by both passes and the
-//!   storage migration's shed, and starts without pressure when the node
-//!   starts.
-//! - **The erase floor.** Only records farther from the node than
-//!   [`ERASE_FLOOR_MULTIPLE`] (10) times the XOR distance from the node to its
-//!   own `close_group_size`-th nearest peer (the 7th at production parameters,
-//!   from the local routing table, the node itself not counted) may be erased.
-//!   With fewer peers known, nothing may. "Farther" is strict, and the multiple
-//!   is computed without overflow: past the end of the key space nothing is
-//!   farther.
+//! - **Free space** is the smaller of two shares of the partition holding the
+//!   record store: its free bytes, measured as the chunk store's capacity
+//!   guard measures them, and its free inodes, where the filesystem counts
+//!   them (a filesystem that reports none, or a query that fails, leaves bytes
+//!   alone). A byte measurement that fails counts as no pressure.
+//! - **Disk pressure** starts when free space falls to the first step of the
+//!   falling floor below, and lasts until free space is back to at least
+//!   [`DISK_PRESSURE_END_PERCENT`] (15%) of bytes and inodes, and to the
+//!   clamp's level plus [`LEAVE_FULL_MARGIN`]. The state lives in memory, is
+//!   shared by both passes and the storage migration's shed, and starts
+//!   without pressure when the node starts.
+//! - **The falling floor.** Only records farther from the node than the
+//!   floor may be erased. The floor falls as free space does, through
+//!   [`FLOOR_STEPS`]: 10 times the XOR distance from the node to its own
+//!   `close_group_size`-th nearest peer (the 7th at production parameters,
+//!   from the local routing table, the node itself not counted) below 10%
+//!   free, 5 times below 7.5%, 2 times below 5%, and the edge of the node's
+//!   own range below 2.5%. At the edge no distance is kept: every record the
+//!   prune pass counts as a candidate is eligible, which is a record for which
+//!   the node has not been among the retention width's nearest (9, more with
+//!   full peers among them) for the whole out-of-range wait; no record within
+//!   the width ever is. With fewer peers known than the close group, nothing
+//!   may be erased. "Farther" is strict, and multiples are computed without
+//!   overflow: past the end of the key space nothing is farther.
+//! - **Small partitions.** Each step also fires once free bytes are at or
+//!   below the full line plus one chunk ([`STEP_CLAMP_ABOVE_LINE`]), so on a
+//!   partition too small for a step's share to clear the line, the steps
+//!   collapse in order onto the line and the last one always runs before the
+//!   node is "full". A store with no line (`disk_reserve_mb` 0) has no clamp.
 //! - **Order.** Eligible records go farthest from the node first, chunks and
 //!   pointers each in their own pass. A record whose possession check failed
 //!   earlier in the same spell of pressure is tried after those not tried yet,
 //!   so the per-pass budgets reach every eligible record in turn. Each is
 //!   erased only after the nodes now nearest to it prove they hold it and the
 //!   pass's re-check just before deleting passes. Free space is measured again
-//!   before each record, and erasing stops once it is back to 15%.
+//!   before each record, and erasing stops once the pressure is over.
+//! - **At the line.** Free bytes at or below the clamp's level, or free inodes
+//!   below the last step's 2.5% share, are "at the line": a node there whose
+//!   last pass at the edge erased nothing is full (see [`super::full`]),
+//!   until free space is back above the line by [`LEAVE_FULL_MARGIN`].
+//!
+//! A failed proof of possession for a key beyond ten times the distance to
+//! the node's 7th-nearest peer (the floor's first step, whatever step it is
+//! at) is not penalised: the node's routing table may not know which nodes
+//! are nearest a key that far away.
 //!
 //! Everything else about pruning stays as it was: the out-of-range wait, the
 //! retained-commitment veto, the bootstrap deferral and the audit budgets.
@@ -45,40 +67,150 @@ use parking_lot::Mutex;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
-use crate::ant_protocol::XorName;
+use crate::ant_protocol::{XorName, MAX_CHUNK_SIZE};
 use crate::client::xor_distance;
 use crate::logging::{debug, info, warn};
 use crate::storage::chunk_store::CHUNKS_DIR_NAME;
-use crate::storage::ChunkStore;
+use crate::storage::{ChunkStore, FullTrigger, Inodes, INODES_AT_THE_LINE_PER_MILLE, MIB};
 
 #[cfg(test)]
 mod census;
 
 /// Disk pressure starts when free space falls below this share of the
-/// partition holding the record store, in percent.
+/// partition holding the record store, in percent: the falling floor's first
+/// step.
 pub const DISK_PRESSURE_START_PERCENT: u64 = 10;
 
 /// Disk pressure ends once free space is back to at least this share of the
 /// partition, in percent.
 pub const DISK_PRESSURE_END_PERCENT: u64 = 15;
 
-/// Under disk pressure, records farther from the node than this many times
-/// the distance to its `close_group_size`-th nearest peer may be erased.
+/// The multiple of the distance to the node's `close_group_size`-th nearest
+/// peer at the falling floor's first step, and the reach within which a
+/// failed proof of possession is penalised.
 pub const ERASE_FLOOR_MULTIPLE: u8 = 10;
 
-/// Free and total bytes of the partition holding the record store.
+/// How far a step of the falling floor lets erasure reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Records farther than this many times the distance to the node's
+    /// `close_group_size`-th nearest peer.
+    Multiple(u8),
+    /// The edge of the node's own range: every record the prune pass counts
+    /// as a candidate, with no distance kept.
+    Edge,
+}
+
+/// One step of the falling floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorStep {
+    /// The step fires once free space is below this share of the partition,
+    /// in tenths of a percent.
+    pub below_per_mille: u64,
+    /// How far erasure reaches from it on.
+    pub reach: Reach,
+}
+
+/// The falling floor's steps, first to last.
+pub const FLOOR_STEPS: [FloorStep; 4] = [
+    FloorStep {
+        below_per_mille: DISK_PRESSURE_START_PERCENT * 10,
+        reach: Reach::Multiple(ERASE_FLOOR_MULTIPLE),
+    },
+    FloorStep {
+        below_per_mille: 75,
+        reach: Reach::Multiple(5),
+    },
+    FloorStep {
+        below_per_mille: 50,
+        reach: Reach::Multiple(2),
+    },
+    FloorStep {
+        below_per_mille: INODES_AT_THE_LINE_PER_MILLE,
+        reach: Reach::Edge,
+    },
+];
+
+/// The index of the falling floor's last step, the edge of the node's range.
+pub const LAST_FLOOR_STEP: usize = FLOOR_STEPS.len() - 1;
+
+/// Each step also fires once free bytes are at or below the full line plus
+/// this: one chunk, the most a single record takes.
+pub const STEP_CLAMP_ABOVE_LINE: u64 = MAX_CHUNK_SIZE as u64;
+
+/// How far above the full line free bytes must be for a full node to leave
+/// "full", and for disk pressure that the clamp started to end.
+///
+/// 64 chunks, a whole wave of an upload, so a node that leaves "full" can
+/// take at least one before it is back at the line.
+pub const LEAVE_FULL_MARGIN: u64 = 64 * STEP_CLAMP_ABOVE_LINE;
+
+/// How many inodes above the last step's share a full node needs to leave
+/// "full" when inodes put it there.
+///
+/// The margin in records of the smallest allocation, 4 KiB, one inode each. Bounded by the filesystem's own size
+/// (see [`leave_full_inode_margin`]), so a filesystem with few inodes can
+/// always reach it.
+pub const LEAVE_FULL_INODE_MARGIN: u64 = LEAVE_FULL_MARGIN / (4 * 1024);
+
+/// The inode margin for leaving "full" on a filesystem of `total` inodes.
+///
+/// [`LEAVE_FULL_INODE_MARGIN`], or a fortieth of the inodes (2.5%, the line's
+/// own share) where that is smaller. The line's share plus this is at most
+/// 5% of the inodes, so a node whose inodes are freed can always leave.
+#[must_use]
+pub fn leave_full_inode_margin(total: u64) -> u64 {
+    LEAVE_FULL_INODE_MARGIN.min(total / 40)
+}
+
+const _: () = assert!(
+    LEAVE_FULL_MARGIN == 256 * MIB,
+    "the margin for leaving full is 256 MiB"
+);
+const _: () = assert!(
+    FLOOR_STEPS[0].below_per_mille > FLOOR_STEPS[1].below_per_mille
+        && FLOOR_STEPS[1].below_per_mille > FLOOR_STEPS[2].below_per_mille
+        && FLOOR_STEPS[2].below_per_mille > FLOOR_STEPS[3].below_per_mille,
+    "the floor falls step by step"
+);
+
+/// Free and total bytes of the partition holding the record store, and its
+/// inodes where the filesystem counts them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskSpace {
     /// Bytes available to the node on the partition.
     pub available: u64,
     /// The partition's size in bytes.
     pub total: u64,
+    /// Free and total inodes; `None` where they aren't counted, and bytes
+    /// alone count.
+    pub inodes: Option<Inodes>,
 }
 
 impl DiskSpace {
-    /// Whether free space is below `percent` of the partition.
-    fn below_percent(self, percent: u64) -> bool {
-        u128::from(self.available) * 100 < u128::from(self.total) * u128::from(percent)
+    /// A measurement of bytes alone.
+    #[must_use]
+    pub const fn bytes(available: u64, total: u64) -> Self {
+        Self {
+            available,
+            total,
+            inodes: None,
+        }
+    }
+
+    /// Whether free bytes are below `per_mille` tenths of a percent of the
+    /// partition.
+    fn bytes_below_per_mille(self, per_mille: u64) -> bool {
+        u128::from(self.available) * 1000 < u128::from(self.total) * u128::from(per_mille)
+    }
+
+    /// Whether free space, the smaller of the byte and inode shares, is below
+    /// `per_mille` tenths of a percent of the partition.
+    fn below_per_mille(self, per_mille: u64) -> bool {
+        self.bytes_below_per_mille(per_mille)
+            || self
+                .inodes
+                .is_some_and(|inodes| inodes.below_per_mille(per_mille))
     }
 
     /// Free space as a percentage of the partition, for logs.
@@ -93,28 +225,121 @@ impl DiskSpace {
     }
 }
 
-/// Whether the node is under disk pressure after measuring `space`, given
-/// whether it was before the measurement.
+/// The level at or below which every step of the falling floor fires: the
+/// full line plus [`STEP_CLAMP_ABOVE_LINE`]. Zero, no clamp, for a store
+/// with no line.
+#[must_use]
+pub const fn step_clamp(line: u64) -> u64 {
+    if line == 0 {
+        0
+    } else {
+        line.saturating_add(STEP_CLAMP_ABOVE_LINE)
+    }
+}
+
+/// Whether the step `index` of [`FLOOR_STEPS`] fires at `space`, for a store
+/// whose full line is `line`.
 ///
-/// Pressure starts below [`DISK_PRESSURE_START_PERCENT`] free, holds while
-/// free space stays below [`DISK_PRESSURE_END_PERCENT`], and ends at that or
-/// more. A failed measurement (`None`), or a partition reported as having no
-/// size, is no pressure.
+/// It fires at free space below the step's share, or free bytes at or below
+/// [`step_clamp`]. A partition reported as having no size reaches no step.
+#[must_use]
+pub fn step_fires(index: usize, space: DiskSpace, line: u64) -> bool {
+    let Some(step) = FLOOR_STEPS.get(index) else {
+        return false;
+    };
+    if space.total == 0 {
+        return false;
+    }
+    let clamp = step_clamp(line);
+    space.below_per_mille(step.below_per_mille) || (clamp > 0 && space.available <= clamp)
+}
+
+/// The deepest step of the falling floor that fires at `space`, if any.
+#[must_use]
+pub fn deepest_step(space: DiskSpace, line: u64) -> Option<usize> {
+    (0..FLOOR_STEPS.len())
+        .rev()
+        .find(|index| step_fires(*index, space, line))
+}
+
+/// What puts a node with `space` at the full line `line`, if it is there:
+/// free bytes at or below [`step_clamp`] (the line itself for a store with
+/// none), or free inodes below the last step's share.
+#[must_use]
+pub fn at_the_line(space: DiskSpace, line: u64) -> Option<FullTrigger> {
+    if space.available <= step_clamp(line) {
+        Some(FullTrigger::Bytes)
+    } else if space.inodes.is_some_and(Inodes::at_the_line) {
+        Some(FullTrigger::Inodes)
+    } else {
+        None
+    }
+}
+
+/// Whether a full node with `space`, put at the line by `trigger`, has the
+/// room to leave "full".
+///
+/// That is free bytes at least [`LEAVE_FULL_MARGIN`] above the line, and,
+/// where inodes are counted, inodes not at the line. When inodes put the node
+/// in "full", they also need [`leave_full_inode_margin`] above the last
+/// step's share, so the state doesn't flap; when bytes did, the inodes need
+/// no margin of their own.
+#[must_use]
+pub fn may_leave_full(space: DiskSpace, line: u64, trigger: FullTrigger) -> bool {
+    let bytes = space.available >= line.saturating_add(LEAVE_FULL_MARGIN);
+    let inodes = space.inodes.is_none_or(|inodes| match trigger {
+        FullTrigger::Bytes => !inodes.at_the_line(),
+        FullTrigger::Inodes => {
+            let at_the_line =
+                u128::from(inodes.total) * u128::from(INODES_AT_THE_LINE_PER_MILLE) / 1000;
+            u128::from(inodes.free)
+                >= at_the_line + u128::from(leave_full_inode_margin(inodes.total))
+        }
+    });
+    bytes && inodes
+}
+
+/// Whether the node is under disk pressure after measuring `space`, given
+/// whether it was before the measurement, for a store with no full line.
+///
+/// See [`next_disk_pressure_at`].
 #[must_use]
 pub fn next_disk_pressure(was_under_pressure: bool, space: Option<DiskSpace>) -> bool {
+    next_disk_pressure_at(was_under_pressure, space, 0)
+}
+
+/// Whether the node is under disk pressure after measuring `space`, given
+/// whether it was before the measurement, for a store whose full line is
+/// `line`.
+///
+/// Pressure starts at the falling floor's first step (below
+/// [`DISK_PRESSURE_START_PERCENT`] free, or at the clamp), holds while free
+/// space stays below [`DISK_PRESSURE_END_PERCENT`] or the clamp's level plus
+/// [`LEAVE_FULL_MARGIN`], and ends once both are reached. A failed
+/// measurement (`None`), or a partition reported as having no size, is no
+/// pressure.
+#[must_use]
+pub fn next_disk_pressure_at(
+    was_under_pressure: bool,
+    space: Option<DiskSpace>,
+    line: u64,
+) -> bool {
     let Some(space) = space.filter(|space| space.total > 0) else {
         return false;
     };
     if was_under_pressure {
-        space.below_percent(DISK_PRESSURE_END_PERCENT)
+        let clamp = step_clamp(line);
+        let below_clamp_margin =
+            clamp > 0 && space.available < clamp.saturating_add(LEAVE_FULL_MARGIN);
+        space.below_per_mille(DISK_PRESSURE_END_PERCENT * 10) || below_clamp_margin
     } else {
-        space.below_percent(DISK_PRESSURE_START_PERCENT)
+        step_fires(0, space, line)
     }
 }
 
-/// The erase floor of a node whose routing table holds `peers`:
-/// [`ERASE_FLOOR_MULTIPLE`] times the XOR distance from the node to its
-/// `close_group_size`-th nearest peer.
+/// The erase floor of a node whose routing table holds `peers` at the
+/// falling floor's first step: [`ERASE_FLOOR_MULTIPLE`] times the XOR
+/// distance from the node to its `close_group_size`-th nearest peer.
 ///
 /// `None` when fewer peers than that are known, so nothing may be erased. A
 /// multiple past the end of the key space saturates to the largest distance,
@@ -125,6 +350,29 @@ pub fn erase_floor(
     peers: &[XorName],
     close_group_size: usize,
 ) -> Option<XorName> {
+    erase_floor_at(
+        self_id,
+        peers,
+        close_group_size,
+        Reach::Multiple(ERASE_FLOOR_MULTIPLE),
+    )
+}
+
+/// The erase floor of a node whose routing table holds `peers`, at a step
+/// reaching `reach`.
+///
+/// That many times the distance to its `close_group_size`-th nearest peer,
+/// or, at the edge of its range, zero, so that every key but the node's own
+/// address is beyond it.
+///
+/// `None` when fewer peers than that are known, at any step.
+#[must_use]
+pub fn erase_floor_at(
+    self_id: &XorName,
+    peers: &[XorName],
+    close_group_size: usize,
+    reach: Reach,
+) -> Option<XorName> {
     let rank = close_group_size.checked_sub(1)?;
     let mut distances: Vec<XorName> = peers
         .iter()
@@ -133,9 +381,11 @@ pub fn erase_floor(
         .collect();
     distances.sort_unstable();
     distances.dedup();
-    distances
-        .get(rank)
-        .map(|distance| saturating_multiply(distance, ERASE_FLOOR_MULTIPLE))
+    let distance = distances.get(rank)?;
+    Some(match reach {
+        Reach::Multiple(factor) => saturating_multiply(distance, factor),
+        Reach::Edge => [0u8; 32],
+    })
 }
 
 /// `distance * factor` as a 256-bit big-endian number, or the largest
@@ -163,12 +413,21 @@ pub fn is_beyond_floor(self_id: &XorName, key: &XorName, floor: Option<&XorName>
     floor.is_some_and(|floor| xor_distance(self_id, key) > *floor)
 }
 
+/// The floors one pass works with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Floors {
+    /// The floor at the step the node is at: records beyond it may be erased.
+    pub erase: Option<XorName>,
+    /// The floor's first step, [`ERASE_FLOOR_MULTIPLE`] times the distance: a
+    /// failed proof for a key beyond it is not penalised, whatever the step.
+    pub penalty: Option<XorName>,
+}
+
 /// The records of one kind whose possession check failed during the current
 /// spell of disk pressure, and when.
 ///
-/// Process-local, like the out-of-range clocks. [`erase_order`] keeps only the
-/// records that are still eligible, so it forgets them all once the pressure
-/// is over.
+/// Process-local. [`erase_order`] keeps only the records that are still
+/// eligible, so it forgets them all once the pressure is over.
 #[derive(Debug, Default)]
 pub struct FailedChecks {
     failed_at: Mutex<HashMap<XorName, Instant>>,
@@ -244,8 +503,8 @@ pub fn erase_order<T>(
 /// pressure, and return what each step returned.
 ///
 /// Free space is measured again before each candidate, so erasing stops as
-/// soon as it is back to [`DISK_PRESSURE_END_PERCENT`] or can no longer be
-/// measured. The remaining candidates are left for a later pass.
+/// soon as the pressure is over or free space can no longer be measured. The
+/// remaining candidates are left for a later pass.
 pub(crate) async fn erase_while_under_pressure<T, O, F, Fut>(
     retention: &DiskRetention,
     candidates: Vec<T>,
@@ -265,18 +524,34 @@ where
     outcomes
 }
 
+/// What the last measurement found.
+#[derive(Debug, Clone, Copy, Default)]
+struct Measured {
+    /// Whether the node is under disk pressure.
+    under_pressure: bool,
+    /// The deepest step of the falling floor reached, while under pressure:
+    /// at least the first.
+    step: Option<usize>,
+    /// What puts the node at the full line, if it is there.
+    at_the_line: Option<FullTrigger>,
+    /// The measurement itself, if it succeeded.
+    space: Option<DiskSpace>,
+}
+
 /// The disk-pressure state of one node, and the measurements behind it.
 ///
 /// Shared by the chunk and pointer prune passes and the storage migration, so
-/// they never disagree about whether the node is erasing. It also holds the
-/// records whose possession check failed during the current spell of
-/// pressure.
+/// they never disagree about whether the node is erasing, or how far. It also
+/// holds the records whose possession check failed during the current spell
+/// of pressure.
 pub struct DiskRetention {
     /// A directory on the partition holding the record store: the chunk
     /// store's own, which its capacity guard measures.
     dir: PathBuf,
-    /// Whether the node is under disk pressure.
-    under_pressure: Mutex<bool>,
+    /// The full line: the free bytes the chunk store keeps unused.
+    line: u64,
+    /// What the last measurement found.
+    measured: Mutex<Measured>,
     /// Chunks whose possession check failed during this spell of pressure.
     failed_chunk_checks: FailedChecks,
     /// Pointers whose possession check failed during this spell of pressure.
@@ -312,19 +587,21 @@ enum Fixed<T> {
 
 impl DiskRetention {
     /// The state for a node whose chunk store is `storage`: free space is
-    /// measured on the partition holding the store's chunk directory.
+    /// measured on the partition holding the store's chunk directory, against
+    /// the store's full line.
     #[must_use]
     pub fn for_store(storage: &ChunkStore) -> Self {
-        Self::new(storage.root_dir().join(CHUNKS_DIR_NAME))
+        Self::new(storage.root_dir().join(CHUNKS_DIR_NAME)).with_line(storage.full_line())
     }
 
-    /// The state for a record store on the partition holding `dir`. Starts
-    /// without disk pressure.
+    /// The state for a record store on the partition holding `dir`, with no
+    /// full line. Starts without disk pressure.
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
-            under_pressure: Mutex::new(false),
+            line: 0,
+            measured: Mutex::new(Measured::default()),
             failed_chunk_checks: FailedChecks::default(),
             failed_pointer_checks: FailedChecks::default(),
             #[cfg(any(test, feature = "test-utils"))]
@@ -332,10 +609,43 @@ impl DiskRetention {
         }
     }
 
+    /// The same state, measured against the full line `line`.
+    #[must_use]
+    pub fn with_line(mut self, line: u64) -> Self {
+        self.line = line;
+        self
+    }
+
+    /// The full line this state measures against.
+    #[must_use]
+    pub fn line(&self) -> u64 {
+        self.line
+    }
+
     /// Whether the node was under disk pressure at the last measurement.
     #[must_use]
     pub fn under_pressure(&self) -> bool {
-        *self.under_pressure.lock()
+        self.measured.lock().under_pressure
+    }
+
+    /// The deepest step of the falling floor the last measurement reached,
+    /// as an index into [`FLOOR_STEPS`]: `None` without disk pressure.
+    #[must_use]
+    pub fn step(&self) -> Option<usize> {
+        self.measured.lock().step
+    }
+
+    /// What put the node at the full line at the last measurement, if it was
+    /// there.
+    #[must_use]
+    pub fn at_the_line(&self) -> Option<FullTrigger> {
+        self.measured.lock().at_the_line
+    }
+
+    /// The last successful measurement, if the last one succeeded.
+    #[must_use]
+    pub fn last_space(&self) -> Option<DiskSpace> {
+        self.measured.lock().space
     }
 
     /// The chunks whose possession check failed during this spell of
@@ -352,38 +662,31 @@ impl DiskRetention {
         &self.failed_pointer_checks
     }
 
-    /// Measure free space again and update the pressure state. Returns
-    /// whether the node is now under disk pressure.
+    /// Measure free space again and update the pressure state, the step and
+    /// whether the node is at the line. Returns whether the node is now under
+    /// disk pressure.
     pub fn refresh(&self) -> bool {
-        let space = self.measure();
-        let mut under_pressure = self.under_pressure.lock();
-        let was = *under_pressure;
-        let now = next_disk_pressure(was, space);
-        *under_pressure = now;
-        drop(under_pressure);
-        match (was, now, space.filter(|space| space.total > 0)) {
-            (false, true, Some(space)) => info!(
-                "Disk pressure: {:.1}% of the record store's partition is free, below \
-                 {DISK_PRESSURE_START_PERCENT}%; records far from this node may now be erased, \
-                 farthest first, until {DISK_PRESSURE_END_PERCENT}% is free",
-                space.free_percent()
-            ),
-            (true, false, Some(space)) => info!(
-                "Disk pressure over: {:.1}% of the record store's partition is free; \
-                 keeping every record again",
-                space.free_percent()
-            ),
-            (true, false, None) => warn!(
-                "Free space on the record store's partition could not be measured; \
-                 erasing stops until it can"
-            ),
-            _ => {}
-        }
-        now
+        let space = self.measure().filter(|space| space.total > 0);
+        let mut measured = self.measured.lock();
+        let before = *measured;
+        let under_pressure = next_disk_pressure_at(before.under_pressure, space, self.line);
+        let step = match space {
+            Some(space) if under_pressure => Some(deepest_step(space, self.line).unwrap_or(0)),
+            _ => None,
+        };
+        *measured = Measured {
+            under_pressure,
+            step,
+            at_the_line: space.and_then(|space| at_the_line(space, self.line)),
+            space,
+        };
+        drop(measured);
+        log_pressure_change(before, under_pressure, step, space);
+        under_pressure
     }
 
-    /// Free and total bytes of the partition, or `None` if they could not be
-    /// read.
+    /// Free and total bytes and inodes of the partition, or `None` if the
+    /// bytes could not be read.
     fn measure(&self) -> Option<DiskSpace> {
         #[cfg(any(test, feature = "test-utils"))]
         {
@@ -399,6 +702,10 @@ impl DiskRetention {
                             Some(total) => total,
                             None => fs2::total_space(&self.dir).ok()?,
                         },
+                        inodes: space
+                            .inodes
+                            .map(|(free, total)| Inodes { free, total })
+                            .filter(|inodes| inodes.total > 0),
                     }),
                     Err(e) => {
                         debug!("The free-space seam could not be read: {e}");
@@ -411,6 +718,7 @@ impl DiskRetention {
             Ok(stats) => Some(DiskSpace {
                 available: stats.available_space(),
                 total: stats.total_space(),
+                inodes: crate::storage::free_inodes(&self.dir),
             }),
             Err(e) => {
                 debug!(
@@ -422,19 +730,24 @@ impl DiskRetention {
         }
     }
 
-    /// The erase floor from the node's local routing table (see
-    /// [`erase_floor`]). `None`: nothing may be erased.
-    pub async fn floor_from_routing_table(
+    /// The floors from the node's local routing table at the step the last
+    /// measurement reached (see [`erase_floor_at`]): `erase` is `None`, and
+    /// nothing may be erased, without disk pressure or with too few peers
+    /// known.
+    pub async fn floors_from_routing_table(
         &self,
         p2p_node: &P2PNode,
         self_id: &PeerId,
         close_group_size: usize,
-    ) -> Option<XorName> {
+    ) -> Floors {
         #[cfg(any(test, feature = "test-utils"))]
         {
             let fixed = self.fixed.lock().floor;
             if let Fixed::To(floor) = fixed {
-                return floor;
+                return Floors {
+                    erase: floor,
+                    penalty: floor,
+                };
             }
         }
         let peers: Vec<XorName> = p2p_node
@@ -444,7 +757,86 @@ impl DiskRetention {
             .into_iter()
             .map(|node| *node.peer_id.as_bytes())
             .collect();
-        erase_floor(self_id.as_bytes(), &peers, close_group_size)
+        self.floors_from_peers(self_id.as_bytes(), &peers, close_group_size)
+    }
+
+    /// The floors for a node with `peers` at the step the last measurement
+    /// reached (see [`Self::floors_from_routing_table`]).
+    #[must_use]
+    pub fn floors_from_peers(
+        &self,
+        self_id: &XorName,
+        peers: &[XorName],
+        close_group_size: usize,
+    ) -> Floors {
+        let reach = self
+            .step()
+            .and_then(|step| FLOOR_STEPS.get(step))
+            .map(|step| step.reach);
+        Floors {
+            erase: reach.and_then(|reach| erase_floor_at(self_id, peers, close_group_size, reach)),
+            penalty: erase_floor(self_id, peers, close_group_size),
+        }
+    }
+}
+
+/// Log a change in the pressure state or the floor's step.
+#[cfg_attr(not(feature = "logging"), allow(unused_variables))]
+fn log_pressure_change(
+    before: Measured,
+    under_pressure: bool,
+    step: Option<usize>,
+    space: Option<DiskSpace>,
+) {
+    let inodes_note = |space: DiskSpace| {
+        space.inodes.map_or_else(String::new, |inodes| {
+            format!(", {} of {} inodes free", inodes.free, inodes.total)
+        })
+    };
+    match (before.under_pressure, under_pressure, space) {
+        (false, true, Some(space)) => info!(
+            "Disk pressure: {:.1}% of the record store's partition is free{}; records far from \
+             this node may now be erased, farthest first, until {DISK_PRESSURE_END_PERCENT}% is \
+             free (floor step {}: {})",
+            space.free_percent(),
+            inodes_note(space),
+            step.unwrap_or(0) + 1,
+            step_reach_text(step),
+        ),
+        (true, true, Some(space)) if before.step != step => info!(
+            "Disk pressure: the erase floor moves to step {} ({}); {:.1}% of the record store's \
+             partition is free{}",
+            step.unwrap_or(0) + 1,
+            step_reach_text(step),
+            space.free_percent(),
+            inodes_note(space),
+        ),
+        (true, false, Some(space)) => info!(
+            "Disk pressure over: {:.1}% of the record store's partition is free{}; keeping every \
+             record again",
+            space.free_percent(),
+            inodes_note(space),
+        ),
+        (true, false, None) => warn!(
+            "Free space on the record store's partition could not be measured; \
+             erasing stops until it can"
+        ),
+        _ => {}
+    }
+}
+
+/// How far a step reaches, for logs.
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+fn step_reach_text(step: Option<usize>) -> String {
+    match step
+        .and_then(|step| FLOOR_STEPS.get(step))
+        .map(|step| step.reach)
+    {
+        Some(Reach::Multiple(factor)) => {
+            format!("{factor} times the distance to the node's 7th-nearest peer")
+        }
+        Some(Reach::Edge) => "the edge of the node's own range".to_string(),
+        None => "none".to_string(),
     }
 }
 
@@ -465,9 +857,9 @@ impl DiskRetention {
         self.fixed.lock().space = Some(Arc::new(source));
     }
 
-    /// From now on, use `floor` instead of the routing table's (`None`:
-    /// nothing may be erased; all zeroes: every other key is beyond it).
-    /// Tests only.
+    /// From now on, use `floor` instead of the routing table's, for erasure
+    /// and for penalties alike (`None`: nothing may be erased; all zeroes:
+    /// every other key is beyond it). Tests only.
     pub fn set_floor_for_test(&self, floor: Option<XorName>) {
         self.fixed.lock().floor = Fixed::To(floor);
     }
@@ -481,10 +873,7 @@ mod tests {
     /// A partition of 1000 bytes with `available` free, as a measurement.
     #[allow(clippy::unnecessary_wraps)]
     fn space(available: u64) -> Option<DiskSpace> {
-        Some(DiskSpace {
-            available,
-            total: 1000,
-        })
+        Some(DiskSpace::bytes(available, 1000))
     }
 
     /// A key at XOR distance `distance` from the all-zero node id.
@@ -561,25 +950,16 @@ mod tests {
             !next_disk_pressure(true, None),
             "a failed measurement ends the pressure"
         );
-        let no_size = Some(DiskSpace {
-            available: 0,
-            total: 0,
-        });
+        let no_size = Some(DiskSpace::bytes(0, 0));
         assert!(!next_disk_pressure(false, no_size));
         assert!(!next_disk_pressure(true, no_size));
     }
 
     #[test]
     fn pressure_arithmetic_does_not_overflow_on_huge_partitions() {
-        let huge = Some(DiskSpace {
-            available: u64::MAX / 20,
-            total: u64::MAX,
-        });
+        let huge = Some(DiskSpace::bytes(u64::MAX / 20, u64::MAX));
         assert!(next_disk_pressure(false, huge), "5% free starts pressure");
-        let roomy = Some(DiskSpace {
-            available: u64::MAX / 4,
-            total: u64::MAX,
-        });
+        let roomy = Some(DiskSpace::bytes(u64::MAX / 4, u64::MAX));
         assert!(!next_disk_pressure(true, roomy), "25% free ends it");
     }
 
@@ -894,5 +1274,404 @@ mod tests {
         })
         .await;
         assert_eq!(erased, vec![1]);
+    }
+
+    // -- The falling floor -------------------------------------------------------
+
+    use crate::storage::{DEFAULT_DISK_RESERVE, GIB};
+
+    /// Bytes in a decimal gigabyte, as partitions are sold.
+    const GB: u64 = 1_000_000_000;
+
+    /// The partitions the small-disk tests simulate, the operator guide's
+    /// 20 GB minimum among them.
+    const PARTITIONS: [u64; 4] = [15 * GB, 20 * GB, 40 * GB, 80 * GB];
+
+    fn at(available: u64, total: u64) -> DiskSpace {
+        DiskSpace::bytes(available, total)
+    }
+
+    #[test]
+    fn the_steps_are_the_falling_floors() {
+        let shares: Vec<u64> = FLOOR_STEPS.iter().map(|s| s.below_per_mille).collect();
+        assert_eq!(shares, vec![100, 75, 50, 25]);
+        let reaches: Vec<Reach> = FLOOR_STEPS.iter().map(|s| s.reach).collect();
+        assert_eq!(
+            reaches,
+            vec![
+                Reach::Multiple(10),
+                Reach::Multiple(5),
+                Reach::Multiple(2),
+                Reach::Edge
+            ]
+        );
+        assert_eq!(STEP_CLAMP_ABOVE_LINE, 4 * MIB);
+        assert_eq!(LEAVE_FULL_MARGIN, 256 * MIB);
+    }
+
+    #[test]
+    fn on_a_large_partition_each_step_fires_at_its_own_share() {
+        let total = 10_000 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        assert_eq!(deepest_step(at(total / 10, total), line), None);
+        assert_eq!(deepest_step(at(total / 10 - 1, total), line), Some(0));
+        assert_eq!(
+            deepest_step(at(total * 75 / 1000 - 1, total), line),
+            Some(1)
+        );
+        assert_eq!(deepest_step(at(total / 20 - 1, total), line), Some(2));
+        assert_eq!(deepest_step(at(total / 40 - 1, total), line), Some(3));
+        assert_eq!(
+            deepest_step(at(total / 40, total), line),
+            Some(2),
+            "exactly 2.5% free is not below it"
+        );
+    }
+
+    /// Each step fires at the larger of its share and the line plus one
+    /// chunk, so on the small partitions the steps collapse, in order, onto
+    /// the line, and the last one runs before the node is at the line.
+    #[test]
+    fn on_small_partitions_the_steps_collapse_onto_the_line_in_order() {
+        let line = DEFAULT_DISK_RESERVE;
+        let clamp = line + 4 * MIB;
+        assert_eq!(step_clamp(line), clamp);
+        for total in PARTITIONS {
+            // Walk free space down from 12% to nothing, a MiB at a time near the
+            // line: the step never goes back, and every step is reached before
+            // the line is.
+            let mut last = None;
+            let mut first_at: [Option<u64>; 4] = [None; 4];
+            let mut available = total * 12 / 100;
+            loop {
+                let space = at(available, total);
+                let step = deepest_step(space, line);
+                assert!(step >= last, "{total}: the floor rose at {available}");
+                if let Some(step) = step {
+                    for reached in first_at.iter_mut().take(step + 1) {
+                        reached.get_or_insert(available);
+                    }
+                }
+                last = step;
+                if available == 0 {
+                    break;
+                }
+                available = available.saturating_sub(if available > clamp + GIB {
+                    64 * MIB
+                } else {
+                    MIB
+                });
+            }
+            let first_at = first_at.map(|level| level.expect("every step is reached"));
+            // Each step's level is the larger of its share and the clamp.
+            for (index, step) in FLOOR_STEPS.iter().enumerate() {
+                let share =
+                    u64::try_from(u128::from(total) * u128::from(step.below_per_mille) / 1000)
+                        .unwrap();
+                let expected = share.max(clamp);
+                assert!(
+                    first_at[index] <= expected && first_at[index] + 64 * MIB >= expected,
+                    "{total}: step {index} first fired at {}, its level is {expected}",
+                    first_at[index]
+                );
+            }
+            // The last step fires no later than the clamp, which is above the line.
+            assert!(first_at[LAST_FLOOR_STEP] >= clamp - MIB);
+            assert_eq!(deepest_step(at(clamp, total), line), Some(LAST_FLOOR_STEP));
+            assert_eq!(
+                at_the_line(at(clamp, total), line),
+                Some(FullTrigger::Bytes)
+            );
+            assert_eq!(at_the_line(at(clamp + 1, total), line), None);
+        }
+    }
+
+    /// With the 1 GiB line the clamp decides the 2.5% step below about
+    /// 40 GiB, and the 5% step below about 20 GiB.
+    #[test]
+    fn the_clamp_decides_the_last_steps_on_partitions_under_40_gib() {
+        let line = DEFAULT_DISK_RESERVE;
+        let clamp = step_clamp(line);
+        let clamped = |total: u64, index: usize| {
+            let share = u64::try_from(
+                u128::from(total) * u128::from(FLOOR_STEPS[index].below_per_mille) / 1000,
+            )
+            .unwrap();
+            share < clamp
+        };
+        assert!(clamped(15 * GB, LAST_FLOOR_STEP));
+        assert!(clamped(20 * GB, LAST_FLOOR_STEP));
+        assert!(clamped(40 * GB, LAST_FLOOR_STEP));
+        assert!(!clamped(80 * GB, LAST_FLOOR_STEP));
+        assert!(clamped(15 * GB, 2));
+        assert!(clamped(20 * GB, 2));
+        assert!(!clamped(40 * GB, 2));
+        assert!(!clamped(15 * GB, 0));
+    }
+
+    #[test]
+    fn a_store_with_no_line_has_no_clamp() {
+        assert_eq!(step_clamp(0), 0);
+        assert_eq!(deepest_step(at(1, 1000), 0), Some(LAST_FLOOR_STEP));
+        assert_eq!(deepest_step(at(100, 1000), 0), None);
+        assert_eq!(at_the_line(at(1, 1000), 0), None);
+        assert_eq!(at_the_line(at(0, 1000), 0), Some(FullTrigger::Bytes));
+    }
+
+    #[test]
+    fn pressure_started_by_the_clamp_ends_a_margin_above_it() {
+        let line = DEFAULT_DISK_RESERVE;
+        let clamp = step_clamp(line);
+        // 5 GB: 10% (500 MB) is below the clamp, so the clamp starts it.
+        let total = 5 * GB;
+        assert!(!next_disk_pressure_at(
+            false,
+            Some(at(clamp + 1, total)),
+            line
+        ));
+        assert!(next_disk_pressure_at(false, Some(at(clamp, total)), line));
+        assert!(next_disk_pressure_at(
+            true,
+            Some(at(clamp + LEAVE_FULL_MARGIN - 1, total)),
+            line
+        ));
+        assert!(!next_disk_pressure_at(
+            true,
+            Some(at(clamp + LEAVE_FULL_MARGIN, total)),
+            line
+        ));
+        // On a large partition 15% is the higher of the two.
+        let total = 1000 * GB;
+        assert!(next_disk_pressure_at(
+            true,
+            Some(at(total * 15 / 100 - 1, total)),
+            line
+        ));
+        assert!(!next_disk_pressure_at(
+            true,
+            Some(at(total * 15 / 100, total)),
+            line
+        ));
+    }
+
+    #[test]
+    fn the_floor_follows_the_step() {
+        let peers: Vec<XorName> = (1..=9u8).map(|d| distance(0, d)).collect();
+        assert_eq!(
+            erase_floor_at(&NODE, &peers, 7, Reach::Multiple(10)),
+            Some(distance(0, 70))
+        );
+        assert_eq!(
+            erase_floor_at(&NODE, &peers, 7, Reach::Multiple(5)),
+            Some(distance(0, 35))
+        );
+        assert_eq!(
+            erase_floor_at(&NODE, &peers, 7, Reach::Multiple(2)),
+            Some(distance(0, 14))
+        );
+        assert_eq!(
+            erase_floor_at(&NODE, &peers, 7, Reach::Edge),
+            Some([0u8; 32]),
+            "at the edge every key but the node's own is beyond the floor"
+        );
+        assert_eq!(
+            erase_floor_at(&NODE, &peers[..6], 7, Reach::Edge),
+            None,
+            "with fewer than seven peers known nothing may be erased, at any step"
+        );
+        assert!(is_beyond_floor(&NODE, &distance(0, 1), Some(&[0u8; 32])));
+        assert!(!is_beyond_floor(&NODE, &NODE, Some(&[0u8; 32])));
+    }
+
+    #[test]
+    fn the_shared_state_reports_its_step_and_keeps_the_penalty_at_ten_times() {
+        let line = DEFAULT_DISK_RESERVE;
+        let total = 1000 * GB;
+        let retention = DiskRetention::new(PathBuf::from(".")).with_line(line);
+        let peers: Vec<XorName> = (1..=9u8).map(|d| distance(0, d)).collect();
+        let floors = |retention: &DiskRetention| retention.floors_from_peers(&NODE, &peers, 7);
+
+        retention.set_space_for_test(Some(at(total / 5, total)));
+        assert!(!retention.refresh());
+        assert_eq!(retention.step(), None);
+        assert_eq!(floors(&retention).erase, None, "no floor without pressure");
+        assert_eq!(floors(&retention).penalty, Some(distance(0, 70)));
+
+        for (available, step, erase) in [
+            (total * 9 / 100, 0, Some(distance(0, 70))),
+            (total * 7 / 100, 1, Some(distance(0, 35))),
+            (total * 4 / 100, 2, Some(distance(0, 14))),
+            (total * 2 / 100, 3, Some([0u8; 32])),
+        ] {
+            retention.set_space_for_test(Some(at(available, total)));
+            assert!(retention.refresh());
+            assert_eq!(retention.step(), Some(step), "{available}");
+            assert_eq!(floors(&retention).erase, erase, "{available}");
+            assert_eq!(
+                floors(&retention).penalty,
+                Some(distance(0, 70)),
+                "a failed proof is penalised within ten times the distance, at every step"
+            );
+        }
+        // Back up between 10% and 15%: still pressure, at the first step.
+        retention.set_space_for_test(Some(at(total * 12 / 100, total)));
+        assert!(retention.refresh());
+        assert_eq!(retention.step(), Some(0));
+    }
+
+    // -- Inodes ------------------------------------------------------------------
+
+    fn with_inodes(available: u64, total: u64, free: u64, inodes: u64) -> DiskSpace {
+        DiskSpace {
+            available,
+            total,
+            inodes: Some(Inodes {
+                free,
+                total: inodes,
+            }),
+        }
+    }
+
+    #[test]
+    fn free_space_is_the_smaller_of_the_byte_and_inode_shares() {
+        let total = 1000 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        // Bytes plentiful, inodes at 6%: the third step.
+        let space = with_inodes(total / 2, total, 60, 1000);
+        assert_eq!(deepest_step(space, line), Some(1));
+        let space = with_inodes(total / 2, total, 40, 1000);
+        assert_eq!(deepest_step(space, line), Some(2));
+        let space = with_inodes(total / 2, total, 24, 1000);
+        assert_eq!(deepest_step(space, line), Some(LAST_FLOOR_STEP));
+        assert!(next_disk_pressure_at(false, Some(space), line));
+    }
+
+    #[test]
+    fn inodes_below_the_last_steps_share_are_at_the_line() {
+        let total = 1000 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        assert_eq!(
+            at_the_line(with_inodes(total / 2, total, 24, 1000), line),
+            Some(FullTrigger::Inodes)
+        );
+        assert_eq!(
+            at_the_line(with_inodes(total / 2, total, 25, 1000), line),
+            None
+        );
+        // Bytes first when both are short.
+        assert_eq!(
+            at_the_line(with_inodes(line, total, 0, 1000), line),
+            Some(FullTrigger::Bytes)
+        );
+    }
+
+    #[test]
+    fn a_filesystem_that_counts_no_inodes_is_never_at_the_line_by_inodes() {
+        let total = 1000 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        let no_count = DiskSpace::bytes(total / 2, total);
+        assert_eq!(at_the_line(no_count, line), None);
+        assert_eq!(deepest_step(no_count, line), None);
+        assert!(may_leave_full(no_count, line, FullTrigger::Bytes));
+        assert!(may_leave_full(no_count, line, FullTrigger::Inodes));
+        assert!(!crate::storage::Inodes { free: 0, total: 0 }.at_the_line());
+    }
+
+    #[test]
+    fn leaving_full_needs_the_margin_above_the_line() {
+        let total = 20 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        for trigger in [FullTrigger::Bytes, FullTrigger::Inodes] {
+            assert!(!may_leave_full(at(line, total), line, trigger));
+            assert!(!may_leave_full(
+                at(step_clamp(line) + 1, total),
+                line,
+                trigger
+            ));
+            assert!(!may_leave_full(
+                at(line + LEAVE_FULL_MARGIN - 1, total),
+                line,
+                trigger
+            ));
+            assert!(may_leave_full(
+                at(line + LEAVE_FULL_MARGIN, total),
+                line,
+                trigger
+            ));
+        }
+        // Inodes that put the node in "full" need their own margin.
+        let inodes = 10_000_000;
+        let share = inodes * 25 / 1000;
+        let roomy = line + 10 * GIB;
+        assert_eq!(leave_full_inode_margin(inodes), LEAVE_FULL_INODE_MARGIN);
+        assert!(!may_leave_full(
+            with_inodes(roomy, total, share + LEAVE_FULL_INODE_MARGIN - 1, inodes),
+            line,
+            FullTrigger::Inodes
+        ));
+        assert!(may_leave_full(
+            with_inodes(roomy, total, share + LEAVE_FULL_INODE_MARGIN, inodes),
+            line,
+            FullTrigger::Inodes
+        ));
+    }
+
+    /// Bytes put the node in "full": inodes need only be off the line, with no
+    /// margin, however few the filesystem has.
+    #[test]
+    fn a_node_full_by_bytes_leaves_on_a_filesystem_with_few_inodes() {
+        let total = 20 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        let roomy = line + LEAVE_FULL_MARGIN;
+        // ext4 made with -T largefile4 on a 20 GB partition: about 5,000 inodes.
+        let inodes = 5_000;
+        let share = inodes * 25 / 1000;
+        assert!(may_leave_full(
+            with_inodes(roomy, total, inodes / 2, inodes),
+            line,
+            FullTrigger::Bytes
+        ));
+        assert!(may_leave_full(
+            with_inodes(roomy, total, share, inodes),
+            line,
+            FullTrigger::Bytes
+        ));
+        // Not straight back to the line by inodes.
+        assert!(!may_leave_full(
+            with_inodes(roomy, total, share - 1, inodes),
+            line,
+            FullTrigger::Bytes
+        ));
+        // A larger filesystem whose free inodes sit between the share and the
+        // share plus the fixed margin: inodes never put it at the line.
+        let more = 10_000_000;
+        assert!(may_leave_full(
+            with_inodes(roomy, total, more * 25 / 1000 + 1, more),
+            line,
+            FullTrigger::Bytes
+        ));
+    }
+
+    /// Inodes put a node on a tiny filesystem in "full": it leaves once free
+    /// inodes reach the share plus a fortieth of the inodes.
+    #[test]
+    fn a_node_full_by_inodes_on_a_tiny_filesystem_can_leave() {
+        let total = 20 * GB;
+        let line = DEFAULT_DISK_RESERVE;
+        let roomy = line + LEAVE_FULL_MARGIN;
+        let inodes = 20_000;
+        let share = inodes * 25 / 1000;
+        let margin = leave_full_inode_margin(inodes);
+        assert_eq!(margin, inodes / 40);
+        assert!(!may_leave_full(
+            with_inodes(roomy, total, share + margin - 1, inodes),
+            line,
+            FullTrigger::Inodes
+        ));
+        assert!(may_leave_full(
+            with_inodes(roomy, total, share + margin, inodes),
+            line,
+            FullTrigger::Inodes
+        ));
     }
 }

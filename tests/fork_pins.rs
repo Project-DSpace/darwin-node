@@ -4,7 +4,10 @@
 //! allowance of new browser sessions per source, browser limits a starting
 //! node accepts and binds, within the most sessions the transport holds
 //! (`browser_listener` below), and the penalty for not holding a close-group
-//! chunk, which nothing can withhold. And how the
+//! chunk, which nothing withholds but one bounded case: a full peer (its own
+//! "full" notice fresh) answering that it lacks a key it was never seen
+//! proving, in a check not pinned to its commitment and, after a write, not
+//! paid for it ("full, not faulty", `unheld_chunk_penalty` below). And how the
 //! payment check reads the chain (`payment_reads` below), which a release
 //! that rewrites the read path must keep: the node's own RPC is read first,
 //! then, if that is one of Robinhood Chain's public RPCs, the others; a failed
@@ -22,6 +25,10 @@
 //! (`payment_encodings` below). And the census of test files, so a merge
 //! can't bring back a test this fork removed, or add one, unreviewed
 //! (`every_test_file_is_reviewed`).
+//!
+//! And the order a node dials a peer's addresses in, a verified direct address
+//! before a relay, which comes from the vendored saorsa-core, the only one this
+//! lock resolves (`direct_first` below).
 //!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes. The payment reads need the
@@ -267,12 +274,14 @@ fn rust_files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
 }
 
 /// A peer that doesn't hold a close-group chunk it should is penalised, as in
-/// upstream v0.23.0, and nothing in the node or the image can withhold it: no
-/// switch and no environment override. The census
-/// (src/replication/retention/census.rs) pins the lanes that charge it, and a
-/// build whose trust weights fall to zero doesn't compile (src/replication/mod.rs).
+/// upstream v0.23.0, and nothing in the node or the image can withhold it but
+/// the one bounded case of "full, not faulty" (`unheld_chunk_penalty` below):
+/// no switch and no environment override. The census
+/// (src/replication/retention/census.rs) pins the lanes that charge it and the
+/// one waiver each lane asks, and a build whose trust weights fall to zero
+/// doesn't compile (src/replication/mod.rs).
 #[test]
-fn nothing_withholds_the_unheld_chunk_penalty() {
+fn nothing_but_a_fresh_full_notice_withholds_the_unheld_chunk_penalty() {
     // The census names the switch's parts to pin them away, in test-only code.
     let census = repo_path("src/replication/retention/census.rs");
     let mut sources = Vec::new();
@@ -290,7 +299,7 @@ fn nothing_withholds_the_unheld_chunk_penalty() {
             assert!(
                 !text.contains(name),
                 "{} names {name}: the penalty for an unheld close-group chunk is applied \
-                 on every lane, and nothing may withhold it",
+                 on every lane, and nothing may withhold it but the waiver for a full peer",
                 path.display()
             );
         }
@@ -423,6 +432,193 @@ fn a_notice_records_its_class_and_a_fetch_on_that_entry_alone_is_checked() {
     assert_eq!(writers, ["src/replication/mod.rs"]);
 }
 
+/// A verified direct address is dialled before a relay (from ds.17). The node
+/// builds saorsa-core from `vendor/saorsa-core`, its 0.29.1 release with
+/// `AddressType::priority` and the dial plan
+/// (`select_dial_candidates_with_context`) putting a verified Direct address
+/// ahead of the relay, so traffic to a reachable peer doesn't pass through
+/// another peer's relay. A peer behind NAT has no verified Direct address, so
+/// its relay is still dialled first. The dial plan is private to saorsa-core:
+/// its own tests pin it there, and test.yml runs them.
+mod direct_first {
+    use super::repo_text;
+    use saorsa_core::{AddressType, DHTNode, MultiAddr, PeerId};
+
+    /// The saorsa-core release the copy is, and upstream's commit for it.
+    const SAORSA_CORE_VERSION: &str = "0.29.1";
+    const SAORSA_CORE_COMMIT: &str = "29bb069691880de59f5157c315a6233b1c57b20f";
+
+    /// The saorsa-transport release the lock holds (ds.16's bump).
+    const SAORSA_TRANSPORT_VERSION: &str = "0.38.2";
+
+    const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+    /// The vendored crate's tests of the change, by file, each of which must
+    /// stay: the dial plan, the stored order, and the tag rank that keeps
+    /// re-tagging and the lookup's tie-break as upstream's.
+    const DIRECT_FIRST_TESTS: &[(&str, &[&str])] = &[
+        (
+            "vendor/saorsa-core/src/dht_network_manager.rs",
+            &[
+                "direct_first_direct_plus_relay_dials_direct_first",
+                "direct_first_unverified_plus_relay_dials_relay_first",
+                "direct_first_unverified_alone_is_still_dialled",
+                "direct_first_full_order_direct_relay_unverified",
+                "direct_first_same_wan_lan_stays_first",
+                "direct_first_same_wan_relay_still_skipped",
+                "direct_first_home_node_behind_nat_keeps_its_relay_first",
+                "direct_first_lan_is_the_last_fallback",
+                "direct_first_lookup_order_agrees_with_dial_order",
+            ],
+        ),
+        (
+            "vendor/saorsa-core/src/dht/core_engine.rs",
+            &[
+                "address_type_priority_is_direct_relay_unverified_lan",
+                "address_type_tag_rank_is_relay_direct_unverified_lan",
+                "merge_typed_address_keeps_direct_before_relay",
+                "upgrade_only_gossip_cannot_retag_relay_as_direct",
+                "unsequenced_lookup_view_cannot_retag_relay_as_direct",
+            ],
+        ),
+        (
+            "vendor/saorsa-core/src/client_routing.rs",
+            &["direct_first_leaves_the_lookup_tie_break_as_upstream_made_it"],
+        ),
+    ];
+
+    fn toml_file(path: &str) -> toml::Value {
+        toml::from_str(&repo_text(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// Every package Cargo.lock resolves under `name`, as (version, source).
+    fn locked(name: &str) -> Vec<(String, Option<String>)> {
+        let lock = toml_file("Cargo.lock");
+        lock["package"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|package| package["name"].as_str() == Some(name))
+            .map(|package| {
+                (
+                    package["version"].as_str().unwrap().to_string(),
+                    package
+                        .get("source")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_lock_holds_one_saorsa_core_the_vendored_copy() {
+        let manifest = toml_file("Cargo.toml");
+        assert_eq!(
+            manifest["patch"]["crates-io"]["saorsa-core"]["path"].as_str(),
+            Some("vendor/saorsa-core"),
+            "[patch.crates-io] must put vendor/saorsa-core in place of the crates.io release"
+        );
+        assert_eq!(
+            manifest["dependencies"]["saorsa-core"].as_str(),
+            Some(SAORSA_CORE_VERSION)
+        );
+        let vendored = toml_file("vendor/saorsa-core/Cargo.toml");
+        assert_eq!(
+            vendored["package"]["version"].as_str(),
+            Some(SAORSA_CORE_VERSION)
+        );
+        let vcs = repo_text("vendor/saorsa-core/.cargo_vcs_info.json");
+        assert!(
+            vcs.contains(&format!("\"sha1\": \"{SAORSA_CORE_COMMIT}\"")),
+            "vendor/saorsa-core is not saorsa-core {SAORSA_CORE_VERSION}'s release: {vcs}"
+        );
+
+        // One saorsa-core, from the path (a path package has no source).
+        assert_eq!(
+            locked("saorsa-core"),
+            vec![(SAORSA_CORE_VERSION.to_string(), None)]
+        );
+        // One saorsa-transport: 0.38.2 from crates.io (ds.16's
+        // bump, Cargo.toml's direct requirement), which both this package's
+        // requirement and the vendored saorsa-core's accept.
+        let transport = locked("saorsa-transport");
+        assert_eq!(transport.len(), 1, "one saorsa-transport: {transport:?}");
+        let (version, source) = &transport[0];
+        assert_eq!(source.as_deref(), Some(CRATES_IO));
+        assert_eq!(version, SAORSA_TRANSPORT_VERSION);
+        assert_eq!(
+            manifest["dependencies"]["saorsa-transport"]["version"].as_str(),
+            Some(SAORSA_TRANSPORT_VERSION)
+        );
+        let version = semver::Version::parse(version).unwrap();
+        for (path, requirement) in [
+            (
+                "Cargo.toml",
+                &manifest["dependencies"]["saorsa-transport"]["version"],
+            ),
+            (
+                "vendor/saorsa-core/Cargo.toml",
+                &vendored["dependencies"]["saorsa-transport"]["version"],
+            ),
+        ] {
+            let requirement = semver::VersionReq::parse(requirement.as_str().unwrap()).unwrap();
+            assert!(
+                requirement.matches(&version),
+                "{path} requires saorsa-transport {requirement}; the lock has {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_verified_direct_address_is_dialled_before_a_relay() {
+        assert!(AddressType::Direct.priority() < AddressType::Relay.priority());
+        assert!(AddressType::Relay.priority() < AddressType::Unverified.priority());
+        assert!(AddressType::Unverified.priority() < AddressType::Lan.priority());
+
+        // Lookups order a peer's addresses as the dial plan dials them.
+        let entries = [
+            ("/ip4/192.168.1.10/udp/9003/quic", AddressType::Lan),
+            ("/ip6/2001:db8::9/udp/9002/quic", AddressType::Unverified),
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ];
+        let node = DHTNode {
+            peer_id: PeerId::from_bytes([7u8; 32]),
+            addresses: entries
+                .iter()
+                .map(|(address, _)| address.parse::<MultiAddr>().unwrap())
+                .collect(),
+            address_types: entries.iter().map(|(_, kind)| *kind).collect(),
+            distance: None,
+            reliability: 1.0,
+            address_authority: None,
+        };
+        assert_eq!(
+            node.address_type_labels_by_priority(),
+            vec!["direct", "relay", "unverified", "lan"]
+        );
+    }
+
+    #[test]
+    fn the_direct_first_tests_stay_and_run() {
+        for (path, names) in DIRECT_FIRST_TESTS {
+            let source = repo_text(path);
+            for name in *names {
+                assert!(
+                    source.contains(&format!("fn {name}()")),
+                    "{path} lost {name}, a test of direct-first dialling"
+                );
+            }
+        }
+        let test_workflow = repo_text(".github/workflows/test.yml");
+        assert!(
+            test_workflow.contains("run: cargo test --locked -p saorsa-core --lib"),
+            "test.yml no longer runs vendor/saorsa-core's own tests"
+        );
+    }
+}
+
 /// Every file under `tests/`, reviewed on 2026-10-25 when the suite was cut
 /// back to the tests that protect something. A file that isn't here, from an
 /// upstream merge or a new branch, fails the census below until it is
@@ -444,7 +640,9 @@ const TEST_FILES: &[&str] = &[
     "tests/e2e/pointer_replication.rs",
     "tests/e2e/replication.rs",
     "tests/e2e/settlement_version_gate.rs",
+    "tests/e2e/slim_proofs.rs",
     "tests/e2e/subtree_audit_testnet.rs",
+    "tests/e2e/sync_pages.rs",
     "tests/e2e/testnet.rs",
     "tests/e2e/verify_storage_gate.rs",
     "tests/fork_pins.rs",
@@ -457,6 +655,7 @@ const TEST_FILES: &[&str] = &[
     "tests/pointer_convergence.rs",
     "tests/price_multiplier.rs",
     "tests/record_weight.rs",
+    "tests/small_disks.rs",
     "tests/storage_scale.rs",
     "tests/test_seams.rs",
     "tests/webrtc_direct_devnet.rs",
@@ -526,6 +725,121 @@ fn every_test_file_is_reviewed() {
         "test files not in TEST_FILES (review each, then list it): {unreviewed:?}; \
          listed but gone (take them off the list): {missing:?}"
     );
+}
+
+/// "Full, not faulty": the one case in which the unheld-chunk penalty is
+/// waived, on each lane that charges it, through the one function every lane
+/// asks (`FullView::waives_unheld_penalty`). The bound on how long a node may
+/// answer "full" without the penalty is how long one "full" notice stays
+/// fresh: a node that keeps renewing it is never charged for being full, and
+/// one that stops is charged again once its last notice is that old.
+mod unheld_chunk_penalty {
+    use ant_node::replication::full::{
+        FullView, Lane, OwnQuote, UnheldAnswer, UnheldCase, FULL_NOTICE_FRESHNESS,
+    };
+    use saorsa_core::identity::PeerId;
+    use std::time::{Duration, Instant};
+
+    /// How long one "full" notice stays fresh: 40 minutes, two of the
+    /// longest neighbour-sync intervals.
+    const FRESHNESS: Duration = Duration::from_mins(40);
+
+    fn case<'a>(lane: Lane, peer: &'a PeerId, key: &'a [u8; 32]) -> UnheldCase<'a> {
+        UnheldCase {
+            lane,
+            peer,
+            key,
+            answer: UnheldAnswer::Absent,
+            commitment_pinned: false,
+            own_quote: if matches!(
+                lane,
+                Lane::PossessionFailed | Lane::PossessionNoAnswer | Lane::PointerPossession
+            ) {
+                OwnQuote::NotPaid
+            } else {
+                OwnQuote::NoProof
+            },
+        }
+    }
+
+    #[test]
+    fn a_full_notice_stays_fresh_for_forty_minutes() {
+        assert_eq!(FULL_NOTICE_FRESHNESS, FRESHNESS);
+    }
+
+    /// On every lane: no notice, a stale notice, a check pinned to the peer's
+    /// commitment, a key the peer was seen holding, the peer's own paid quote,
+    /// and an answer other than "absent" (no answer among them) are all
+    /// charged; a fresh notice for any other key is not.
+    #[test]
+    fn only_a_fresh_notice_for_a_key_never_seen_held_and_not_paid_for_is_waived() {
+        let view = FullView::default();
+        let peer = PeerId::from_bytes([1; 32]);
+        let other = PeerId::from_bytes([2; 32]);
+        let key = [7u8; 32];
+        let held = [8u8; 32];
+        let now = Instant::now();
+        for lane in Lane::ALL {
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &peer, &key), now),
+                "{lane:?}: no notice, charged"
+            );
+        }
+        view.marks.note_notice(peer, true, now);
+        view.seen.record(&peer, &held);
+        for lane in Lane::ALL {
+            let fresh = case(lane, &peer, &key);
+            assert!(view.waives_unheld_penalty(&fresh, now), "{lane:?}: waived");
+            assert!(
+                view.waives_unheld_penalty(
+                    &fresh,
+                    now + FRESHNESS.saturating_sub(Duration::from_secs(1))
+                ),
+                "{lane:?}: still fresh"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&fresh, now + FRESHNESS),
+                "{lane:?}: a stale notice is charged"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &other, &key), now),
+                "{lane:?}: another peer's notice is no notice"
+            );
+            let pinned = UnheldCase {
+                commitment_pinned: true,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&pinned, now),
+                "{lane:?}: a commitment-pinned check is charged"
+            );
+            assert!(
+                !view.waives_unheld_penalty(&case(lane, &peer, &held), now),
+                "{lane:?}: a key the peer was seen holding is charged"
+            );
+            let paid = UnheldCase {
+                own_quote: OwnQuote::PaidOrUnknown,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&paid, now),
+                "{lane:?}: a peer paid for the record is charged"
+            );
+            let unanswered = UnheldCase {
+                answer: UnheldAnswer::Other,
+                ..fresh
+            };
+            assert!(
+                !view.waives_unheld_penalty(&unanswered, now),
+                "{lane:?}: no answer, or any answer but absent, is charged"
+            );
+        }
+        // A peer that says it has left "full" is charged at once.
+        view.marks.note_notice(peer, false, now);
+        for lane in Lane::ALL {
+            assert!(!view.waives_unheld_penalty(&case(lane, &peer, &key), now));
+        }
+    }
 }
 
 /// How the payment check reads the chain, through the path a node takes
@@ -1845,10 +2159,11 @@ mod payment_encodings {
         }
     }
 
-    /// A single-node proof, as a client sends it with a PUT and nodes pass it
-    /// on: here two of the close group's quotes, enough to pin how the list
-    /// is laid out, with the payment's transaction and the commitment the
-    /// first quote is bound to (an opaque sidecar).
+    /// A single-node proof, as a client sends it with a PUT: here two of the
+    /// close group's quotes, enough to pin how the list is laid out, with the
+    /// payment's transaction and the commitment the first quote is bound to
+    /// (an opaque sidecar). Nodes pass on its slim form instead, pinned in
+    /// `a_slim_proof_keeps_its_bytes`.
     fn proof() -> PaymentProof {
         PaymentProof {
             proof_of_payment: ProofOfPayment {
@@ -1925,6 +2240,106 @@ mod payment_encodings {
         assert_eq!(decoded.tx_hashes, sample.tx_hashes);
         assert_eq!(decoded.commitment_sidecars, sample.commitment_sidecars);
         assert_eq!(serialize_single_node_proof(&decoded).unwrap(), pinned);
+    }
+
+    /// The address the slim pin's quotes name.
+    const SLIM_CONTENT: [u8; 32] = [0xAB; 32];
+
+    /// A quote the slim builder keeps or drops: on the pricing curve at its
+    /// key count, naming `SLIM_CONTENT`, with the rest of its fields from
+    /// `byte` as in `quote`.
+    fn on_curve_quote(byte: u8, committed: bool) -> PaymentQuote {
+        let count: usize = if committed { 70_000 } else { 0 };
+        PaymentQuote {
+            content: xor_name::XorName(SLIM_CONTENT),
+            price: ant_node::payment::calculate_price(count),
+            committed_key_count: u32::try_from(count).unwrap(),
+            ..quote(byte, committed)
+        }
+    }
+
+    /// A client's proof the slim builder reads: three quotes, two of them
+    /// at the median price (bound to a commitment) and a cheaper baseline
+    /// one, the payment's transaction, and a sidecar per quote.
+    fn slim_source() -> PaymentProof {
+        PaymentProof {
+            proof_of_payment: ProofOfPayment {
+                peer_quotes: vec![
+                    (EncodedPeerId::new([0x61; 32]), on_curve_quote(0x30, true)),
+                    (EncodedPeerId::new([0x62; 32]), on_curve_quote(0x40, false)),
+                    (EncodedPeerId::new([0x63; 32]), on_curve_quote(0x50, true)),
+                ],
+            },
+            tx_hashes: vec![TxHash::from([0x7B; 32])],
+            commitment_sidecars: vec![vec![0xC3], vec![0xC4], vec![0xC5]],
+        }
+    }
+
+    /// `slim_source()`'s slim form, as nodes pass it on in notices, offers
+    /// and pointer offers: the single-node tag (01), then the proof in
+    /// `MessagePack` with every byte field a byte string (c4), only the two
+    /// median-priced quotes in the client's order, the transaction hash, and
+    /// an empty sidecar list (90).
+    const PINNED_SLIM_PROOF: &str = "0193919292c420616161616161616161616161616161616161616161616161616161616161616198dc0020ccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccab92ce6acfc000ce075bccbcc4200000000000000000000000000000000000000000000000084ec55f0bf49d0000c4143131313131313131313131313131313131313131c403323232c40433333333ce00011170dc0020343434343434343434343434343434343434343434343434343434343434343492c420636363636363636363636363636363636363636363636363636363636363636398dc0020ccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccabccab92ce6acfc000ce075bccbcc4200000000000000000000000000000000000000000000000084ec55f0bf49d0000c4145151515151515151515151515151515151515151c403525252c40453535353ce00011170dc0020545454545454545454545454545454545454545454545454545454545454545491c4207b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b90";
+
+    /// The rmp-serde release ds.15 builds with, whose decoder reads the
+    /// pinned slim proof. A lock bump changes how a byte string decodes into
+    /// a `Vec<u8>` only with a new release, which then comes with a check
+    /// that the pinned bytes still decode as below.
+    const DS15_RMP_SERDE: &str = "1.3.1";
+
+    #[test]
+    fn a_slim_proof_keeps_its_bytes() {
+        let source = slim_source();
+        let slim = ant_node::payment::slim::slim_proof(&source, &SLIM_CONTENT)
+            .unwrap_or_else(|e| panic!("the slim builder declined the sample: {e}"));
+        let bytes = hex::encode(&slim);
+        assert!(
+            bytes == PINNED_SLIM_PROOF,
+            "
+A slim payment proof no longer matches its pinned bytes in tests/fork_pins.rs.              Nodes up to ds.15 decode these bytes in every fresh offer, paid notice and              pointer offer. Its bytes now:
+
+{bytes}
+"
+        );
+
+        // The pinned bytes, read with the decoder every release has: the two
+        // median-priced quotes with their signed bytes and hashes, the
+        // transaction, and no sidecars.
+        let pinned = hex::decode(PINNED_SLIM_PROOF).unwrap();
+        let decoded = deserialize_single_node_proof(&pinned)
+            .unwrap_or_else(|e| panic!("the pinned slim proof doesn't decode: {e}"));
+        let kept = &decoded.proof_of_payment.peer_quotes;
+        let expected = [
+            &source.proof_of_payment.peer_quotes[0],
+            &source.proof_of_payment.peer_quotes[2],
+        ];
+        assert_eq!(kept.len(), expected.len());
+        for ((id, quote), (want_id, want)) in kept.iter().zip(expected) {
+            assert_eq!(id, want_id);
+            assert_eq!(quote.hash(), want.hash());
+            assert_eq!(quote.bytes_for_sig(), want.bytes_for_sig());
+            assert_eq!(quote, want);
+        }
+        assert_eq!(decoded.tx_hashes, source.tx_hashes);
+        assert!(decoded.commitment_sidecars.is_empty());
+
+        // The decoder these bytes were checked with is ds.15's.
+        let lock = super::repo_text("Cargo.lock");
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"rmp-serde\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \""))
+                    .map(|v| v.trim_end_matches('"').to_string())
+            })
+            .expect("rmp-serde in Cargo.lock");
+        assert_eq!(
+            version, DS15_RMP_SERDE,
+            "rmp-serde moved from the release ds.15 builds; check the pinned slim proof still              decodes as ds.15 decodes it, then move DS15_RMP_SERDE"
+        );
     }
 
     #[test]
@@ -2007,5 +2422,108 @@ mod payment_encodings {
             assert_eq!(&decoded, quote, "{name}");
             assert_eq!(hex::encode(decoded.hash()), *hash, "{name}");
         }
+    }
+}
+
+/// The names of fresh replication's counters, which the network monitor reads
+/// from the traffic summary: holding notices and notices with a proof, offers
+/// sent and skipped, how holds end, peers left unserved, slim proofs
+/// declined, proofs refused for their form, possession checks by how each
+/// peer was served, the byte budget, and the warnings, as counts. A rename
+/// would zero the monitor's reading of it without an error.
+#[test]
+fn the_fresh_replication_counters_keep_their_names() {
+    assert_eq!(
+        ant_node::replication::fresh_metrics::SUMMARY_FIELDS,
+        [
+            "holding_notices_sent",
+            "held_answer_notices_sent",
+            "proof_notices_sent",
+            "holding_notices_received",
+            "proof_notices_received",
+            "offers_sent",
+            "offers_skipped_heard_from",
+            "offers_skipped_marked_full",
+            "holds_ended_early",
+            "holds_ended_at_hold",
+            "holds_ended_at_cap",
+            "peers_left_unserved",
+            "holds_without_proof",
+            "heard_from_not_kept",
+            "slim_proofs_declined",
+            "proofs_refused_form_notice",
+            "proofs_refused_form_offer",
+            "proofs_refused_form_pointer_offer",
+            "possession_checks_heard_from",
+            "possession_checks_marked_full",
+            "possession_checks_offered",
+            "possession_checks_waiting_budget",
+            "possession_budget_bytes_held",
+            "possession_failures_skipped",
+            "pop_verification_errors",
+            "paid_notify_rejected",
+            "paid_notify_dropped_at_admission",
+            "pointer_offers_refused",
+            "offer_answers_not_sent",
+        ]
+    );
+}
+
+/// The per-recipient send counters of every message between nodes keep
+/// their names and their message: `<stem>_sent_count` and `<stem>_sent_bytes`,
+/// beside the per-encoding `<stem>_tx_*` fields. The "full" notice's are at
+/// its own index, which the protocol names.
+#[test]
+fn the_per_recipient_send_counters_keep_their_names() {
+    const STEMS: [&str; 25] = [
+        "fresh_offer",
+        "fresh_response",
+        "paid_notify",
+        "neighbor_sync_request",
+        "neighbor_sync_response",
+        "verification_request",
+        "verification_response",
+        "fetch_request",
+        "fetch_response",
+        "audit_challenge",
+        "audit_response",
+        "subtree_audit_challenge",
+        "subtree_audit_response",
+        "subtree_byte_challenge",
+        "subtree_byte_response",
+        "get_commitment_by_pin",
+        "get_commitment_by_pin_response",
+        "pointer_fresh_offer",
+        "pointer_hints",
+        "pointer_fetch_request",
+        "pointer_fetch_response",
+        "pointer_state_request",
+        "pointer_state_response",
+        "neighbor_sync_page_request",
+        "neighbor_sync_page_response",
+    ];
+    let source: String = repo_text("src/replication/protocol.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (i, stem) in STEMS.iter().enumerate() {
+        for field in [
+            format!("{stem}_sent_count = sc({i})"),
+            format!("{stem}_sent_bytes = sb({i})"),
+        ] {
+            assert!(
+                source.contains(&field),
+                "src/replication/protocol.rs no longer logs `{field}`"
+            );
+        }
+    }
+    for field in [
+        "full_notice_sent_count = sc(FULL_NOTICE_INDEX)",
+        "full_notice_sent_bytes = sb(FULL_NOTICE_INDEX)",
+    ] {
+        assert!(
+            source.contains(field),
+            "src/replication/protocol.rs no longer logs `{field}`"
+        );
     }
 }
