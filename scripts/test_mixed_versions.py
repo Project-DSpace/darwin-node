@@ -1546,7 +1546,7 @@ def analyze(run):
                 decode_failures.append(f"{source}: {text[:400]}")
             for kind, pattern in PROOF_REFUSED:
                 if pattern.search(text):
-                    key = (role, release, kind)
+                    key = (role, own_release, kind)
                     proof_refusals[key] = proof_refusals.get(key, 0) + 1
             if TRUST_LINE in text:
                 found = fields(text)
