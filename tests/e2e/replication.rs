@@ -642,6 +642,11 @@ fn dummy_payment_proof() -> Vec<u8> {
 /// it. Its signature is a stand-in and it pays nothing on chain: receivers
 /// accept it only from the payment cache, which the tests fill.
 fn well_formed_payment_proof(address: &XorName) -> Vec<u8> {
+    well_formed_payment_proof_from(address, [0x5D; 32])
+}
+
+/// [`well_formed_payment_proof`], its one quote issued by `issuer`.
+fn well_formed_payment_proof_from(address: &XorName, issuer: [u8; 32]) -> Vec<u8> {
     use ant_node::payment::{calculate_price, serialize_single_node_proof, PaymentProof};
     use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 
@@ -657,7 +662,7 @@ fn well_formed_payment_proof(address: &XorName) -> Vec<u8> {
     };
     serialize_single_node_proof(&PaymentProof {
         proof_of_payment: ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::new([0x5D; 32]), quote)],
+            peer_quotes: vec![(EncodedPeerId::new(issuer), quote)],
         },
         tx_hashes: vec![],
         commitment_sidecars: vec![],
@@ -1120,11 +1125,10 @@ async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
 
     harness.prepopulate_payment_cache_everywhere(&address);
 
-    let dummy_proof = dummy_payment_proof();
     let offer = FreshReplicationOffer {
         key: address,
         data: content.clone(),
-        proof_of_payment: dummy_proof.clone(),
+        proof_of_payment: dummy_payment_proof(),
     };
     let response = send_replication_request(
         checker_p2p,
@@ -1173,9 +1177,15 @@ async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
         .await
         .expect("put on checker");
 
+    // A proof the slim builder forwards, so the checker offers the record and
+    // checks its close group (a proof it can't slim sends holding notices
+    // only). Its paid quote is the full node's own, so the full node is
+    // charged for not holding the record whether or not the checker marks it
+    // full.
     let trust_before = checker_p2p.peer_trust(&full_peer);
+    let pop = well_formed_payment_proof_from(&address, *full_peer.as_bytes());
     checker_engine
-        .replicate_fresh(&address, &content, &dummy_proof)
+        .replicate_fresh(&address, &content, &pop)
         .await;
 
     let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
