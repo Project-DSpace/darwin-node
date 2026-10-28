@@ -537,7 +537,14 @@ impl Chain {
     }
 
     /// The vaults' logs matching `topics` (`None` = any) in blocks
-    /// `from..=to`: one query for every vault of `vaults`.
+    /// `from..=to`. Each vault is asked in its own `eth_getLogs`, naming its
+    /// one address, and with a root vault both queries go together in one
+    /// batch, their logs merged in the chain's order (block, then log
+    /// index). Providers allow a much narrower block range when any position
+    /// of the filter is a list: Robinhood's RPC allows 100,000 blocks for
+    /// such a query and 10,000,000 for one with a single value in each
+    /// position, so a list of both addresses would narrow every search. A
+    /// node with no root vault sends the one query it always did.
     async fn vault_logs(
         &self,
         vaults: &VaultSet,
@@ -553,29 +560,39 @@ impl Chain {
                 })
             })
             .collect();
-        let addresses: Vec<String> = vaults
+        let queries: Vec<Value> = vaults
             .addresses()
             .iter()
-            .map(|vault| format!("0x{}", hex::encode(vault)))
+            .map(|vault| {
+                json!([{
+                    "address": format!("0x{}", hex::encode(vault)),
+                    "fromBlock": quantity(from),
+                    "toBlock": quantity(to),
+                    "topics": topics,
+                }])
+            })
             .collect();
-        // One vault is named alone, as before a root vault was known.
-        let address = match addresses.as_slice() {
-            [one] => json!(one),
-            _ => json!(addresses),
+        let answers = match queries.as_slice() {
+            // The per-quote vault alone: one call, as before a root vault
+            // was known.
+            [one] => vec![self.call("eth_getLogs", one.clone()).await?],
+            _ => self.batch("eth_getLogs", &queries).await?,
         };
-        let filter = json!({
-            "address": address,
-            "fromBlock": quantity(from),
-            "toBlock": quantity(to),
-            "topics": topics,
-        });
-        let logs = self.call("eth_getLogs", json!([filter])).await?;
-        let logs = logs
-            .as_array()
-            .ok_or_else(|| malformed("logs are not a list"))?;
-        logs.iter()
-            .map(|log| parse_vault_log(log).ok_or_else(|| malformed("a log is incomplete")))
-            .collect()
+        let mut found = Vec::new();
+        for logs in &answers {
+            let logs = logs
+                .as_array()
+                .ok_or_else(|| malformed("logs are not a list"))?;
+            for log in logs {
+                found.push(parse_vault_log(log).ok_or_else(|| malformed("a log is incomplete"))?);
+            }
+        }
+        if answers.len() > 1 {
+            // Each vault's logs come in the chain's order; merged, so do
+            // all of them together.
+            found.sort_by_key(|log| (log.block_number, log.log_index));
+        }
+        Ok(found)
     }
 
     /// The receipt of each of the first [`MAX_RECEIPTS`] transactions among
@@ -610,11 +627,43 @@ impl Chain {
                 return rpc_result(method, &mock.lock().answer(method, &params));
             }
         }
+        self.through_rpcs(|index| self.call_rpc(&self.rpc_urls[index], method, &params))
+            .await
+    }
+
+    /// Call `method` once with each of `params`, together in one JSON-RPC
+    /// batch, on the RPC that last answered, then on the others in turn
+    /// until one answers every call: the results in the order of `params`,
+    /// or every RPC's error if none does. An RPC that fails any call of the
+    /// batch counts as failing it all.
+    async fn batch(&self, method: &str, params: &[Value]) -> Result<Vec<Value>> {
+        #[cfg(test)]
+        {
+            let mock = self.mock.lock().clone();
+            if let Some(mock) = mock {
+                mock.lock().batches += 1;
+                return params
+                    .iter()
+                    .map(|params| rpc_result(method, &mock.lock().answer(method, params)))
+                    .collect();
+            }
+        }
+        self.through_rpcs(|index| self.batch_rpc(&self.rpc_urls[index], method, params))
+            .await
+    }
+
+    /// `send` to the RPC that last answered, then to the others in turn
+    /// until one answers; every RPC's error if none does. `send` takes the
+    /// RPC's index in `rpc_urls`.
+    async fn through_rpcs<T, F>(&self, send: impl Fn(usize) -> F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
         let count = self.rpc_urls.len();
         let first = self.answered.load(Ordering::Relaxed) % count;
         let mut errors = Vec::new();
         for index in (0..count).map(|offset| (first + offset) % count) {
-            match self.call_rpc(&self.rpc_urls[index], method, &params).await {
+            match send(index).await {
                 Ok(result) => {
                     self.answered.store(index, Ordering::Relaxed);
                     return Ok(result);
@@ -643,6 +692,45 @@ impl Chain {
             .await
             .map_err(|e| Error::Network(format!("payment chain {method}: {e}")))?;
         rpc_result(method, &response)
+    }
+
+    async fn batch_rpc(&self, rpc_url: &str, method: &str, params: &[Value]) -> Result<Vec<Value>> {
+        let requests: Vec<Value> = params
+            .iter()
+            .enumerate()
+            .map(|(id, params)| {
+                json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+            })
+            .collect();
+        let response: Value = self
+            .http
+            .post(rpc_url)
+            .json(&requests)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| Error::Network(format!("payment chain {method} batch: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::Network(format!("payment chain {method} batch: {e}")))?;
+        let Some(answers) = response.as_array() else {
+            // A provider that takes no batches answers with one error.
+            rpc_result(method, &response)?;
+            return Err(malformed("a batch's answer is not a list"));
+        };
+        let mut results: Vec<Option<Value>> = vec![None; params.len()];
+        for answer in answers {
+            let slot = answer["id"]
+                .as_u64()
+                .and_then(|id| usize::try_from(id).ok())
+                .and_then(|id| results.get_mut(id))
+                .ok_or_else(|| malformed("a batch's answer names no call of it"))?;
+            *slot = Some(rpc_result(method, answer)?);
+        }
+        results
+            .into_iter()
+            .map(|result| result.ok_or_else(|| malformed("a batch's call went unanswered")))
+            .collect()
     }
 }
 
@@ -841,6 +929,15 @@ pub mod tests {
         pub logs: Vec<MockLog>,
         /// `eth_getLogs` refuses ranges wider than this.
         pub max_log_range: Option<u64>,
+        /// `eth_getLogs` refuses ranges wider than this when any position of
+        /// its filter (the address or a topic) is a list, as Robinhood's RPC
+        /// caps such queries at 100,000 blocks against 10,000,000 for single
+        /// values.
+        pub max_list_log_range: Option<u64>,
+        /// The filter of every `eth_getLogs` call made, in order.
+        pub log_filters: Vec<Value>,
+        /// How many JSON-RPC batches were sent, served or in process.
+        pub batches: usize,
         /// The calls this says fail, by method and parameters, with an
         /// error as an overloaded provider's.
         pub fails: Option<FailingCalls>,
@@ -905,9 +1002,22 @@ pub mod tests {
                     let from = parse_u64(filter["fromBlock"].as_str().unwrap()).unwrap();
                     let to = parse_u64(filter["toBlock"].as_str().unwrap()).unwrap();
                     self.log_ranges.push((from, to));
+                    self.log_filters.push(filter.clone());
                     if self.max_log_range.is_some_and(|max| to - from + 1 > max) {
                         return json!({ "jsonrpc": "2.0", "id": 1,
                             "error": { "code": -32005, "message": "range too large" } });
+                    }
+                    let lists = filter["address"].is_array()
+                        || filter["topics"]
+                            .as_array()
+                            .is_some_and(|topics| topics.iter().any(Value::is_array));
+                    if lists
+                        && self
+                            .max_list_log_range
+                            .is_some_and(|max| to - from + 1 > max)
+                    {
+                        return json!({ "jsonrpc": "2.0", "id": 1,
+                            "error": { "code": -32602, "message": "block range too large" } });
                     }
                     // One address, or a list of them.
                     let addresses: Vec<[u8; 20]> = match &filter["address"] {
@@ -951,6 +1061,43 @@ pub mod tests {
             json!({ "jsonrpc": "2.0", "id": 1, "result": result })
         }
 
+        /// The JSON-RPC response to `request`, one call or a batch of them,
+        /// or `None` for HTTP 403 when it calls a [`Self::refused`] method.
+        fn answer_request(&mut self, request: &Value) -> Option<Value> {
+            let batch = request.as_array().cloned();
+            if batch.is_some() {
+                self.batches += 1;
+            }
+            let requests = batch.unwrap_or_else(|| vec![request.clone()]);
+            let methods: Vec<&str> = requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect();
+            // A refused method refuses its whole batch.
+            if methods.iter().any(|method| self.refused.contains(method)) {
+                for method in methods {
+                    self.calls.push(method.to_string());
+                }
+                return None;
+            }
+            let mut answers: Vec<Value> = requests
+                .iter()
+                .map(|request| {
+                    let method = request["method"].as_str().unwrap();
+                    let mut answer = self.answer(method, &request["params"]);
+                    answer["id"] = request["id"].clone();
+                    answer
+                })
+                .collect();
+            if request.is_array() {
+                // Answers in a batch can come in any order.
+                answers.reverse();
+                Some(json!(answers))
+            } else {
+                answers.pop()
+            }
+        }
+
         /// Serve this chain; returns its URL.
         pub async fn serve(chain: Arc<Mutex<Self>>) -> String {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -961,16 +1108,7 @@ pub mod tests {
                     tokio::spawn(async move {
                         while let Some(body) = read_request(&mut socket).await {
                             let request: Value = serde_json::from_slice(&body).unwrap();
-                            let method = request["method"].as_str().unwrap();
-                            let response = {
-                                let mut chain = chain.lock();
-                                if chain.refused.iter().any(|refused| *refused == method) {
-                                    chain.calls.push(method.to_string());
-                                    None
-                                } else {
-                                    Some(chain.answer(method, &request["params"]))
-                                }
-                            };
+                            let response = chain.lock().answer_request(&request);
                             let reply = match response {
                                 Some(response) => {
                                     let body = response.to_string();
@@ -1387,6 +1525,186 @@ pub mod tests {
         let found = chain.fetch(&lookup, &shown, &VAULTS, Search::Brief).await;
         assert_eq!(found.unwrap().len(), 1);
         assert_eq!(refusing.lock().calls.len(), refused_before);
+    }
+
+    /// A root vault of the tests below.
+    const ROOT: ant_listings::RootVault = ant_listings::RootVault {
+        address: [0x6a; 20],
+        token: [0x70; 20],
+    };
+
+    /// The mock chain's vault and [`ROOT`].
+    const WITH_ROOT: VaultSet = VaultSet::with_root(VAULT, ROOT);
+
+    /// A chain of 150,001 blocks capping list filters at 100,000 as
+    /// Robinhood's RPC does, where quote `[5; 32]` is paid by the per-quote
+    /// vault in block 100,000 (log index 4) and by [`ROOT`] in block 50,000
+    /// (log index 9).
+    fn paid_by_both_vaults() -> MockChain {
+        let mut chain = chain_with(150_001, &[(100_000, 5)]);
+        let mut root_log = vault_log([5; 32], 9);
+        root_log.address = ROOT.address;
+        chain.add_receipt(PaymentReceipt {
+            tx_hash: [6; 32],
+            success: true,
+            block_number: 50_000,
+            logs: vec![root_log],
+        });
+        chain.max_list_log_range = Some(100_000);
+        chain
+    }
+
+    /// Where each of `logs` is, in order.
+    fn located(logs: &[VaultLog]) -> Vec<(u64, u64)> {
+        logs.iter()
+            .map(|log| (log.block_number, log.log_index))
+            .collect()
+    }
+
+    /// With a root vault, each vault is asked in its own `eth_getLogs`
+    /// naming its one address, both in one batch, over a range wider than
+    /// Robinhood allows a list filter; their logs come merged in the chain's
+    /// order. A filter naming both is refused over that range.
+    #[tokio::test]
+    async fn a_node_with_a_root_vault_asks_each_vault_alone_in_one_batch() {
+        let (chain, mock) = client(paid_by_both_vaults()).await;
+        let topics = [Some(DATA_PAYMENT_MADE_TOPIC), None, None, Some([5; 32])];
+
+        let logs = chain
+            .vault_logs(&WITH_ROOT, &topics, 0, 150_000)
+            .await
+            .unwrap();
+        assert_eq!(located(&logs), vec![(50_000, 9), (100_000, 4)]);
+        let filters = std::mem::take(&mut mock.lock().log_filters);
+        assert_eq!(mock.lock().batches, 1, "both queries in one batch");
+        let addresses: Vec<&Value> = filters.iter().map(|f| &f["address"]).collect();
+        assert_eq!(
+            addresses,
+            vec![
+                &json!(format!("0x{}", hex::encode(VAULT))),
+                &json!(format!("0x{}", hex::encode(ROOT.address))),
+            ]
+        );
+        for filter in &filters {
+            assert_eq!(filter["fromBlock"], json!("0x0"));
+            assert_eq!(filter["toBlock"], json!(quantity(150_000)));
+            assert_eq!(filters[0]["topics"], filter["topics"]);
+        }
+
+        // The same answered in process.
+        let in_process = Chain::new("http://127.0.0.1:9".into()).unwrap();
+        in_process.answer_from(Arc::clone(&mock));
+        let again = in_process
+            .vault_logs(&WITH_ROOT, &topics, 0, 150_000)
+            .await
+            .unwrap();
+        assert_eq!(again, logs);
+
+        // What a list of both addresses would have met.
+        let mut both = filters[0].clone();
+        both["address"] = json!([filters[0]["address"], filters[1]["address"]]);
+        let refused = chain.call("eth_getLogs", json!([both])).await;
+        assert!(
+            format!("{refused:?}").contains("block range too large"),
+            "{refused:?}"
+        );
+
+        // A quote's search over the whole chain takes one round, and finds
+        // both payments.
+        mock.lock().log_ranges.clear();
+        let lookup = Lookup::Quote {
+            quote_hash: [5; 32],
+            block_number: None,
+            search_from: 0,
+            not_after: None,
+        };
+        let found = chain
+            .fetch(
+                &lookup,
+                &ListingPayment::default(),
+                &WITH_ROOT,
+                Search::Full,
+            )
+            .await
+            .unwrap();
+        let blocks: Vec<u64> = found
+            .iter()
+            .map(|(receipt, _)| receipt.as_ref().unwrap().block_number)
+            .collect();
+        assert_eq!(blocks, vec![50_000, 100_000]);
+        assert_eq!(mock.lock().log_ranges, vec![(0, 150_000), (0, 150_000)]);
+    }
+
+    /// Without a root vault, a node sends the one query it always did: one
+    /// call, not a batch, naming the per-quote vault's address alone.
+    #[tokio::test]
+    async fn a_node_without_a_root_vault_sends_its_one_query_as_before() {
+        let (chain, mock) = client(paid_by_both_vaults()).await;
+        let topics = [Some(DATA_PAYMENT_MADE_TOPIC), None, None, Some([5; 32])];
+        let logs = chain
+            .vault_logs(&VAULTS, &topics, 0, 150_000)
+            .await
+            .unwrap();
+        assert_eq!(located(&logs), vec![(100_000, 4)]);
+        assert_eq!(mock.lock().batches, 0);
+        assert_eq!(
+            mock.lock().log_filters,
+            vec![json!({
+                "address": format!("0x{}", hex::encode(VAULT)),
+                "fromBlock": "0x0",
+                "toBlock": quantity(150_000),
+                "topics": [
+                    format!("0x{}", hex::encode(DATA_PAYMENT_MADE_TOPIC)),
+                    null,
+                    null,
+                    format!("0x{}", hex::encode([5u8; 32])),
+                ],
+            })]
+        );
+    }
+
+    /// An RPC that refuses a batch, or fails any call in it, fails it all:
+    /// the batch goes to the next RPC whole.
+    #[tokio::test]
+    async fn a_batch_an_rpc_fails_goes_to_the_next_one() {
+        let topics = [Some(DATA_PAYMENT_MADE_TOPIC), None, None, Some([5; 32])];
+        let root = json!(format!("0x{}", hex::encode(ROOT.address)));
+        let mut refusing = paid_by_both_vaults();
+        refusing.refused = vec!["eth_getLogs"];
+        let mut failing = paid_by_both_vaults();
+        failing.fails = Some(Box::new(move |method, params| {
+            method == "eth_getLogs" && params[0]["address"] == root
+        }));
+        let [refusing, failing, answering] =
+            [refusing, failing, paid_by_both_vaults()].map(|chain| Arc::new(Mutex::new(chain)));
+        let urls = vec![
+            MockChain::serve(Arc::clone(&refusing)).await,
+            MockChain::serve(Arc::clone(&failing)).await,
+            MockChain::serve(Arc::clone(&answering)).await,
+        ];
+        let chain = Chain::with_rpcs(urls).unwrap();
+        let logs = chain
+            .vault_logs(&WITH_ROOT, &topics, 0, 150_000)
+            .await
+            .unwrap();
+        assert_eq!(located(&logs), vec![(50_000, 9), (100_000, 4)]);
+        assert_eq!(refusing.lock().batches, 1);
+        assert_eq!(failing.lock().batches, 1);
+        assert_eq!(answering.lock().batches, 1);
+
+        // Through the first two alone, every RPC's error.
+        let error = Chain::with_rpcs(vec![
+            MockChain::serve(Arc::clone(&refusing)).await,
+            MockChain::serve(Arc::clone(&failing)).await,
+        ])
+        .unwrap()
+        .vault_logs(&WITH_ROOT, &topics, 0, 150_000)
+        .await;
+        let error = format!("{error:?}");
+        assert!(
+            error.contains("403") && error.contains("rate limited"),
+            "{error}"
+        );
     }
 
     #[test]
