@@ -2727,6 +2727,18 @@ const REPLICATION_MESSAGES: &[(&str, &str)] = &[
     ("PointerFetchResponse", "The pointer record."),
     ("PointerStateRequest", "Which pointer states a peer holds."),
     ("PointerStateResponse", "Its answer."),
+    (
+        "NeighborSyncPageRequest",
+        "One page of a paged neighbour-sync exchange, sent only to a peer known to read pages.",
+    ),
+    (
+        "NeighborSyncPageResponse",
+        "The responder's page, or busy, sent only to a peer that sent a page.",
+    ),
+    (
+        "FullNotice",
+        "The sender is full, or has left full: one-way, sent only to a peer known to read it.",
+    ),
 ];
 
 /// Every message the chunk protocol carries, every kind of payment proof, and
