@@ -2280,9 +2280,9 @@ fn every_place_that_decides_by_proof_type_is_reviewed() {
 
 /// The peer whose quote a root proof paid is charged on the possession check
 /// after a write whatever its refusal of the fresh offer says: a node paid
-/// for a record it then can't take is charged. Only an unpaid quoted peer's
-/// payment-verification refusal is excused, and only where the offer's
-/// refusals are noted.
+/// for a record it then can't take is charged. Only another peer's
+/// payment-verification refusal is excused, whether or not the proof holds a
+/// quote from it, and only where the offer's refusals are noted.
 #[test]
 fn the_paid_peer_of_a_root_offer_is_always_charged() {
     use crate::replication::fresh::{
@@ -2301,11 +2301,9 @@ fn the_paid_peer_of_a_root_offer_is_always_charged() {
 
     let paid = PeerId::from_bytes([2; 32]);
     let unpaid = PeerId::from_bytes([1; 32]);
-    let targets = vec![unpaid, paid, PeerId::from_bytes([3; 32])];
-    let quotes = RootQuotes {
-        quoted: [unpaid, paid].into_iter().collect(),
-        paid: Some(paid),
-    };
+    let unquoted = PeerId::from_bytes([3; 32]);
+    let targets = vec![unpaid, paid, unquoted];
+    let quotes = RootQuotes { paid: Some(paid) };
     let key = [0x42; 32];
     let error = format!("{PAYMENT_VERIFICATION_ERROR}: no root vault configured");
     let failed = format!("{PAYMENT_VERIFICATION_FAILED}: payment required");
@@ -2320,9 +2318,34 @@ fn the_paid_peer_of_a_root_offer_is_always_charged() {
              possession check after refusing its fresh offer with {reason:?}.\n\n\
              A node paid for a record it then can't take is charged. The refusal's reason \
              is the peer's own word, so the paid peer is charged whatever it says; only an \
-             unpaid quoted peer's payment-verification refusal is excused \
+             unpaid peer's payment-verification refusal is excused \
              (src/replication/fresh.rs, RootOfferRefusals::note_refusal).\n"
         );
+    }
+
+    // Any other peer, quoted or not, is charged for every refusal but a
+    // payment-verification one. Offers carry the slim proof, whose unpaid
+    // quotes are only the median-priced ones, so an excuse that turned on
+    // being unquoted would excuse most of the close group for any reason.
+    for peer in [unpaid, unquoted] {
+        for reason in [
+            "Not in storage-admission range for this key",
+            "Out of space",
+            "",
+        ] {
+            let offers = RootOfferRefusals::default();
+            offers.open(1, key, &targets, &quotes);
+            let refusal = offers.note_refusal(1, &peer, &key, reason);
+            let checked = offers.close(1, targets.clone());
+            assert!(
+                refusal == Refusal::Charged && checked.contains(&peer),
+                "\nA peer whose quote a root proof did not pay was excused from the key's \
+                 possession check after refusing its fresh offer with {reason:?}.\n\n\
+                 Only a payment-verification refusal is excused, whether or not the slim \
+                 proof holds a quote from the peer: a node that can't check a root proof \
+                 refuses there (src/replication/fresh.rs, RootOfferRefusals::note_refusal).\n"
+            );
+        }
     }
 
     let report = unreviewed(Counting::Calls(EXCUSE), EXCUSED_AT);
@@ -2818,21 +2841,19 @@ const PROOF_TYPE_SITES: &[Reviewed] = &[
         "detect_proof_type",
         1,
     ),
-    // Whether a fresh offer is root-paid, which peers its proof holds a quote
-    // from and whose quote it paid, so a refusing peer the proof holds no
-    // quote from is left out of the key's possession check and the paid one
-    // never is: root proofs only; single-node,
-    // merkle, unknown tags and a root proof that doesn't decode are checked
-    // as before.
+    // Whether a fresh offer is root-paid and whose quote its proof paid, so
+    // the paid peer is never left out of the key's possession check: root
+    // proofs only; single-node, merkle, unknown tags and a root proof that
+    // doesn't decode are checked as before.
     (
         "src/replication/fresh.rs",
-        "root_quoted_peers",
+        "root_quotes",
         "detect_proof_type",
         1,
     ),
     (
         "src/replication/fresh.rs",
-        "root_quoted_peers",
+        "root_quotes",
         "deserialize_root_proof",
         1,
     ),

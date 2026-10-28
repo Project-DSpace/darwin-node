@@ -170,14 +170,16 @@ pub(crate) struct FreshOfferContext {
 /// a quote in a root proof doesn't show that its peer can check a root proof;
 /// an older node or one with no root vault may have given it at version 2,
 /// to a client that mixes quotes of both versions or during a mixed-version
-/// rollout. Such a peer refuses the offer at payment verification. A refusal
-/// whose reason is a payment-verification refusal
-/// ([`is_payment_refusal`]) is therefore excused from an unpaid quoted peer,
-/// as payment outcomes are never charged on the receiving side either. A
-/// peer the proof holds no quote from is excused whatever its reason. A
-/// quoted peer that refuses for any other reason (out of range, out of
-/// space, a failed write) stays in the possession check, charged as a
-/// missing chunk as every refusal of a single-node offer is.
+/// rollout. A node with no root vault refuses a root proof at payment
+/// verification, and nowhere earlier: the checks before it (the proof's
+/// size, the record's size and address, storage-admission range, free
+/// space) read nothing of the proof's tag. So a refusal is excused exactly
+/// when its reason is a payment-verification refusal
+/// ([`is_payment_refusal`]), whether or not the proof holds a quote from the
+/// peer, as payment outcomes are never charged on the receiving side either.
+/// A peer that refuses for any other reason (out of range, out of space, a
+/// failed write) stays in the possession check, charged as a missing chunk
+/// as every refusal of a single-node offer is.
 ///
 /// The peer of the paid quote (the quote whose hash the root proof names,
 /// paid straight to its payee) is never excused, whatever its reason: a
@@ -185,14 +187,21 @@ pub(crate) struct FreshOfferContext {
 /// peer's own word, so a paid peer refusing at payment verification would
 /// otherwise keep the payment and skip the check; the same holds when a
 /// client paid a version-2 quote through the root vault. The quotes are not
-/// signature-checked here: a client that lists a peer it never asked only
-/// narrows that peer's excuse to payment refusals, or removes it when it
-/// names that peer's quote as the paid one.
+/// signature-checked here: a client that names another peer's quote as the
+/// paid one only moves that always-charged place to that peer.
 ///
 /// Offers carry the slim proof ([`crate::payment::slim`]), which keeps only
-/// the median-priced quotes, the paid one always among them. So the quoted
-/// peers here are those quotes' peers: a peer whose unpaid quote was off the
-/// median counts as one the proof holds no quote from.
+/// the median-priced quotes, the paid one always among them, so the paid
+/// quote's peer is read from the slim proof. Which unpaid quotes the slim
+/// proof keeps changes nothing here: no excuse depends on them.
+///
+/// What stays open: any peer other than the paid one can word its refusal as
+/// a payment-verification refusal and so be left out of the key's possession
+/// check for that offer, whatever its real reason. That is inherent: a node
+/// that can't check a root proof is told from any other only by its own
+/// word, and the reason is neither signed nor checked. The peer is still
+/// checked for the record at any later possession check, and neighbour
+/// sync places the record with it.
 ///
 /// Single-node offers are not tracked, and a peer that accepts a root-paid
 /// offer, or doesn't answer, is checked as before. A node answers a one-way
@@ -207,24 +216,21 @@ pub(crate) struct RootOfferRefusals {
     offers: parking_lot::Mutex<HashMap<u64, RootOffer>>,
 }
 
-/// One root-paid offer: the key, the peers it was sent to, those of them
-/// the proof holds a quote from, the peer of the paid quote, and those
-/// excused for refusing it.
+/// One root-paid offer: the key, the peers it was sent to, the peer of the
+/// paid quote, and those excused for refusing it.
 struct RootOffer {
     key: XorName,
     targets: HashSet<PeerId>,
-    quoted: HashSet<PeerId>,
     paid: Option<PeerId>,
     refused: HashSet<PeerId>,
 }
 
-/// The peers a root proof holds a quote from, and the peer of the quote it
-/// paid: the quote whose hash is the proof's paid quote hash. `paid` is
-/// `None` only when no quote has that hash, a proof this node's own
+/// What the possession check reads of a root proof's quotes: the peer of the
+/// quote it paid, the quote whose hash is the proof's paid quote hash.
+/// `paid` is `None` only when no quote has that hash, a proof this node's own
 /// verification refuses before it sends any offer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RootQuotes {
-    pub(crate) quoted: HashSet<PeerId>,
     pub(crate) paid: Option<PeerId>,
 }
 
@@ -234,14 +240,13 @@ pub(crate) enum Refusal {
     /// Not a refusal of a tracked root-paid offer, by a peer it was sent to,
     /// naming its key: nothing changes.
     Untracked,
-    /// The proof holds no quote from the peer, or the peer's unpaid quote
-    /// is in it and the peer refused at payment verification, so it may be
-    /// one that can't check a root proof: it is left out of the possession
-    /// check.
+    /// The peer's quote is not the paid one and it refused at payment
+    /// verification, so it may be one that can't check a root proof: it is
+    /// left out of the possession check.
     Excused,
     /// The peer's quote is the paid one, whatever its reason, or the peer
-    /// quoted the key and refused for a reason other than payment
-    /// verification: it stays in the possession check.
+    /// refused for a reason other than payment verification: it stays in the
+    /// possession check.
     Charged,
 }
 
@@ -256,13 +261,11 @@ impl RootOfferRefusals {
         proof: &RootQuotes,
     ) {
         let targets: HashSet<PeerId> = targets.iter().copied().collect();
-        let quoted = targets.intersection(&proof.quoted).copied().collect();
         self.offers.lock().insert(
             request_id,
             RootOffer {
                 key,
                 targets,
-                quoted,
                 paid: proof.paid,
                 refused: HashSet::new(),
             },
@@ -272,8 +275,8 @@ impl RootOfferRefusals {
     /// Note that `source` refused the offer `request_id` of `key`, giving
     /// `reason`. Only a peer the offer was sent to, naming the offer's key,
     /// counts. The peer of the paid quote is charged whatever `reason` is;
-    /// another is excused when the proof holds no quote from it or when
-    /// `reason` is a payment-verification refusal.
+    /// another is excused only when `reason` is a payment-verification
+    /// refusal, whether or not the proof holds a quote from it.
     pub(crate) fn note_refusal(
         &self,
         request_id: u64,
@@ -288,10 +291,7 @@ impl RootOfferRefusals {
         if offer.key != *key || !offer.targets.contains(source) {
             return Refusal::Untracked;
         }
-        if offer.paid == Some(*source) {
-            return Refusal::Charged;
-        }
-        if offer.quoted.contains(source) && !is_payment_refusal(reason) {
+        if offer.paid == Some(*source) || !is_payment_refusal(reason) {
             return Refusal::Charged;
         }
         offer.refused.insert(*source);
@@ -356,20 +356,15 @@ pub(crate) fn is_root_paid(proof_of_payment: &[u8]) -> bool {
     }
 }
 
-/// For a proof that pays through the root vault, the peers it holds a quote
-/// from and the peer of the quote it paid; a peer outside them that can't
-/// check a root proof may refuse the offer. `None` for any other proof, and
-/// for a root proof that doesn't decode, whose offer is then checked as a
-/// single-node one is.
-fn root_quoted_peers(proof_of_payment: &[u8]) -> Option<RootQuotes> {
+/// For a proof that pays through the root vault, the peer of the quote it
+/// paid, which is charged whatever its refusal of the offer says. `None` for
+/// any other proof, and for a root proof that doesn't decode, whose offer is
+/// then checked as a single-node one is.
+fn root_quotes(proof_of_payment: &[u8]) -> Option<RootQuotes> {
     match detect_proof_type(proof_of_payment) {
         Some(ProofType::Root) => deserialize_root_proof(proof_of_payment).ok().map(|proof| {
             let peer_quotes = &proof.payment.proof_of_payment.peer_quotes;
             RootQuotes {
-                quoted: peer_quotes
-                    .iter()
-                    .map(|(peer, _)| PeerId::from_bytes(*peer.as_bytes()))
-                    .collect(),
                 paid: peer_quotes
                     .iter()
                     .find(|(_, quote)| quote.hash() == proof.quote_hash)
@@ -517,7 +512,7 @@ pub(crate) async fn send_fresh_offers(
     // the median-priced quotes, so it names the same issuers as the full one.
     let paid_quote_issuers = crate::replication::full::paid_quote_issuers(&proof_of_payment);
 
-    let root_quoted = root_quoted_peers(&proof_of_payment);
+    let root_quoted = root_quotes(&proof_of_payment);
     let offer = FreshReplicationOffer {
         key: *key,
         data,
@@ -1519,71 +1514,70 @@ mod tests {
     }
 
     /// Only a root proof makes an offer one a peer may refuse unpenalised,
-    /// and it names the peers it holds a quote from and the peer of the
-    /// quote it paid.
+    /// and it names the peer of the quote it paid.
     #[test]
     fn only_a_root_proof_is_root_paid() {
         use crate::ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_ROOT, PROOF_TAG_SINGLE_NODE};
 
+        assert_eq!(root_quotes(&root_proof(&[])), Some(RootQuotes::default()));
         assert_eq!(
-            root_quoted_peers(&root_proof(&[])),
-            Some(RootQuotes::default())
-        );
-        let quoted: HashSet<PeerId> = [peer(4), peer(5), peer(6)].into_iter().collect();
-        assert_eq!(
-            root_quoted_peers(&root_proof(&[peer(4), peer(5), peer(6)])),
-            Some(RootQuotes {
-                quoted: quoted.clone(),
-                paid: None,
-            })
+            root_quotes(&root_proof(&[peer(4), peer(5), peer(6)])),
+            Some(RootQuotes { paid: None })
         );
         assert_eq!(
-            root_quoted_peers(&root_proof_paying(&[peer(4), peer(5), peer(6)], Some(1))),
+            root_quotes(&root_proof_paying(&[peer(4), peer(5), peer(6)], Some(1))),
             Some(RootQuotes {
-                quoted,
                 paid: Some(peer(5)),
             })
         );
-        assert_eq!(root_quoted_peers(&[PROOF_TAG_SINGLE_NODE, 0x90]), None);
-        assert_eq!(root_quoted_peers(&[PROOF_TAG_MERKLE, 0x90]), None);
-        assert_eq!(root_quoted_peers(&[0x7f, 0x90]), None);
-        assert_eq!(root_quoted_peers(&[]), None);
+        assert_eq!(root_quotes(&[PROOF_TAG_SINGLE_NODE, 0x90]), None);
+        assert_eq!(root_quotes(&[PROOF_TAG_MERKLE, 0x90]), None);
+        assert_eq!(root_quotes(&[0x7f, 0x90]), None);
+        assert_eq!(root_quotes(&[]), None);
         // A root tag that doesn't decode is checked as a single-node offer.
-        assert_eq!(root_quoted_peers(&[PROOF_TAG_ROOT, 0x90]), None);
+        assert_eq!(root_quotes(&[PROOF_TAG_ROOT, 0x90]), None);
     }
 
     /// A refusal reason that is not about payment, as a peer out of range
     /// for the key gives.
     const OUT_OF_RANGE: &str = "Not in storage-admission range for this key";
 
-    /// A peer that refuses a root-paid offer is left out of that key's
-    /// possession check; one that accepted or never answered stays in it. A
-    /// refusal from a peer the offer was not sent to, naming another key, or
-    /// for another offer, is ignored, and closing the offer forgets it.
+    /// The refusal a node with no root vault gives a root-paid offer, worded
+    /// as `handle_fresh_offer` words it.
+    fn no_root_vault() -> String {
+        format!("{PAYMENT_VERIFICATION_ERROR}: no root vault configured")
+    }
+
+    /// A peer that refuses a root-paid offer at payment verification is left
+    /// out of that key's possession check; one that accepted or never
+    /// answered stays in it. A refusal from a peer the offer was not sent to,
+    /// naming another key, or for another offer, is ignored, and closing the
+    /// offer forgets it.
     #[test]
     fn a_peer_that_refuses_a_root_paid_offer_is_left_out_of_its_possession_check() {
         let offers = RootOfferRefusals::default();
         let key = [0x42; 32];
         let targets = vec![peer(1), peer(2), peer(3)];
+        let refused = no_root_vault();
         offers.open(7, key, &targets, &RootQuotes::default());
         assert_eq!(offers.pending(), 1);
 
         assert_eq!(
-            offers.note_refusal(7, &peer(2), &key, OUT_OF_RANGE),
+            offers.note_refusal(7, &peer(2), &key, &refused),
             Refusal::Excused
         );
         assert_eq!(
-            offers.note_refusal(7, &peer(9), &key, OUT_OF_RANGE),
+            offers.note_refusal(7, &peer(9), &key, &refused),
             Refusal::Untracked,
             "not a target"
         );
         assert_eq!(
-            offers.note_refusal(7, &peer(3), &[0x43; 32], OUT_OF_RANGE),
+            offers.note_refusal(7, &peer(3), &[0x43; 32], &refused),
             Refusal::Untracked,
             "another key"
         );
         assert_eq!(
-            offers.note_refusal(8, &peer(1), &key, OUT_OF_RANGE),
+            offers.note_refusal(8, &peer(1), &key, &refused),
             Refusal::Untracked,
             "another offer"
         );
@@ -1592,41 +1586,57 @@ mod tests {
         assert_eq!(offers.pending(), 0);
         // Closed: a late refusal is ignored, and the id no longer filters.
         assert_eq!(
-            offers.note_refusal(7, &peer(1), &key, OUT_OF_RANGE),
+            offers.note_refusal(7, &peer(1), &key, &refused),
             Refusal::Untracked
         );
         assert_eq!(offers.close(7, targets.clone()), targets);
     }
 
-    /// A peer the root proof holds a quote from that refuses the offer for a
-    /// reason other than payment verification stays in the key's possession
-    /// check, as a refuser of a single-node offer does; an unquoted peer that
-    /// refuses beside it is still left out.
+    /// A peer that refuses the offer for a reason other than payment
+    /// verification stays in the key's possession check, as a refuser of a
+    /// single-node offer does, whether or not the proof holds a quote from
+    /// it. Offers carry the slim proof, which usually holds only the paid
+    /// quote, so being unquoted excuses nothing: the close group's other
+    /// members keep their check. A peer the slim proof holds no quote from
+    /// that refuses at payment verification is still excused.
     #[test]
-    fn a_quoted_peer_that_refuses_a_root_paid_offer_for_another_reason_stays_in_its_possession_check(
-    ) {
-        let offers = RootOfferRefusals::default();
+    fn a_peer_that_refuses_a_root_paid_offer_for_another_reason_stays_in_its_possession_check() {
         let key = [0x42; 32];
-        let targets = vec![peer(1), peer(2), peer(3)];
-        let proof = root_proof(&[peer(1), peer(2), peer(8)]);
-        let quoted = root_quoted_peers(&proof).expect("a root proof");
-        offers.open(7, key, &targets, &quoted);
-
-        assert_eq!(
-            offers.note_refusal(7, &peer(1), &key, OUT_OF_RANGE),
-            Refusal::Charged
-        );
-        assert_eq!(
-            offers.note_refusal(7, &peer(3), &key, OUT_OF_RANGE),
-            Refusal::Excused
-        );
-        // A quoted peer the offer was not sent to counts for nothing.
-        assert_eq!(
-            offers.note_refusal(7, &peer(8), &key, OUT_OF_RANGE),
-            Refusal::Untracked
-        );
-
-        assert_eq!(offers.close(7, targets), vec![peer(1), peer(2)]);
+        let targets = vec![peer(1), peer(2), peer(3), peer(4)];
+        // Peer 1's quote is the paid one; peer 2's unpaid quote is in the
+        // proof too, and so is peer 8's, a peer the offer isn't sent to.
+        // Peers 3 and 4 hold no quote in it, as most of the close group hold
+        // none in a slim proof.
+        let proof = root_proof_paying(&[peer(1), peer(2), peer(8)], Some(0));
+        let quotes = root_quotes(&proof).expect("a root proof");
+        for reason in [OUT_OF_RANGE, "Out of space", "Failed to store chunk", ""] {
+            let offers = RootOfferRefusals::default();
+            offers.open(7, key, &targets, &quotes);
+            assert_eq!(
+                offers.note_refusal(7, &peer(2), &key, reason),
+                Refusal::Charged,
+                "a quoted peer refusing with {reason:?}"
+            );
+            assert_eq!(
+                offers.note_refusal(7, &peer(3), &key, reason),
+                Refusal::Charged,
+                "an unquoted peer refusing with {reason:?}"
+            );
+            assert_eq!(
+                offers.note_refusal(7, &peer(4), &key, &no_root_vault()),
+                Refusal::Excused,
+                "an unquoted peer refusing at payment verification"
+            );
+            // A quoted peer the offer was not sent to counts for nothing.
+            assert_eq!(
+                offers.note_refusal(7, &peer(8), &key, reason),
+                Refusal::Untracked
+            );
+            assert_eq!(
+                offers.close(7, targets.clone()),
+                vec![peer(1), peer(2), peer(3)]
+            );
+        }
     }
 
     /// A quote doesn't record its settlement version, so a quote an older
@@ -1644,7 +1654,7 @@ mod tests {
         let targets = vec![peer(1), peer(2), peer(3)];
         // Peers 1 and 2 quoted at version 2; the proof can't tell.
         let proof = root_proof(&[peer(1), peer(2), peer(3)]);
-        let quoted = root_quoted_peers(&proof).expect("a root proof");
+        let quoted = root_quotes(&proof).expect("a root proof");
         offers.open(7, key, &targets, &quoted);
 
         // The two reasons a fresh-offer receiver gives at payment
@@ -1675,7 +1685,7 @@ mod tests {
         let targets = vec![peer(1), peer(2), peer(3)];
         // Peer 2's quote is the paid one.
         let proof = root_proof_paying(&[peer(1), peer(2), peer(3)], Some(1));
-        let quotes = root_quoted_peers(&proof).expect("a root proof");
+        let quotes = root_quotes(&proof).expect("a root proof");
         assert_eq!(quotes.paid, Some(peer(2)));
 
         let error = format!("{PAYMENT_VERIFICATION_ERROR}: no root vault configured");

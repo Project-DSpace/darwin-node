@@ -74,22 +74,26 @@ never ran.
   quoting, so an up-to-date client never pays through the root vault to a
   node that can't check the payment. The minimum stays version 1. A node
   that stores a root-paid chunk leaves out of the chunk's possession check a
-  close-group peer that answers its fresh offer with a refusal, as a node
-  with no root vault does, when the root proof holds no quote from that peer
-  or the refusal is at payment verification; neighbour sync places the chunk
-  with it later. Offers go one-way, and from ds.20 a node answers a one-way
-  offer only to refuse a root-paid one; releases before ds.19 answered every
-  one-way offer, and ds.19 answers none, so a ds.19 peer that refuses stays
-  in the check. A root proof is forwarded to other nodes, as a per-chunk
-  proof is, only in its slim form (`src/payment/slim.rs`): its
-  median-priced quotes, the paid one among them, and the leaf whole. The
-  offer's proof is that slim form, so a peer whose unpaid quote was off the
-  median counts as one the root proof holds no quote from. A quote doesn't record the settlement
+  close-group peer that answers its fresh offer with a refusal at payment
+  verification, as a node with no root vault does, whether or not the root
+  proof holds a quote from that peer (a quote doesn't record the settlement
   version it was asked at, so a quote in a root proof may come from a node
-  that can't check it. A quoted peer refusing for any other reason is
-  checked and charged as a refusal of a single-node offer is, and the peer
-  of the paid quote is always checked and charged, whatever its refusal
-  says: a node paid for a chunk it then can't take is charged. The traffic
+  that can't check it); neighbour sync places the chunk with it later.
+  Offers go one-way, and from ds.20 a node answers a one-way offer only to
+  refuse a root-paid one; releases before ds.19 answered every one-way
+  offer, and ds.19 answers none, so a ds.19 peer that refuses stays in the
+  check. A root proof is forwarded to other nodes, as a per-chunk proof is,
+  only in its slim form (`src/payment/slim.rs`): its median-priced quotes,
+  the paid one among them, and the leaf whole. The offer's proof is that
+  slim form, which usually holds no quote from most of the close group, so
+  no excuse turns on holding one. A peer refusing for any other reason (out
+  of range, out of space, a failed write) is checked and charged as a
+  refusal of a single-node offer is, and the peer of the paid quote is
+  always checked and charged, whatever its refusal says: a node paid for a
+  chunk it then can't take is charged. What stays open: a peer other than
+  the paid one can word any refusal as a payment-verification one and skip
+  that offer's check, as the reason is its own word; it is still checked at
+  any later possession check. The traffic
   lines count quote requests by settlement version and
   settled proofs by tag, and the record read as a kind of its own. Tests in
   `src/payment/verifier/root_tests.rs` check root proofs through the real

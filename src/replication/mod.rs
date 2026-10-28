@@ -6751,10 +6751,10 @@ async fn handle_replication_message(
             Ok(())
         }
         // A refusal of a root-paid fresh offer this node sent: a refusing
-        // peer the proof holds no quote from, or an unpaid quoted one that
-        // refused at payment verification, is left out of that key's
-        // possession check; the peer of the paid quote, whatever its reason,
-        // and a quoted one refusing for any other reason stay in it.
+        // peer whose quote was not the paid one and that refused at payment
+        // verification is left out of that key's possession check; the peer
+        // of the paid quote, whatever its reason, and any peer refusing for
+        // another reason stay in it.
         ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
             key,
             reason,
@@ -6764,14 +6764,14 @@ async fn handle_replication_message(
                 .note_refusal(msg.request_id, source, &key, &reason)
             {
                 fresh::Refusal::Excused => debug!(
-                    "Root-paid fresh offer for {} refused by {source}, unquoted or at payment \
+                    "Root-paid fresh offer for {} refused by {source} at payment \
                      verification, left out of its possession check: {reason}",
                     hex::encode(key)
                 ),
                 fresh::Refusal::Charged => debug!(
                     "Root-paid fresh offer for {} refused by {source}, whose quote was paid \
-                     or which quoted it and refused for a reason other than payment \
-                     verification, kept in its possession check: {reason}",
+                     or which refused for a reason other than payment verification, kept in \
+                     its possession check: {reason}",
                     hex::encode(key)
                 ),
                 fresh::Refusal::Untracked => {}
@@ -6975,11 +6975,10 @@ fn fresh_offer_structural_rejection(
 ///
 /// `fresh::send_fresh_offers` sends one-way (`send_message`). A refusal of a
 /// root-paid offer (proof tag `0x03`) is answered all the same, and the
-/// sender reads it: if the root proof holds no quote from this node, or holds
-/// an unpaid one and `reason` is a payment-verification refusal, the sender
-/// leaves this node out of the key's delayed possession check
-/// (`fresh::RootOfferRefusals`); otherwise, and always when this node's quote
-/// is the paid one, it stays in the check. Any other offer that arrived
+/// sender reads it: if `reason` is a payment-verification refusal and this
+/// node's quote is not the paid one, the sender leaves this node out of the
+/// key's delayed possession check (`fresh::RootOfferRefusals`); otherwise it
+/// stays in the check. Any other offer that arrived
 /// one-way gets no answer (`is_answer_to_one_way_offer`); its refusal is
 /// observed only as a later absence by the delayed possession check, the gap
 /// ADR-0005 records.
