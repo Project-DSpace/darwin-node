@@ -175,7 +175,7 @@ pub(crate) fn log_fresh_summary() {
     let c = |counter: FreshCounter| read(counter);
     crate::logging::info!(
         target: "ant_node::replication::traffic",
-        group = 7,
+        group = 9,
         holding_notices_sent = c(FreshCounter::HoldingNoticesSent),
         held_answer_notices_sent = c(FreshCounter::HeldAnswerNoticesSent),
         proof_notices_sent = c(FreshCounter::ProofNoticesSent),
