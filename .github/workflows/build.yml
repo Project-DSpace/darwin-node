@@ -128,8 +128,9 @@ jobs:
           exit $fail
 
       # vendor/saorsa-transport is saorsa-transport 0.38.2 from crates.io
-      # (vendor/saorsa-transport/VENDORED.md): src/nat_traversal_api.rs and
-      # the rest of the copy are the git objects that file records.
+      # with only the bookkeeping of accepted connections changed
+      # (vendor/saorsa-transport/VENDORED.md): the patched file and the rest
+      # of the copy are the git objects that file records.
       - name: Check the vendored saorsa-transport
         shell: bash
         run: |

@@ -5448,6 +5448,109 @@ impl NatTraversalEndpoint {
         });
     }
 
+    /// Take a connection an accept loop accepted, the main endpoint's or a
+    /// relay endpoint's, into the bookkeeping they share.
+    ///
+    /// The connection map, the endpoint tracking and the announced set
+    /// (`emitted_established_events`) all key it by its normalized address,
+    /// the key `spawn_connection_handler` announces under and
+    /// `remove_connection` clears. A relay endpoint's socket reports an IPv4
+    /// peer as `[::ffff:a.b.c.d]:p`; keyed by that form, the connection was
+    /// announced under both forms and its removal left `a.b.c.d:p` behind.
+    ///
+    /// Returns the key to announce the connection under, or `None` when it is
+    /// not to be announced: a second connection from an address that has a
+    /// live one, which gets a relay request handler and stays out of the map,
+    /// or one that another path announced while this one was being taken.
+    ///
+    /// An address already announced while no live connection is held under
+    /// any of its forms was announced for a connection that is gone, since
+    /// every path puts a connection in the map before announcing it (an
+    /// outgoing one in `add_connection`, an accepted one here). The new
+    /// connection is then announced in its place, rather than accepted and
+    /// never handed on.
+    fn take_accepted_connection(
+        connections: &dashmap::DashMap<SocketAddr, InnerConnection>,
+        connection_endpoints: &Arc<dashmap::DashMap<SocketAddr, InnerEndpoint>>,
+        emitted: &dashmap::DashSet<SocketAddr>,
+        relay_server: &Option<Arc<MasqueRelayServer>>,
+        relay_handler_connections: &Arc<dashmap::DashSet<usize>>,
+        owner_endpoint: &InnerEndpoint,
+        connection: &InnerConnection,
+    ) -> Option<SocketAddr> {
+        let remote_address = connection.remote_address();
+
+        // Only insert into `connections` if no existing LIVE connection is
+        // keyed at this address, under any of its forms (IPv4 and
+        // IPv4-mapped IPv6). Unconditionally overwriting would replace a
+        // working connection with a duplicate that may die shortly, leaving
+        // the DashMap pointing at a dead connection while the original's
+        // reader task still runs.
+        let has_live = socket_addr_variants(remote_address).iter().any(|addr| {
+            connections
+                .get(addr)
+                .is_some_and(|entry| entry.value().close_reason().is_none())
+        });
+        if has_live {
+            // Symmetric P2P + port-preserving NAT collapses every outbound
+            // from the same NAT'd peer onto one (src_ip, src_port) tuple, so
+            // the remote can end up dialing a second QUIC connection to us
+            // with the same remote_address as an existing one — for example
+            // to open a CONNECT-UDP bidi stream for proactive relay
+            // acquisition against a fresh connection. Quinn distinguishes
+            // these via Connection IDs, but our `connections` map is keyed by
+            // remote address, so we can hold only one.
+            //
+            // Keep the existing connection as the canonical DHT path and
+            // attach a relay request handler to the new one so its
+            // CONNECT-UDP streams can be served. The new connection is not
+            // added to `connections` and is not emitted as
+            // `ConnectionEstablished`; it lives as long as the handler (and
+            // thus the peer) keeps it open, then drops naturally on idle
+            // timeout. Previously we force-closed it with `b"duplicate"`,
+            // which made proactive relay acquisition fail with "connection
+            // lost" mid-handshake and kept NAT'd peers from ever publishing a
+            // Relay address.
+            info!(
+                "accept_loop: {} already has a live connection, \
+                 attaching relay handler to the new connection \
+                 without replacing the existing entry",
+                remote_address
+            );
+            Self::spawn_relay_handler_task(relay_server, relay_handler_connections, connection);
+            return None;
+        }
+
+        let connection_key = normalize_socket_addr(remote_address);
+        let announced_for_a_gone_connection = emitted.contains(&connection_key);
+        connections.insert(connection_key, connection.clone());
+        Self::track_connection_endpoint(connection_endpoints, connection_key, owner_endpoint);
+
+        // Announce only an address not announced yet. Without this guard, a
+        // simultaneous-open (both sides connect at the same time), or the
+        // main accept loop forwarding a hole-punched connection it found in
+        // the map, sends a second entry to handshake_tx, causing duplicate
+        // reader tasks for the same connection address. An address that was
+        // announced before this connection was taken, while no live
+        // connection was held under any of its forms, was announced for a
+        // connection that is gone.
+        if emitted.insert(connection_key) {
+            Some(connection_key)
+        } else if announced_for_a_gone_connection {
+            info!(
+                "accept: {} was announced for a connection that is gone; announcing the new one",
+                connection_key
+            );
+            Some(connection_key)
+        } else {
+            debug!(
+                "Duplicate connection from {} already emitted, skipping",
+                remote_address
+            );
+            None
+        }
+    }
+
     fn spawn_accept_loop(&self) {
         let endpoint = match self.inner_endpoint.clone() {
             Some(ep) => ep,
@@ -5522,70 +5625,15 @@ impl NatTraversalEndpoint {
                     let remote_address = connection.remote_address();
                     info!("Accepted connection from {} (unified path)", remote_address);
 
-                    // Only insert into `connections` if no existing LIVE
-                    // connection is keyed at this address. Unconditionally
-                    // overwriting would replace a working connection with a
-                    // duplicate that may die shortly, leaving the DashMap
-                    // pointing at a dead connection while the original's
-                    // reader task still runs.
-                    // Check both raw and normalized forms (IPv4-mapped IPv6).
-                    let normalized_remote = crate::shared::normalize_socket_addr(remote_address);
-                    let has_live = |addr: &std::net::SocketAddr| -> bool {
-                        connections2
-                            .get(addr)
-                            .is_some_and(|e| e.value().close_reason().is_none())
-                    };
-                    if has_live(&remote_address) || has_live(&normalized_remote) {
-                        // Symmetric P2P + port-preserving NAT collapses every
-                        // outbound from the same NAT'd peer onto one
-                        // (src_ip, src_port) tuple, so the remote can end up
-                        // dialing a second QUIC connection to us with the
-                        // same remote_address as an existing one — for
-                        // example to open a CONNECT-UDP bidi stream for
-                        // proactive relay acquisition against a fresh
-                        // connection. Quinn distinguishes these via
-                        // Connection IDs, but our `connections` map is keyed
-                        // by remote address, so we can hold only one.
-                        //
-                        // Keep the existing connection as the canonical DHT
-                        // path and attach a relay request handler to the
-                        // new one so its CONNECT-UDP streams can be served.
-                        // The new connection is not added to `connections`
-                        // and is not emitted as `ConnectionEstablished`; it
-                        // lives as long as the handler (and thus the peer)
-                        // keeps it open, then drops naturally on idle
-                        // timeout. Previously we force-closed it with
-                        // `b"duplicate"`, which made proactive relay
-                        // acquisition fail with "connection lost" mid-
-                        // handshake and kept NAT'd peers from ever publishing
-                        // a Relay address.
-                        info!(
-                            "accept_loop: {} already has a live connection, \
-                             attaching relay handler to the new connection \
-                             without replacing the existing entry",
-                            remote_address
-                        );
-                        Self::spawn_relay_handler_task(
-                            &relay_server2,
-                            &relay_handler_connections2,
-                            &connection,
-                        );
-                        return; // new connection is not tracked in `connections`
-                    }
-                    let connection_key = normalize_socket_addr(remote_address);
-                    connections2.insert(connection_key, connection.clone());
-                    Self::track_connection_endpoint(
+                    if let Some(connection_key) = Self::take_accepted_connection(
+                        &connections2,
                         &connection_endpoints2,
-                        connection_key,
+                        &emitted2,
+                        &relay_server2,
+                        &relay_handler_connections2,
                         &owner_endpoint,
-                    );
-
-                    // Only forward to handshake_tx if this is the first time
-                    // we've seen this address. Without this guard, a
-                    // simultaneous-open (both sides connect at the same time)
-                    // sends two entries to handshake_tx, causing duplicate
-                    // reader tasks for the same connection address.
-                    if emitted2.insert(connection_key) {
+                        &connection,
+                    ) {
                         if let Some(ref server) = relay_server2 {
                             let conn_clone = connection.clone();
                             let server_clone = Arc::clone(server);
@@ -5610,11 +5658,6 @@ impl NatTraversalEndpoint {
                         }
 
                         let _ = tx2.send(Ok((connection_key, connection))).await;
-                    } else {
-                        debug!(
-                            "Duplicate connection from {} already emitted, skipping",
-                            remote_address
-                        );
                     }
                 });
             }
@@ -5856,6 +5899,10 @@ impl NatTraversalEndpoint {
     /// - the peer is notified via a CONNECTION_CLOSE frame when reachable,
     /// - any reader tasks holding a clone of the Connection observe the
     ///   close and exit cleanly.
+    ///
+    /// Either way, every form of the address that keys no connection
+    /// afterwards leaves the announced set (`emitted_established_events`),
+    /// so the next connection from the address is announced.
     pub fn remove_connection(
         &self,
         addr: &SocketAddr,
@@ -5913,10 +5960,6 @@ impl NatTraversalEndpoint {
             remove_keys.push(*candidate);
         }
 
-        if expected_stable_id.is_some() && remove_keys.is_empty() {
-            return Ok(None);
-        }
-
         let mut removed = None;
         for key in remove_keys {
             if let Some((_, connection)) = self.connections.remove(&key) {
@@ -5926,6 +5969,19 @@ impl NatTraversalEndpoint {
                 if removed.is_none() {
                     removed = Some(connection);
                 }
+            }
+        }
+
+        // No form of the address that keys no connection may stay announced,
+        // whether or not this call removed anything: a connection announced
+        // under one form and keyed by another, or one whose entry was dropped
+        // elsewhere (`is_connected` and `poll`'s reaper drop closed
+        // connections), would leave its address announced, and every later
+        // connection from it would be taken for a duplicate and never handed
+        // on.
+        for candidate in &variants {
+            if !self.connections.contains_key(candidate) {
+                self.emitted_established_events.remove(candidate);
             }
         }
         Ok(removed)
@@ -6309,10 +6365,10 @@ impl NatTraversalEndpoint {
 
     /// Spawn an accept loop for the relay endpoint.
     ///
-    /// Accepted connections are inserted into the shared `connections`
-    /// DashMap and forwarded through the same `handshake_tx` channel as
-    /// main-endpoint connections, so the upper layer sees them
-    /// identically.
+    /// Accepted connections are taken into the shared `connections` DashMap
+    /// by [`take_accepted_connection`](Self::take_accepted_connection), keyed
+    /// as main-endpoint connections are, and forwarded through the same
+    /// `handshake_tx` channel, so the upper layer sees them identically.
     ///
     /// `relay_public_addr` is the externally-visible address peers were
     /// told to dial — logged on accept-loop exit so operators can
@@ -6376,39 +6432,15 @@ impl NatTraversalEndpoint {
                         remote_address
                     );
 
-                    let normalized_remote = crate::shared::normalize_socket_addr(remote_address);
-                    let has_live = |addr: &std::net::SocketAddr| -> bool {
-                        connections2
-                            .get(addr)
-                            .is_some_and(|e| e.value().close_reason().is_none())
-                    };
-                    if has_live(&remote_address) || has_live(&normalized_remote) {
-                        // See the matching comment in the unified accept loop:
-                        // a duplicate-remote connection is expected when the
-                        // peer opens a second QUIC session for proactive
-                        // relay acquisition. Serve its CONNECT-UDP bidi
-                        // streams on a fresh handler instead of force-closing.
-                        info!(
-                            "relay accept_loop: {} already has a live connection, \
-                             attaching relay handler to the new connection \
-                             without replacing the existing entry",
-                            remote_address
-                        );
-                        Self::spawn_relay_handler_task(
-                            &relay_server2,
-                            &relay_handler_connections2,
-                            &connection,
-                        );
-                        return;
-                    }
-                    connections2.insert(remote_address, connection.clone());
-                    Self::track_connection_endpoint(
+                    if let Some(connection_key) = Self::take_accepted_connection(
+                        &connections2,
                         &connection_endpoints2,
-                        remote_address,
+                        &emitted2,
+                        &relay_server2,
+                        &relay_handler_connections2,
                         owner_endpoint.as_ref(),
-                    );
-
-                    if emitted2.insert(remote_address) {
+                        &connection,
+                    ) {
                         if let Some(ref server) = relay_server2 {
                             let conn_clone = connection.clone();
                             let server_clone = Arc::clone(server);
@@ -6427,11 +6459,11 @@ impl NatTraversalEndpoint {
                             let etx = etx.clone();
                             let conn = connection.clone();
                             tokio::spawn(async move {
-                                Self::handle_connection(remote_address, conn, etx).await;
+                                Self::handle_connection(connection_key, conn, etx).await;
                             });
                         }
 
-                        let _ = tx2.send(Ok((remote_address, connection))).await;
+                        let _ = tx2.send(Ok((connection_key, connection))).await;
                     }
                 });
             }
@@ -10463,5 +10495,295 @@ mod tests {
         assert!(r2.promote_now);
         assert!(promoted.contains(&real));
         assert!(!promoted.contains(&ghost));
+    }
+
+    // ------------------------------------------------------------------
+    // Accepted connections: one key per address
+    // ------------------------------------------------------------------
+
+    /// A node whose connection map, endpoint tracking and announced set the
+    /// accept bookkeeping writes, an endpoint that accepts beside the node's
+    /// own as a relay endpoint does, and a client dialling it from one
+    /// socket. The accepting endpoint is bound to `[::]:0`, so its
+    /// dual-stack socket reports the IPv4 client as `[::ffff:127.0.0.1]:p`,
+    /// the form a relay endpoint's accept loop saw.
+    struct AcceptSides {
+        node: NatTraversalEndpoint,
+        accepting: InnerEndpoint,
+        accepting_port: u16,
+        client: InnerEndpoint,
+    }
+
+    impl AcceptSides {
+        async fn new() -> Self {
+            let config = |bind: &str| NatTraversalConfig {
+                bind_addr: Some(bind.parse().expect("test bind address")),
+                allow_loopback: true,
+                upnp: crate::upnp::UpnpConfig::disabled(),
+                ..NatTraversalConfig::default()
+            };
+            let node = NatTraversalEndpoint::new(config("127.0.0.1:0"), None, None)
+                .await
+                .expect("node");
+            let registry = crate::transport::TransportRegistry::new();
+            let (accepting, _, _, accepting_addr, _) = NatTraversalEndpoint::create_inner_endpoint(
+                &config("[::]:0"),
+                None,
+                &registry,
+                None,
+            )
+            .await
+            .expect("accepting endpoint on [::]:0");
+            let (client, _, _, _, _) = NatTraversalEndpoint::create_inner_endpoint(
+                &config("127.0.0.1:0"),
+                None,
+                &registry,
+                None,
+            )
+            .await
+            .expect("client endpoint");
+            Self {
+                node,
+                accepting,
+                accepting_port: accepting_addr.port(),
+                client,
+            }
+        }
+
+        /// A new connection from the client's socket: the accepting side's
+        /// handle, and the client's, which the test holds so the connection
+        /// stays open.
+        async fn connect(&self) -> (InnerConnection, InnerConnection) {
+            let target = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.accepting_port));
+            let dialling = self.client.connect(target, "127.0.0.1").expect("dial");
+            let (accepted, dialled) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    async {
+                        self.accepting
+                            .accept()
+                            .await
+                            .expect("an incoming connection")
+                            .await
+                            .expect("the accepting side's handshake")
+                    },
+                    async { dialling.await.expect("the client's handshake") },
+                )
+            })
+            .await
+            .expect("the handshake timed out");
+            (accepted, dialled)
+        }
+
+        /// What either accept loop does with a connection the accepting
+        /// endpoint accepted, before announcing it.
+        fn take(&self, connection: &InnerConnection) -> Option<SocketAddr> {
+            NatTraversalEndpoint::take_accepted_connection(
+                &self.node.connections,
+                &self.node.connection_endpoints,
+                &self.node.emitted_established_events,
+                &self.node.relay_server,
+                &self.node.relay_handler_connections,
+                &self.accepting,
+                connection,
+            )
+        }
+
+        fn connection_keys(&self) -> Vec<SocketAddr> {
+            let mut keys: Vec<SocketAddr> = self
+                .node
+                .connections
+                .iter()
+                .map(|entry| *entry.key())
+                .collect();
+            keys.sort();
+            keys
+        }
+
+        fn announced(&self) -> Vec<SocketAddr> {
+            let mut announced: Vec<SocketAddr> = self
+                .node
+                .emitted_established_events
+                .iter()
+                .map(|key| *key)
+                .collect();
+            announced.sort();
+            announced
+        }
+
+        async fn shut_down(self) {
+            self.client.close(VarInt::from_u32(0), b"test over");
+            self.accepting.close(VarInt::from_u32(0), b"test over");
+            let _ = self.node.shutdown().await;
+        }
+    }
+
+    /// A connection from an IPv4 peer to a dual-stack socket, as through a
+    /// relay endpoint, is held and announced under the peer's plain IPv4
+    /// address, the key `spawn_connection_handler` announces under and
+    /// `remove_connection` clears.
+    #[tokio::test]
+    async fn accepted_connections_are_keyed_by_the_normalized_address() {
+        let sides = AcceptSides::new().await;
+        let (accepted, _client_side) = sides.connect().await;
+        let mapped = accepted.remote_address();
+        let plain = normalize_socket_addr(mapped);
+        assert_ne!(
+            mapped, plain,
+            "the dual-stack socket reports the IPv4-mapped form"
+        );
+        assert_eq!(
+            plain,
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, mapped.port()))
+        );
+
+        assert_eq!(sides.take(&accepted), Some(plain));
+        assert_eq!(sides.connection_keys(), vec![plain]);
+        assert_eq!(sides.announced(), vec![plain]);
+        assert!(sides.node.connection_endpoints.contains_key(&plain));
+        sides.shut_down().await;
+    }
+
+    /// The bookkeeping a connection through a relay endpoint had before:
+    /// the map and the announced set keyed it by the IPv4-mapped form, and
+    /// `spawn_connection_handler` announced it under the plain form too.
+    /// Once the relay closed, `remove_connection` cleared only the mapped
+    /// form, so every later connection from the peer's socket was taken for
+    /// a duplicate, accepted and never handed on.
+    #[tokio::test]
+    async fn a_reconnect_after_a_relayed_connection_closed_is_announced() {
+        let sides = AcceptSides::new().await;
+        let (relayed, _relayed_client_side) = sides.connect().await;
+        let mapped = relayed.remote_address();
+        let plain = normalize_socket_addr(mapped);
+        assert_ne!(
+            mapped, plain,
+            "the dual-stack socket reports the IPv4-mapped form"
+        );
+
+        sides.node.connections.insert(mapped, relayed.clone());
+        sides.node.emitted_established_events.insert(mapped);
+        sides
+            .node
+            .spawn_connection_handler(mapped, relayed.clone(), Side::Server)
+            .expect("connection handler");
+        assert_eq!(sides.announced(), vec![plain, mapped]);
+
+        // The relay closes, and the connection's reader removes it.
+        relayed.close(VarInt::from_u32(0), b"relay closed");
+        let removed = sides
+            .node
+            .remove_connection(&mapped, Some(relayed.stable_id()))
+            .expect("remove the closed connection");
+        assert_eq!(
+            removed.map(|connection| connection.stable_id()),
+            Some(relayed.stable_id())
+        );
+        assert!(sides.connection_keys().is_empty());
+        assert!(
+            sides.announced().is_empty(),
+            "remove_connection left announced forms behind: {:?}",
+            sides.announced()
+        );
+
+        // The peer connects again from the same socket.
+        let (direct, _direct_client_side) = sides.connect().await;
+        assert_eq!(direct.remote_address(), mapped);
+        assert_eq!(sides.take(&direct), Some(plain));
+        sides.shut_down().await;
+    }
+
+    /// An address still announced with no live connection under any of its
+    /// forms, however that came about (here a connection that closed before
+    /// anything removed it), is announced again for a new connection, with
+    /// an INFO line, rather than the new connection being taken for a
+    /// duplicate.
+    #[tokio::test]
+    async fn an_announcement_without_a_live_connection_is_renewed() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        let sides = AcceptSides::new().await;
+        let (first, _first_client_side) = sides.connect().await;
+        let plain = normalize_socket_addr(first.remote_address());
+        assert_eq!(sides.take(&first), Some(plain));
+
+        first.close(VarInt::from_u32(0), b"gone");
+        assert!(
+            sides
+                .node
+                .connections
+                .get(&plain)
+                .is_some_and(|entry| entry.value().close_reason().is_some()),
+            "the map holds the closed connection"
+        );
+        assert_eq!(sides.announced(), vec![plain]);
+
+        let (second, _second_client_side) = sides.connect().await;
+        assert_eq!(sides.take(&second), Some(plain));
+        assert_eq!(
+            sides
+                .node
+                .connections
+                .get(&plain)
+                .map(|entry| entry.value().stable_id()),
+            Some(second.stable_id()),
+            "the new connection takes the closed one's entry"
+        );
+        let line = format!(
+            "accept: {plain} was announced for a connection that is gone; announcing the new one"
+        );
+        assert!(
+            logs.text().contains(&line),
+            "no INFO line {line:?} in:\n{}",
+            logs.text()
+        );
+        sides.shut_down().await;
+    }
+
+    /// A second connection from an address that has a live one is not
+    /// announced, as before: the live one keeps its entry and its
+    /// announcement, and the new one gets a relay request handler.
+    #[tokio::test]
+    async fn a_second_connection_while_one_is_live_is_not_announced() {
+        let sides = AcceptSides::new().await;
+        let (first, _first_client_side) = sides.connect().await;
+        let plain = normalize_socket_addr(first.remote_address());
+        assert_eq!(sides.take(&first), Some(plain));
+
+        let (second, _second_client_side) = sides.connect().await;
+        assert_eq!(second.remote_address(), first.remote_address());
+        assert_eq!(sides.take(&second), None);
+        assert_eq!(
+            sides
+                .node
+                .connections
+                .get(&plain)
+                .map(|entry| entry.value().stable_id()),
+            Some(first.stable_id()),
+            "the live connection keeps its entry"
+        );
+        assert_eq!(sides.announced(), vec![plain]);
+
+        assert!(
+            sides.node.relay_server.is_some(),
+            "nodes serve relays by default"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !sides
+                .node
+                .relay_handler_connections
+                .contains(&second.stable_id())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the second connection gets a relay request handler");
+        sides.shut_down().await;
     }
 }

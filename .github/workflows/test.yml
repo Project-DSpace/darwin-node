@@ -144,9 +144,11 @@ jobs:
         run: cargo test --locked -p saorsa-core --lib
 
       # vendor/saorsa-transport's own unit tests, under this repository's
-      # Cargo.lock too: the QUIC transport the node is built from. Its
-      # integration tests start endpoints and networks of their own, some in
-      # Docker, and are left to the node's own.
+      # Cargo.lock too: the QUIC transport the node is built from, the
+      # bookkeeping of accepted connections among them (a peer reconnecting
+      # after a relay closed is answered again). Its integration tests start
+      # endpoints and networks of their own, some in Docker, and are left to
+      # the node's own.
       - name: Vendored saorsa-transport
         if: ${{ !cancelled() }}
         run: cargo test --locked -p saorsa-transport --lib

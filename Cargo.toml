@@ -276,7 +276,8 @@ webrtc = { path = "vendor/webrtc" }
 # A verified direct address is dialled before a relay
 # (vendor/saorsa-core/VENDORED.md).
 saorsa-core = { path = "vendor/saorsa-core" }
-# saorsa-transport 0.38.2 (vendor/saorsa-transport/VENDORED.md).
+# A peer reconnecting after a relay closed is answered again
+# (vendor/saorsa-transport/VENDORED.md).
 saorsa-transport = { path = "vendor/saorsa-transport" }
 
 [profile.release]
