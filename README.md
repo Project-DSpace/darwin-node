@@ -205,6 +205,27 @@ never ran.
   run, and that `Cargo.lock` holds one saorsa-core, the vendored copy, and
   one saorsa-transport, the vendored copy of a release that `Cargo.toml` and
   the vendored saorsa-core both accept.
+- **A peer reconnecting after a relay closed is answered again** (from
+  ds.21). saorsa-transport 0.38.2 recorded a connection that came in
+  through a relay endpoint under the address that endpoint's socket gives
+  an IPv4 peer, `[::ffff:a.b.c.d]:p`, while the node announced the
+  connection under `a.b.c.d:p`, so the peer counted as announced under
+  both. When the relay closed, only the first was cleared, and every later
+  connection from that peer's socket, direct ones too, was accepted and
+  never handed on (no reader, no event), so the peer's requests went
+  unanswered. The vendored copy in `vendor/saorsa-transport` records the
+  connections of both accept loops, the node's own endpoint's and a relay
+  endpoint's, under `a.b.c.d:p`; removing a connection clears every form of
+  its address that no connection is recorded under; and a connection from
+  an address still announced with no live connection under any of its
+  forms is announced in place of the one that is gone, with the INFO line
+  `accept: <address> was announced for a connection that is gone;
+  announcing the new one`. A second connection while one is live is still
+  not announced and gets only a relay handler, as upstream's. The copy's
+  own tests pin each of these and the Test workflow runs them (`cargo test
+  --locked -p saorsa-transport --lib`); `tests/fork_pins.rs` pins the
+  patch, the copy's release and upstream commit, that those tests stay,
+  and that the workflow runs them.
 - **Request routing survives falling behind** (from ds.10). The loop that
   hands chunk and listings requests to their handlers reads saorsa-core's
   event broadcast, which keeps 1,000 events. Upstream's loop stopped for good
@@ -545,9 +566,10 @@ never ran.
   0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
   in progress; `vendor/saorsa-core` is saorsa-core 0.29.1, which dials a
   verified direct address before a relay; `vendor/saorsa-transport` is
-  saorsa-transport 0.38.2; and `vendor/ant-listings` is darwin-listings
-  0.4.0, unchanged: the envelope format, listings, their payment checks,
-  the listings protocol and its change feeds. `[patch.crates-io]` puts the
+  saorsa-transport 0.38.2, which answers a peer reconnecting after a relay
+  closed; and `vendor/ant-listings` is darwin-listings 0.4.0, unchanged:
+  the envelope format, listings, their payment checks, the listings
+  protocol and its change feeds. `[patch.crates-io]` puts the
   first four in place of the crates.io releases. `vendor/ant-listings`,
   `vendor/ant-protocol`, `vendor/saorsa-core` and `vendor/saorsa-transport`
   are workspace members, so their own tests run under this repository's

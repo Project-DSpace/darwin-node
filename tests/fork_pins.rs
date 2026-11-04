@@ -30,6 +30,9 @@
 //! before a relay, which comes from the vendored saorsa-core, the only one this
 //! lock resolves (`direct_first` below).
 //!
+//! And that a peer reconnecting after a relay closed is answered again, which
+//! comes from the vendored saorsa-transport (`relay_reconnect` below).
+//!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes. The payment reads need the
 //! `test-utils` feature, with which CI runs every test.
@@ -620,6 +623,86 @@ mod direct_first {
         assert!(
             test_workflow.contains("run: cargo test --locked -p saorsa-core --lib"),
             "test.yml no longer runs vendor/saorsa-core's own tests"
+        );
+    }
+}
+
+/// A peer reconnecting after a relay closed is answered again (from ds.21).
+/// The node builds saorsa-transport from `vendor/saorsa-transport`, its
+/// 0.38.2 release with the bookkeeping of accepted connections changed
+/// (`src/nat_traversal_api.rs`): both accept loops, the node's own
+/// endpoint's and a relay endpoint's, key a connection by its normalized
+/// address; removing a connection takes every form of its address that keys
+/// no connection out of the announced set; and an address announced for a
+/// connection that is gone is announced again for the next one. Upstream
+/// keyed a relay endpoint's connections by the IPv4-mapped form, so a peer
+/// that had come through a relay stayed announced once the relay closed, and
+/// every later connection from it was accepted and never handed on. The
+/// bookkeeping is private to saorsa-transport: its own tests pin it there,
+/// and test.yml runs them.
+mod relay_reconnect {
+    use super::repo_text;
+
+    /// The saorsa-transport release the copy is, and upstream's commit for it.
+    const SAORSA_TRANSPORT_VERSION: &str = "0.38.2";
+    const SAORSA_TRANSPORT_COMMIT: &str = "54382015dfae81f922389f1986bef904e9b6dc80";
+
+    const PATCHED_FILE: &str = "vendor/saorsa-transport/src/nat_traversal_api.rs";
+
+    /// The vendored crate's tests of the change, each of which must stay:
+    /// the key, the incident's sequence, the renewed announcement, and the
+    /// duplicate a live connection still turns away.
+    const RELAY_RECONNECT_TESTS: &[&str] = &[
+        "accepted_connections_are_keyed_by_the_normalized_address",
+        "a_reconnect_after_a_relayed_connection_closed_is_announced",
+        "an_announcement_without_a_live_connection_is_renewed",
+        "a_second_connection_while_one_is_live_is_not_announced",
+    ];
+
+    fn toml_file(path: &str) -> toml::Value {
+        toml::from_str(&repo_text(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[test]
+    fn the_node_builds_the_vendored_saorsa_transport() {
+        let manifest = toml_file("Cargo.toml");
+        assert_eq!(
+            manifest["patch"]["crates-io"]["saorsa-transport"]["path"].as_str(),
+            Some("vendor/saorsa-transport"),
+            "[patch.crates-io] must put vendor/saorsa-transport in place of the crates.io release"
+        );
+        let members = manifest["workspace"]["members"].as_array().unwrap();
+        assert!(
+            members
+                .iter()
+                .any(|member| member.as_str() == Some("vendor/saorsa-transport")),
+            "vendor/saorsa-transport must stay a workspace member, so its tests run under this lock"
+        );
+        let vendored = toml_file("vendor/saorsa-transport/Cargo.toml");
+        assert_eq!(
+            vendored["package"]["version"].as_str(),
+            Some(SAORSA_TRANSPORT_VERSION)
+        );
+        let vcs = repo_text("vendor/saorsa-transport/.cargo_vcs_info.json");
+        assert!(
+            vcs.contains(&format!("\"sha1\": \"{SAORSA_TRANSPORT_COMMIT}\"")),
+            "vendor/saorsa-transport is not the {SAORSA_TRANSPORT_VERSION} release: {vcs}"
+        );
+    }
+
+    #[test]
+    fn the_relay_reconnect_tests_stay_and_run() {
+        let source = repo_text(PATCHED_FILE);
+        for name in RELAY_RECONNECT_TESTS {
+            assert!(
+                source.contains(&format!("fn {name}()")),
+                "{PATCHED_FILE} lost {name}, a test of the accepted-connection bookkeeping"
+            );
+        }
+        let test_workflow = repo_text(".github/workflows/test.yml");
+        assert!(
+            test_workflow.contains("run: cargo test --locked -p saorsa-transport --lib"),
+            "test.yml no longer runs vendor/saorsa-transport's own tests"
         );
     }
 }
