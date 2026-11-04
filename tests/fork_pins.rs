@@ -452,10 +452,9 @@ mod direct_first {
     const SAORSA_CORE_VERSION: &str = "0.29.1";
     const SAORSA_CORE_COMMIT: &str = "29bb069691880de59f5157c315a6233b1c57b20f";
 
-    /// The saorsa-transport release the lock holds (ds.16's bump).
+    /// The saorsa-transport release the lock holds (ds.16's bump), vendored
+    /// in `vendor/saorsa-transport` from ds.21.
     const SAORSA_TRANSPORT_VERSION: &str = "0.38.2";
-
-    const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     /// The vendored crate's tests of the change, by file, each of which must
     /// stay: the dial plan, the stored order, and the tag rank that keeps
@@ -543,14 +542,16 @@ mod direct_first {
             locked("saorsa-core"),
             vec![(SAORSA_CORE_VERSION.to_string(), None)]
         );
-        // One saorsa-transport: 0.38.2 from crates.io (ds.16's
-        // bump, Cargo.toml's direct requirement), which both this package's
-        // requirement and the vendored saorsa-core's accept.
+        // One saorsa-transport: 0.38.2 (ds.16's bump, Cargo.toml's direct
+        // requirement), from the path, the vendored copy, which both this
+        // package's requirement and the vendored saorsa-core's accept.
         let transport = locked("saorsa-transport");
-        assert_eq!(transport.len(), 1, "one saorsa-transport: {transport:?}");
-        let (version, source) = &transport[0];
-        assert_eq!(source.as_deref(), Some(CRATES_IO));
-        assert_eq!(version, SAORSA_TRANSPORT_VERSION);
+        assert_eq!(
+            transport,
+            vec![(SAORSA_TRANSPORT_VERSION.to_string(), None)],
+            "one saorsa-transport, from vendor/saorsa-transport"
+        );
+        let version = &transport[0].0;
         assert_eq!(
             manifest["dependencies"]["saorsa-transport"]["version"].as_str(),
             Some(SAORSA_TRANSPORT_VERSION)

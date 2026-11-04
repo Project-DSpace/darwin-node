@@ -1,0 +1,907 @@
+// Copyright 2024 Saorsa Labs Ltd.
+//
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under these licenses is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+//! Connection strategy state machine for progressive NAT traversal fallback.
+//!
+//! This module implements a state machine that attempts connections using
+//! progressively more aggressive NAT traversal techniques:
+//!
+//! 1. **Direct IPv4** - Simple direct connection (fastest when both peers have public IPv4)
+//! 2. **Direct IPv6** - Many ISPs have native IPv6 even behind CGNAT
+//! 3. **Hole-Punch** - Coordinated NAT traversal via a common peer
+//! 4. **Relay** - MASQUE CONNECT-UDP relay (guaranteed connectivity)
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! let config = StrategyConfig::default();
+//! let mut strategy = ConnectionStrategy::new(config);
+//!
+//! loop {
+//!     match strategy.current_stage() {
+//!         ConnectionStage::DirectIPv4 { .. } => {
+//!             // Try direct IPv4 connection
+//!         }
+//!         ConnectionStage::DirectIPv6 { .. } => {
+//!             // Try direct IPv6 connection
+//!         }
+//!         ConnectionStage::HolePunching { .. } => {
+//!             // Coordinate hole-punching via common peer
+//!         }
+//!         ConnectionStage::Relay { .. } => {
+//!             // Connect via MASQUE relay
+//!         }
+//!         ConnectionStage::Connected { via } => {
+//!             println!("Connected via {:?}", via);
+//!             break;
+//!         }
+//!         ConnectionStage::Failed { errors } => {
+//!             eprintln!("All strategies failed: {:?}", errors);
+//!             break;
+//!         }
+//!     }
+//! }
+//! ```
+
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+/// Timeout for observing direct connection progress (both IPv4 and IPv6).
+///
+/// This bounds how long we wait for the first authenticated QUIC packet from a
+/// peer before treating the address as dead. Full QUIC + PQC handshake
+/// completion is governed separately by [`DEFAULT_DIRECT_HANDSHAKE_TIMEOUT`].
+const DEFAULT_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Timeout for full direct QUIC + PQC handshake completion after progress.
+const DEFAULT_DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// How a connection was established
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionMethod {
+    /// Direct IPv4 connection succeeded
+    DirectIPv4,
+    /// Direct IPv6 connection succeeded (NAT bypassed)
+    DirectIPv6,
+    /// Connection established via coordinated hole-punching
+    HolePunched {
+        /// The coordinator peer that helped with hole-punching
+        coordinator: SocketAddr,
+    },
+    /// Connection established via relay
+    Relayed {
+        /// The relay server address
+        relay: SocketAddr,
+    },
+}
+
+impl std::fmt::Display for ConnectionMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionMethod::DirectIPv4 => write!(f, "Direct IPv4"),
+            ConnectionMethod::DirectIPv6 => write!(f, "Direct IPv6"),
+            ConnectionMethod::HolePunched { coordinator } => {
+                write!(f, "Hole-punched via {}", coordinator)
+            }
+            ConnectionMethod::Relayed { relay } => write!(f, "Relayed via {}", relay),
+        }
+    }
+}
+
+/// Error that occurred during a connection attempt
+#[derive(Debug, Clone)]
+pub struct ConnectionAttemptError {
+    /// The method that was attempted
+    pub method: AttemptedMethod,
+    /// Description of the error
+    pub error: String,
+    /// When the attempt was made
+    pub timestamp: Instant,
+}
+
+/// Which method was attempted
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptedMethod {
+    /// Direct IPv4 connection
+    DirectIPv4,
+    /// Direct IPv6 connection
+    DirectIPv6,
+    /// Hole-punching with specified round
+    HolePunch {
+        /// The round number
+        round: u32,
+    },
+    /// Relay connection
+    Relay,
+}
+
+/// Current stage of the connection strategy
+#[derive(Debug, Clone)]
+pub enum ConnectionStage {
+    /// Attempting direct IPv4 connection
+    DirectIPv4 {
+        /// When this stage started
+        started: Instant,
+    },
+    /// Attempting direct IPv6 connection
+    DirectIPv6 {
+        /// When this stage started
+        started: Instant,
+    },
+    /// Attempting hole-punching via a coordinator
+    HolePunching {
+        /// The coordinator peer address
+        coordinator: SocketAddr,
+        /// Current hole-punch round (starts at 1)
+        round: u32,
+        /// When this stage started
+        started: Instant,
+    },
+    /// Attempting relay connection
+    Relay {
+        /// The relay server address being tried
+        relay_addr: SocketAddr,
+        /// Index into relay_addrs being tried
+        relay_index: usize,
+        /// When this stage started
+        started: Instant,
+    },
+    /// Successfully connected
+    Connected {
+        /// How the connection was established
+        via: ConnectionMethod,
+    },
+    /// All methods failed
+    Failed {
+        /// Errors from all attempted methods
+        errors: Vec<ConnectionAttemptError>,
+    },
+}
+
+/// Configuration for connection strategy timeouts and behavior
+#[derive(Debug, Clone)]
+pub struct StrategyConfig {
+    /// Timeout for receiving the first authenticated QUIC packet on direct attempts
+    pub direct_connect_timeout: Duration,
+    /// Timeout for full direct handshake completion after progress
+    pub direct_handshake_timeout: Duration,
+    /// Timeout for each hole-punch round
+    pub holepunch_timeout: Duration,
+    /// Timeout for relay connection
+    pub relay_timeout: Duration,
+    /// Maximum number of hole-punch rounds before falling back to relay
+    pub max_holepunch_rounds: u32,
+    /// Whether to attempt IPv6 connections
+    pub ipv6_enabled: bool,
+    /// Whether to attempt hole-punch NAT traversal
+    pub holepunch_enabled: bool,
+    /// Whether to attempt relay connections as final fallback
+    pub relay_enabled: bool,
+    /// Optional coordinator address for hole-punching
+    pub coordinator: Option<SocketAddr>,
+    /// Relay server addresses for fallback (tried in order)
+    pub relay_addrs: Vec<SocketAddr>,
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            direct_connect_timeout: DEFAULT_DIRECT_CONNECT_TIMEOUT,
+            direct_handshake_timeout: DEFAULT_DIRECT_HANDSHAKE_TIMEOUT,
+            holepunch_timeout: Duration::from_secs(8),
+            relay_timeout: Duration::from_secs(10),
+            max_holepunch_rounds: 2,
+            ipv6_enabled: true,
+            holepunch_enabled: true,
+            relay_enabled: true,
+            coordinator: None,
+            relay_addrs: Vec::new(),
+        }
+    }
+}
+
+impl StrategyConfig {
+    /// Create a new strategy config with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a strategy config that only allows direct connections.
+    ///
+    /// Both hole-punching and relay fallback are disabled. Use this when
+    /// all published addresses are known to be publicly reachable (e.g.
+    /// ADR-014 pre-classified addresses).
+    pub fn direct_only() -> Self {
+        Self {
+            holepunch_enabled: false,
+            relay_enabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// Set the direct connection timeout (applies to both IPv4 and IPv6)
+    pub fn with_direct_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.direct_connect_timeout = timeout;
+        self
+    }
+
+    /// Set the direct handshake timeout
+    pub fn with_direct_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.direct_handshake_timeout = timeout;
+        self
+    }
+
+    /// Set the hole-punch timeout
+    pub fn with_holepunch_timeout(mut self, timeout: Duration) -> Self {
+        self.holepunch_timeout = timeout;
+        self
+    }
+
+    /// Set the relay timeout
+    pub fn with_relay_timeout(mut self, timeout: Duration) -> Self {
+        self.relay_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum number of hole-punch rounds
+    pub fn with_max_holepunch_rounds(mut self, rounds: u32) -> Self {
+        self.max_holepunch_rounds = rounds;
+        self
+    }
+
+    /// Enable or disable IPv6 attempts
+    pub fn with_ipv6_enabled(mut self, enabled: bool) -> Self {
+        self.ipv6_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable hole-punch NAT traversal
+    pub fn with_holepunch_enabled(mut self, enabled: bool) -> Self {
+        self.holepunch_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable relay fallback
+    pub fn with_relay_enabled(mut self, enabled: bool) -> Self {
+        self.relay_enabled = enabled;
+        self
+    }
+
+    /// Set the coordinator address for hole-punching
+    pub fn with_coordinator(mut self, addr: SocketAddr) -> Self {
+        self.coordinator = Some(addr);
+        self
+    }
+
+    /// Add a relay server address to the fallback list
+    pub fn with_relay(mut self, addr: SocketAddr) -> Self {
+        self.relay_addrs.push(addr);
+        self
+    }
+
+    /// Set multiple relay server addresses for fallback
+    pub fn with_relays(mut self, addrs: Vec<SocketAddr>) -> Self {
+        self.relay_addrs = addrs;
+        self
+    }
+}
+
+/// Connection strategy state machine
+///
+/// Manages the progression through connection methods from fastest (direct)
+/// to most reliable (relay).
+#[derive(Debug)]
+pub struct ConnectionStrategy {
+    stage: ConnectionStage,
+    config: StrategyConfig,
+    errors: Vec<ConnectionAttemptError>,
+}
+
+impl ConnectionStrategy {
+    /// Create a new connection strategy with the given configuration
+    pub fn new(config: StrategyConfig) -> Self {
+        Self {
+            stage: ConnectionStage::DirectIPv4 {
+                started: Instant::now(),
+            },
+            config,
+            errors: Vec::new(),
+        }
+    }
+
+    /// Get the current stage
+    pub fn current_stage(&self) -> &ConnectionStage {
+        &self.stage
+    }
+
+    /// Get the configuration
+    pub fn config(&self) -> &StrategyConfig {
+        &self.config
+    }
+
+    /// Get the direct connection timeout
+    pub fn direct_connect_timeout(&self) -> Duration {
+        self.config.direct_connect_timeout
+    }
+
+    /// Get the direct handshake timeout
+    pub fn direct_handshake_timeout(&self) -> Duration {
+        self.config.direct_handshake_timeout
+    }
+
+    /// Get the hole-punch timeout
+    pub fn holepunch_timeout(&self) -> Duration {
+        self.config.holepunch_timeout
+    }
+
+    /// Get the relay timeout
+    pub fn relay_timeout(&self) -> Duration {
+        self.config.relay_timeout
+    }
+
+    /// Record an error and transition to IPv6 stage
+    pub fn transition_to_ipv6(&mut self, error: impl Into<String>) {
+        self.errors.push(ConnectionAttemptError {
+            method: AttemptedMethod::DirectIPv4,
+            error: error.into(),
+            timestamp: Instant::now(),
+        });
+
+        if self.config.ipv6_enabled {
+            self.stage = ConnectionStage::DirectIPv6 {
+                started: Instant::now(),
+            };
+        } else {
+            self.transition_to_holepunch_internal();
+        }
+    }
+
+    /// Record an error and transition to hole-punching stage
+    pub fn transition_to_holepunch(&mut self, error: impl Into<String>) {
+        self.errors.push(ConnectionAttemptError {
+            method: AttemptedMethod::DirectIPv6,
+            error: error.into(),
+            timestamp: Instant::now(),
+        });
+        self.transition_to_holepunch_internal();
+    }
+
+    fn transition_to_holepunch_internal(&mut self) {
+        if !self.config.holepunch_enabled {
+            self.transition_to_relay_internal();
+            return;
+        }
+        if let Some(coordinator) = self.config.coordinator {
+            self.stage = ConnectionStage::HolePunching {
+                coordinator,
+                round: 1,
+                started: Instant::now(),
+            };
+        } else {
+            // No coordinator available, skip to relay
+            self.transition_to_relay_internal();
+        }
+    }
+
+    /// Record a hole-punch error and either retry or transition to relay
+    pub fn record_holepunch_error(&mut self, round: u32, error: impl Into<String>) {
+        self.errors.push(ConnectionAttemptError {
+            method: AttemptedMethod::HolePunch { round },
+            error: error.into(),
+            timestamp: Instant::now(),
+        });
+    }
+
+    /// Check if we should retry hole-punching
+    pub fn should_retry_holepunch(&self) -> bool {
+        if let ConnectionStage::HolePunching { round, .. } = &self.stage {
+            *round < self.config.max_holepunch_rounds
+        } else {
+            false
+        }
+    }
+
+    /// Change the coordinator for the next hole-punch round.
+    pub fn set_coordinator(&mut self, coordinator: SocketAddr) {
+        if let ConnectionStage::HolePunching { coordinator: c, .. } = &mut self.stage {
+            *c = coordinator;
+        }
+        self.config.coordinator = Some(coordinator);
+    }
+
+    /// Increment the hole-punch round
+    pub fn increment_round(&mut self) {
+        if let ConnectionStage::HolePunching {
+            coordinator, round, ..
+        } = &self.stage
+        {
+            self.stage = ConnectionStage::HolePunching {
+                coordinator: *coordinator,
+                round: round + 1,
+                started: Instant::now(),
+            };
+        }
+    }
+
+    /// Transition to relay stage
+    pub fn transition_to_relay(&mut self, error: impl Into<String>) {
+        if let ConnectionStage::HolePunching { round, .. } = &self.stage {
+            self.errors.push(ConnectionAttemptError {
+                method: AttemptedMethod::HolePunch { round: *round },
+                error: error.into(),
+                timestamp: Instant::now(),
+            });
+        }
+        self.transition_to_relay_internal();
+    }
+
+    /// Record a relay error and try the next relay, or fail if all exhausted
+    pub fn transition_to_next_relay(&mut self, error: impl Into<String>) {
+        if let ConnectionStage::Relay { relay_index, .. } = &self.stage {
+            self.errors.push(ConnectionAttemptError {
+                method: AttemptedMethod::Relay,
+                error: error.into(),
+                timestamp: Instant::now(),
+            });
+
+            let next_index = relay_index + 1;
+            if next_index < self.config.relay_addrs.len() {
+                self.stage = ConnectionStage::Relay {
+                    relay_addr: self.config.relay_addrs[next_index],
+                    relay_index: next_index,
+                    started: Instant::now(),
+                };
+            } else {
+                // All relays exhausted
+                self.stage = ConnectionStage::Failed {
+                    errors: std::mem::take(&mut self.errors),
+                };
+            }
+        }
+    }
+
+    fn transition_to_relay_internal(&mut self) {
+        if self.config.relay_enabled && !self.config.relay_addrs.is_empty() {
+            self.stage = ConnectionStage::Relay {
+                relay_addr: self.config.relay_addrs[0],
+                relay_index: 0,
+                started: Instant::now(),
+            };
+        } else if !self.config.relay_enabled {
+            self.transition_to_failed("Relay disabled and all other methods failed");
+        } else {
+            self.transition_to_failed("No relay servers configured");
+        }
+    }
+
+    /// Transition to failed state
+    pub fn transition_to_failed(&mut self, error: impl Into<String>) {
+        // Record the final error if we came from relay stage
+        if let ConnectionStage::Relay { .. } = &self.stage {
+            self.errors.push(ConnectionAttemptError {
+                method: AttemptedMethod::Relay,
+                error: error.into(),
+                timestamp: Instant::now(),
+            });
+        }
+
+        self.stage = ConnectionStage::Failed {
+            errors: std::mem::take(&mut self.errors),
+        };
+    }
+
+    /// Mark connection as successful via the specified method
+    pub fn mark_connected(&mut self, method: ConnectionMethod) {
+        self.stage = ConnectionStage::Connected { via: method };
+    }
+
+    /// Check if the strategy has reached a terminal state
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.stage,
+            ConnectionStage::Connected { .. } | ConnectionStage::Failed { .. }
+        )
+    }
+
+    /// Get all recorded errors
+    pub fn errors(&self) -> &[ConnectionAttemptError] {
+        &self.errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = StrategyConfig::default();
+        assert_eq!(
+            config.direct_connect_timeout,
+            DEFAULT_DIRECT_CONNECT_TIMEOUT
+        );
+        assert_eq!(
+            config.direct_handshake_timeout,
+            DEFAULT_DIRECT_HANDSHAKE_TIMEOUT
+        );
+        assert_eq!(config.holepunch_timeout, Duration::from_secs(8));
+        assert_eq!(config.relay_timeout, Duration::from_secs(10));
+        assert_eq!(config.max_holepunch_rounds, 2);
+        assert!(config.ipv6_enabled);
+        assert!(config.relay_enabled);
+    }
+
+    #[test]
+    fn test_config_builder() {
+        let config = StrategyConfig::new()
+            .with_direct_connect_timeout(Duration::from_secs(2))
+            .with_direct_handshake_timeout(Duration::from_secs(4))
+            .with_max_holepunch_rounds(5)
+            .with_ipv6_enabled(false);
+
+        assert_eq!(config.direct_connect_timeout, Duration::from_secs(2));
+        assert_eq!(config.direct_handshake_timeout, Duration::from_secs(4));
+        assert_eq!(config.max_holepunch_rounds, 5);
+        assert!(!config.ipv6_enabled);
+    }
+
+    #[test]
+    fn test_initial_stage() {
+        let strategy = ConnectionStrategy::new(StrategyConfig::default());
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::DirectIPv4 { .. }
+        ));
+    }
+
+    #[test]
+    fn test_transition_ipv4_to_ipv6() {
+        let mut strategy = ConnectionStrategy::new(StrategyConfig::default());
+
+        strategy.transition_to_ipv6("Connection refused");
+
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::DirectIPv6 { .. }
+        ));
+        assert_eq!(strategy.errors().len(), 1);
+        assert!(matches!(
+            strategy.errors()[0].method,
+            AttemptedMethod::DirectIPv4
+        ));
+    }
+
+    #[test]
+    fn test_skip_ipv6_when_disabled() {
+        let config = StrategyConfig::new()
+            .with_ipv6_enabled(false)
+            .with_coordinator("127.0.0.1:9000".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("Connection refused");
+
+        // Should skip directly to hole-punching
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::HolePunching { round: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn test_transition_to_holepunch() {
+        let config = StrategyConfig::new().with_coordinator("127.0.0.1:9000".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::HolePunching {
+                round: 1,
+                coordinator,
+                ..
+            } if coordinator.port() == 9000
+        ));
+    }
+
+    #[test]
+    fn test_holepunch_rounds() {
+        let config = StrategyConfig::new()
+            .with_coordinator("127.0.0.1:9000".parse().unwrap())
+            .with_max_holepunch_rounds(3);
+        let mut strategy = ConnectionStrategy::new(config);
+
+        // Get to holepunch stage
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+
+        // Round 1
+        assert!(strategy.should_retry_holepunch());
+        strategy.record_holepunch_error(1, "Round 1 failed");
+        strategy.increment_round();
+
+        // Round 2
+        if let ConnectionStage::HolePunching { round, .. } = strategy.current_stage() {
+            assert_eq!(*round, 2);
+        } else {
+            panic!("Expected HolePunching stage");
+        }
+        assert!(strategy.should_retry_holepunch());
+        strategy.record_holepunch_error(2, "Round 2 failed");
+        strategy.increment_round();
+
+        // Round 3 - last round
+        if let ConnectionStage::HolePunching { round, .. } = strategy.current_stage() {
+            assert_eq!(*round, 3);
+        } else {
+            panic!("Expected HolePunching stage");
+        }
+        assert!(!strategy.should_retry_holepunch());
+    }
+
+    #[test]
+    fn test_transition_to_relay() {
+        let config = StrategyConfig::new()
+            .with_coordinator("127.0.0.1:9000".parse().unwrap())
+            .with_relay("127.0.0.1:9001".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+        strategy.transition_to_relay("Holepunch failed");
+
+        if let ConnectionStage::Relay {
+            relay_addr,
+            relay_index,
+            ..
+        } = strategy.current_stage()
+        {
+            assert_eq!(relay_addr.port(), 9001);
+            assert_eq!(*relay_index, 0);
+        } else {
+            panic!("Expected Relay stage");
+        }
+    }
+
+    #[test]
+    fn test_transition_to_failed() {
+        let config = StrategyConfig::new()
+            .with_coordinator("127.0.0.1:9000".parse().unwrap())
+            .with_relay("127.0.0.1:9001".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+        strategy.transition_to_relay("Holepunch failed");
+        strategy.transition_to_failed("Relay failed");
+
+        if let ConnectionStage::Failed { errors } = strategy.current_stage() {
+            assert_eq!(errors.len(), 4);
+        } else {
+            panic!("Expected Failed stage");
+        }
+    }
+
+    #[test]
+    fn test_mark_connected() {
+        let mut strategy = ConnectionStrategy::new(StrategyConfig::default());
+
+        strategy.mark_connected(ConnectionMethod::DirectIPv4);
+
+        if let ConnectionStage::Connected { via } = strategy.current_stage() {
+            assert_eq!(*via, ConnectionMethod::DirectIPv4);
+        } else {
+            panic!("Expected Connected stage");
+        }
+        assert!(strategy.is_terminal());
+    }
+
+    #[test]
+    fn test_connection_method_display() {
+        assert_eq!(format!("{}", ConnectionMethod::DirectIPv4), "Direct IPv4");
+        assert_eq!(format!("{}", ConnectionMethod::DirectIPv6), "Direct IPv6");
+        assert_eq!(
+            format!(
+                "{}",
+                ConnectionMethod::HolePunched {
+                    coordinator: "1.2.3.4:9000".parse().unwrap()
+                }
+            ),
+            "Hole-punched via 1.2.3.4:9000"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                ConnectionMethod::Relayed {
+                    relay: "5.6.7.8:9001".parse().unwrap()
+                }
+            ),
+            "Relayed via 5.6.7.8:9001"
+        );
+    }
+
+    #[test]
+    fn test_no_coordinator_skips_to_relay() {
+        let config = StrategyConfig::new().with_relay("127.0.0.1:9001".parse().unwrap());
+        // No coordinator set
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+
+        // Should skip hole-punching and go to relay
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::Relay { .. }
+        ));
+    }
+
+    #[test]
+    fn test_no_relay_fails() {
+        let config = StrategyConfig::new()
+            .with_coordinator("127.0.0.1:9000".parse().unwrap())
+            .with_relay_enabled(false);
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+        strategy.transition_to_relay("Holepunch failed");
+
+        // Should fail since relay is disabled
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_multi_relay_fallback() {
+        let config = StrategyConfig::new()
+            .with_coordinator("127.0.0.1:9000".parse().unwrap())
+            .with_relay("127.0.0.1:9001".parse().unwrap())
+            .with_relay("127.0.0.1:9002".parse().unwrap())
+            .with_relay("127.0.0.1:9003".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+        strategy.transition_to_relay("Holepunch failed");
+
+        // Should start at first relay
+        if let ConnectionStage::Relay {
+            relay_addr,
+            relay_index,
+            ..
+        } = strategy.current_stage()
+        {
+            assert_eq!(relay_addr.port(), 9001);
+            assert_eq!(*relay_index, 0);
+        } else {
+            panic!("Expected Relay stage");
+        }
+
+        // Fail first relay, try second
+        strategy.transition_to_next_relay("Relay 1 failed");
+        if let ConnectionStage::Relay {
+            relay_addr,
+            relay_index,
+            ..
+        } = strategy.current_stage()
+        {
+            assert_eq!(relay_addr.port(), 9002);
+            assert_eq!(*relay_index, 1);
+        } else {
+            panic!("Expected Relay stage");
+        }
+
+        // Fail second relay, try third
+        strategy.transition_to_next_relay("Relay 2 failed");
+        if let ConnectionStage::Relay {
+            relay_addr,
+            relay_index,
+            ..
+        } = strategy.current_stage()
+        {
+            assert_eq!(relay_addr.port(), 9003);
+            assert_eq!(*relay_index, 2);
+        } else {
+            panic!("Expected Relay stage");
+        }
+
+        // Fail third relay - all exhausted
+        strategy.transition_to_next_relay("Relay 3 failed");
+        if let ConnectionStage::Failed { errors } = strategy.current_stage() {
+            // Should have errors from: IPv4, IPv6, holepunch, relay1, relay2, relay3
+            assert_eq!(errors.len(), 6);
+        } else {
+            panic!("Expected Failed stage");
+        }
+    }
+
+    #[test]
+    fn test_with_relays_vec() {
+        let relays: Vec<SocketAddr> = vec![
+            "127.0.0.1:9001".parse().unwrap(),
+            "127.0.0.1:9002".parse().unwrap(),
+        ];
+        let config = StrategyConfig::new().with_relays(relays);
+        assert_eq!(config.relay_addrs.len(), 2);
+    }
+
+    #[test]
+    fn test_single_relay_still_works() {
+        // Verify backward compatibility - single with_relay() still works
+        let config = StrategyConfig::new().with_relay("127.0.0.1:9001".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+        strategy.transition_to_relay("Holepunch failed");
+
+        if let ConnectionStage::Relay { relay_addr, .. } = strategy.current_stage() {
+            assert_eq!(relay_addr.port(), 9001);
+        } else {
+            panic!("Expected Relay stage");
+        }
+
+        strategy.transition_to_next_relay("Relay failed");
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_holepunch_disabled_skips_to_relay() {
+        let config = StrategyConfig::new()
+            .with_holepunch_enabled(false)
+            .with_coordinator("127.0.0.1:9000".parse().unwrap())
+            .with_relay("127.0.0.1:9001".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+
+        // Should skip hole-punching and go directly to relay
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::Relay { .. }
+        ));
+    }
+
+    #[test]
+    fn test_holepunch_and_relay_disabled_fails() {
+        let config = StrategyConfig::new()
+            .with_holepunch_enabled(false)
+            .with_relay_enabled(false)
+            .with_coordinator("127.0.0.1:9000".parse().unwrap());
+        let mut strategy = ConnectionStrategy::new(config);
+
+        strategy.transition_to_ipv6("IPv4 failed");
+        strategy.transition_to_holepunch("IPv6 failed");
+
+        // Both fallbacks disabled -- should fail immediately
+        assert!(matches!(
+            strategy.current_stage(),
+            ConnectionStage::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_direct_only_config() {
+        let config = StrategyConfig::direct_only();
+        assert!(!config.holepunch_enabled);
+        assert!(!config.relay_enabled);
+        assert!(config.ipv6_enabled);
+    }
+}

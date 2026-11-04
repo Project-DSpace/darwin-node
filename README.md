@@ -203,8 +203,8 @@ never ran.
   Test workflow runs them (`cargo test --locked -p saorsa-core --lib`);
   `tests/fork_pins.rs` pins the address priority, that those tests stay and
   run, and that `Cargo.lock` holds one saorsa-core, the vendored copy, and
-  one saorsa-transport, a crates.io release that `Cargo.toml` and the
-  vendored copy both accept.
+  one saorsa-transport, the vendored copy of a release that `Cargo.toml` and
+  the vendored saorsa-core both accept.
 - **Request routing survives falling behind** (from ds.10). The loop that
   hands chunk and listings requests to their handlers reads saorsa-core's
   event broadcast, which keeps 1,000 events. Upstream's loop stopped for good
@@ -537,26 +537,26 @@ never ran.
   is there. Both build.yml and release.yml build the node with exactly
   `cargo build --release --locked --bin ant-node`, and check it for test
   seams before packaging it.
-- **Four crates are vendored**, each with a `VENDORED.md` saying what it is:
+- **Five crates are vendored**, each with a `VENDORED.md` saying what it is:
   `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
   `VENDORED.md` lists, the price curve and the legacy curve still
   accepted, the functions that price a record by its size, and root
   payment proofs (tag `0x03`, settlement version 3); `vendor/webrtc` is webrtc
   0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
   in progress; `vendor/saorsa-core` is saorsa-core 0.29.1, which dials a
-  verified direct address before a relay; and `vendor/ant-listings` is
-  darwin-listings 0.4.0, unchanged: the envelope format, listings, their
-  payment checks, the listings protocol and its change feeds.
-  `[patch.crates-io]` puts the first three in place of the crates.io
-  releases. `vendor/ant-listings`, `vendor/ant-protocol` and
-  `vendor/saorsa-core` are workspace members, so their own tests run under
-  this repository's `Cargo.lock` in the Test workflow (`cargo test --locked
-  -p ant-listings`, `cargo test --locked --manifest-path
-  vendor/ant-protocol/Cargo.toml`, `cargo test --locked -p saorsa-core
-  --lib`), and the Build workflow checks the git objects of
-  `vendor/ant-listings` and `vendor/saorsa-core` against their
-  `VENDORED.md`. saorsa-transport is its crates.io release, as
-  upstream's is.
+  verified direct address before a relay; `vendor/saorsa-transport` is
+  saorsa-transport 0.38.2; and `vendor/ant-listings` is darwin-listings
+  0.4.0, unchanged: the envelope format, listings, their payment checks,
+  the listings protocol and its change feeds. `[patch.crates-io]` puts the
+  first four in place of the crates.io releases. `vendor/ant-listings`,
+  `vendor/ant-protocol`, `vendor/saorsa-core` and `vendor/saorsa-transport`
+  are workspace members, so their own tests run under this repository's
+  `Cargo.lock` in the Test workflow (`cargo test --locked -p ant-listings`,
+  `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml`,
+  `cargo test --locked -p saorsa-core --lib`, `cargo test --locked -p
+  saorsa-transport --lib`), and the Build workflow checks the git objects
+  of `vendor/ant-listings`, `vendor/saorsa-core` and
+  `vendor/saorsa-transport` against their `VENDORED.md`.
 - **Release builds link self_encryption** (GPL-3.0 with MaidSafe's linking
   exception), which upstream's don't: `vendor/ant-listings` reads the data
   maps in file envelopes with it. The exception lets the binary be

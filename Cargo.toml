@@ -252,14 +252,21 @@ webrtc-direct = [
     "saorsa-transport/webrtc-direct",
 ]
 
-# The vendored ant-listings, ant-protocol and saorsa-core are members so their
-# own tests run under this lock (`cargo test --locked -p ant-listings`,
-# `cargo test --locked --manifest-path vendor/ant-protocol/Cargo.toml` and
-# `cargo test --locked -p saorsa-core`, in test.yml): the code the node is built
-# from is tested with the dependencies the node is built with. Commands run here
-# without -p still build and test ant-node alone.
+# The vendored ant-listings, ant-protocol, saorsa-core and saorsa-transport are
+# members so their own tests run under this lock (`cargo test --locked -p
+# ant-listings`, `cargo test --locked --manifest-path
+# vendor/ant-protocol/Cargo.toml`, `cargo test --locked -p saorsa-core` and
+# `cargo test --locked -p saorsa-transport`, in test.yml): the code the node is
+# built from is tested with the dependencies the node is built with. Commands
+# run here without -p still build and test ant-node alone.
 [workspace]
-members = [".", "vendor/ant-listings", "vendor/ant-protocol", "vendor/saorsa-core"]
+members = [
+    ".",
+    "vendor/ant-listings",
+    "vendor/ant-protocol",
+    "vendor/saorsa-core",
+    "vendor/saorsa-transport",
+]
 
 [patch.crates-io]
 ant-protocol = { path = "vendor/ant-protocol" }
@@ -269,6 +276,8 @@ webrtc = { path = "vendor/webrtc" }
 # A verified direct address is dialled before a relay
 # (vendor/saorsa-core/VENDORED.md).
 saorsa-core = { path = "vendor/saorsa-core" }
+# saorsa-transport 0.38.2 (vendor/saorsa-transport/VENDORED.md).
+saorsa-transport = { path = "vendor/saorsa-transport" }
 
 [profile.release]
 lto = true

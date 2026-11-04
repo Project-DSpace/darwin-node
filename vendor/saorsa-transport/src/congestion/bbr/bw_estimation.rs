@@ -1,0 +1,169 @@
+// Copyright 2024 Saorsa Labs Ltd.
+//
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under these licenses is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+use std::fmt::{Debug, Display, Formatter};
+
+use super::min_max::MinMax;
+use crate::{Duration, Instant};
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BandwidthEstimation {
+    total_acked: u64,
+    prev_total_acked: u64,
+    acked_time: Option<Instant>,
+    prev_acked_time: Option<Instant>,
+    total_sent: u64,
+    prev_total_sent: u64,
+    sent_time: Option<Instant>,
+    prev_sent_time: Option<Instant>,
+    max_filter: MinMax,
+    acked_at_last_window: u64,
+}
+
+impl BandwidthEstimation {
+    pub(crate) fn on_sent(&mut self, now: Instant, bytes: u64) {
+        self.prev_total_sent = self.total_sent;
+        self.total_sent += bytes;
+        self.prev_sent_time = self.sent_time;
+        self.sent_time = Some(now);
+    }
+
+    pub(crate) fn on_ack(
+        &mut self,
+        now: Instant,
+        _sent: Instant,
+        bytes: u64,
+        round: u64,
+        app_limited: bool,
+    ) {
+        self.prev_total_acked = self.total_acked;
+        self.total_acked += bytes;
+        self.prev_acked_time = self.acked_time;
+        self.acked_time = Some(now);
+
+        let prev_sent_time = match self.prev_sent_time {
+            Some(prev_sent_time) => prev_sent_time,
+            None => return,
+        };
+
+        let send_rate = match self.sent_time {
+            Some(sent_time) if sent_time > prev_sent_time => Self::bw_from_delta(
+                self.total_sent - self.prev_total_sent,
+                sent_time - prev_sent_time,
+            )
+            .unwrap_or(0),
+            _ => u64::MAX, // will take the min of send and ack, so this is just a skip
+        };
+
+        let ack_rate = match self.prev_acked_time {
+            Some(prev_acked_time) => Self::bw_from_delta(
+                self.total_acked - self.prev_total_acked,
+                now - prev_acked_time,
+            )
+            .unwrap_or(0),
+            None => 0,
+        };
+
+        let bandwidth = send_rate.min(ack_rate);
+        // Feed every non-app-limited sample into the windowed max filter.
+        // MinMax internally tracks 2nd- and 3rd-best samples so the max can
+        // age out gracefully; short-circuiting on `current_max < sample`
+        // defeats that fallback.
+        if !app_limited {
+            self.max_filter.update_max(round, bandwidth);
+        }
+    }
+
+    pub(crate) fn bytes_acked_this_window(&self) -> u64 {
+        self.total_acked - self.acked_at_last_window
+    }
+
+    pub(crate) fn end_acks(&mut self, _current_round: u64, _app_limited: bool) {
+        self.acked_at_last_window = self.total_acked;
+    }
+
+    pub(crate) fn get_estimate(&self) -> u64 {
+        self.max_filter.get()
+    }
+
+    pub(crate) const fn bw_from_delta(bytes: u64, delta: Duration) -> Option<u64> {
+        let window_duration_ns = delta.as_nanos();
+        if window_duration_ns == 0 {
+            return None;
+        }
+        let b_ns = bytes * 1_000_000_000;
+        let bytes_per_second = b_ns / (window_duration_ns as u64);
+        Some(bytes_per_second)
+    }
+}
+
+impl Display for BandwidthEstimation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:.3} MB/s",
+            self.get_estimate() as f32 / (1024 * 1024) as f32
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the filter used to short-circuit `update_max` when the new
+    /// sample was below the current max, which defeated the internal 2nd/3rd-
+    /// best tracking in `MinMax`. With the guard removed, a sequence of
+    /// "big then smaller" samples should still converge to the correct max
+    /// as older samples age out of the round window (10 rounds by default).
+    #[test]
+    fn max_filter_ages_out_stale_peak() {
+        let mut be = BandwidthEstimation::default();
+        let t0 = Instant::now();
+
+        // Round 0: send & ack a large batch to record a high-bandwidth sample.
+        be.on_sent(t0, 100_000);
+        be.on_sent(t0 + Duration::from_millis(1), 100_000);
+        be.on_ack(t0 + Duration::from_millis(10), t0, 100_000, 0, false);
+        be.on_ack(t0 + Duration::from_millis(11), t0, 100_000, 0, false);
+        let peak = be.get_estimate();
+        assert!(peak > 0, "should observe a non-zero peak");
+
+        // Rounds 1..20: steady small samples that are individually below the
+        // peak. Without the fix, these are never fed to `update_max`, so the
+        // peak is never replaced — it just persists indefinitely (or resets
+        // to 0 when the window check is finally satisfied, depending on
+        // timing). With the fix, samples enter the filter and the max
+        // eventually settles at the newer lower value once the peak round
+        // falls out of the window.
+        let mut t = t0 + Duration::from_millis(20);
+        for round in 1..=20 {
+            be.on_sent(t, 1_000);
+            be.on_sent(t + Duration::from_millis(1), 1_000);
+            be.on_ack(t + Duration::from_millis(5), t, 1_000, round, false);
+            be.on_ack(t + Duration::from_millis(6), t, 1_000, round, false);
+            t += Duration::from_millis(10);
+        }
+
+        // Once the original peak's round is > 10 rounds old, the filter
+        // should either track the peak (still valid while in window) or have
+        // aged it out to reflect the recent samples. The important property
+        // is that it *responds* to new samples rather than being frozen.
+        // We assert it's no longer stuck at the original peak.
+        let final_estimate = be.get_estimate();
+        assert!(
+            final_estimate < peak || final_estimate == peak && be.max_filter.get() != 0,
+            "filter should either age the peak out or still track it; \
+             got {final_estimate} vs peak {peak}"
+        );
+    }
+}

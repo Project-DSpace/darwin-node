@@ -127,6 +127,34 @@ jobs:
           check "the rest of $dir" "$recorded" "$actual"
           exit $fail
 
+      # vendor/saorsa-transport is saorsa-transport 0.38.2 from crates.io
+      # (vendor/saorsa-transport/VENDORED.md): src/nat_traversal_api.rs and
+      # the rest of the copy are the git objects that file records.
+      - name: Check the vendored saorsa-transport
+        shell: bash
+        run: |
+          dir=vendor/saorsa-transport
+          patched="src/nat_traversal_api.rs"
+          fail=0
+          check() {
+            if [[ -z "$2" || "$3" != "$2" ]]; then
+              echo "::error::$1 is $3; $dir/VENDORED.md records ${2:-none}"
+              fail=1
+            fi
+          }
+          for file in $patched; do
+            recorded=$(sed -n "s|^- $file blob: \([0-9a-f]\{40\}\)\$|\1|p" $dir/VENDORED.md)
+            check "$dir/$file" "$recorded" "$(git rev-parse "HEAD:$dir/$file")"
+          done
+          recorded=$(sed -n "s/^- rest sha256: \([0-9a-f]\{64\}\)\$/\1/p" $dir/VENDORED.md)
+          actual=$(git ls-tree -r HEAD $dir \
+            | awk -F'\t' -v dir="$dir" -v skip="VENDORED.md $patched" '
+                BEGIN { n = split(skip, s, " "); for (i = 1; i <= n; i++) drop[dir "/" s[i]] = 1 }
+                !($2 in drop)' \
+            | sha256sum | cut -d' ' -f1)
+          check "the rest of $dir" "$recorded" "$actual"
+          exit $fail
+
   linux-x64:
     if: ${{ !inputs.reuse_build }}
     # Pinned to the servers' Ubuntu release: a binary built against a newer

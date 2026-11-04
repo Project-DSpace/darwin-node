@@ -1,0 +1,1433 @@
+// Copyright 2024 Saorsa Labs Ltd.
+//
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under these licenses is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+use std::{
+    collections::VecDeque,
+    fmt,
+    future::Future,
+    io,
+    io::IoSliceMut,
+    mem,
+    net::{SocketAddr, SocketAddrV6},
+    pin::Pin,
+    str,
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Waker},
+};
+
+#[cfg(not(wasm_browser))]
+use super::runtime::default_runtime;
+use super::{
+    runtime::{AsyncUdpSocket, Runtime},
+    udp_transmit,
+};
+use crate::Instant;
+use crate::traffic::SOCKET_TRAFFIC;
+use crate::{
+    ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointEvent,
+    ServerConfig,
+};
+use bytes::{Bytes, BytesMut};
+use pin_project_lite::pin_project;
+use quinn_udp::{BATCH_SIZE, RecvMeta};
+use rustc_hash::FxHashMap;
+#[cfg(all(not(wasm_browser), feature = "network-discovery"))]
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::sync::{Notify, futures::Notified, mpsc};
+use tracing::{Instrument, Span};
+use tracing::{error, trace};
+
+use super::{
+    ConnectionEvent, IO_LOOP_BOUND, RECV_TIME_BOUND, connection::Connecting,
+    work_limiter::WorkLimiter,
+};
+use crate::{EndpointConfig, VarInt};
+
+/// A QUIC endpoint.
+///
+/// An endpoint corresponds to a single UDP socket, may host many connections, and may act as both
+/// client and server for different connections.
+///
+/// May be cloned to obtain another handle to the same endpoint.
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    pub(crate) inner: EndpointRef,
+    pub(crate) default_client_config: Option<ClientConfig>,
+    runtime: Arc<dyn Runtime>,
+}
+
+impl Endpoint {
+    /// Helper to construct an endpoint for use with outgoing connections only
+    ///
+    /// Note that `addr` is the *local* address to bind to, which should usually be a wildcard
+    /// address like `0.0.0.0:0` or `[::]:0`, which allow communication with any reachable IPv4 or
+    /// IPv6 address respectively from an OS-assigned port.
+    ///
+    /// If an IPv6 address is provided, attempts to make the socket dual-stack so as to allow
+    /// communication with both IPv4 and IPv6 addresses. As such, calling `Endpoint::client` with
+    /// the address `[::]:0` is a reasonable default to maximize the ability to connect to other
+    /// address. For example:
+    ///
+    /// ```
+    /// # use std::net::{Ipv6Addr, SocketAddr};
+    /// # fn example() -> std::io::Result<()> {
+    /// use saorsa_transport::high_level::Endpoint;
+    ///
+    /// let addr: SocketAddr = (Ipv6Addr::UNSPECIFIED, 0).into();
+    /// let endpoint = Endpoint::client(addr)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Some environments may not allow creation of dual-stack sockets, in which case an IPv6
+    /// client will only be able to connect to IPv6 servers. An IPv4 client is never dual-stack.
+    #[cfg(all(not(wasm_browser), feature = "network-discovery"))]
+    pub fn client(addr: SocketAddr) -> io::Result<Self> {
+        let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+        if addr.is_ipv6() {
+            if let Err(e) = socket.set_only_v6(false) {
+                tracing::debug!(%e, "unable to make socket dual-stack");
+            }
+        }
+
+        // Apply platform-appropriate buffer sizes to avoid WSAEMSGSIZE errors on Windows
+        // and ensure reliable QUIC connections, especially with PQC
+        use crate::config::buffer_defaults;
+        let buffer_size = buffer_defaults::PLATFORM_DEFAULT;
+        if let Err(e) = socket.set_send_buffer_size(buffer_size) {
+            tracing::debug!(%e, "unable to set send buffer size to {}", buffer_size);
+        }
+        if let Err(e) = socket.set_recv_buffer_size(buffer_size) {
+            tracing::debug!(%e, "unable to set recv buffer size to {}", buffer_size);
+        }
+
+        socket.bind(&addr.into())?;
+        let runtime =
+            default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+        Self::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            runtime.wrap_udp_socket(socket.into())?,
+            runtime,
+        )
+    }
+
+    /// Returns relevant stats from this Endpoint
+    pub fn stats(&self) -> EndpointStats {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.stats)
+            .unwrap_or_else(|_| {
+                error!("Endpoint state mutex poisoned");
+                EndpointStats::default()
+            })
+    }
+
+    /// Helper to construct an endpoint for use with both incoming and outgoing connections
+    ///
+    /// When binding to an IPv6 address, this creates a dual-stack socket (IPV6_V6ONLY=0)
+    /// that can accept both IPv4 and IPv6 connections. IPv4 connections will appear as
+    /// IPv4-mapped IPv6 addresses (::ffff:x.x.x.x).
+    ///
+    /// Platform defaults for dual-stack sockets vary. For example, any socket bound to a wildcard
+    /// IPv6 address on Windows will not by default be able to communicate with IPv4
+    /// addresses. This method explicitly enables dual-stack for IPv6 sockets.
+    #[cfg(all(not(wasm_browser), feature = "network-discovery"))]
+    pub fn server(config: ServerConfig, addr: SocketAddr) -> io::Result<Self> {
+        let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+
+        // Enable dual-stack for IPv6 sockets (consistent with client() behavior)
+        if addr.is_ipv6() {
+            if let Err(e) = socket.set_only_v6(false) {
+                tracing::debug!(%e, "unable to make server socket dual-stack");
+            }
+        }
+
+        socket.set_nonblocking(true)?;
+
+        // Apply platform-appropriate buffer sizes to avoid WSAEMSGSIZE errors on Windows
+        // and ensure reliable QUIC connections, especially with PQC
+        use crate::config::buffer_defaults;
+        let buffer_size = buffer_defaults::PLATFORM_DEFAULT;
+        if let Err(e) = socket.set_send_buffer_size(buffer_size) {
+            tracing::debug!(%e, "unable to set send buffer size to {}", buffer_size);
+        }
+        if let Err(e) = socket.set_recv_buffer_size(buffer_size) {
+            tracing::debug!(%e, "unable to set recv buffer size to {}", buffer_size);
+        }
+
+        socket.bind(&addr.into())?;
+        let runtime =
+            default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+        Self::new_with_abstract_socket(
+            EndpointConfig::default(),
+            Some(config),
+            runtime.wrap_udp_socket(socket.into())?,
+            runtime,
+        )
+    }
+
+    /// Helper to construct an endpoint for use with both incoming and outgoing connections
+    /// (fallback without network-discovery feature)
+    #[cfg(all(not(wasm_browser), not(feature = "network-discovery")))]
+    pub fn server(config: ServerConfig, addr: SocketAddr) -> io::Result<Self> {
+        let socket = std::net::UdpSocket::bind(addr)?;
+        let runtime =
+            default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+        Self::new_with_abstract_socket(
+            EndpointConfig::default(),
+            Some(config),
+            runtime.wrap_udp_socket(socket)?,
+            runtime,
+        )
+    }
+
+    /// Construct an endpoint with arbitrary configuration and socket.
+    ///
+    /// When the `network-discovery` feature is enabled (the default), this
+    /// also raises `SO_SNDBUF` / `SO_RCVBUF` on `socket` to the PQC-sized
+    /// recommendation (see [`buffer_defaults::recommended_buffer_size`]).
+    /// saorsa-transport defaults to PQC handshakes, whose Initial flights
+    /// and sustained throughput both benefit from multi-MB kernel buffers;
+    /// the platform default (e.g. 512 KiB on macOS) is too small for bulk
+    /// transfer. Failures are logged at debug — kernel limits (e.g. Linux
+    /// `net.core.{r,w}mem_max`) may cap the actual value, in which case
+    /// the socket simply keeps whatever the OS accepted.
+    #[cfg(not(wasm_browser))]
+    pub fn new(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        socket: std::net::UdpSocket,
+        runtime: Arc<dyn Runtime>,
+    ) -> io::Result<Self> {
+        Self::tune_udp_buffers(&socket);
+        let socket = runtime.wrap_udp_socket(socket)?;
+        Self::new_with_abstract_socket(config, server_config, socket, runtime)
+    }
+
+    /// Best-effort raise of UDP socket buffers to the crate's recommended
+    /// size for the active crypto mode.
+    #[cfg(all(not(wasm_browser), feature = "network-discovery"))]
+    fn tune_udp_buffers(socket: &std::net::UdpSocket) {
+        let size = crate::config::buffer_defaults::recommended_buffer_size(true);
+        let sock = socket2::SockRef::from(socket);
+        if let Err(e) = sock.set_send_buffer_size(size) {
+            tracing::debug!(%e, requested = size, "unable to raise SO_SNDBUF");
+        }
+        if let Err(e) = sock.set_recv_buffer_size(size) {
+            tracing::debug!(%e, requested = size, "unable to raise SO_RCVBUF");
+        }
+    }
+
+    /// No-op stub when the `network-discovery` feature is disabled. Callers
+    /// that bypass that feature are expected to size their sockets manually.
+    #[cfg(all(not(wasm_browser), not(feature = "network-discovery")))]
+    fn tune_udp_buffers(_socket: &std::net::UdpSocket) {}
+
+    /// Construct an endpoint with arbitrary configuration and pre-constructed abstract socket
+    ///
+    /// Useful when `socket` has additional state (e.g. sidechannels) attached for which shared
+    /// ownership is needed.
+    pub fn new_with_abstract_socket(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        socket: Arc<dyn AsyncUdpSocket>,
+        runtime: Arc<dyn Runtime>,
+    ) -> io::Result<Self> {
+        let addr = socket.local_addr()?;
+        let allow_mtud = !socket.may_fragment();
+        let rc = EndpointRef::new(
+            socket,
+            crate::endpoint::Endpoint::new(
+                Arc::new(config),
+                server_config.map(Arc::new),
+                allow_mtud,
+                None,
+            ),
+            addr.is_ipv6(),
+            runtime.clone(),
+        );
+        let driver = EndpointDriver(rc.clone());
+        runtime.spawn(Box::pin(
+            async {
+                if let Err(e) = driver.await {
+                    tracing::error!("I/O error: {}", e);
+                }
+            }
+            .instrument(Span::current()),
+        ));
+        Ok(Self {
+            inner: rc,
+            default_client_config: None,
+            runtime,
+        })
+    }
+
+    /// Get the next incoming connection attempt from a client
+    ///
+    /// Yields `Incoming`s, or `None` if the endpoint is [`close`](Self::close)d. `Incoming`
+    /// can be `await`ed to obtain the final [`Connection`](crate::Connection), or used to e.g.
+    /// filter connection attempts or force address validation, or converted into an intermediate
+    /// `Connecting` future which can be used to e.g. send 0.5-RTT data.
+    pub fn accept(&self) -> Accept<'_> {
+        Accept {
+            endpoint: self,
+            notify: self.inner.shared.incoming.notified(),
+        }
+    }
+
+    /// Set the client configuration used by `connect`
+    pub fn set_default_client_config(&mut self, config: ClientConfig) {
+        self.default_client_config = Some(config.clone());
+        // Also store in State so the driver can initiate hole-punch connections
+        if let Ok(mut state) = self.inner.0.state.lock() {
+            state.default_client_config = Some(config);
+        }
+    }
+
+    /// Set the channel for forwarding hole-punch addresses to the NatTraversalEndpoint.
+    ///
+    /// When set, the endpoint driver will send hole-punch addresses through this channel
+    /// instead of doing fire-and-forget QUIC connections. This allows the NatTraversalEndpoint
+    /// to fully track and register the resulting connections.
+    pub fn set_hole_punch_tx(&self, tx: mpsc::UnboundedSender<SocketAddr>) {
+        if let Ok(mut state) = self.inner.0.state.lock() {
+            state.hole_punch_tx = Some(tx);
+        }
+    }
+
+    /// Set channel for peer address update events (ADD_ADDRESS → DHT bridge).
+    /// Register a peer ID for a connection, enabling PUNCH_ME_NOW relay
+    /// routing by peer identity instead of socket address.
+    /// Get the remote address of a peer's connection by peer ID.
+    /// Get the remote address of a peer's connection by peer ID.
+    pub fn peer_connection_addr_by_id(&self, peer_id: &[u8; 32]) -> Option<SocketAddr> {
+        let state = self.inner.0.state.lock().ok()?;
+        let pid = crate::nat_traversal_api::PeerId(*peer_id);
+        state.inner.peer_connection_addr(&pid)
+    }
+
+    /// Register a peer ID for a connection at the low-level endpoint.
+    pub fn register_connection_peer_id(
+        &self,
+        addr: SocketAddr,
+        peer_id: crate::nat_traversal_api::PeerId,
+    ) {
+        if let Ok(mut state) = self.inner.0.state.lock() {
+            // Find the connection handle for this address
+            let normalized = crate::shared::normalize_socket_addr(addr);
+            let handle = state.inner.connection_handle_for_addr(&normalized);
+            if let Some(ch) = handle {
+                state.inner.set_connection_peer_id(ch, peer_id);
+            } else {
+                tracing::debug!(
+                    "No connection handle found for {} — peer ID not registered",
+                    normalized
+                );
+            }
+        }
+    }
+
+    /// Set the channel for forwarding peer address updates to the upper layer.
+    pub fn set_peer_address_update_tx(&self, tx: mpsc::UnboundedSender<(SocketAddr, SocketAddr)>) {
+        if let Ok(mut state) = self.inner.0.state.lock() {
+            state.peer_address_update_tx = Some(tx);
+        }
+    }
+
+    /// Connect to a remote endpoint
+    ///
+    /// `server_name` must be covered by the certificate presented by the server. This prevents a
+    /// connection from being intercepted by an attacker with a valid certificate for some other
+    /// server.
+    ///
+    /// May fail immediately due to configuration errors, or in the future if the connection could
+    /// not be established.
+    pub fn connect(&self, addr: SocketAddr, server_name: &str) -> Result<Connecting, ConnectError> {
+        let config = match &self.default_client_config {
+            Some(config) => config.clone(),
+            None => return Err(ConnectError::NoDefaultClientConfig),
+        };
+
+        self.connect_with(config, addr, server_name)
+    }
+
+    /// Connect to a remote endpoint using a custom configuration.
+    ///
+    /// See [`connect()`] for details.
+    ///
+    /// [`connect()`]: Endpoint::connect
+    pub fn connect_with(
+        &self,
+        config: ClientConfig,
+        addr: SocketAddr,
+        server_name: &str,
+    ) -> Result<Connecting, ConnectError> {
+        let mut endpoint = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ConnectError::EndpointStopping)?;
+        if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
+            return Err(ConnectError::EndpointStopping);
+        }
+        if addr.is_ipv6() && !endpoint.ipv6 {
+            return Err(ConnectError::InvalidRemoteAddress(addr));
+        }
+        let addr = if endpoint.ipv6 {
+            SocketAddr::V6(ensure_ipv6(addr))
+        } else {
+            addr
+        };
+
+        let (ch, conn) = endpoint
+            .inner
+            .connect(self.runtime.now(), config, addr, server_name)?;
+
+        let socket = endpoint.socket.clone();
+        endpoint.stats.outgoing_handshakes += 1;
+        Ok(endpoint
+            .recv_state
+            .connections
+            .insert(ch, conn, socket, self.runtime.clone()))
+    }
+
+    /// Switch to a new UDP socket
+    ///
+    /// See [`Endpoint::rebind_abstract()`] for details.
+    #[cfg(not(wasm_browser))]
+    pub fn rebind(&self, socket: std::net::UdpSocket) -> io::Result<()> {
+        self.rebind_abstract(self.runtime.wrap_udp_socket(socket)?)
+    }
+
+    /// Clone the current underlying socket.
+    ///
+    /// Used by the MASQUE relay to snapshot the original socket before
+    /// `rebind_abstract` replaces it — the relay connection's own QUIC
+    /// traffic must continue on the original socket to avoid a circular
+    /// dependency (the tunnel carrying itself).
+    pub fn current_socket(&self) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        let inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))?;
+        Ok(inner.socket.clone())
+    }
+
+    /// Switch to a new UDP socket
+    ///
+    /// Allows the endpoint's address to be updated live, affecting all active connections. Incoming
+    /// connections and connections to servers unreachable from the new address will be lost.
+    ///
+    /// On error, the old UDP socket is retained.
+    pub fn rebind_abstract(&self, socket: Arc<dyn AsyncUdpSocket>) -> io::Result<()> {
+        let addr = socket.local_addr()?;
+        let mut inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))?;
+        inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
+        inner.ipv6 = addr.is_ipv6();
+
+        // Update connection socket references
+        let num_connections = inner.recv_state.connections.senders.len();
+        tracing::info!(
+            new_addr = %addr,
+            connections = num_connections,
+            "RELAY_REBIND: rebinding endpoint, notifying all connections"
+        );
+        let rebind_socket = inner.socket.clone();
+        let State {
+            stats, recv_state, ..
+        } = &mut *inner;
+        for sender in recv_state.connections.senders.values() {
+            // Rebinds are rare (socket migration). Inbox-full here means that
+            // connection is wedged; we shed the Rebind and count it rather
+            // than blocking every other connection's migration.
+            forward_or_drop(
+                sender,
+                ConnectionEvent::Rebind(rebind_socket.clone()),
+                stats,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Replace the server configuration, affecting new incoming connections only
+    ///
+    /// Useful for e.g. refreshing TLS certificates without disrupting existing connections.
+    pub fn set_server_config(&self, server_config: Option<ServerConfig>) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.inner.set_server_config(server_config.map(Arc::new));
+        } else {
+            error!("Failed to set server config: endpoint state mutex poisoned");
+        }
+    }
+
+    /// Get the local `SocketAddr` the underlying socket is bound to
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Endpoint state mutex poisoned"))?
+            .socket
+            .local_addr()
+    }
+
+    /// Check whether the low-level endpoint still has an active connection
+    /// to the given address. Returns `false` for zombie connections that have
+    /// been removed from the endpoint but still exist in higher-level caches.
+    pub fn has_active_connection(&self, addr: &SocketAddr) -> bool {
+        self.connection_stable_id_for_addr(addr).is_some()
+    }
+
+    /// Get the stable ID of the low-level endpoint's connection to the given
+    /// address. Returns `None` if no connection exists. The stable ID uniquely
+    /// identifies a specific QUIC connection and can be compared against a
+    /// cached Connection's stable_id() to detect stale references.
+    pub fn connection_stable_id_for_addr(&self, addr: &SocketAddr) -> Option<usize> {
+        let Ok(state) = self.inner.state.lock() else {
+            return None;
+        };
+        let normalized = crate::shared::normalize_socket_addr(*addr);
+        let handle = state.inner.connection_handle_for_addr(&normalized);
+        handle.map(|h| state.inner.connection_stable_id(h))
+    }
+
+    /// Get the number of connections that are currently open
+    pub fn open_connections(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.inner.open_connections())
+            .unwrap_or(0)
+    }
+
+    /// Close all of this endpoint's connections immediately and cease accepting new connections.
+    ///
+    /// See [`Connection::close()`] for details.
+    ///
+    /// [`Connection::close()`]: crate::Connection::close
+    pub fn close(&self, error_code: VarInt, reason: &[u8]) {
+        let reason = Bytes::copy_from_slice(reason);
+        let mut endpoint = match self.inner.state.lock() {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                error!("Failed to close endpoint: state mutex poisoned");
+                return;
+            }
+        };
+        endpoint.recv_state.connections.close = Some((error_code, reason.clone()));
+        let State {
+            stats, recv_state, ..
+        } = &mut *endpoint;
+        for sender in recv_state.connections.senders.values() {
+            forward_or_drop(
+                sender,
+                ConnectionEvent::Close {
+                    error_code,
+                    reason: reason.clone(),
+                },
+                stats,
+            );
+        }
+        self.inner.shared.incoming.notify_waiters();
+    }
+
+    /// Wait for all connections on the endpoint to be cleanly shut down
+    ///
+    /// Waiting for this condition before exiting ensures that a good-faith effort is made to notify
+    /// peers of recent connection closes, whereas exiting immediately could force them to wait out
+    /// the idle timeout period.
+    ///
+    /// Does not proactively close existing connections or cause incoming connections to be
+    /// rejected. Consider calling [`close()`] if that is desired.
+    ///
+    /// [`close()`]: Endpoint::close
+    pub async fn wait_idle(&self) {
+        loop {
+            {
+                let endpoint = match self.inner.state.lock() {
+                    Ok(endpoint) => endpoint,
+                    Err(_) => {
+                        error!("Failed to wait for idle: state mutex poisoned");
+                        break;
+                    }
+                };
+                if endpoint.recv_state.connections.is_empty() {
+                    break;
+                }
+                // Construct future while lock is held to avoid race
+                self.inner.shared.idle.notified()
+            }
+            .await;
+        }
+    }
+}
+
+/// Statistics on [Endpoint] activity
+#[non_exhaustive]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct EndpointStats {
+    /// Cummulative number of Quic handshakes accepted by this [Endpoint]
+    pub accepted_handshakes: u64,
+    /// Cummulative number of Quic handshakees sent from this [Endpoint]
+    pub outgoing_handshakes: u64,
+    /// Cummulative number of Quic handshakes refused on this [Endpoint]
+    pub refused_handshakes: u64,
+    /// Cummulative number of Quic handshakes ignored on this [Endpoint]
+    pub ignored_handshakes: u64,
+    /// Cumulative count of [`ConnectionEvent`]s dropped because a
+    /// per-connection inbox was full.
+    ///
+    /// Since the per-connection mailbox was converted from
+    /// `mpsc::unbounded_channel` to a bounded [`mpsc::channel`] of
+    /// `CONN_EVENT_QUEUE_CAPACITY`, the endpoint sheds events when a
+    /// connection driver falls behind rather than growing memory without
+    /// bound. Shedding a `Proto` event is safe — the peer will retransmit —
+    /// but a non-zero value here is a strong signal that a connection is
+    /// overloaded or that the queue is undersized.
+    pub dropped_conn_events: u64,
+}
+
+/// A future that drives IO on an endpoint
+///
+/// This task functions as the switch point between the UDP socket object and the
+/// `Endpoint` responsible for routing datagrams to their owning `Connection`.
+/// In order to do so, it also facilitates the exchange of different types of events
+/// flowing between the `Endpoint` and the tasks managing `Connection`s. As such,
+/// running this task is necessary to keep the endpoint's connections running.
+///
+/// `EndpointDriver` futures terminate when all clones of the `Endpoint` have been dropped, or when
+/// an I/O error occurs.
+#[must_use = "endpoint drivers must be spawned for I/O to occur"]
+#[derive(Debug)]
+pub(crate) struct EndpointDriver(pub(crate) EndpointRef);
+
+impl Future for EndpointDriver {
+    type Output = Result<(), io::Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let mut endpoint = match self.0.state.lock() {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                return Poll::Ready(Err(io::Error::other("Endpoint state mutex poisoned")));
+            }
+        };
+        if endpoint.driver.is_none() {
+            endpoint.driver = Some(cx.waker().clone());
+        }
+
+        let now = endpoint.runtime.now();
+        let mut keep_going = false;
+        keep_going |= endpoint.drive_recv(cx, now)?;
+        keep_going |= endpoint.handle_events(cx, &self.0.shared);
+
+        if !endpoint.recv_state.incoming.is_empty() {
+            self.0.shared.incoming.notify_waiters();
+        }
+
+        if endpoint.ref_count == 0 && endpoint.recv_state.connections.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            drop(endpoint);
+            // If there is more work to do schedule the endpoint task again.
+            // `wake_by_ref()` is called outside the lock to minimize
+            // lock contention on a multithreaded runtime.
+            if keep_going {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for EndpointDriver {
+    fn drop(&mut self) {
+        if let Ok(mut endpoint) = self.0.state.lock() {
+            endpoint.driver_lost = true;
+            self.0.shared.incoming.notify_waiters();
+            // Drop all outgoing channels, signaling the termination of the endpoint to the associated
+            // connections.
+            endpoint.recv_state.connections.senders.clear();
+        } else {
+            error!("Failed to lock endpoint state in drop - mutex poisoned");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct EndpointInner {
+    pub(crate) state: Mutex<State>,
+    pub(crate) shared: Shared,
+}
+
+impl EndpointInner {
+    pub(crate) fn accept(
+        &self,
+        incoming: crate::Incoming,
+        server_config: Option<Arc<ServerConfig>>,
+    ) -> Result<Connecting, ConnectionError> {
+        let mut state = self.state.lock().map_err(|_| {
+            ConnectionError::TransportError(crate::transport_error::Error::INTERNAL_ERROR(
+                "Endpoint state mutex poisoned".to_string(),
+            ))
+        })?;
+        let mut response_buffer = Vec::new();
+        let now = state.runtime.now();
+        match state
+            .inner
+            .accept(incoming, now, &mut response_buffer, server_config)
+        {
+            Ok((handle, conn)) => {
+                state.stats.accepted_handshakes += 1;
+                let socket = state.socket.clone();
+                let runtime = state.runtime.clone();
+                Ok(state
+                    .recv_state
+                    .connections
+                    .insert(handle, conn, socket, runtime))
+            }
+            Err(error) => {
+                if let Some(transmit) = error.response {
+                    respond(transmit, &response_buffer, &*state.socket);
+                }
+                Err(error.cause)
+            }
+        }
+    }
+
+    pub(crate) fn refuse(&self, incoming: crate::Incoming) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                error!("Failed to refuse connection: endpoint state mutex poisoned");
+                return;
+            }
+        };
+        state.stats.refused_handshakes += 1;
+        let mut response_buffer = Vec::new();
+        let transmit = state.inner.refuse(incoming, &mut response_buffer);
+        respond(transmit, &response_buffer, &*state.socket);
+    }
+
+    pub(crate) fn retry(
+        &self,
+        incoming: crate::Incoming,
+    ) -> Result<(), crate::endpoint::RetryError> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                error!("Failed to retry connection: endpoint state mutex poisoned");
+                return Err(crate::endpoint::RetryError::incoming(incoming));
+            }
+        };
+        let mut response_buffer = Vec::new();
+        let transmit = state.inner.retry(incoming, &mut response_buffer)?;
+        respond(transmit, &response_buffer, &*state.socket);
+        Ok(())
+    }
+
+    pub(crate) fn ignore(&self, incoming: crate::Incoming) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stats.ignored_handshakes += 1;
+            state.inner.ignore(incoming);
+        } else {
+            error!("Failed to ignore incoming connection: endpoint state mutex poisoned");
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct State {
+    socket: Arc<dyn AsyncUdpSocket>,
+    /// During an active migration, abandoned_socket receives traffic
+    /// until the first packet arrives on the new socket.
+    prev_socket: Option<Arc<dyn AsyncUdpSocket>>,
+    inner: crate::endpoint::Endpoint,
+    recv_state: RecvState,
+    driver: Option<Waker>,
+    ipv6: bool,
+    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
+    /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
+    ref_count: usize,
+    driver_lost: bool,
+    runtime: Arc<dyn Runtime>,
+    stats: EndpointStats,
+    /// Client config for initiating hole-punch connections
+    default_client_config: Option<ClientConfig>,
+    /// Channel for forwarding hole-punch addresses to the NatTraversalEndpoint
+    /// for full connection tracking instead of fire-and-forget.
+    hole_punch_tx: Option<mpsc::UnboundedSender<SocketAddr>>,
+    peer_address_update_tx: Option<mpsc::UnboundedSender<(SocketAddr, SocketAddr)>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Shared {
+    incoming: Notify,
+    idle: Notify,
+}
+
+impl State {
+    fn drive_recv(&mut self, cx: &mut Context, now: Instant) -> Result<bool, io::Error> {
+        let get_time = || self.runtime.now();
+        self.recv_state.recv_limiter.start_cycle(get_time);
+        if let Some(socket) = &self.prev_socket {
+            // We don't care about the `PollProgress` from old sockets.
+            let poll_res = self.recv_state.poll_socket(
+                cx,
+                &mut self.inner,
+                &**socket,
+                &*self.runtime,
+                now,
+                &mut self.stats,
+            );
+            if poll_res.is_err() {
+                self.prev_socket = None;
+            }
+        };
+        let poll_res = self.recv_state.poll_socket(
+            cx,
+            &mut self.inner,
+            &*self.socket,
+            &*self.runtime,
+            now,
+            &mut self.stats,
+        );
+        self.recv_state.recv_limiter.finish_cycle(get_time);
+        let poll_res = poll_res?;
+        if poll_res.received_connection_packet {
+            // Traffic has arrived on self.socket, therefore there is no need for the abandoned
+            // one anymore. TODO: Account for multiple outgoing connections.
+            self.prev_socket = None;
+        }
+        Ok(poll_res.keep_going)
+    }
+
+    fn handle_events(&mut self, cx: &mut Context, shared: &Shared) -> bool {
+        let mut did_work = false;
+
+        for _ in 0..IO_LOOP_BOUND {
+            let (ch, event) = match self.events.poll_recv(cx) {
+                Poll::Ready(Some(x)) => x,
+                Poll::Ready(None) => unreachable!("EndpointInner owns one sender"),
+                Poll::Pending => {
+                    break;
+                }
+            };
+
+            did_work = true;
+
+            if event.is_drained() {
+                self.recv_state.connections.senders.remove(&ch);
+                if self.recv_state.connections.is_empty() {
+                    shared.idle.notify_waiters();
+                }
+            }
+            let Some(event) = self.inner.handle_event(ch, event) else {
+                continue;
+            };
+            // Ignoring errors from dropped connections that haven't yet been cleaned up
+            if let Some(sender) = self.recv_state.connections.senders.get_mut(&ch) {
+                forward_or_drop(sender, ConnectionEvent::Proto(event), &mut self.stats);
+            }
+        }
+
+        // Process relay events generated by the endpoint
+        // These are PUNCH_ME_NOW frames that need to be forwarded to target connections
+        for (ch, event) in self.inner.drain_relay_events() {
+            did_work = true;
+            if let Some(sender) = self.recv_state.connections.senders.get_mut(&ch) {
+                tracing::debug!("Sending relay event to connection {:?}", ch);
+                forward_or_drop(sender, ConnectionEvent::Proto(event), &mut self.stats);
+            } else {
+                tracing::warn!(
+                    "Cannot send relay event: connection {:?} not found in senders",
+                    ch
+                );
+            }
+        }
+
+        // Process hole-punch connection attempts from relayed PUNCH_ME_NOW.
+        // Forward addresses to the NatTraversalEndpoint (via channel) for full
+        // connection tracking, or fall back to fire-and-forget if no channel.
+        let hole_punch_addrs: Vec<SocketAddr> = self.inner.drain_hole_punch_addrs().collect();
+        for peer_address in hole_punch_addrs {
+            did_work = true;
+            if let Some(ref tx) = self.hole_punch_tx {
+                // Forward to NatTraversalEndpoint for full tracking
+                match tx.send(peer_address) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Hole-punch: forwarded {} to NatTraversalEndpoint for tracked connection",
+                            peer_address,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Hole-punch: failed to forward {} (channel closed): {}",
+                            peer_address,
+                            e,
+                        );
+                    }
+                }
+            } else if let Some(ref config) = self.default_client_config {
+                // Fallback: fire-and-forget (no NatTraversalEndpoint channel configured).
+                // This is intentional for backward compatibility: when no hole_punch_tx
+                // is configured we still send a QUIC Initial to create a NAT binding.
+                // The resulting connection handles (_ch, _conn) are deliberately
+                // discarded — Quinn's internal idle timeout will clean them up.
+                let addr = if self.ipv6 {
+                    SocketAddr::V6(ensure_ipv6(peer_address))
+                } else {
+                    peer_address
+                };
+                match self
+                    .inner
+                    .connect(crate::Instant::now(), config.clone(), addr, "peer")
+                {
+                    Ok((_ch, _conn)) => {
+                        tracing::info!(
+                            "Hole-punch: sent QUIC Initial to {} for NAT binding (fire-and-forget fallback)",
+                            peer_address,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Hole-punch: failed to initiate connection to {}: {:?}",
+                            peer_address,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Forward peer address updates from ADD_ADDRESS frames to the
+        // NatTraversalEndpoint so it can update the DHT routing table.
+        let address_updates: Vec<(SocketAddr, SocketAddr)> =
+            self.inner.drain_peer_address_updates().collect();
+        for (peer_addr, advertised_addr) in address_updates {
+            did_work = true;
+            if let Some(ref tx) = self.peer_address_update_tx {
+                let _ = tx.send((peer_addr, advertised_addr));
+            }
+        }
+
+        did_work
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        for incoming in self.recv_state.incoming.drain(..) {
+            self.inner.ignore(incoming);
+        }
+    }
+}
+
+fn respond(transmit: crate::Transmit, response_buffer: &[u8], socket: &dyn AsyncUdpSocket) {
+    // Send if there's kernel buffer space; otherwise, drop it
+    //
+    // As an endpoint-generated packet, we know this is an
+    // immediate, stateless response to an unconnected peer,
+    // one of:
+    //
+    // - A version negotiation response due to an unknown version
+    // - A `CLOSE` due to a malformed or unwanted connection attempt
+    // - A stateless reset due to an unrecognized connection
+    // - A `Retry` packet due to a connection attempt when
+    //   `use_retry` is set
+    //
+    // In each case, a well-behaved peer can be trusted to retry a
+    // few times, which is guaranteed to produce the same response
+    // from us. Repeated failures might at worst cause a peer's new
+    // connection attempt to time out, which is acceptable if we're
+    // under such heavy load that there's never room for this code
+    // to transmit. This is morally equivalent to the packet getting
+    // lost due to congestion further along the link, which
+    // similarly relies on peer retries for recovery.
+    //
+    // V2-834: these packets are counted in the socket totals like any other
+    // send, but they belong to no connection, so itemise them here to keep
+    // "endpoint total minus connection totals" explainable.
+    if socket
+        .try_send(&udp_transmit(&transmit, &response_buffer[..transmit.size]))
+        .is_ok()
+    {
+        SOCKET_TRAFFIC.record_stateless_tx(transmit.size);
+    }
+}
+
+#[inline]
+fn proto_ecn(ecn: quinn_udp::EcnCodepoint) -> crate::EcnCodepoint {
+    match ecn {
+        quinn_udp::EcnCodepoint::Ect0 => crate::EcnCodepoint::Ect0,
+        quinn_udp::EcnCodepoint::Ect1 => crate::EcnCodepoint::Ect1,
+        quinn_udp::EcnCodepoint::Ce => crate::EcnCodepoint::Ce,
+    }
+}
+
+/// Capacity of each per-connection `ConnectionEvent` mailbox.
+///
+/// Chosen as a compromise between memory usage (every active connection holds
+/// a queue of this size) and tolerance for transient driver lag. 1024 events
+/// is well above the burst size produced by normal congestion-window-sized
+/// inflight packets, so a healthy driver never hits the bound; under DoS or
+/// a stalled task, excess events are shed via [`mpsc::Sender::try_send`] and
+/// counted on [`EndpointStats::dropped_conn_events`].
+const CONN_EVENT_QUEUE_CAPACITY: usize = 1024;
+
+#[derive(Debug)]
+struct ConnectionSet {
+    /// Senders for communicating with the endpoint's connections.
+    ///
+    /// Bounded ([`CONN_EVENT_QUEUE_CAPACITY`]) so a slow per-connection
+    /// driver can't grow memory without bound under sustained packet
+    /// arrival. Overflow is shed via [`mpsc::Sender::try_send`] and counted
+    /// on [`EndpointStats::dropped_conn_events`].
+    senders: FxHashMap<ConnectionHandle, mpsc::Sender<ConnectionEvent>>,
+    /// Stored to give out clones to new ConnectionInners
+    sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    /// Set if the endpoint has been manually closed
+    close: Option<(VarInt, Bytes)>,
+}
+
+impl ConnectionSet {
+    fn insert(
+        &mut self,
+        handle: ConnectionHandle,
+        conn: crate::Connection,
+        socket: Arc<dyn AsyncUdpSocket>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Connecting {
+        let (send, recv) = mpsc::channel(CONN_EVENT_QUEUE_CAPACITY);
+        if let Some((error_code, ref reason)) = self.close {
+            // Fresh channel has full capacity — this cannot fail, but we
+            // ignore the error defensively in case a refactor ever changes
+            // that invariant.
+            let _ = send.try_send(ConnectionEvent::Close {
+                error_code,
+                reason: reason.clone(),
+            });
+        }
+        self.senders.insert(handle, send);
+        Connecting::new(handle, conn, self.sender.clone(), recv, socket, runtime)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.senders.is_empty()
+    }
+}
+
+fn ensure_ipv6(x: SocketAddr) -> SocketAddrV6 {
+    match x {
+        SocketAddr::V6(x) => x,
+        SocketAddr::V4(x) => SocketAddrV6::new(x.ip().to_ipv6_mapped(), x.port(), 0, 0),
+    }
+}
+
+/// Try to forward a [`ConnectionEvent`] to a per-connection mailbox, shedding
+/// it (and bumping [`EndpointStats::dropped_conn_events`]) if the mailbox is
+/// full. Closed mailboxes correspond to a connection that has already been
+/// torn down and are silently ignored, matching the prior
+/// `let _ = sender.send(..)` behaviour.
+///
+/// A full mailbox on a [`ConnectionEvent::Proto`] is safe: the peer will
+/// retransmit the unacknowledged packets. For [`ConnectionEvent::Rebind`]
+/// and [`ConnectionEvent::Close`] it merely delays the control event for
+/// that connection; callers log the incident through the counter instead
+/// of blocking the endpoint-wide driver.
+#[inline]
+fn forward_or_drop(
+    sender: &mpsc::Sender<ConnectionEvent>,
+    event: ConnectionEvent,
+    stats: &mut EndpointStats,
+) {
+    match sender.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            stats.dropped_conn_events = stats.dropped_conn_events.saturating_add(1);
+            trace!(
+                dropped_total = stats.dropped_conn_events,
+                "connection inbox full, shedding event"
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // Receiver dropped — connection is already being torn down.
+        }
+    }
+}
+
+pin_project! {
+    /// Future produced by [`Endpoint::accept`]
+    pub struct Accept<'a> {
+        endpoint: &'a Endpoint,
+        #[pin]
+        notify: Notified<'a>,
+    }
+}
+
+impl Future for Accept<'_> {
+    type Output = Option<super::incoming::Incoming>;
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let mut endpoint = match this.endpoint.inner.state.lock() {
+            Ok(endpoint) => endpoint,
+            Err(_) => return Poll::Ready(None),
+        };
+        if endpoint.driver_lost {
+            return Poll::Ready(None);
+        }
+        if let Some(incoming) = endpoint.recv_state.incoming.pop_front() {
+            // Release the mutex lock on endpoint so cloning it doesn't deadlock
+            drop(endpoint);
+            let incoming = super::incoming::Incoming::new(incoming, this.endpoint.inner.clone());
+            return Poll::Ready(Some(incoming));
+        }
+        if endpoint.recv_state.connections.close.is_some() {
+            return Poll::Ready(None);
+        }
+        loop {
+            match this.notify.as_mut().poll(ctx) {
+                // `state` lock ensures we didn't race with readiness
+                Poll::Pending => return Poll::Pending,
+                // Spurious wakeup, get a new future
+                Poll::Ready(()) => this
+                    .notify
+                    .set(this.endpoint.inner.shared.incoming.notified()),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct EndpointRef(Arc<EndpointInner>);
+
+impl EndpointRef {
+    pub(crate) fn new(
+        socket: Arc<dyn AsyncUdpSocket>,
+        inner: crate::endpoint::Endpoint,
+        ipv6: bool,
+        runtime: Arc<dyn Runtime>,
+    ) -> Self {
+        let (sender, events) = mpsc::unbounded_channel();
+        let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
+        Self(Arc::new(EndpointInner {
+            shared: Shared {
+                incoming: Notify::new(),
+                idle: Notify::new(),
+            },
+            state: Mutex::new(State {
+                socket,
+                prev_socket: None,
+                inner,
+                ipv6,
+                events,
+                driver: None,
+                ref_count: 0,
+                driver_lost: false,
+                recv_state,
+                runtime,
+                stats: EndpointStats::default(),
+                default_client_config: None,
+                hole_punch_tx: None,
+                peer_address_update_tx: None,
+            }),
+        }))
+    }
+}
+
+impl Clone for EndpointRef {
+    fn clone(&self) -> Self {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.ref_count += 1;
+        }
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for EndpointRef {
+    fn drop(&mut self) {
+        if let Ok(mut endpoint) = self.0.state.lock() {
+            if let Some(x) = endpoint.ref_count.checked_sub(1) {
+                endpoint.ref_count = x;
+                if x == 0 {
+                    // If the driver is about to be on its own, ensure it can shut down if the last
+                    // connection is gone.
+                    if let Some(task) = endpoint.driver.take() {
+                        task.wake();
+                    }
+                }
+            }
+        } else {
+            error!("Failed to drop EndpointRef: state mutex poisoned");
+        }
+    }
+}
+
+impl std::ops::Deref for EndpointRef {
+    type Target = EndpointInner;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// State directly involved in handling incoming packets
+struct RecvState {
+    incoming: VecDeque<crate::Incoming>,
+    connections: ConnectionSet,
+    recv_buf: Box<[u8]>,
+    recv_limiter: WorkLimiter,
+}
+
+/// Returns `true` for UDP receive errors that pertain to a single prior
+/// transmit — typically surfaced from an ICMP error report — rather than to the
+/// shared endpoint socket itself. Such errors must NOT terminate the endpoint
+/// driver: the endpoint multiplexes every peer connection over one socket, so
+/// tearing it down on a per-peer ICMP report drops all connections at once and,
+/// because the driver is never respawned, wedges the node permanently.
+///
+/// On Windows these are delivered inline from `recvfrom` unless the
+/// `SIO_UDP_CONNRESET` / `SIO_UDP_NETRESET` ioctls are cleared (which this
+/// socket path does not do). The damaging one observed in the field is
+/// `WSAENETRESET` (os error 10052), reported for an ICMP "TTL expired in
+/// transit" on an earlier outbound datagram; it has no stable `io::ErrorKind`,
+/// so it is matched by raw code. The numeric WinSock codes do not collide with
+/// Unix `errno` values, so the raw-code check is harmless on every platform.
+fn is_transient_recv_error(e: &io::Error) -> bool {
+    use io::ErrorKind::{ConnectionRefused, ConnectionReset, HostUnreachable, NetworkUnreachable};
+    if matches!(
+        e.kind(),
+        ConnectionReset | ConnectionRefused | HostUnreachable | NetworkUnreachable
+    ) {
+        return true;
+    }
+    // WinSock codes for per-datagram ICMP conditions, several of which lack a
+    // portable `ErrorKind`: NETUNREACH(10051), NETRESET(10052), CONNRESET(10054),
+    // CONNREFUSED(10061), HOSTUNREACH(10065).
+    matches!(
+        e.raw_os_error(),
+        Some(10051 | 10052 | 10054 | 10061 | 10065)
+    )
+}
+
+impl RecvState {
+    fn new(
+        sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+        max_receive_segments: usize,
+        endpoint: &crate::endpoint::Endpoint,
+    ) -> Self {
+        // Use a receive buffer size large enough to handle any incoming packet.
+        // This is especially important for PQC handshakes which can send 4096+ byte datagrams
+        // before transport parameters are exchanged. We use the maximum of:
+        // - The configured max_udp_payload_size (what we expect to receive)
+        // - PQC minimum MTU (4096 bytes) to handle PQC handshakes regardless of config
+        // - Capped at 64KB for practical memory usage
+        const PQC_MIN_RECV_SIZE: u64 = 4096;
+        let configured_size = endpoint.config().get_max_udp_payload_size();
+        let effective_size = configured_size.max(PQC_MIN_RECV_SIZE).min(64 * 1024) as usize;
+
+        let recv_buf = vec![0; effective_size * max_receive_segments * BATCH_SIZE];
+        Self {
+            connections: ConnectionSet {
+                senders: FxHashMap::default(),
+                sender,
+                close: None,
+            },
+            incoming: VecDeque::new(),
+            recv_buf: recv_buf.into(),
+            recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
+        }
+    }
+
+    fn poll_socket(
+        &mut self,
+        cx: &mut Context,
+        endpoint: &mut crate::endpoint::Endpoint,
+        socket: &dyn AsyncUdpSocket,
+        runtime: &dyn Runtime,
+        now: Instant,
+        stats: &mut EndpointStats,
+    ) -> Result<PollProgress, io::Error> {
+        let mut received_connection_packet = false;
+        let mut metas = [RecvMeta::default(); BATCH_SIZE];
+        let mut iovs: [IoSliceMut; BATCH_SIZE] = {
+            let mut bufs = self
+                .recv_buf
+                .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
+                .map(IoSliceMut::new);
+
+            // expect() safe as self.recv_buf is chunked into BATCH_SIZE items
+            // and iovs will be of size BATCH_SIZE, thus from_fn is called
+            // exactly BATCH_SIZE times.
+            std::array::from_fn(|_| {
+                bufs.next().unwrap_or_else(|| {
+                    error!("Insufficient buffers for BATCH_SIZE");
+                    IoSliceMut::new(&mut [])
+                })
+            })
+        };
+        loop {
+            match socket.poll_recv(cx, &mut iovs, &mut metas) {
+                Poll::Ready(Ok(msgs)) => {
+                    self.recv_limiter.record_work(msgs);
+                    for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
+                        let mut data: BytesMut = buf[0..meta.len].into();
+                        while !data.is_empty() {
+                            let buf = data.split_to(meta.stride.min(data.len()));
+                            let mut response_buffer = Vec::new();
+                            match endpoint.handle(
+                                now,
+                                meta.addr,
+                                meta.dst_ip,
+                                meta.ecn.map(proto_ecn),
+                                buf,
+                                &mut response_buffer,
+                            ) {
+                                Some(DatagramEvent::NewConnection(incoming)) => {
+                                    if self.connections.close.is_none() {
+                                        self.incoming.push_back(incoming);
+                                    } else {
+                                        let transmit =
+                                            endpoint.refuse(incoming, &mut response_buffer);
+                                        respond(transmit, &response_buffer, socket);
+                                    }
+                                }
+                                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                                    // Ignoring errors from dropped connections that haven't yet been cleaned up
+                                    received_connection_packet = true;
+                                    if let Some(sender) = self.connections.senders.get_mut(&handle)
+                                    {
+                                        forward_or_drop(
+                                            sender,
+                                            ConnectionEvent::Proto(event),
+                                            stats,
+                                        );
+                                    }
+                                }
+                                Some(DatagramEvent::Response(transmit)) => {
+                                    respond(transmit, &response_buffer, socket);
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                }
+                Poll::Pending => {
+                    return Ok(PollProgress {
+                        received_connection_packet,
+                        keep_going: false,
+                    });
+                }
+                // Tolerate per-datagram receive errors instead of killing the
+                // endpoint driver. ECONNRESET is undefined in QUIC and may be
+                // injected by an attacker; the ICMP-driven family (e.g. Windows
+                // WSAENETRESET / os error 10052) refers to a single prior transmit
+                // to one peer. Tearing down the shared socket for any of these
+                // drops every multiplexed connection permanently. See
+                // `is_transient_recv_error`.
+                Poll::Ready(Err(ref e)) if is_transient_recv_error(e) => {
+                    trace!(error = %e, "ignoring transient UDP recv error");
+                    continue;
+                }
+                Poll::Ready(Err(e)) => {
+                    return Err(e);
+                }
+            }
+            if !self.recv_limiter.allow_work(|| runtime.now()) {
+                return Ok(PollProgress {
+                    received_connection_packet,
+                    keep_going: true,
+                });
+            }
+        }
+    }
+}
+
+impl fmt::Debug for RecvState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("RecvState")
+            .field("incoming", &self.incoming)
+            .field("connections", &self.connections)
+            // recv_buf too large
+            .field("recv_limiter", &self.recv_limiter)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+struct PollProgress {
+    /// Whether a datagram was routed to an existing connection
+    received_connection_packet: bool,
+    /// Whether datagram handling was interrupted early by the work limiter for fairness
+    keep_going: bool,
+}
+
+#[cfg(test)]
+mod transient_recv_error_tests {
+    use super::is_transient_recv_error;
+    use std::io;
+
+    #[test]
+    fn wsaenetreset_10052_is_transient() {
+        // The exact error that wedged Windows nodes in the field: an ICMP
+        // "TTL expired in transit" surfaced as WSAENETRESET. It has no portable
+        // ErrorKind, so it must be recognised by its raw WinSock code.
+        assert!(is_transient_recv_error(&io::Error::from_raw_os_error(
+            10052
+        )));
+    }
+
+    #[test]
+    fn icmp_family_winsock_codes_are_transient() {
+        // NETUNREACH, CONNRESET, CONNREFUSED, HOSTUNREACH.
+        for code in [10051, 10054, 10061, 10065] {
+            assert!(
+                is_transient_recv_error(&io::Error::from_raw_os_error(code)),
+                "WinSock {code} should be tolerated"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_error_kinds_are_transient() {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+        ] {
+            assert!(
+                is_transient_recv_error(&io::Error::from(kind)),
+                "{kind:?} should be tolerated"
+            );
+        }
+    }
+
+    #[test]
+    fn genuinely_fatal_errors_still_propagate() {
+        // A dead/closed socket must still kill the driver, not be swallowed.
+        assert!(!is_transient_recv_error(&io::Error::from(
+            io::ErrorKind::NotConnected
+        )));
+        // WSAENETDOWN (10050) is deliberately excluded: a downed adapter is not a
+        // per-datagram condition and tolerating it could busy-loop the driver.
+        assert!(!is_transient_recv_error(&io::Error::from_raw_os_error(
+            10050
+        )));
+    }
+}
