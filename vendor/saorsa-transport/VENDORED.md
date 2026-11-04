@@ -5,6 +5,8 @@
 # settings and notes, packaging and lint settings, Go and protobuf files, shell scripts, README.md,
 # CHANGELOG.md, Cargo.lock, Cargo.toml.orig, the disabled tests and examples no target compiles, and
 # saved test output, none of which the build or the crate's tests read.
+# Cargo warns that the copy's own [profile.release] is ignored. That is expected (cargo ignored it
+# when the crate came from crates.io too), and the copy's Cargo.toml is left unpatched on purpose.
 # The only change from upstream is to the bookkeeping of accepted connections, in
 # src/nat_traversal_api.rs. Upstream's relay endpoint accept loop keyed a connection by the address
 # its socket reports, [::ffff:a.b.c.d]:p for an IPv4 peer, in the connection map and the set of

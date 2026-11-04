@@ -639,7 +639,11 @@ mod direct_first {
 /// that had come through a relay stayed announced once the relay closed, and
 /// every later connection from it was accepted and never handed on. The
 /// bookkeeping is private to saorsa-transport: its own tests pin it there,
-/// and test.yml runs them.
+/// and test.yml runs them. What they can't pin is checked here as text: that
+/// both accept loops still take their connections through
+/// `take_accepted_connection`, and that `remove_connection` still takes the
+/// forms of an address that key no connection out of the announced set, so a
+/// re-vendor or a merge can't bring back upstream's bookkeeping unnoticed.
 mod relay_reconnect {
     use super::repo_text;
 
@@ -703,6 +707,49 @@ mod relay_reconnect {
         assert!(
             test_workflow.contains("run: cargo test --locked -p saorsa-transport --lib"),
             "test.yml no longer runs vendor/saorsa-transport's own tests"
+        );
+    }
+
+    /// `text` with all its whitespace left out, so a snippet is found however
+    /// its lines are broken.
+    fn squeezed(text: &str) -> String {
+        text.split_whitespace().collect()
+    }
+
+    /// The patched file's wiring, as text: both accept loops take their
+    /// connection through `take_accepted_connection` (two calls outside the
+    /// tests module), and `remove_connection` still takes the forms of an
+    /// address that key no connection out of the announced set. A re-vendor
+    /// or a merge that brings back upstream's bookkeeping fails here.
+    #[test]
+    fn both_accept_loops_and_the_removal_keep_the_bookkeeping() {
+        let source = repo_text(PATCHED_FILE).replace("\r\n", "\n");
+        // Outside the tests module, whose own call is a test's.
+        let outside_tests = source.split("\nmod tests {").next().unwrap();
+        let calls = outside_tests
+            .matches("Self::take_accepted_connection(")
+            .count();
+        assert_eq!(
+            calls, 2,
+            "{PATCHED_FILE}: the main endpoint's accept loop and a relay endpoint's must each \
+             take an accepted connection through Self::take_accepted_connection, once"
+        );
+
+        let from_removal = outside_tests
+            .split("    pub fn remove_connection(")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{PATCHED_FILE} lost remove_connection"));
+        let removal = from_removal.split("\n    }\n").next().unwrap();
+        let cleanup = concat!(
+            "for candidate in &variants {",
+            " if !self.connections.contains_key(candidate) {",
+            " self.emitted_established_events.remove(candidate);",
+            " } }"
+        );
+        assert!(
+            squeezed(removal).contains(&squeezed(cleanup)),
+            "{PATCHED_FILE}: remove_connection must take every form of the address that keys no \
+             connection out of emitted_established_events, whether or not it removed one"
         );
     }
 }

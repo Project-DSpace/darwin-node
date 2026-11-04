@@ -114,6 +114,11 @@
 #   and the reset and log-forwarding routes; its image job needs that job
 #   and passes the image marker, and attests the image it pushed (build
 #   provenance, kept in GitHub's attestations API);
+# - build.yml's notices job keeps its steps "Check the vendored
+#   ant-listings", "Check the vendored saorsa-core" and "Check the vendored
+#   saorsa-transport", each comparing the copy's git objects (the files it
+#   patched or kept, and a hash of the rest) with its VENDORED.md, so a
+#   re-vendor or a merge can't change a copy unnoticed;
 # - build.yml's linux-x64 job, which builds the image's node, and
 #   release.yml's build job, which builds the node releases install, build it
 #   with exactly `cargo build --release --locked --bin ant-node`, so no
@@ -1090,6 +1095,41 @@ else
         'subject-name: ghcr.io/project-dspace/storage-node' \
         'subject-digest: ${{ steps.digest.outputs.digest }}' \
         'push-to-registry: false'
+    # The vendored crates are the copies their VENDORED.md files record: the
+    # notices job compares the git objects of what each copy keeps with the
+    # record, in one step a crate. A step that is gone, or no longer compares
+    # them, would let a re-vendor or a merge change a copy unnoticed.
+    notices=$(job notices "${BUILD}")
+    holds "$(step "Check the vendored ant-listings" "${notices}")" \
+        "build.yml's notices job must keep its step 'Check the vendored ant-listings', which compares vendor/ant-listings's src tree and Cargo.toml with the git objects its VENDORED.md records" \
+        'for object in "src tree" "Cargo.toml blob"; do' \
+        'recorded=$(sed -n "s/^- $object: \([0-9a-f]\{40\}\)\$/\1/p" vendor/ant-listings/VENDORED.md)' \
+        'actual=$(git rev-parse "HEAD:$path")' \
+        'refuse: if [[ -z "$recorded" || "$actual" != "$recorded" ]]; then'
+    holds "$(step "Check the vendored saorsa-core" "${notices}")" \
+        "build.yml's notices job must keep its step 'Check the vendored saorsa-core', which compares vendor/saorsa-core's four patched files and the rest of the copy with the git objects and the hash its VENDORED.md records" \
+        'dir=vendor/saorsa-core' \
+        'patched="src/client_routing.rs src/dht/core_engine.rs src/dht_network_manager.rs src/peer_record.rs"' \
+        'for file in $patched; do' \
+        'recorded=$(sed -n "s|^- $file blob: \([0-9a-f]\{40\}\)\$|\1|p" $dir/VENDORED.md)' \
+        'refuse: if [[ -z "$2" || "$3" != "$2" ]]; then' \
+        'check "$dir/$file" "$recorded" "$(git rev-parse "HEAD:$dir/$file")"' \
+        'recorded=$(sed -n "s/^- rest sha256: \([0-9a-f]\{64\}\)\$/\1/p" $dir/VENDORED.md)' \
+        'actual=$(git ls-tree -r HEAD $dir \' \
+        'check "the rest of $dir" "$recorded" "$actual"' \
+        'exit $fail'
+    holds "$(step "Check the vendored saorsa-transport" "${notices}")" \
+        "build.yml's notices job must keep its step 'Check the vendored saorsa-transport', which compares vendor/saorsa-transport's patched file and the rest of the copy with the git object and the hash its VENDORED.md records" \
+        'dir=vendor/saorsa-transport' \
+        'patched="src/nat_traversal_api.rs"' \
+        'for file in $patched; do' \
+        'recorded=$(sed -n "s|^- $file blob: \([0-9a-f]\{40\}\)\$|\1|p" $dir/VENDORED.md)' \
+        'refuse: if [[ -z "$2" || "$3" != "$2" ]]; then' \
+        'check "$dir/$file" "$recorded" "$(git rev-parse "HEAD:$dir/$file")"' \
+        'recorded=$(sed -n "s/^- rest sha256: \([0-9a-f]\{64\}\)\$/\1/p" $dir/VENDORED.md)' \
+        'actual=$(git ls-tree -r HEAD $dir \' \
+        'check "the rest of $dir" "$recorded" "$actual"' \
+        'exit $fail'
 fi
 
 # The node is built the same way for the image (build.yml's linux-x64 job)
@@ -1211,4 +1251,4 @@ if ((PROBLEMS > 0)); then
     echo "${PROBLEMS} problem(s) in ${DIR}" >&2
     exit 1
 fi
-echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with the tagged commit's release notes after the fixed text, and moves :latest forward only; latest.yml runs only by hand with no default permissions, names each run for its digest, checks its own commit with this script, and moves :latest in the latest environment, once it asks for its one reviewer's approval, only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested (for a withdrawal, also recorded, or listed in ${RELEASE_IMAGES_FILE}), from a commit whose Test run succeeded, with a published release's node whose code changes since its tag node_code names, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, to an image without a marker from one with a marker only in a withdrawal with allow_unmarked, to an older node only once the withdrawn release is gone and no other published release is newer, to the same node only one image back, with its release checked again after the approval, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, each with one registry write, and build.yml's image job alone pushes other tags; only release.yml's publish job runs in the release environment, and latest.yml's latest job in the latest environment; ${RELEASE_IMAGES_FILE} lists the images releases put on :latest before attestation; ${TOOLCHAIN_FILE} pins an exact Rust release that every workflow builds with."
+echo "${DIR}: build.yml, latest.yml, release.yml and test.yml, every action pinned; release.yml runs for v*+ds.* tags with no default permissions, checks the release key, publishes in the release environment only after the tagged commit's Test and Build runs succeeded, its Test run from the push to main or by hand without the listings cross-test, with the tagged commit's release notes after the fixed text, and moves :latest forward only; latest.yml runs only by hand with no default permissions, names each run for its digest, checks its own commit with this script, and moves :latest in the latest environment, once it asks for its one reviewer's approval, only after checking, with nothing that can write, that the run is from main and that the image is the one a commit on main's Build run tested and attested (for a withdrawal, also recorded, or listed in ${RELEASE_IMAGES_FILE}), from a commit whose Test run succeeded, with a published release's node whose code changes since its tag node_code names, to the node :latest has, or an older one or an older image only in a withdrawal, back to an image :latest held, to an image without a marker from one with a marker only in a withdrawal with allow_unmarked, to an older node only once the withdrawn release is gone and no other published release is newer, to the same node only one image back, with its release checked again after the approval, naming :latest's digest in the summary first; neither has a condition, anything continuing on error, or a refusal that doesn't stop its step; test.yml's test job runs every test; build.yml builds the image's node manager with --locked from the pinned darwin-client commit, which is on darwin-client's main, checks it, gives the image its marker, and attests the image; build.yml's notices job checks each vendored crate against its VENDORED.md; build.yml and release.yml build the node with no feature and check it for test seams before packaging it; only the latest jobs of release.yml and latest.yml move :latest, each with one registry write, and build.yml's image job alone pushes other tags; only release.yml's publish job runs in the release environment, and latest.yml's latest job in the latest environment; ${RELEASE_IMAGES_FILE} lists the images releases put on :latest before attestation; ${TOOLCHAIN_FILE} pins an exact Rust release that every workflow builds with."

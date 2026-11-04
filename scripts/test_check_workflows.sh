@@ -1322,6 +1322,39 @@ fresh
 edit "${BUILD}" $'      id-token: write\n' ''
 expect "the image job unable to attest" "build.yml's image job must be able to attest the image"
 
+# The vendored crates are checked against their VENDORED.md files, one step a
+# crate in the notices job: each step stays, and keeps comparing.
+fresh
+drop_step "${BUILD}" "Check the vendored ant-listings"
+expect "the vendored ant-listings not checked" \
+    "build.yml's notices job must keep its step 'Check the vendored ant-listings'"
+
+fresh
+drop_step "${BUILD}" "Check the vendored saorsa-core"
+expect "the vendored saorsa-core not checked" \
+    "build.yml's notices job must keep its step 'Check the vendored saorsa-core'"
+
+fresh
+drop_step "${BUILD}" "Check the vendored saorsa-transport"
+expect "the vendored saorsa-transport not checked" \
+    "build.yml's notices job must keep its step 'Check the vendored saorsa-transport'"
+
+fresh
+edit "${BUILD}" 'actual=$(git rev-parse "HEAD:$path")' 'actual=$recorded'
+expect "the vendored ant-listings compared with itself" \
+    "build.yml's notices job must keep its step 'Check the vendored ant-listings'"
+
+fresh
+edit "${BUILD}" 'patched="src/client_routing.rs src/dht/core_engine.rs src/dht_network_manager.rs src/peer_record.rs"' \
+    'patched="src/client_routing.rs"'
+expect "the vendored saorsa-core checked for one patched file" \
+    "build.yml's notices job must keep its step 'Check the vendored saorsa-core'"
+
+fresh
+edit "${BUILD}" 'patched="src/nat_traversal_api.rs"' 'patched=""'
+expect "the vendored saorsa-transport checked for no patched file" \
+    "build.yml's notices job must keep its step 'Check the vendored saorsa-transport'"
+
 # The node, for the image and for releases: built with no feature, and
 # checked for test seams after it is built and before it is packaged.
 SEAM_STEP=$'      - name: Check the test seams are left out\n        run: |\n          if [[ ! -s target/release/ant-node ]]; then\n            echo "::error::there is no target/release/ant-node to check"\n            exit 1\n          fi\n          if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then\n            echo "::error::target/release/ant-node holds a test seam (ANT_TEST_SEAM_*): it was built with test-utils"\n            exit 1\n          fi\n\n'
