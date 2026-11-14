@@ -288,8 +288,11 @@ never ran.
   of it; to be confirmed by Dan). When one is full, the oldest request of
   the source with the most waiting is dropped unanswered, so a source with
   fewer waiting never loses one to a source with more; the node logs a
-  warning on the first drop and each time the count doubles. An answer to
-  one of the node's own listings requests is taken at once, as before.
+  warning on the first drop and each time the count doubles. The router
+  decodes no listings message: it reads only the request id, and a message
+  is decoded by its handler once a permit is held, so large listings
+  messages can't hold up chunk requests. An answer to one of the node's
+  own listings requests is still taken at once, without a permit.
   Nothing on the wire changes, and replication between nodes, which has
   its own admission, is not affected. A census test
   (`inbound_requests_wait_their_turn_for_a_slot`) and `tests/fork_pins.rs`

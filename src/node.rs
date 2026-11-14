@@ -1424,6 +1424,7 @@ impl RunningNode {
             handlers.clone(),
             answer_chunk,
         );
+        let answers = handlers.clone();
         let listings_dispatch = {
             let (listings, queue) = (listings.clone(), Arc::clone(&listings_queue));
             async move {
@@ -1457,7 +1458,13 @@ impl RunningNode {
                 };
                 if topic == ant_listings::TOPIC {
                     if let Some(listings) = &listings {
-                        Self::take_listings_message(listings, &listings_queue, turn, request);
+                        Self::take_listings_message(
+                            listings,
+                            &listings_queue,
+                            &answers,
+                            turn,
+                            request,
+                        );
                     }
                 } else if topic == CHUNK_PROTOCOL_ID {
                     debug!("Received chunk protocol message from {source}");
@@ -1468,20 +1475,33 @@ impl RunningNode {
         tokio::join!(route, chunk_dispatch, listings_dispatch);
     }
 
-    /// Take one message on the listings topic. An answer to one of this
-    /// node's own requests is handed to the request waiting for it at once,
-    /// taking no permit; a request waits in `queue` for one of the listing
-    /// service's own permits.
+    /// Take one message on the listings topic, without decoding it: the
+    /// router reads only its request id, so a stream of large listings
+    /// messages can't slow the task that also hands out chunk requests. A
+    /// message naming one of this node's own requests waiting for an answer
+    /// is decoded in a task of its own on `answers`, taking no permit, and
+    /// handed to that request ([`crate::listings::ListingService::take_awaited`]
+    /// takes the request, so at most one such task runs for each); if it
+    /// turns out to be a request, it is queued as any other. Every other
+    /// message waits in `queue` as the bytes that came, and is decoded by its
+    /// handler once one of the listing service's own permits is held.
     fn take_listings_message(
-        listings: &crate::listings::ListingService,
-        queue: &RequestQueue,
+        listings: &Arc<crate::listings::ListingService>,
+        queue: &Arc<RequestQueue>,
+        answers: &TaskTracker,
         turn: Turn,
         message: QueuedRequest,
     ) {
-        if listings.handle_response(&message.source, &message.data) {
+        let Some(awaited) = listings.take_awaited(&message.source, &message.data) else {
+            let _dropped = queue.push(turn, message);
             return;
-        }
-        let _dropped = queue.push(turn, message);
+        };
+        let (listings, queue) = (Arc::clone(listings), Arc::clone(queue));
+        answers.spawn(async move {
+            if !listings.answer_awaited(&message.source, &message.data, awaited) {
+                let _dropped = queue.push(turn, message);
+            }
+        });
     }
 
     /// Answer one request on the listings topic and send the answer. Started
@@ -2500,35 +2520,43 @@ mod tests {
         let response = message(8, ListingsBody::GetResponse { listing: None });
 
         // An answer to a request of the node's is taken at once, with every
-        // permit held, and never waits in the queue; a request waits there.
+        // permit held, and never waits in the queue; a request waits there,
+        // as do answers nothing waits for (their handler ignores them).
         let source = saorsa_core::identity::PeerId::from_bytes([1; 32]);
-        let queue = RequestQueue::new("listings", MAX_QUEUED_REQUESTS);
+        let queue = Arc::new(RequestQueue::new("listings", MAX_QUEUED_REQUESTS));
+        let answers = TaskTracker::new();
         let held = permits.acquire_many(16).await.expect("permits");
-        RunningNode::take_listings_message(
-            &listings,
-            &queue,
-            Turn::Peer(source),
-            QueuedRequest {
-                source,
-                data: response.clone(),
-                received_at: Instant::now(),
-            },
+        let awaiting = listings.await_answer_for_tests(source, 8);
+        let take = |data: &Vec<u8>| {
+            RunningNode::take_listings_message(
+                &listings,
+                &queue,
+                &answers,
+                Turn::Peer(source),
+                QueuedRequest {
+                    source,
+                    data: data.clone(),
+                    received_at: Instant::now(),
+                },
+            );
+        };
+        take(&response);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), awaiting)
+                .await
+                .expect("the answer came at once")
+                .expect("the answer was handed over"),
+            None,
+            "the GetResponse's listing (none) reaches the request waiting"
         );
         assert!(
             queue.is_empty(),
             "an answer to the node's own request waited"
         );
-        RunningNode::take_listings_message(
-            &listings,
-            &queue,
-            Turn::Peer(source),
-            QueuedRequest {
-                source,
-                data: request.clone(),
-                received_at: Instant::now(),
-            },
-        );
+        take(&request);
         assert_eq!(queue.len(), 1);
+        take(&response);
+        assert_eq!(queue.len(), 2, "an answer nothing waits for is queued");
         drop(held);
 
         // Through the router: answers go to `answers`, and each send waits
@@ -2614,6 +2642,126 @@ mod tests {
             answered.try_recv().is_err(),
             "a request was answered after the node began stopping"
         );
+    }
+
+    /// The router reads only a listings message's request id: a message
+    /// naming one of this node's waiting requests is taken whatever follows
+    /// the id (here a megabyte that doesn't decode), and is decoded only when
+    /// it is handed over. A request that reuses a waiting request's id puts
+    /// that request back to wait for its answer, and is answered as any
+    /// request; one that has stopped waiting is not put back.
+    #[tokio::test]
+    async fn the_router_reads_only_a_listings_messages_request_id() {
+        use ant_listings::{ListingKey, ListingsBody, ListingsMessage};
+
+        let dir = TempDir::new().expect("temp dir");
+        let listings = test_listing_service(&dir).await;
+        let source = saorsa_core::identity::PeerId::from_bytes([3; 32]);
+        let mut large = postcard::to_stdvec(&11u64).expect("request id");
+        large.extend(std::iter::repeat_n(0xFF_u8, 1 << 20));
+        assert!(ListingsMessage::decode(&large).is_err());
+
+        // Taken on the request id alone; decoded when handed over.
+        assert!(
+            listings.take_awaited(&source, &large).is_none(),
+            "nothing waits"
+        );
+        let awaiting = listings.await_answer_for_tests(source, 11);
+        let awaited = listings
+            .take_awaited(&source, &large)
+            .expect("taken by its request id");
+        assert!(!listings.awaits_for_tests(source, 11), "taken, not shared");
+        assert!(listings.answer_awaited(&source, &large, awaited));
+        assert_eq!(awaiting.await.expect("handed over"), None, "no answer");
+
+        // A request reusing the id: the waiting request is put back.
+        let request = ListingsMessage {
+            request_id: 12,
+            body: ListingsBody::ListRequest {
+                from: ListingKey::MIN,
+                limit: 1,
+            },
+        }
+        .encode()
+        .expect("encodes");
+        let mut awaiting = listings.await_answer_for_tests(source, 12);
+        let awaited = listings.take_awaited(&source, &request).expect("taken");
+        assert!(
+            !listings.answer_awaited(&source, &request, awaited),
+            "a request"
+        );
+        assert!(listings.awaits_for_tests(source, 12), "put back");
+        assert!(awaiting.try_recv().is_err(), "still waiting");
+
+        // One that stopped waiting meanwhile is not put back.
+        let awaited = listings.take_awaited(&source, &request).expect("taken");
+        drop(awaiting);
+        assert!(!listings.answer_awaited(&source, &request, awaited));
+        assert!(!listings.awaits_for_tests(source, 12), "not put back");
+    }
+
+    /// A listings request waits in its queue as the bytes that came and is
+    /// decoded only by its handler, once a listing permit is held: while all
+    /// sixteen are held, a large listings message stays undecoded and a chunk
+    /// request behind it still starts at once; once a permit frees, the
+    /// handler gets the very bytes that were sent.
+    #[tokio::test]
+    async fn a_listings_message_waits_as_the_bytes_that_came() {
+        let dir = TempDir::new().expect("temp dir");
+        let listings = test_listing_service(&dir).await;
+        let mut large = postcard::to_stdvec(&21u64).expect("request id");
+        large.extend(std::iter::repeat_n(0xFF_u8, 1 << 20));
+        let (tx, rx) = broadcast::channel(64);
+        let handlers = TaskTracker::new();
+        let stopping = CancellationToken::new();
+        let gate = Arc::new(Semaphore::new(0));
+        let counts = HandlerCounts::default();
+        let (got, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let held = listings
+            .request_permits()
+            .acquire_many(16)
+            .await
+            .expect("permits");
+        let routing = tokio::spawn(RunningNode::route_requests(
+            rx,
+            Arc::new(Semaphore::new(64)),
+            Some(Arc::clone(&listings)),
+            stopping.clone(),
+            handlers.clone(),
+            counts.handler(&gate),
+            move |_listings, request: QueuedRequest| {
+                let got = got.clone();
+                async move {
+                    got.send(request.data).expect("taken");
+                }
+            },
+        ));
+        for _ in 0..4 {
+            tx.send(routed_message(ant_listings::TOPIC, 4, None, large.clone()))
+                .expect("sent");
+        }
+        tx.send(routed_message(CHUNK_PROTOCOL_ID, 5, None, vec![0]))
+            .expect("sent");
+        eventually("the chunk request starts", || {
+            HandlerCounts::get(&counts.started) == 1
+        })
+        .await;
+        assert!(
+            received.try_recv().is_err(),
+            "a listings handler ran without a permit"
+        );
+        drop(held);
+        for _ in 0..4 {
+            let data = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+                .await
+                .expect("handled once a permit frees")
+                .expect("bytes");
+            assert_eq!(data, large, "the handler gets the bytes that came");
+        }
+        stopping.cancel();
+        drop(tx);
+        gate.add_permits(1_000);
+        routing.await.expect("routing ends");
     }
 
     /// What a node logs at start about where it is paid: the token, the vault

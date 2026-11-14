@@ -164,6 +164,14 @@ const SWEEP_PAUSE: Duration = Duration::from_millis(100);
 /// peer asked and the request id.
 type Waiting = Mutex<HashMap<(PeerId, u64), oneshot::Sender<Option<Listing>>>>;
 
+/// One of this node's own listing requests, taken from those waiting by
+/// [`ListingService::take_awaited`] to be handed the message that names it.
+#[derive(Debug)]
+pub struct Awaited {
+    key: (PeerId, u64),
+    answer: oneshot::Sender<Option<Listing>>,
+}
+
 /// Records and serves the listings for the envelopes this node stores.
 pub struct ListingService {
     store: ListingStore,
@@ -797,6 +805,95 @@ impl ListingService {
             | ListingsBody::Error { .. }
             | ListingsBody::ChangesResponse(_)
             | ListingsBody::RangeListResponse(_) => true,
+        }
+    }
+
+    /// The request of this node's that a message `source` sent on [`TOPIC`]
+    /// names by its request id, taken from those waiting, if one is.
+    ///
+    /// Reads the request id alone, a few bytes at the front of the message,
+    /// never the rest: the node's router calls this for every listings
+    /// message, and decoding a message up to the wire maximum there would
+    /// slow the one task that hands out chunk requests too. The message is
+    /// decoded later, by [`Self::answer_awaited`] in a task of its own when
+    /// this returns a request (an answer takes no permit), or else by
+    /// [`Self::handle_message`] once one of the listing service's permits is
+    /// held. Taking the request means no other message can claim it
+    /// meanwhile, so at most one task decodes for each request waiting.
+    pub fn take_awaited(&self, source: &PeerId, data: &[u8]) -> Option<Awaited> {
+        let request_id = request_id_of(data)?;
+        let key = (*source, request_id);
+        let answer = self.waiting.lock().remove(&key)?;
+        Some(Awaited { key, answer })
+    }
+
+    /// Hand `data`, the message that named `awaited`'s request id, to that
+    /// request, as [`Self::handle_response`] does: an answer that doesn't
+    /// decode is handed over as no answer. Returns `false` for a request,
+    /// which [`Self::handle_message`] then answers; for it, and for an
+    /// answer of a kind nothing waits for, `awaited` is put back to wait for
+    /// its own answer, unless it has stopped waiting meanwhile.
+    pub fn answer_awaited(&self, source: &PeerId, data: &[u8], awaited: Awaited) -> bool {
+        let message = match ListingsMessage::decode(data) {
+            Ok(message) => message,
+            Err(e) => {
+                debug!("An answer from {source} to a listings request doesn't decode: {e}");
+                let _ = awaited.answer.send(None);
+                return true;
+            }
+        };
+        match message.body {
+            ListingsBody::GetResponse { listing } => {
+                let _ = awaited.answer.send(listing);
+                true
+            }
+            ListingsBody::ListRequest { .. }
+            | ListingsBody::GetRequest { .. }
+            | ListingsBody::ChangesRequest(_)
+            | ListingsBody::RangeListRequest(_) => {
+                self.put_back(awaited);
+                false
+            }
+            ListingsBody::ListResponse { .. }
+            | ListingsBody::Error { .. }
+            | ListingsBody::ChangesResponse(_)
+            | ListingsBody::RangeListResponse(_) => {
+                self.put_back(awaited);
+                true
+            }
+        }
+    }
+
+    /// Tests only: register a request of this node's to `source` with
+    /// `request_id` as waiting, as [`request_listing`] does, and return
+    /// where its answer arrives.
+    #[cfg(test)]
+    pub(crate) fn await_answer_for_tests(
+        &self,
+        source: PeerId,
+        request_id: u64,
+    ) -> oneshot::Receiver<Option<Listing>> {
+        let (answer, answered) = oneshot::channel();
+        self.waiting.lock().insert((source, request_id), answer);
+        answered
+    }
+
+    /// Tests only: whether a request of this node's to `source` with
+    /// `request_id` is waiting.
+    #[cfg(test)]
+    pub(crate) fn awaits_for_tests(&self, source: PeerId, request_id: u64) -> bool {
+        self.waiting.lock().contains_key(&(source, request_id))
+    }
+
+    /// Put `awaited` back among the requests waiting, if it still waits. A
+    /// request that gives up drops its receiver first and only then removes
+    /// its entry, under this lock ([`request_listing`], `Pending`); checking
+    /// the receiver under the same lock means an entry is never put back
+    /// after its removal.
+    fn put_back(&self, awaited: Awaited) {
+        let mut waiting = self.waiting.lock();
+        if !awaited.answer.is_closed() {
+            waiting.insert(awaited.key, awaited.answer);
         }
     }
 

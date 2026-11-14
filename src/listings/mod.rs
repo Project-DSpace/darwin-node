@@ -28,5 +28,5 @@ mod service;
 mod store;
 
 pub(crate) use chain::{listings_rpc_urls, parse_receipt, parse_u64, quantity, vault_payments};
-pub use service::ListingService;
 pub(crate) use service::MAX_PROOF_TXS;
+pub use service::{Awaited, ListingService};

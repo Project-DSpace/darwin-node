@@ -1916,6 +1916,58 @@ fn inbound_requests_wait_their_turn_for_a_slot() {
     );
 }
 
+/// The router decodes no listings message (from ds.23's follow-up). It reads
+/// a listings message's request id alone (`take_awaited`) and queues the
+/// bytes; a message is decoded only by its handler once a listing permit is
+/// held (`handle_message`, in `RunningNode::answer_listings`), or, for an
+/// answer to one of the node's own requests, in a task of its own with no
+/// permit (`answer_awaited`). Decoding on the router would let a stream of
+/// large listings messages slow the one task that also hands out chunk
+/// requests, until it falls behind the event buffer and skips requests.
+/// The devnet's own router (`Devnet::start_node`) is a test network's and
+/// keeps its inline handling.
+#[test]
+fn the_router_decodes_no_listings_message() {
+    const DECODERS: &[(Option<&str>, &str)] = &[
+        (None, "take_awaited"),
+        (None, "answer_awaited"),
+        (None, "handle_response"),
+        (None, "handle_message"),
+    ];
+    const REVIEWED: &[Reviewed] = &[
+        (
+            "src/node.rs",
+            "RunningNode::take_listings_message",
+            "take_awaited",
+            1,
+        ),
+        (
+            "src/node.rs",
+            "RunningNode::take_listings_message",
+            "answer_awaited",
+            1,
+        ),
+        (
+            "src/node.rs",
+            "RunningNode::answer_listings",
+            "handle_message",
+            1,
+        ),
+        ("src/devnet.rs", "Devnet::start_node", "handle_response", 1),
+        ("src/devnet.rs", "Devnet::start_node", "handle_message", 1),
+    ];
+    let report = unreviewed(Counting::Calls(DECODERS), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nA listings message is decoded somewhere new.\n\n{report}\n\
+         RunningNode::route_requests (src/node.rs) must read only a listings message's \
+         request id (take_awaited) and queue its bytes: a message is decoded by its handler \
+         with a listing permit held (handle_message in answer_listings), or, for an answer \
+         to one of the node's own requests, by answer_awaited in a task of its own. \
+         Decoding on the router lets large listings messages hold up chunk requests.\n"
+    );
+}
+
 /// A peer that doesn't hold a close-group chunk it should is penalised on
 /// every lane that finds it out, as in upstream v0.23.0: the responsible-chunk
 /// audit, the possession check after a fresh write, the prune audit, a
