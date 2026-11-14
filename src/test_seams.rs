@@ -30,9 +30,9 @@
 //! and audit challenges while it lasts; and the responsible-chunk audit's tick
 //! and the age a repair hint must reach before its key is audited
 //! ([`AUDIT_SECS`]), for a run that counts the audits each exchange gives;
-//! and whether a node leaves the get-or-closer token out of its agent
-//! ([`LEAVE_OUT_GET_OR_CLOSER`]), for a test network that stands in for
-//! nodes of the releases before it.
+//! and whether a node announces the get-or-closer token in its agent
+//! ([`ANNOUNCE_GET_OR_CLOSER`]), which no node of ds.22 does by default, for a
+//! test network whose nodes clients may send the request to.
 //! Each is compiled only with `test-utils` and named
 //! under [`PREFIX`], so the Build workflow's check covers it, and the harness
 //! refuses a run that needs a seam with a binary that lacks it, as it refuses
@@ -74,16 +74,20 @@ pub const SYNC_PAGES_FROM_RELEASE: &str = "ANT_TEST_SEAM_SYNC_PAGES_FROM_RELEASE
 /// ignored.
 pub const ANNOUNCED_RELEASE: &str = "ANT_TEST_SEAM_ANNOUNCED_RELEASE";
 
-/// Leaves the get-or-closer token (ADR-0020) out of this node's user agent.
+/// Makes this process's nodes announce the get-or-closer token (ADR-0020) in
+/// their user agents, which a node of ds.22 does not by default
+/// ([`ANNOUNCES_GET_OR_CLOSER`](crate::node::ANNOUNCES_GET_OR_CLOSER)).
 ///
-/// Set to `1`, `true` or `yes`, a node announces what a node of a release
-/// before get-or-closer announces, its version alone, and clients then read
-/// from it with FIND_NODE and GET as they read from such a node. A test
-/// network of such nodes stands in for today's nodes during a rolling upgrade
-/// (darwin-client's `a_kad_read_reads_older_nodes_with_find_node_and_get`).
-/// The node still answers the request if one is sent. Any other value is
-/// ignored.
-pub const LEAVE_OUT_GET_OR_CLOSER: &str = "ANT_TEST_SEAM_LEAVE_OUT_GET_OR_CLOSER";
+/// Set to `1`, `true` or `yes`, a node that serves chunks announces
+/// `node/<version>[.image.<commit>] get-or-closer/1`, and clients then send it
+/// the request, as they will once the token is turned on; unset, it announces
+/// its version alone and clients read it with FIND_NODE and GET. Every node
+/// answers the request it is sent either way. It is read when a node builds
+/// its agent, for the whole process: a test that builds several nodes in one
+/// process, some announcing and some not, sets each one's agent with
+/// [`agent_for_tests`](crate::node::agent_for_tests) instead. Any other value
+/// is ignored.
+pub const ANNOUNCE_GET_OR_CLOSER: &str = "ANT_TEST_SEAM_ANNOUNCE_GET_OR_CLOSER";
 
 /// Neighbour-sync requests a node admits at once, across peers.
 ///
@@ -134,13 +138,13 @@ fn with_release(version: &str, release: u64) -> String {
     format!("{base}+ds.{release}")
 }
 
-/// Whether a test set this process's nodes to leave the get-or-closer token
-/// out of their agents ([`LEAVE_OUT_GET_OR_CLOSER`]).
-pub(crate) fn leaves_out_get_or_closer() -> bool {
-    std::env::var(LEAVE_OUT_GET_OR_CLOSER).is_ok_and(|value| parse_leave_out(&value))
+/// Whether a test set this process's nodes to announce the get-or-closer
+/// token in their agents ([`ANNOUNCE_GET_OR_CLOSER`]).
+pub(crate) fn announces_get_or_closer() -> bool {
+    std::env::var(ANNOUNCE_GET_OR_CLOSER).is_ok_and(|value| parse_yes(&value))
 }
 
-fn parse_leave_out(value: &str) -> bool {
+fn parse_yes(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "yes")
 }
 
@@ -544,7 +548,7 @@ mod tests {
             SYNC_PAGE_BYTES,
             SYNC_PAGES_FROM_RELEASE,
             ANNOUNCED_RELEASE,
-            LEAVE_OUT_GET_OR_CLOSER,
+            ANNOUNCE_GET_OR_CLOSER,
             SYNC_ADMISSION_LIMIT,
             FULL_FRESHNESS_SECS,
             FULL_NOTICE_FROM_RELEASE,
@@ -576,12 +580,12 @@ mod tests {
     }
 
     #[test]
-    fn only_a_yes_leaves_the_token_out() {
+    fn only_a_yes_announces_the_token() {
         for yes in ["1", "true", "yes", " 1\n"] {
-            assert!(parse_leave_out(yes), "{yes:?}");
+            assert!(parse_yes(yes), "{yes:?}");
         }
         for no in ["", "0", "false", "no", "2", "YES please"] {
-            assert!(!parse_leave_out(no), "{no:?}");
+            assert!(!parse_yes(no), "{no:?}");
         }
     }
 

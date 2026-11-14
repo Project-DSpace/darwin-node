@@ -177,6 +177,35 @@ fn no_bootstrap_peers_ship() {
     );
 }
 
+/// ds.22 nodes do not announce get-or-closer (upstream v0.24.0's ADR-0020 token,
+/// `get-or-closer/1` after the version in a node's agent); they still answer the
+/// request. A node before ds.22 reads the whole agent as its release, so it reads
+/// an agent with the token as no release, sends that node single neighbour-sync
+/// messages and charges their slow answers (the mixed-version harness, 14 November
+/// 2026). Held back by Claude's decision of that day, under Dan's words "do not risk
+/// our data". Announcing is a deliberate later act: change this pin with
+/// `ANNOUNCES_GET_OR_CLOSER` only then.
+#[test]
+fn get_or_closer_is_not_announced() {
+    let announces = ant_node::node::ANNOUNCES_GET_OR_CLOSER;
+    assert!(
+        !announces,
+        "ant_node::node::ANNOUNCES_GET_OR_CLOSER is on. Announce get-or-closer only once no \
+         node below ds.22 is left on the network: ds.22 is the first release whose parsers \
+         read the first word of a peer's agent, and older nodes read an agent with the \
+         token as no release and charge it for slow single-message syncs."
+    );
+    // The default agent is ds.21's form with this version, whatever the node serves.
+    let agent = ant_node::node::agent_for_tests(None, false);
+    assert_eq!(agent, format!("node/{}", env!("CARGO_PKG_VERSION")));
+    let source = repo_text("src/node.rs");
+    assert!(
+        source.contains("serves_chunks && announces"),
+        "src/node.rs's user_agent must announce the token only where ANNOUNCES_GET_OR_CLOSER \
+         (or the test seam) says so"
+    );
+}
+
 #[test]
 fn a_browser_source_opens_12_sessions_then_6_a_minute() {
     let empty: NodeConfig = toml::from_str("").unwrap();

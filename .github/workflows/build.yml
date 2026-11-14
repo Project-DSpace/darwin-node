@@ -225,7 +225,8 @@ jobs:
       # the other test-only hooks, which a binary without the seams lacks too:
       # among them upstream v0.24.0's RunningNode::answer_chunk_request and
       # the payment verifier's test_skip_closeness_without_p2p switch, and
-      # ds.22's seam that leaves get-or-closer out of a node's agent.
+      # ds.22's seam that makes nodes announce get-or-closer
+      # (and node::agent_for_tests, which builds one node's agent with it).
       - name: Check the test seams are left out
         shell: bash
         run: |

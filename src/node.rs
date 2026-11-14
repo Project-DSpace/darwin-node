@@ -62,24 +62,51 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// release as the semver after `node/` and the `ds.<n>` its build metadata starts with, so it
 /// still reads the release, and can count the nodes whose image gave no marker.
 ///
-/// A node that serves chunks also carries the get-or-closer token (ADR-0020), after a space:
-/// `node/0.24.0+ds.22.image.<commit> get-or-closer/1`. Native peers exchange no capabilities,
-/// and a node built before that request drops it without a reply, so this token is how a client
-/// knows it may send one. A node with storage switched off never answers chunk requests, so it
-/// does not announce it. This fork's readers of a peer's release read the first word only
-/// ([`crate::replication::sync_pages::agent_version`]), so the token changes no release a peer
-/// reads. In a `test-utils` build a test may leave the token out, as a node of a release
-/// before it does ([`crate::test_seams::LEAVE_OUT_GET_OR_CLOSER`]).
+/// A node of this release does not announce the get-or-closer token (ADR-0020), whether or not
+/// it serves chunks ([`ANNOUNCES_GET_OR_CLOSER`]): its agent is the form ds.21's is, with this
+/// version. It still answers a get-or-closer request it is sent. Announced, the token follows
+/// the version after a space (`node/0.24.0+ds.22.image.<commit> get-or-closer/1`), and nodes
+/// before ds.22 read the whole agent as their release, find none, and send such a node single
+/// neighbour-sync messages, whose slow answers they charge as connection timeouts (the mixed-
+/// version harness, 14 November 2026). Nodes from ds.22 read the first word only
+/// ([`crate::replication::sync_pages::agent_version`]). In a `test-utils` build a test may make
+/// a node announce it ([`crate::test_seams::ANNOUNCE_GET_OR_CLOSER`], or
+/// [`agent_for_tests`] for one node of many in one process).
 pub(crate) fn user_agent(image: Option<&str>, serves_chunks: bool) -> String {
     #[cfg(any(test, feature = "test-utils"))]
     let version = crate::test_seams::announced_version(env!("CARGO_PKG_VERSION"));
     #[cfg(not(any(test, feature = "test-utils")))]
     let version = env!("CARGO_PKG_VERSION");
     #[cfg(any(test, feature = "test-utils"))]
-    let announces_get_or_closer = serves_chunks && !crate::test_seams::leaves_out_get_or_closer();
+    let announces = ANNOUNCES_GET_OR_CLOSER || crate::test_seams::announces_get_or_closer();
     #[cfg(not(any(test, feature = "test-utils")))]
-    let announces_get_or_closer = serves_chunks;
-    agent_with(&version, image, announces_get_or_closer)
+    let announces = ANNOUNCES_GET_OR_CLOSER;
+    agent_with(&version, image, serves_chunks && announces)
+}
+
+/// Whether a node of this release announces the get-or-closer token in its agent: no.
+///
+/// Held back in ds.22, the first release whose readers of a peer's release read the first word
+/// of its agent only. A node before ds.22 reads an agent with the token after its version as no
+/// release at all, so it would send single neighbour-sync messages to a node announcing it and
+/// charge their slow answers. Turn this on only once no node below ds.22 is left on the network
+/// (`tests/fork_pins.rs`, `get_or_closer_is_not_announced`, fails until then by design). Clients
+/// read a node that does not announce it with FIND_NODE and GET, as before. Decided by Claude on
+/// 14 November 2026 under Dan's words of that day ("dont stop at all. dont worry about stuff
+/// being live. full send." and "ensure we dont hurt our own changes and differences from
+/// upstream and do not risk our data").
+pub const ANNOUNCES_GET_OR_CLOSER: bool = false;
+
+/// The agent a node of this build gives, with `image`'s marker and, if `get_or_closer`, the
+/// get-or-closer token, whatever [`ANNOUNCES_GET_OR_CLOSER`] says. Test-only: for a test that
+/// builds several nodes in one process and sets each one's agent itself
+/// (`custom_user_agent`), some announcing the token and some not, as darwin-client's harness
+/// does. The release it names follows [`crate::test_seams::ANNOUNCED_RELEASE`] as a node's does.
+#[cfg(any(test, feature = "test-utils"))]
+#[must_use]
+pub fn agent_for_tests(image: Option<&str>, get_or_closer: bool) -> String {
+    let version = crate::test_seams::announced_version(env!("CARGO_PKG_VERSION"));
+    agent_with(&version, image, get_or_closer)
 }
 
 /// The agent of a node of `version`, with `image`'s marker and, if
@@ -1654,13 +1681,10 @@ mod tests {
         };
 
         // What it tells every peer, in the user agent saorsa-core sends with each signed
-        // message: this build's version under the `node/` prefix with no image marker, and,
-        // since it serves chunks, the get-or-closer token after a space (ADR-0020).
+        // message: this build's version under the `node/` prefix, and nothing after it when it
+        // has no image marker: it serves chunks, but does not announce get-or-closer.
         let agent = node.p2p_node.config().user_agent();
-        assert_eq!(
-            agent,
-            format!("node/{} get-or-closer/1", env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(agent, format!("node/{}", env!("CARGO_PKG_VERSION")));
         assert_eq!(agent, user_agent(None, true));
         node.shutdown.cancel();
     }
@@ -1738,10 +1762,11 @@ mod tests {
             "this build's version gives no ds release: {plain}"
         );
         assert_eq!(census_release(&marked), release, "{marked}");
-        // A node that serves chunks carries the get-or-closer token after its version;
-        // the census still reads its release.
-        let serving = user_agent(Some(MARKER), true);
-        assert_eq!(census_release(&serving), release, "{serving}");
+        // A node made to announce get-or-closer carries the token after its version; the
+        // census still reads its release.
+        let announcing = agent_for_tests(Some(MARKER), true);
+        assert!(announcing.ends_with(" get-or-closer/1"), "{announcing}");
+        assert_eq!(census_release(&announcing), release, "{announcing}");
         let version = semver::Version::parse(marked.strip_prefix("node/").unwrap()).unwrap();
         assert_eq!(
             version.build.as_str().rsplit('.').next(),
@@ -2584,16 +2609,14 @@ mod tests {
     }
 
     /// The prefix is what keeps this node in its peers' routing tables, and the version is
-    /// this build's, then the image marker, then (on a node that serves chunks) the
-    /// get-or-closer token after a space.
+    /// this build's, then the image marker, and nothing after them.
     #[test]
     fn the_user_agent_is_this_builds_version_under_the_node_prefix() {
         assert_eq!(
             super::user_agent(None, false),
             format!("node/{}", env!("CARGO_PKG_VERSION"))
         );
-        assert!(super::user_agent(None, false).starts_with("node/"));
-        assert!(super::user_agent(None, true).starts_with("node/"));
+        assert_eq!(super::user_agent(None, true), super::user_agent(None, false));
         let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
         assert_eq!(
             super::user_agent(Some(marker), false),
@@ -2601,11 +2624,31 @@ mod tests {
         );
     }
 
-    /// A node of this fork that serves chunks announces its release, its image
-    /// and the get-or-closer token, in that order, and its peers still read its
-    /// release from it: paging and full notices go on between merged nodes.
+    /// By default a ds.22 node's agent is ds.21's form with its own version, the get-or-closer
+    /// token left out whether or not it serves chunks, so nodes before ds.22, which read the
+    /// whole agent as their release, read its release (and page to it).
     #[test]
-    fn a_merged_node_announces_its_release_image_and_get_or_closer() {
+    fn a_ds22_node_announces_its_release_and_image_without_get_or_closer() {
+        let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
+        for serves_chunks in [true, false] {
+            let agent = super::user_agent(Some(marker), serves_chunks);
+            assert_eq!(
+                agent,
+                format!("node/{}.image.{marker}", env!("CARGO_PKG_VERSION"))
+            );
+            assert!(!crate::ant_protocol::advertises_get_or_closer(&agent));
+            assert!(semver::Version::parse(agent.strip_prefix("node/").unwrap()).is_ok());
+        }
+        let ds22 = super::agent_with("0.24.0+ds.22", Some(marker), false);
+        assert_eq!(ds22, format!("node/0.24.0+ds.22.image.{marker}"));
+        assert!(crate::replication::sync_pages::agent_reads_pages(&ds22, 17));
+    }
+
+    /// A node made to announce get-or-closer (through the seam, or [`agent_for_tests`] for one
+    /// node of many) gives its release, its image and the token, in that order, and this
+    /// release's readers still read its release from it.
+    #[test]
+    fn a_node_made_to_announce_gives_its_release_image_and_get_or_closer() {
         let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
         let agent = super::agent_with("0.24.0+ds.22", Some(marker), true);
         assert_eq!(
@@ -2624,38 +2667,35 @@ mod tests {
         assert!(crate::replication::full::agent_reads_full_notice(
             &agent, 17
         ));
-        let built = super::user_agent(Some(marker), true);
         assert_eq!(
-            built,
+            super::agent_for_tests(Some(marker), true),
             format!(
                 "node/{}.image.{marker} get-or-closer/1",
                 env!("CARGO_PKG_VERSION")
             )
         );
+        assert_eq!(
+            super::agent_for_tests(Some(marker), false),
+            super::user_agent(Some(marker), true)
+        );
+        assert!(crate::test_seams::ANNOUNCE_GET_OR_CLOSER.starts_with(crate::test_seams::PREFIX));
     }
 
-    /// The seam a test node uses to leave the token out, as a node of a release
-    /// before get-or-closer does: its agent is then the one such a node sends,
-    /// and clients read it as a node to ask with FIND_NODE and GET.
+    /// Upstream's check, to this fork's default: the token is advertised only by a node that
+    /// is made to announce it and serves chunks.
     #[test]
-    fn a_test_node_can_leave_get_or_closer_out_of_its_agent() {
-        let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
-        let without = super::agent_with("0.24.0+ds.22", Some(marker), false);
-        assert_eq!(without, format!("node/0.24.0+ds.22.image.{marker}"));
-        assert!(!crate::ant_protocol::advertises_get_or_closer(&without));
-        assert!(crate::replication::sync_pages::agent_reads_pages(
-            &without, 17
-        ));
-        assert!(crate::test_seams::LEAVE_OUT_GET_OR_CLOSER.starts_with(crate::test_seams::PREFIX));
-    }
-
-    #[test]
-    fn user_agent_advertises_get_or_closer_only_when_serving_chunks() {
-        assert!(crate::ant_protocol::advertises_get_or_closer(
+    fn user_agent_advertises_get_or_closer_only_when_made_to_announce() {
+        assert!(!crate::ant_protocol::advertises_get_or_closer(
             &super::user_agent(None, true)
         ));
         assert!(!crate::ant_protocol::advertises_get_or_closer(
             &super::user_agent(None, false)
+        ));
+        assert!(crate::ant_protocol::advertises_get_or_closer(
+            &super::agent_for_tests(None, true)
+        ));
+        assert!(!crate::ant_protocol::advertises_get_or_closer(
+            &super::agent_for_tests(None, false)
         ));
     }
 

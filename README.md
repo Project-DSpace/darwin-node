@@ -256,17 +256,25 @@ never ran.
   fails if a later merge swaps any of it in. What the merge did take from
   that change is the responsible-chunk audit sampling only the keys a node
   is in range for, which charges fewer peers, never more.
-- **Get-or-closer, with the release first in the agent** (ds.22). Upstream
-  v0.24.0 answers ADR-0020's get-or-closer request (a chunk, or the peers a
-  FIND_NODE would name), and a node that serves chunks says so with a token
-  after its version: `node/0.24.0+ds.22.image.<commit> get-or-closer/1`.
-  This fork reads a peer's release from the first word only
-  (`sync_pages::agent_version`), so paged sync and full notices go on
-  between nodes that carry the token, and darwin-client reads it the same
-  way. The request reads its chunk through `get_or_quarantine`, as a GET
-  does, and the browser listener refuses it, as ADR-0020 wants. In a
-  `test-utils` build a test node can leave the token out
-  (`ANT_TEST_SEAM_LEAVE_OUT_GET_OR_CLOSER`), as nodes before ds.22 do.
+- **Get-or-closer is answered, not announced** (ds.22). Upstream v0.24.0
+  answers ADR-0020's get-or-closer request (a chunk, or the peers a
+  FIND_NODE would name), and its nodes announce it with a token after their
+  version (`... get-or-closer/1`). ds.22 nodes answer the request, reading
+  the chunk through `get_or_quarantine` as a GET does (the browser listener
+  refuses it, as ADR-0020 wants), but do not announce it: their agent is
+  ds.21's form with the new version. Nodes before ds.22 read the whole agent
+  as their release, so they would read an announcing node as no release,
+  send it single neighbour-sync messages and charge their slow answers; the
+  mixed-version harness showed this on 14 November 2026, and Claude held the
+  token back that day under Dan's words "do not risk our data". Clients read
+  ds.22 nodes with FIND_NODE and GET, as before. ds.22 is the first release
+  that reads only the first word of a peer's agent
+  (`sync_pages::agent_version`), so the token may be turned on
+  (`ant_node::node::ANNOUNCES_GET_OR_CLOSER`, pinned off by
+  `tests/fork_pins.rs`) once no node below ds.22 is left on the network. In a
+  `test-utils` build a test can make nodes announce it: every node of a
+  process with `ANT_TEST_SEAM_ANNOUNCE_GET_OR_CLOSER=1`, or one node of many
+  by setting its agent to `ant_node::node::agent_for_tests(image, true)`.
 - **Audits remove rotted chunk files, and the census lists every removal**
   (from ds.13). As upstream 0.23.0 does, digest audits, possession checks,
   prune audits and the recheck of chunks a storage audit found rotted remove a
