@@ -144,27 +144,25 @@ fn read_public_key(path: &Path) -> Result<MlDsaPublicKey, String> {
         .map_err(|_| format!("{} is not an ML-DSA-65 public key", path.display()))
 }
 
-/// The secret key from `input`, as hex. Every message is fixed text: none
-/// carries a byte of what was read, its length aside from whether it fit.
+/// The secret key from `input`, as hex. ASCII whitespace anywhere in it,
+/// line breaks included, is ignored, as the release workflow's earlier path
+/// (`xxd -r -p`) ignored it, so a secret stored over several lines reads the
+/// same; any other character that isn't hex is refused. Every message is
+/// fixed text: none carries a byte of what was read.
 fn read_secret_key(input: &mut impl Read) -> Result<MlDsaSecretKey, String> {
-    let mut text = Vec::new();
+    // Room for a key's hex and generous whitespace up front, so the buffer
+    // is not regrown, which would leave freed copies of the hex behind.
+    let mut text = Vec::with_capacity(16 * 1024);
     let read = input.read_to_end(&mut text);
+    let mut digits: Vec<u8> = Vec::with_capacity(text.len());
     let outcome = read
         .map_err(|_| "can't read the secret key from standard input".to_string())
         .and_then(|_| {
-            let start = text
-                .iter()
-                .position(|b| !b.is_ascii_whitespace())
-                .unwrap_or(text.len());
-            let end = text
-                .iter()
-                .rposition(|b| !b.is_ascii_whitespace())
-                .map_or(start, |i| i + 1);
-            let trimmed = &text[start..end];
-            if trimmed.is_empty() {
+            digits.extend(text.iter().copied().filter(|b| !b.is_ascii_whitespace()));
+            if digits.is_empty() {
                 return Err("no secret key on standard input".to_string());
             }
-            let mut bytes = hex::decode(trimmed)
+            let mut bytes = hex::decode(&digits)
                 .map_err(|_| "the secret key on standard input is not hex".to_string())?;
             let key = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &bytes).map_err(|_| {
                 "the secret key on standard input is not an ML-DSA-65 secret key".to_string()
@@ -172,6 +170,7 @@ fn read_secret_key(input: &mut impl Read) -> Result<MlDsaSecretKey, String> {
             bytes.fill(0);
             key
         });
+    digits.fill(0);
     text.fill(0);
     outcome
 }
@@ -395,6 +394,60 @@ mod tests {
         padded.extend_from_slice(&good);
         padded.extend_from_slice(b"\n");
         assert!(read_secret_key(&mut padded.as_slice()).is_ok());
+    }
+
+    /// The hex of `secret` with `insert` after every `every` digits.
+    fn with_breaks(secret: &MlDsaSecretKey, every: usize, insert: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in secret_hex(secret).chunks(every) {
+            out.extend_from_slice(chunk);
+            out.extend_from_slice(insert);
+        }
+        out
+    }
+
+    /// Whitespace anywhere in the hex is ignored, as `xxd -r -p` ignored it
+    /// in the release workflow's earlier path: a trailing newline, line
+    /// breaks inside (LF or CRLF, even between the two digits of a byte),
+    /// spaces and tabs. The key read is the same key.
+    #[test]
+    fn whitespace_anywhere_in_the_hex_is_ignored() {
+        let (public, secret) = pair();
+        let mut trailing = secret_hex(&secret);
+        trailing.push(b'\n');
+        for input in [
+            trailing,
+            with_breaks(&secret, 64, b"\n"),
+            with_breaks(&secret, 76, b"\r\n"),
+            with_breaks(&secret, 3, b"\n"),
+            with_breaks(&secret, 2, b" "),
+            with_breaks(&secret, 1000, b"\t\n "),
+        ] {
+            let read = read_secret_key(&mut input.as_slice()).expect("read");
+            assert_eq!(read.to_bytes(), secret.to_bytes());
+            key_belongs(&read, &public).expect("the same key");
+        }
+    }
+
+    /// Any character that is neither hex nor ASCII whitespace is refused,
+    /// with the fixed message, wherever it is.
+    #[test]
+    fn a_stray_character_is_refused() {
+        let (_, secret) = pair();
+        let good = secret_hex(&secret);
+        for stray in [b'Z', b':', b'-', b'x', b'.', 0u8, 0xC3] {
+            for at in [0, 1, good.len() / 2, good.len()] {
+                let mut input = good.clone();
+                input.insert(at, stray);
+                let Err(problem) = read_secret_key(&mut input.as_slice()) else {
+                    panic!("a stray {stray:#04x} at {at} was accepted");
+                };
+                assert_eq!(problem, "the secret key on standard input is not hex");
+            }
+        }
+        let mut prefixed = b"0x".to_vec();
+        prefixed.extend_from_slice(&good);
+        assert!(read_secret_key(&mut prefixed.as_slice()).is_err());
     }
 
     /// The release key compiled into this build is a well-formed public key
