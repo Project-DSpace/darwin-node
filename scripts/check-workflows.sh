@@ -29,9 +29,15 @@
 #   from the tagged commit and hands on with the archive, and fetches
 #   nothing from outside this repository to sign: it uses no action but
 #   download-artifact and runs no curl, wget, URL, git or package download;
-#   its Sign step checks the secret key against the shipped public key
-#   before it signs, checks the signature with the key compiled into the
-#   release after, and only then writes SHA256SUMS.txt;
+#   its Sign step is exactly the reviewed one (SIGN_STEP): the secret key
+#   checked against the shipped public key, signed, the signature checked
+#   with the key compiled into the release, then SHA256SUMS.txt, every
+#   check fatal and the secret piped to release-sign alone; the tool it
+#   runs can only be the one its build job built from the tagged commit
+#   (that job downloads nothing either); it asks for contents: write
+#   alone and downloads this run's artifact by name alone; every
+#   release.yml step runs in bash, with -e and -o pipefail; the release
+#   archive lists its files by name;
 # - its build job hands the tagged commit's release-notes/<tag>.md, when it
 #   has one, to the publish job as release-notes.md, and the publish job
 #   writes the release's fixed text first and then that file's text into the
@@ -400,6 +406,38 @@ while IFS= read -r hit; do
     fi
 done < <(grep -nE '^[[:space:]]*(-[[:space:]]*)?uses:' "${DIR}"/*.yml || true)
 
+# How release.yml builds the node and the signing tool. The one other build
+# either build job may make is the release-signing tool's, exactly
+# SIGN_TOOL_BUILD, which builds no node binary.
+NODE_BUILD='run: cargo build --release --locked --bin ant-node'
+SIGN_TOOL_BUILD='cargo build --release --locked --bin release-sign'
+# The lines of release.yml's build job that name release-sign, leading
+# spaces left out: its build, its one copy, the artifact path.
+SIGN_TOOL_LINES="${SIGN_TOOL_BUILD}
+cp target/release/release-sign .
+release-sign"
+# release.yml's publish job's Sign step, comments and leading spaces left
+# out. Reviewed as a whole: a change to it is a change to this text too.
+SIGN_STEP=$(cat <<'SIGN'
+- name: Sign
+env:
+SIGNING_KEY_HEX: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}
+run: |
+chmod 755 release-sign
+printf '%s' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub
+printf '%s' "$SIGNING_KEY_HEX" | ./release-sign sign --public release-signing-key.pub \
+--input ant-node-cli-linux-x64.tar.gz --output ant-node-cli-linux-x64.tar.gz.sig
+./release-sign verify --embedded \
+--input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig
+./release-sign verify --key release-signing-key.pub \
+--input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig
+sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt
+SIGN
+)
+# The release archive's tar command, over two lines, leading spaces left out.
+RELEASE_TAR='tar -C dist -czf ant-node-cli-linux-x64.tar.gz ant-node bootstrap_peers.toml \'
+RELEASE_TAR_FILES='LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html'
+
 if [[ ! -f "${RELEASE}" ]]; then
     problem "${RELEASE} is missing"
 else
@@ -459,41 +497,64 @@ else
         fi
     done
 
-    # Signing fetches nothing from outside this repository: the build job
-    # builds release-sign from the tagged commit and hands it on with the
-    # archive; the publish job uses no action but download-artifact and
-    # downloads nothing. Its Sign step checks the key against the shipped
-    # public key first, signs, checks the signature with the key compiled
-    # into the release, then writes the checksums.
-    holds "$(step 'Build the signing tool' "${build}")" "release.yml's build job must build release-sign from the tagged commit" \
-        'cargo build --release --locked --bin release-sign' \
-        'cp target/release/release-sign .'
-    if ! grep -qx '            release-sign' <<<"${build}"; then
-        problem "release.yml's build job must hand release-sign to the publish job with the archive"
+    # Signing fetches nothing from outside this repository, and the tool
+    # the publish job runs can only be the one built from the checked-out
+    # tagged commit: in the build job, release-sign is named only by its
+    # build, one copy of it, and the artifact path, in that order, and the
+    # job downloads nothing (a later line could otherwise put another
+    # release-sign in its place). git fetch of origin, which reads this
+    # repository's own tags, is not a download.
+    build_fetched=$(grep -nE '(^|[^A-Za-z0-9_-])(curl|wget|git[[:space:]]+clone|cargo[[:space:]]+install|pip[0-9]*[[:space:]]+install|npm[[:space:]]+(install|i)|gh[[:space:]]+release[[:space:]]+download)([^A-Za-z0-9_-]|$)|https?://' <<<"${build}" || true)
+    tool_lines=$(sed 's/^[[:space:]]*//' <<<"${build}" | grep -E 'release-sign([^i]|$)' || true)
+    if [[ -n "${build_fetched}" || "${tool_lines}" != "${SIGN_TOOL_LINES}" ]]; then
+        problem "release.yml's publish job must run only the release-sign its build job builds from the tagged commit: the build job must name it only in '${SIGN_TOOL_BUILD}', 'cp target/release/release-sign .' and the artifact path, in that order, and download nothing (found: $(tr '\n' ' ' <<<"${build_fetched}${build_fetched:+ }${tool_lines}"))"
     fi
+
+    # The publish job fetches nothing from outside this repository, its one
+    # action download-artifact takes this run's artifact by name alone (no
+    # run id, token or repository that would bring another run's), and the
+    # job may only write contents.
     publish=$(job publish)
     fetched=$(grep -nE '(^|[^A-Za-z0-9_-])(curl|wget|git[[:space:]]+(clone|fetch|pull)|cargo[[:space:]]+install|pip[0-9]*[[:space:]]+install|npm[[:space:]]+(install|i)|gh[[:space:]]+release[[:space:]]+download)([^A-Za-z0-9_-]|$)|https?://' <<<"${publish}" || true)
     actions=$(sed -n 's/^[[:space:]]*-\{0,1\}[[:space:]]*uses:[[:space:]]*\([^@[:space:]]*\)@.*$/\1/p' <<<"${publish}" | sort -u)
     if [[ -n "${fetched}" || "${actions}" != "actions/download-artifact" ]]; then
         problem "release.yml's publish job must fetch nothing from outside this repository in order to sign: no action but actions/download-artifact, and no curl, wget, URL, git, package or release download (found: $(tr '\n' ' ' <<<"${fetched}${actions:+ uses ${actions}}"))"
     fi
-    signing=$(step Sign "${publish}" | sed 's/^[[:space:]]*//')
-    holds "${signing}" "release.yml's publish job must sign with release-sign: the key checked, the signature checked with the key compiled into the release, then the checksums" \
-        'SIGNING_KEY_HEX: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}' \
-        'printf '\''%s'\'' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub' \
-        'printf '\''%s'\'' "$SIGNING_KEY_HEX" | ./release-sign sign --public release-signing-key.pub \' \
-        './release-sign verify --embedded \' \
-        'sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt'
-    checked=$(grep -nF -- './release-sign check-key' <<<"${signing}" | cut -d: -f1 | tr '\n' ' ' || true)
-    signed=$(grep -nF -- './release-sign sign ' <<<"${signing}" | cut -d: -f1 | tr '\n' ' ' || true)
-    verified=$(grep -nF -- './release-sign verify --embedded' <<<"${signing}" | cut -d: -f1 | tr '\n' ' ' || true)
-    summed=$(grep -nF -- '> SHA256SUMS.txt' <<<"${signing}" | cut -d: -f1 | tr '\n' ' ' || true)
-    if [[ ! "${checked}" =~ ^[0-9]+\ $ || ! "${signed}" =~ ^[0-9]+\ $ || ! "${verified}" =~ ^[0-9]+\ $ || ! "${summed}" =~ ^[0-9]+\ $ ]] \
-        || ((checked > signed || signed > verified || verified > summed)); then
-        problem "release.yml's publish job must check the key once, then sign once, then check the signature with the key compiled into the release once, then write SHA256SUMS.txt"
+    if [[ "$(job_permissions publish "${RELEASE}")" != "contents: write" ]]; then
+        problem "release.yml's publish job must ask for exactly contents: write (it has: $(job_permissions publish "${RELEASE}" | tr '\n' ' '))"
     fi
-    if grep -qE 'SIGNING_KEY_HEX[^|]*(>|tee)|xxd' <<<"${signing}"; then
-        problem "release.yml's publish job must hand the secret key to release-sign on standard input only, never into a file"
+    downloaded=$(awk '/^      - / { inside = (index($0, "uses: actions/download-artifact@") > 0); next } inside' <<<"${publish}" \
+        | sed 's/^[[:space:]]*//')
+    if [[ "${downloaded}" != $'with:\nname: release-unsigned' ]]; then
+        problem "release.yml's publish job must download this run's artifact by its name alone (with: name: release-unsigned; no run-id, github-token, repository or other input) (it has: $(tr '\n' ' ' <<<"${downloaded}"))"
+    fi
+
+    # The Sign step is exactly the reviewed one: the key checked against the
+    # shipped public key, signed, the signature checked with the key
+    # compiled into the release and with the shipped key, then the
+    # checksums; every check fatal (no ||, no other file, no shell of its
+    # own), and the secret named only there, piped to release-sign alone.
+    signing=$(step Sign "${publish}" | sed 's/^[[:space:]]*//')
+    secret_names=$(grep -vE '^[[:space:]]*#' "${RELEASE}" | grep -c 'SIGNING_KEY_HEX' || true)
+    if [[ "${signing}" != "${SIGN_STEP}" || "${secret_names}" -ne 3 ]]; then
+        problem "release.yml's publish job must sign with exactly the reviewed Sign step (scripts/check-workflows.sh's SIGN_STEP: the key checked, signed, checked with the key compiled into the release and the shipped key, then SHA256SUMS.txt; nothing that can make a check pass without running it, and the secret named only there, piped to release-sign alone)"
+    fi
+
+    # Every step in bash, which GitHub runs with -e and -o pipefail, so a
+    # failed check stops the step: as the defaults set it, with no shell of
+    # a job's or a step's own.
+    if [[ "$(section defaults)" != $'defaults:\n  run:\n    shell: bash' ]] \
+        || [[ $(grep -cE '^[[:space:]]*(-[[:space:]]+)?shell:' "${RELEASE}" || true) -ne 1 ]]; then
+        problem "release.yml must run every step in bash, as its defaults set it (defaults: run: shell: bash), with no shell of a job's or a step's own"
+    fi
+
+    # The release archive lists its files by name: nothing else, the
+    # signing tool included, can be packed into what nodes install.
+    package_step=$(step Package "${build}" | sed 's/^[[:space:]]*//')
+    if ! grep -qxF -- "${RELEASE_TAR}" <<<"${package_step}" \
+        || ! grep -qxF -- "${RELEASE_TAR_FILES}" <<<"${package_step}" \
+        || grep -q '\*' <<<"${package_step}"; then
+        problem "release.yml's build job must pack the release archive from named files alone (${RELEASE_TAR} ${RELEASE_TAR_FILES}; no wildcard in the Package step)"
     fi
 
     # A release's own notes: the build job, on the tagged commit, hands
@@ -1182,8 +1243,6 @@ fi
 # it: a build with test-utils has seams a test sets from the environment.
 # The one other build either job may make is the release-signing tool's,
 # exactly SIGN_TOOL_BUILD, which builds no node binary.
-NODE_BUILD='run: cargo build --release --locked --bin ant-node'
-SIGN_TOOL_BUILD='cargo build --release --locked --bin release-sign'
 SEAM_BINARY='if [[ ! -s target/release/ant-node ]]; then'
 SEAM_CHECK='if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then'
 for place in "${BUILD}:linux-x64" "${RELEASE}:build"; do

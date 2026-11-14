@@ -399,12 +399,28 @@ edit "${RELEASE}" $'      - name: Sign\n' \
     $'      - name: Move latest\n        run: docker buildx imagetools create --tag "$IMAGE:latest" x\n\n      - name: Sign\n'
 expect ":latest moved by publish" "${REGISTRY}"
 
-# Signing fetches nothing from outside this repository, and keeps its
-# order: the key checked against the shipped public key, the signature
-# made, checked with the key compiled into the release, then the checksums;
-# the secret key only on standard input.
+# Signing fetches nothing from outside this repository, the tool the
+# publish job runs is the one built from the tagged commit, and the Sign
+# step is exactly the reviewed one: the key checked against the shipped
+# public key, signed, checked with the key compiled into the release, then
+# the checksums, every check fatal and the secret piped to release-sign
+# alone. The publish job asks for contents: write alone and takes this run's
+# artifact by name alone; every step runs in bash; the archive lists its
+# files by name.
 FETCH_NOTHING="release.yml's publish job must fetch nothing from outside this repository in order to sign"
+TOOL_FROM_TAG="release.yml's publish job must run only the release-sign its build job builds from the tagged commit"
+SIGN_STEP_EXACT="release.yml's publish job must sign with exactly the reviewed Sign step"
+PUBLISH_WRITES="release.yml's publish job must ask for exactly contents: write"
+ARTIFACT_BY_NAME="release.yml's publish job must download this run's artifact by its name alone"
+RELEASE_BASH="release.yml must run every step in bash"
+NAMED_FILES="release.yml's build job must pack the release archive from named files alone"
+SIGN_RUN=$'        run: |\n          chmod 755 release-sign\n'
+CHECK_KEY_LINE=$'          printf \'%s\' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub\n'
+EMBEDDED_LINES=$'          ./release-sign verify --embedded \\\n            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig\n'
+SUMS_LINE=$'          sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt\n'
+DOWNLOAD_WITH=$'      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0\n        with:\n          name: release-unsigned\n'
 
+# The publish job downloads nothing.
 fresh
 edit "${RELEASE}" $'      - name: Sign\n' \
     $'      - name: Fetch a signer\n        run: curl -fsSL -o release-sign https://example.org/release-sign\n\n      - name: Sign\n'
@@ -416,35 +432,105 @@ edit "${RELEASE}" $'      - name: Sign\n' \
 expect "a signing action from outside used by publish" "${FETCH_NOTHING}"
 
 fresh
-edit "${RELEASE}" $'        run: |\n          chmod 755 release-sign\n' \
-    $'        run: |\n          gh release download v0.1.0 -R example/keygen\n          chmod 755 release-sign\n'
+edit "${RELEASE}" $'      - name: Sign\n' \
+    $'      - name: Fetch a release\n        run: gh release download v0.1.0 -R example/keygen\n\n      - name: Sign\n'
 expect "a release of another repository downloaded by publish" "${FETCH_NOTHING}"
 
+# The tool publish runs can only be the one built from the tagged commit.
 fresh
 edit "${RELEASE}" $'          cargo build --release --locked --bin release-sign\n          cp target/release/release-sign .\n' \
     $'          curl -fsSL -o release-sign https://example.org/release-sign\n'
-expect "a signer not built from the tagged commit" "release.yml's build job must build release-sign from the tagged commit"
+expect "a signer downloaded by the build job in place of the build" "${TOOL_FROM_TAG}"
 
 fresh
 edit "${RELEASE}" $'            release-notes.md\n            release-sign\n' $'            release-notes.md\n'
-expect "the signer not handed to publish" "release.yml's build job must hand release-sign to the publish job"
+expect "the signer not handed to publish" "${TOOL_FROM_TAG}"
 
 fresh
-edit "${RELEASE}" $'          printf \'%s\' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub\n' ''
-edit "${RELEASE}" $'          # The check a node makes, with the key compiled into this release.\n' \
-    $'          printf \'%s\' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub\n          # The check a node makes, with the key compiled into this release.\n'
-expect "the key checked only after signing" "release.yml's publish job must check the key once, then sign once"
+edit "${RELEASE}" $'          cp sign/release-signing-key.pub .\n' \
+    $'          cp sign/release-signing-key.pub .\n          curl -fsSL -o release-sign https://example.org/release-sign\n'
+expect "the built signer replaced by a download in a later step of the build job" "${TOOL_FROM_TAG}"
 
 fresh
-edit "${RELEASE}" $'          ./release-sign verify --embedded \\\n            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig\n' ''
-edit "${RELEASE}" $'          sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt\n' \
-    $'          sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt\n          ./release-sign verify --embedded \\\n            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig\n'
-expect "the checksums written before the signature is checked" "release.yml's publish job must check the key once, then sign once"
+edit "${RELEASE}" $'          cp sign/release-signing-key.pub .\n' \
+    $'          cp sign/release-signing-key.pub .\n          cp "$RUNNER_TEMP/other" release-sign\n'
+expect "the built signer overwritten by another file in the build job" "${TOOL_FROM_TAG}"
 
 fresh
-edit "${RELEASE}" $'        run: |\n          chmod 755 release-sign\n' \
-    $'        run: |\n          printf \'%s\' "$SIGNING_KEY_HEX" > "$RUNNER_TEMP/release.secret"\n          chmod 755 release-sign\n'
-expect "the secret key written to a file" "release.yml's publish job must hand the secret key to release-sign on standard input only"
+edit "${RELEASE}" $'          cp sign/release-signing-key.pub .\n' \
+    $'          cp sign/release-signing-key.pub .\n          wget -q -O signer.tar.gz example.org/signer.tar.gz\n'
+expect "a download of any kind in the build job" "${TOOL_FROM_TAG}"
+
+# The publish job's permissions and its artifact's inputs are pinned.
+fresh
+edit "${RELEASE}" $'    permissions:\n      contents: write\n' $'    permissions:\n      contents: write\n      actions: read\n'
+expect "publish given actions: read" "${PUBLISH_WRITES}"
+
+fresh
+edit "${RELEASE}" "${DOWNLOAD_WITH}" "${DOWNLOAD_WITH}"$'          run-id: 1234567890\n'
+expect "another run's artifact taken by run id" "${ARTIFACT_BY_NAME}"
+
+fresh
+edit "${RELEASE}" "${DOWNLOAD_WITH}" "${DOWNLOAD_WITH}"$'          github-token: ${{ github.token }}\n'
+expect "an artifact taken with a token" "${ARTIFACT_BY_NAME}"
+
+fresh
+edit "${RELEASE}" "${DOWNLOAD_WITH}" "${DOWNLOAD_WITH}"$'          repository: example/other\n'
+expect "an artifact taken from another repository" "${ARTIFACT_BY_NAME}"
+
+# The Sign step is exactly the reviewed one.
+fresh
+edit "${RELEASE}" "${CHECK_KEY_LINE}" ''
+edit "${RELEASE}" "${SUMS_LINE}" "${CHECK_KEY_LINE}${SUMS_LINE}"
+expect "the key checked only after signing" "${SIGN_STEP_EXACT}"
+
+fresh
+edit "${RELEASE}" "${EMBEDDED_LINES}" ''
+edit "${RELEASE}" "${SUMS_LINE}" "${SUMS_LINE}${EMBEDDED_LINES}"
+expect "the checksums written before the signature is checked" "${SIGN_STEP_EXACT}"
+
+fresh
+edit "${RELEASE}" "${CHECK_KEY_LINE}" "${CHECK_KEY_LINE%$'\n'} || true"$'\n'
+expect "the key check made non-fatal" "${SIGN_STEP_EXACT}"
+
+fresh
+edit "${RELEASE}" $'            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig\n          ./release-sign verify --key' \
+    $'            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig || true\n          ./release-sign verify --key'
+expect "the check with the compiled-in key made non-fatal" "${SIGN_STEP_EXACT}"
+
+fresh
+edit "${RELEASE}" "${EMBEDDED_LINES}" \
+    $'          ./release-sign verify --embedded \\\n            --input release-signing-key.pub --signature release-signing-key.pub\n'
+expect "the compiled-in key's check pointed at another file" "${SIGN_STEP_EXACT}"
+
+fresh
+edit "${RELEASE}" "${CHECK_KEY_LINE}" \
+    $'          printf \'%s\' "$SIGNING_KEY_HEX" | tee "$RUNNER_TEMP/k" | ./release-sign check-key --public release-signing-key.pub\n'
+expect "the secret key copied by tee" "${SIGN_STEP_EXACT}"
+
+fresh
+edit "${RELEASE}" "${SIGN_RUN}" "${SIGN_RUN%$'          chmod 755 release-sign\n'}"$'          printf \'%s\' "$SIGNING_KEY_HEX" > "$RUNNER_TEMP/release.secret"\n          chmod 755 release-sign\n'
+expect "the secret key written to a file" "${SIGN_STEP_EXACT}"
+
+fresh
+edit "${RELEASE}" $'      - name: Publish\n' \
+    $'      - name: Keep the key\n        env:\n          K: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}\n        run: echo "$K" | base64 > "$RUNNER_TEMP/k"\n\n      - name: Publish\n'
+expect "the secret key used by another step" "${SIGN_STEP_EXACT}"
+
+fresh
+edit "${RELEASE}" $'defaults:\n  run:\n    shell: bash\n' $'defaults:\n  run:\n    shell: sh\n'
+expect "release.yml's steps run without pipefail" "${RELEASE_BASH}"
+
+# The archive lists its files by name.
+fresh
+edit "${RELEASE}" $'          tar -C dist -czf ant-node-cli-linux-x64.tar.gz ant-node bootstrap_peers.toml \\\n            LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html\n' \
+    $'          tar -C dist -czf ant-node-cli-linux-x64.tar.gz .\n'
+expect "the archive packed from the whole folder" "${NAMED_FILES}"
+
+fresh
+edit "${RELEASE}" $'          cp target/release/ant-node config/bootstrap_peers.toml' \
+    $'          cp target/release/* config/bootstrap_peers.toml'
+expect "a wildcard copied into the archive's folder" "${NAMED_FILES}"
 
 fresh
 edit "${LATEST}" $'          echo "version=$version" >> "$GITHUB_OUTPUT"\n' \
