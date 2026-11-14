@@ -302,6 +302,24 @@ never ran.
   (`inbound_requests_wait_their_turn_for_a_slot`) and `tests/fork_pins.rs`
   (`request_turns`) fail if the loop goes back to a task per message, or the
   bound stops matching the event buffer.
+- **Releases are signed with this repository's own tool** (from ds.23).
+  A node installs a release by itself only once the archive's ML-DSA-65
+  signature checks out against the key compiled into it
+  (`src/upgrade/signature.rs`). The Release workflow used to download
+  upstream's ant-keygen to sign; that download stopped answering on 14
+  November 2026. Now the workflow builds `release-sign`
+  (`src/bin/release-sign`) from the tagged commit and signs with it, fetching
+  nothing from outside this repository: it checks the secret key, taken on
+  standard input only, against the release's public key, signs, and writes
+  the signature only once the node's own check accepts it; the workflow then
+  checks it again with the key compiled into the release before writing the
+  checksums. The Build workflow rehearses the same path on every build with
+  a throwaway key. To check a release yourself, build it with `cargo build
+  --release --locked --bin release-sign` and run `release-sign verify --key
+  release-signing-key.pub --input ant-node-cli-linux-x64.tar.gz --signature
+  ant-node-cli-linux-x64.tar.gz.sig`; ant-keygen 0.1.0's `verify` accepts the
+  same files. `scripts/check-workflows.sh` and `tests/fork_pins.rs`
+  (`release_signing`) fail if the workflow goes back to a download.
 - **Nodes keep data while the disk has room** (from ds.11). A node keeps the records and
   pointers it holds after it stops being responsible for them, and goes on
   serving them and offering them to their close group. Its prune passes erase

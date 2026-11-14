@@ -3110,3 +3110,101 @@ mod quote_count {
         }
     }
 }
+
+/// Releases are signed with this repository's own tool (from ds.23). Every
+/// node installs a release by itself after checking its signature
+/// (src/upgrade/signature.rs). The release workflow used to download
+/// upstream's ant-keygen to sign, and on 14 November 2026 that download
+/// answered "not found", so ds.22 could not be published. Now release.yml's
+/// build job builds release-sign (src/bin/release-sign) from the tagged
+/// commit, and the publish job signs with it, downloading nothing.
+mod release_signing {
+    use super::repo_text;
+
+    /// The publish job of release.yml: from its key line to the next job's.
+    fn publish_job(release: &str) -> String {
+        let start = release
+            .find("\n  publish:\n")
+            .expect("release.yml has a publish job");
+        let rest = &release[start + 1..];
+        let end = rest[1..]
+            .find("\n  latest:\n")
+            .map_or(rest.len(), |i| i + 1);
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn releases_are_signed_without_a_download() {
+        let release = repo_text(".github/workflows/release.yml").replace("\r\n", "\n");
+        let why = "release.yml must sign with release-sign, built from the tagged commit, and \
+                   fetch nothing from outside this repository to sign: upstream's ant-keygen \
+                   download answered 'not found' on 14 November 2026 and left ds.22 unpublished";
+        for gone in [
+            "Install ant-keygen",
+            "WithAutonomi/ant-keygen",
+            "ant-keygen-linux-x64",
+        ] {
+            assert!(
+                !release.contains(gone),
+                "release.yml has `{gone}` again; {why}"
+            );
+        }
+        let publish = publish_job(&release);
+        for fetch in [
+            "curl ",
+            "wget ",
+            "http://",
+            "https://",
+            "gh release download",
+        ] {
+            assert!(
+                !publish.contains(fetch),
+                "release.yml's publish job has `{fetch}`; {why}"
+            );
+        }
+        for needed in [
+            "cargo build --release --locked --bin release-sign",
+            "./release-sign check-key --public release-signing-key.pub",
+            "./release-sign sign --public release-signing-key.pub",
+            "./release-sign verify --embedded",
+        ] {
+            assert!(
+                release.contains(needed),
+                "release.yml lost `{needed}`; {why}"
+            );
+        }
+        // The tool is never packed into the archive nodes install.
+        let package = release
+            .split("      - name: Package\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - ").next())
+            .expect("release.yml has a Package step");
+        let packs_tool = package.split_whitespace().any(|word| {
+            word == "release-sign" || word.ends_with("/release-sign") || word == "dist/release-sign"
+        });
+        assert!(
+            !packs_tool,
+            "release.yml's Package step packs release-sign into the release archive"
+        );
+    }
+
+    /// The tool checks signatures with the node's own functions, not a copy.
+    #[test]
+    fn the_signing_tool_checks_as_nodes_do() {
+        let manifest = repo_text("Cargo.toml");
+        assert!(manifest.contains("name = \"release-sign\""));
+        let tool = repo_text("src/bin/release-sign/main.rs");
+        for needed in [
+            "use ant_node::upgrade::{",
+            "verify_from_file_with_key(",
+            "verify_from_file(input, signature)",
+            "SIGNING_CONTEXT",
+        ] {
+            assert!(
+                tool.contains(needed),
+                "src/bin/release-sign/main.rs lost `{needed}`: it must sign with the node's \
+                 context and check with the node's own functions (src/upgrade/signature.rs)"
+            );
+        }
+    }
+}

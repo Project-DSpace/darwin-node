@@ -14,7 +14,11 @@
 # The tag has to come from a person: GitHub won't let GITHUB_TOKEN create a tag
 # on a commit that changes .github/workflows, so this only publishes an
 # existing tag. The signing key is the RELEASE_SIGNING_KEY_HEX secret of the
-# `release` environment, which only v*+ds.* tags can use.
+# `release` environment, which only v*+ds.* tags can use. The archive is
+# signed with release-sign (src/bin/release-sign), built by the build job from
+# the tagged commit: signing fetches nothing from outside this repository, and
+# the signature is checked with the node's own function and the key compiled
+# into the release before anything is published.
 #
 # Nothing is published until the checks job has seen the tagged commit pass
 # both other workflows: its newest Test run (from the push to main, or one
@@ -199,6 +203,15 @@ jobs:
             exit 1
           fi
 
+      # The tool the publish job signs with: this commit's release-sign, whose
+      # checks are the node's own (src/upgrade/signature.rs) and whose
+      # embedded key is the one this release's nodes have. It goes to the
+      # publish job with the archive, never into the archive.
+      - name: Build the signing tool
+        run: |
+          cargo build --release --locked --bin release-sign
+          cp target/release/release-sign .
+
       # Same name and layout as Autonomi's release: nodes find the archive by
       # "linux-x64" and take the file named ant-node out of it. As in
       # Autonomi's archives, it also carries the project's licence files, the
@@ -227,6 +240,7 @@ jobs:
             ant-node-cli-linux-x64.tar.gz
             release-signing-key.pub
             release-notes.md
+            release-sign
           if-no-files-found: error
           retention-days: 1
 
@@ -301,28 +315,28 @@ jobs:
         with:
           name: release-unsigned
 
-      - name: Install ant-keygen 0.1.0
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/ant-keygen.tar.gz" \
-            https://github.com/WithAutonomi/ant-keygen/releases/download/v0.1.0/ant-keygen-linux-x64.tar.gz
-          echo "1e81922c3b3d383db0bb8039d6f13363de013b64f80e50280798461ce9e8fcf0  $RUNNER_TEMP/ant-keygen.tar.gz" \
-            | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/ant-keygen.tar.gz" -C "$RUNNER_TEMP" ant-keygen
-
+      # Signed with the build job's release-sign, built from the tagged
+      # commit: nothing is fetched from outside this repository to sign. The
+      # secret key goes to it on standard input only (printf is bash's own,
+      # so it is on no command line), never into a file. The key is checked
+      # first: an ML-DSA-65 key that belongs to the public key this release
+      # ships, which the build job compared with the key compiled into the
+      # node. release-sign writes a signature only once the node's own check
+      # accepts it; it is then checked again as a node of this release checks
+      # it, with the compiled-in key, and with the shipped public key, and
+      # only then are the checksums written.
       - name: Sign
         env:
           SIGNING_KEY_HEX: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}
         run: |
-          umask 077
-          keygen="$RUNNER_TEMP/ant-keygen"
-          key="$RUNNER_TEMP/release.secret"
-          trap 'rm -f "$key"' EXIT
-          printf '%s' "$SIGNING_KEY_HEX" | "$keygen" verify-key > /dev/null
-          printf '%s' "$SIGNING_KEY_HEX" | xxd -r -p > "$key"
-          "$keygen" sign --key "$key" \
+          chmod 755 release-sign
+          printf '%s' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub
+          printf '%s' "$SIGNING_KEY_HEX" | ./release-sign sign --public release-signing-key.pub \
             --input ant-node-cli-linux-x64.tar.gz --output ant-node-cli-linux-x64.tar.gz.sig
           # The check a node makes, with the key compiled into this release.
-          "$keygen" verify --key release-signing-key.pub \
+          ./release-sign verify --embedded \
+            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig
+          ./release-sign verify --key release-signing-key.pub \
             --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig
           sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt
 
@@ -338,8 +352,9 @@ jobs:
             "Storage node $TAG for Linux x86_64 (Ubuntu 24.04 or newer)." \
             "" \
             "Running nodes install it by themselves within the staged-rollout window." \
-            "The archive is signed with ML-DSA-65; check it with:" \
-            "ant-keygen verify --key release-signing-key.pub --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig" \
+            "The archive is signed with ML-DSA-65, as running nodes check it. To check it yourself, build release-sign from this release's source (cargo build --release --locked --bin release-sign) and run:" \
+            "release-sign verify --key release-signing-key.pub --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig" \
+            "ant-keygen 0.1.0's verify, given the same three files, accepts it too." \
             "" \
             "The archive also contains LICENSE-MIT and LICENSE-APACHE, plus THIRD-PARTY-NOTICES.txt and RUST-STD-COPYRIGHT.html with the licences and copyright notices of the third-party code in the binary and of the tools used to build it." \
             > notes.md

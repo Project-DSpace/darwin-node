@@ -395,9 +395,56 @@ edit "${BUILD}" $'      - name: Save image\n' \
 expect "an image pushed by Build in a command split over lines" "${REGISTRY}"
 
 fresh
-edit "${RELEASE}" $'      - name: Install ant-keygen 0.1.0\n' \
-    $'      - name: Move latest\n        run: docker buildx imagetools create --tag "$IMAGE:latest" x\n\n      - name: Install ant-keygen 0.1.0\n'
+edit "${RELEASE}" $'      - name: Sign\n' \
+    $'      - name: Move latest\n        run: docker buildx imagetools create --tag "$IMAGE:latest" x\n\n      - name: Sign\n'
 expect ":latest moved by publish" "${REGISTRY}"
+
+# Signing fetches nothing from outside this repository, and keeps its
+# order: the key checked against the shipped public key, the signature
+# made, checked with the key compiled into the release, then the checksums;
+# the secret key only on standard input.
+FETCH_NOTHING="release.yml's publish job must fetch nothing from outside this repository in order to sign"
+
+fresh
+edit "${RELEASE}" $'      - name: Sign\n' \
+    $'      - name: Fetch a signer\n        run: curl -fsSL -o release-sign https://example.org/release-sign\n\n      - name: Sign\n'
+expect "a signer downloaded by publish" "${FETCH_NOTHING}"
+
+fresh
+edit "${RELEASE}" $'      - name: Sign\n' \
+    $'      - uses: example/signer@0123456789012345678901234567890123456789\n\n      - name: Sign\n'
+expect "a signing action from outside used by publish" "${FETCH_NOTHING}"
+
+fresh
+edit "${RELEASE}" $'        run: |\n          chmod 755 release-sign\n' \
+    $'        run: |\n          gh release download v0.1.0 -R example/keygen\n          chmod 755 release-sign\n'
+expect "a release of another repository downloaded by publish" "${FETCH_NOTHING}"
+
+fresh
+edit "${RELEASE}" $'          cargo build --release --locked --bin release-sign\n          cp target/release/release-sign .\n' \
+    $'          curl -fsSL -o release-sign https://example.org/release-sign\n'
+expect "a signer not built from the tagged commit" "release.yml's build job must build release-sign from the tagged commit"
+
+fresh
+edit "${RELEASE}" $'            release-notes.md\n            release-sign\n' $'            release-notes.md\n'
+expect "the signer not handed to publish" "release.yml's build job must hand release-sign to the publish job"
+
+fresh
+edit "${RELEASE}" $'          printf \'%s\' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub\n' ''
+edit "${RELEASE}" $'          # The check a node makes, with the key compiled into this release.\n' \
+    $'          printf \'%s\' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub\n          # The check a node makes, with the key compiled into this release.\n'
+expect "the key checked only after signing" "release.yml's publish job must check the key once, then sign once"
+
+fresh
+edit "${RELEASE}" $'          ./release-sign verify --embedded \\\n            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig\n' ''
+edit "${RELEASE}" $'          sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt\n' \
+    $'          sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt\n          ./release-sign verify --embedded \\\n            --input ant-node-cli-linux-x64.tar.gz --signature ant-node-cli-linux-x64.tar.gz.sig\n'
+expect "the checksums written before the signature is checked" "release.yml's publish job must check the key once, then sign once"
+
+fresh
+edit "${RELEASE}" $'        run: |\n          chmod 755 release-sign\n' \
+    $'        run: |\n          printf \'%s\' "$SIGNING_KEY_HEX" > "$RUNNER_TEMP/release.secret"\n          chmod 755 release-sign\n'
+expect "the secret key written to a file" "release.yml's publish job must hand the secret key to release-sign on standard input only"
 
 fresh
 edit "${LATEST}" $'          echo "version=$version" >> "$GITHUB_OUTPUT"\n' \

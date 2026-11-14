@@ -253,6 +253,31 @@ jobs:
           tar -C dist -czf ant-node-linux-x64.tar.gz .
           sha256sum ant-node-linux-x64.tar.gz > SHA256SUMS.txt
 
+      # release.yml signs a release with release-sign (src/bin/release-sign),
+      # built from the tagged commit. The same path runs here on every build,
+      # with a throwaway key pair made for this run and never the release key
+      # (a GitHub environment secret this job can't read): the key check, the
+      # signature of the archive just built, the node's own check of it, and
+      # that the release key compiled in refuses it. So a break in signing
+      # shows here, not at the first tag. Nothing of it is uploaded.
+      - name: Rehearse signing
+        shell: bash
+        run: |
+          cargo build --release --locked --bin release-sign
+          tool=target/release/release-sign
+          keys="$RUNNER_TEMP/throwaway-key"
+          sig="$RUNNER_TEMP/rehearsal.sig"
+          trap 'rm -rf "$keys" "$sig"' EXIT
+          "$tool" throwaway-key --dir "$keys"
+          "$tool" check-key --public "$keys/test.pub" < "$keys/test.secret.hex"
+          "$tool" sign --public "$keys/test.pub" --input ant-node-linux-x64.tar.gz --output "$sig" \
+            < "$keys/test.secret.hex"
+          "$tool" verify --key "$keys/test.pub" --input ant-node-linux-x64.tar.gz --signature "$sig"
+          if "$tool" verify --embedded --input ant-node-linux-x64.tar.gz --signature "$sig"; then
+            echo "::error::a throwaway key's signature passed the check with the release key"
+            exit 1
+          fi
+
       - name: Upload build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

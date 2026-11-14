@@ -25,6 +25,13 @@
 #   for has run every pin;
 # - its publish job runs in the release environment and needs build and
 #   checks;
+# - its publish job signs with release-sign, which its build job builds
+#   from the tagged commit and hands on with the archive, and fetches
+#   nothing from outside this repository to sign: it uses no action but
+#   download-artifact and runs no curl, wget, URL, git or package download;
+#   its Sign step checks the secret key against the shipped public key
+#   before it signs, checks the signature with the key compiled into the
+#   release after, and only then writes SHA256SUMS.txt;
 # - its build job hands the tagged commit's release-notes/<tag>.md, when it
 #   has one, to the publish job as release-notes.md, and the publish job
 #   writes the release's fixed text first and then that file's text into the
@@ -451,6 +458,43 @@ else
             problem "release.yml's publish job must need ${need}"
         fi
     done
+
+    # Signing fetches nothing from outside this repository: the build job
+    # builds release-sign from the tagged commit and hands it on with the
+    # archive; the publish job uses no action but download-artifact and
+    # downloads nothing. Its Sign step checks the key against the shipped
+    # public key first, signs, checks the signature with the key compiled
+    # into the release, then writes the checksums.
+    holds "$(step 'Build the signing tool' "${build}")" "release.yml's build job must build release-sign from the tagged commit" \
+        'cargo build --release --locked --bin release-sign' \
+        'cp target/release/release-sign .'
+    if ! grep -qx '            release-sign' <<<"${build}"; then
+        problem "release.yml's build job must hand release-sign to the publish job with the archive"
+    fi
+    publish=$(job publish)
+    fetched=$(grep -nE '(^|[^A-Za-z0-9_-])(curl|wget|git[[:space:]]+(clone|fetch|pull)|cargo[[:space:]]+install|pip[0-9]*[[:space:]]+install|npm[[:space:]]+(install|i)|gh[[:space:]]+release[[:space:]]+download)([^A-Za-z0-9_-]|$)|https?://' <<<"${publish}" || true)
+    actions=$(sed -n 's/^[[:space:]]*-\{0,1\}[[:space:]]*uses:[[:space:]]*\([^@[:space:]]*\)@.*$/\1/p' <<<"${publish}" | sort -u)
+    if [[ -n "${fetched}" || "${actions}" != "actions/download-artifact" ]]; then
+        problem "release.yml's publish job must fetch nothing from outside this repository in order to sign: no action but actions/download-artifact, and no curl, wget, URL, git, package or release download (found: $(tr '\n' ' ' <<<"${fetched}${actions:+ uses ${actions}}"))"
+    fi
+    signing=$(step Sign "${publish}" | sed 's/^[[:space:]]*//')
+    holds "${signing}" "release.yml's publish job must sign with release-sign: the key checked, the signature checked with the key compiled into the release, then the checksums" \
+        'SIGNING_KEY_HEX: ${{ secrets.RELEASE_SIGNING_KEY_HEX }}' \
+        'printf '\''%s'\'' "$SIGNING_KEY_HEX" | ./release-sign check-key --public release-signing-key.pub' \
+        'printf '\''%s'\'' "$SIGNING_KEY_HEX" | ./release-sign sign --public release-signing-key.pub \' \
+        './release-sign verify --embedded \' \
+        'sha256sum ant-node-cli-linux-x64.tar.gz ant-node-cli-linux-x64.tar.gz.sig > SHA256SUMS.txt'
+    checked=$(grep -nF -- './release-sign check-key' <<<"${signing}" | cut -d: -f1 | tr '\n' ' ' || true)
+    signed=$(grep -nF -- './release-sign sign ' <<<"${signing}" | cut -d: -f1 | tr '\n' ' ' || true)
+    verified=$(grep -nF -- './release-sign verify --embedded' <<<"${signing}" | cut -d: -f1 | tr '\n' ' ' || true)
+    summed=$(grep -nF -- '> SHA256SUMS.txt' <<<"${signing}" | cut -d: -f1 | tr '\n' ' ' || true)
+    if [[ ! "${checked}" =~ ^[0-9]+\ $ || ! "${signed}" =~ ^[0-9]+\ $ || ! "${verified}" =~ ^[0-9]+\ $ || ! "${summed}" =~ ^[0-9]+\ $ ]] \
+        || ((checked > signed || signed > verified || verified > summed)); then
+        problem "release.yml's publish job must check the key once, then sign once, then check the signature with the key compiled into the release once, then write SHA256SUMS.txt"
+    fi
+    if grep -qE 'SIGNING_KEY_HEX[^|]*(>|tee)|xxd' <<<"${signing}"; then
+        problem "release.yml's publish job must hand the secret key to release-sign on standard input only, never into a file"
+    fi
 
     # A release's own notes: the build job, on the tagged commit, hands
     # release-notes/<tag>.md on as release-notes.md (empty when there is
@@ -1136,7 +1180,10 @@ fi
 # and for releases (release.yml's build job), with no feature, and each job
 # checks the binary it built for the test seams' variables before packaging
 # it: a build with test-utils has seams a test sets from the environment.
+# The one other build either job may make is the release-signing tool's,
+# exactly SIGN_TOOL_BUILD, which builds no node binary.
 NODE_BUILD='run: cargo build --release --locked --bin ant-node'
+SIGN_TOOL_BUILD='cargo build --release --locked --bin release-sign'
 SEAM_BINARY='if [[ ! -s target/release/ant-node ]]; then'
 SEAM_CHECK='if grep -aqF ANT_TEST_SEAM_ target/release/ant-node; then'
 for place in "${BUILD}:linux-x64" "${RELEASE}:build"; do
@@ -1145,7 +1192,7 @@ for place in "${BUILD}:linux-x64" "${RELEASE}:build"; do
     [[ -f "${file}" ]] || continue
     where="$(basename "${file}")'s ${name} job"
     text=$(job "${name}" "${file}" | sed 's/^[[:space:]]*//')
-    builds=$(grep -n 'cargo build' <<<"${text}" || true)
+    builds=$(grep -n 'cargo build' <<<"${text}" | grep -vxE "[0-9]+:${SIGN_TOOL_BUILD}" || true)
     if [[ "${builds#*:}" != "${NODE_BUILD}" ]]; then
         problem "${where} must build the node once, with exactly '${NODE_BUILD}' (it has: $(cut -d: -f2- <<<"${builds}" | tr '\n' ' '))"
         continue
