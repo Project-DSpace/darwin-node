@@ -205,6 +205,25 @@ never ran.
   run, and that `Cargo.lock` holds one saorsa-core, the vendored copy, and
   one saorsa-transport, the vendored copy of a release that `Cargo.toml` and
   the vendored saorsa-core both accept.
+- **A restarted node is dialled again once it signs a newer address
+  record** (from ds.23). saorsa-core remembers a failed dial of an address
+  for 30 minutes and skips that address meanwhile, counting each skipped
+  attempt as a failed dial against the peer. Upstream clears the entry only
+  on a successful dial, which can't happen while the address is skipped, or
+  when the peer publishes a record in which the address is new. A node that
+  restarts at the same address publishes the same addresses, so other nodes
+  and long-running clients kept skipping it for up to 30 minutes after a
+  short restart. A node signs a new address record only when its addresses
+  change or when it starts; periodic re-publication reuses the same signed
+  record. So in the vendored copy a newer signed record from a peer, whether
+  the peer sent it or another peer relayed it in a lookup, clears the
+  failures of the addresses in it, and the peer is dialled again the next
+  time it is needed. A copy of the same record clears nothing, a relay IP
+  suppressed after several dead sessions stays suppressed until a real dial
+  succeeds, and the 30-minute limit itself is unchanged. Nodes and clients
+  of earlier releases keep upstream's behaviour. The copy's tests pin it,
+  and `tests/fork_pins.rs` (`the_dial_recovery_tests_stay_and_run`) pins
+  that those tests and the patch's calls stay.
 - **A peer reconnecting after a relay closed is answered again** (from
   ds.21). saorsa-transport 0.38.2 (and 0.39.0) recorded a connection that came in
   through a relay endpoint under the address that endpoint's socket gives

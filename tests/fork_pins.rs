@@ -503,6 +503,13 @@ fn a_notice_records_its_class_and_a_fetch_on_that_entry_alone_is_checked() {
 /// another peer's relay. A peer behind NAT has no verified Direct address, so
 /// its relay is still dialled first. The dial plan is private to saorsa-core:
 /// its own tests pin it there, and test.yml runs them.
+///
+/// From ds.23 the copy carries a second change: a peer's newer signed address
+/// record, published by the peer or relayed in a lookup, clears the dial
+/// failures of the addresses in it (`clear_dial_failures_for_newer_record`),
+/// so a node that restarts at the same address is dialled again without
+/// waiting out the 30-minute dial-failure cache. Its tests are pinned below
+/// the same way.
 mod direct_first {
     use super::repo_text;
     use saorsa_core::{AddressType, DHTNode, MultiAddr, PeerId};
@@ -549,6 +556,23 @@ mod direct_first {
             &["direct_first_leaves_the_lookup_tie_break_as_upstream_made_it"],
         ),
     ];
+
+    /// The vendored crate's tests of the second change (ds.23), each of
+    /// which must stay: a newer record clears an unchanged address, the same
+    /// record again clears nothing, relay-IP suppression and exemptions are
+    /// left as upstream's, a relayed record clears too, and a restarted peer
+    /// is dialled again. A re-vendor that loses the patch (the function, or
+    /// its calls after each `clear_dial_failures_for_published`) fails them.
+    const DIAL_RECOVERY_TESTS: &[(&str, &[&str])] = &[(
+        "vendor/saorsa-core/src/dht_network_manager.rs",
+        &[
+            "newer_record_clears_an_unchanged_address",
+            "the_same_record_again_clears_nothing",
+            "newer_record_leaves_relay_ip_suppression",
+            "a_relayed_newer_record_clears_too",
+            "a_restarted_peer_is_dialled_again",
+        ],
+    )];
 
     fn toml_file(path: &str) -> toml::Value {
         toml::from_str(&repo_text(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
@@ -675,6 +699,52 @@ mod direct_first {
                     "{path} lost {name}, a test of direct-first dialling"
                 );
             }
+        }
+        let test_workflow = repo_text(".github/workflows/test.yml");
+        assert!(
+            test_workflow.contains("run: cargo test --locked -p saorsa-core --lib"),
+            "test.yml no longer runs vendor/saorsa-core's own tests"
+        );
+    }
+
+    #[test]
+    fn the_dial_recovery_tests_stay_and_run() {
+        for (path, names) in DIAL_RECOVERY_TESTS {
+            let source = repo_text(path);
+            for name in *names {
+                assert!(
+                    source.contains(&format!("fn {name}()")),
+                    "{path} lost {name}, a test of dialling a restarted peer again \
+                     after its newer signed address record (vendor/saorsa-core/VENDORED.md)"
+                );
+            }
+            // The patch itself: the function, and one call of it beside each
+            // of upstream's calls of clear_dial_failures_for_published, in the
+            // code outside the test module.
+            assert!(
+                source.contains("fn clear_dial_failures_for_newer_record("),
+                "{path} lost clear_dial_failures_for_newer_record"
+            );
+            let code = source
+                .split("\nmod tests {")
+                .next()
+                .expect("split yields at least one part");
+            let calls = |name: &str| {
+                code.matches(&format!("{name}(")).count()
+                    - code.matches(&format!("fn {name}(")).count()
+            };
+            let upstream = calls("clear_dial_failures_for_published");
+            let ours = calls("clear_dial_failures_for_newer_record");
+            assert_eq!(
+                upstream, 3,
+                "{path}: upstream's three calls of clear_dial_failures_for_published \
+                 changed; re-check where a newer address record is applied"
+            );
+            assert_eq!(
+                ours, upstream,
+                "{path}: clear_dial_failures_for_newer_record must be called beside \
+                 each call of clear_dial_failures_for_published"
+            );
         }
         let test_workflow = repo_text(".github/workflows/test.yml");
         assert!(

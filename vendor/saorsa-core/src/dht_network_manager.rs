@@ -1021,6 +1021,56 @@ impl DialFailureCache {
             .retain(|_, at| at.elapsed() < DIAL_FAILURE_PUBLISH_EXEMPTION_TTL);
         self.exempt.insert((*peer, addr), Instant::now());
     }
+
+    /// Drop only `addr`'s own per-address failure, after its owner signed a
+    /// newer address record that lists it (see
+    /// [`clear_dial_failures_for_newer_record`]).
+    ///
+    /// Unlike [`Self::clear`] it leaves the IP-level relay suppression alone
+    /// (a newer record is not proof that this node can reach the relay IP),
+    /// and unlike [`Self::note_republished`] it grants no exemption from it.
+    fn clear_address(&self, addr: &SocketAddr) {
+        let addr = Self::canon_key(*addr);
+        self.entries.remove(&addr);
+    }
+}
+
+/// Restart recovery: when a peer's newer signed address record is applied,
+/// whether the peer published it or another peer relayed it in a lookup,
+/// clear the per-address dial failures of every address in it, including
+/// addresses the previous record already listed.
+///
+/// A peer re-signs its record only when its addresses change or when it has
+/// none yet, which is the case right after it starts; periodic re-publication
+/// reuses the same signed record, which is not applied twice. So a newer
+/// record with an unchanged address set means the peer has started again,
+/// and without this a node that restarts at the same address stays skipped
+/// for up to [`DIAL_FAILURE_CACHE_TTL`], each skipped attempt counted as a
+/// failed dial against it. The record is signed by its owner, so another peer
+/// cannot produce this evidence. A copy at the same sequence is not applied
+/// and clears nothing, so re-publication cannot cause a redial loop.
+///
+/// Only the addresses' own entries are cleared: IP-level relay suppression
+/// stays until a real dial succeeds, and no exemption is granted. This sits
+/// beside [`clear_dial_failures_for_published`] and is called just after each
+/// call of it, which keeps upstream's rules for re-acquired relay addresses.
+/// Returns the number of addresses cleared; a no-op when nothing was applied.
+fn clear_dial_failures_for_newer_record(
+    cache: &DialFailureCache,
+    applied: bool,
+    addresses: &[(crate::MultiAddr, AddressType)],
+) -> usize {
+    if !applied {
+        return 0;
+    }
+    let mut cleared = 0;
+    for (addr, _ty) in addresses {
+        if let Some(socket_addr) = addr.dialable_socket_addr() {
+            cache.clear_address(&socket_addr);
+            cleared += 1;
+        }
+    }
+    cleared
 }
 
 /// ADR-011 self-heal: when a newer authoritative `PublishAddressSet` from
@@ -3448,6 +3498,7 @@ impl DhtNetworkManager {
                 &previous,
                 &current,
             );
+            clear_dial_failures_for_newer_record(self.dial_failure_cache.as_ref(), true, &current);
         }
         Some(native)
     }
@@ -3504,6 +3555,12 @@ impl DhtNetworkManager {
                 &previous,
                 &current,
             );
+        }
+        // A newer record relayed in a lookup answer (not authoritative) is
+        // signed by its owner too, so it clears the same way.
+        if applied {
+            let current = dht.get_node_addresses_typed(owner).await;
+            clear_dial_failures_for_newer_record(self.dial_failure_cache.as_ref(), true, &current);
         }
         applied
     }
@@ -4974,13 +5031,19 @@ impl DhtNetworkManager {
                         .filter(|(addr, _)| current.iter().any(|(c, _)| c == addr))
                         .cloned()
                         .collect();
-                    clear_dial_failures_for_published(
+                    let cleared = clear_dial_failures_for_published(
                         self.dial_failure_cache.as_ref(),
                         authenticated_sender,
                         true,
                         &previous_addresses,
                         &still_current,
-                    )
+                    );
+                    clear_dial_failures_for_newer_record(
+                        self.dial_failure_cache.as_ref(),
+                        true,
+                        &still_current,
+                    );
+                    cleared
                 } else {
                     0
                 };
@@ -8617,6 +8680,222 @@ mod tests {
             cache.is_failed_for_dial(&owner, &socks[0], AddressType::Relay),
             "a fresh failure re-suppresses the address"
         );
+    }
+
+    // Restart recovery: a newer signed address record clears its addresses'
+    // own dial failures, unchanged addresses included.
+
+    #[test]
+    fn newer_record_clears_an_unchanged_address() {
+        let cache = DialFailureCache::new();
+        let peer = PeerId::from_bytes([1; 32]);
+        let direct = crate::MultiAddr::quic(sock("203.0.113.8:9000"));
+        let direct_sa = direct.dialable_socket_addr().expect("dialable");
+        let addrs = vec![(direct, AddressType::Direct)];
+
+        cache.record_failure(direct_sa, AddressType::Direct);
+        // Upstream's rule alone clears nothing for an unchanged set...
+        assert_eq!(
+            clear_dial_failures_for_published(&cache, &peer, true, &addrs, &addrs),
+            0
+        );
+        assert!(cache.is_failed_for_dial(&peer, &direct_sa, AddressType::Direct));
+        // ...a newer record with the same addresses clears the failure.
+        assert_eq!(
+            clear_dial_failures_for_newer_record(&cache, true, &addrs),
+            1
+        );
+        assert!(
+            !cache.is_failed_for_dial(&peer, &direct_sa, AddressType::Direct),
+            "a peer that signed a newer record is dialled again"
+        );
+        assert!(cache.exempt.is_empty(), "no exemption is granted");
+    }
+
+    #[test]
+    fn the_same_record_again_clears_nothing() {
+        let cache = DialFailureCache::new();
+        let peer = PeerId::from_bytes([1; 32]);
+        let direct = crate::MultiAddr::quic(sock("203.0.113.8:9000"));
+        let direct_sa = direct.dialable_socket_addr().expect("dialable");
+        let addrs = vec![(direct, AddressType::Direct)];
+
+        cache.record_failure(direct_sa, AddressType::Direct);
+        // A copy at the same sequence is not applied.
+        assert_eq!(
+            clear_dial_failures_for_newer_record(&cache, false, &addrs),
+            0
+        );
+        assert!(
+            cache.is_failed_for_dial(&peer, &direct_sa, AddressType::Direct),
+            "re-forwarding the same record must not cause a redial loop"
+        );
+    }
+
+    #[test]
+    fn newer_record_leaves_relay_ip_suppression() {
+        let cache = DialFailureCache::new();
+        let owner = PeerId::from_bytes([1; 32]);
+        let mut socks = Vec::new();
+        for port in 9001..9001 + DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            let sa = sock(&format!("198.51.100.11:{port}"));
+            cache.record_failure(sa, AddressType::Relay);
+            socks.push(sa);
+        }
+        let ip = socks[0].ip();
+        assert!(cache.ip_is_suppressed(&ip));
+
+        let addrs = vec![(crate::MultiAddr::quic(socks[0]), AddressType::Relay)];
+        assert_eq!(
+            clear_dial_failures_for_newer_record(&cache, true, &addrs),
+            1
+        );
+
+        assert!(
+            cache.entries.get(&socks[0]).is_none(),
+            "the address's own entry is cleared"
+        );
+        assert!(
+            cache.ip_is_suppressed(&ip),
+            "the relay IP stays suppressed until a real dial succeeds"
+        );
+        assert!(
+            cache.is_failed_for_dial(&owner, &socks[0], AddressType::Relay),
+            "no exemption: the owner's relay session is still suppressed by its IP"
+        );
+        assert!(cache.is_failed(&socks[1], AddressType::Relay));
+        assert!(cache.exempt.is_empty(), "no exemption is granted");
+    }
+
+    async fn dial_recovery_node() -> crate::P2PNode {
+        crate::P2PNode::new(
+            NodeConfig::builder()
+                .local(true)
+                .port(0)
+                .ipv6(false)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn dial_recovery_seed(manager: &DhtNetworkManager, owner: PeerId, address: &str) {
+        manager
+            .dht
+            .write()
+            .await
+            .add_node_no_trust(NodeInfo {
+                id: owner,
+                addresses: vec![address.parse().unwrap()],
+                address_types: vec![AddressType::Direct],
+                last_seen: AtomicInstant::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn dial_recovery_record(address: &str) -> TransportAddressRecord {
+        TransportAddressRecord::from_multiaddr(&address.parse().unwrap(), KnownReachability::Direct)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_relayed_newer_record_clears_too() {
+        let node = dial_recovery_node().await;
+        let manager = node.dht_manager();
+        let owner = PeerId::from_bytes([0x31; 32]);
+        let address = "/ip4/8.8.4.4/udp/9000/quic";
+        dial_recovery_seed(manager, owner, address).await;
+        let socket = address
+            .parse::<crate::MultiAddr>()
+            .unwrap()
+            .dialable_socket_addr()
+            .unwrap();
+        manager
+            .dial_failure_cache
+            .record_failure(socket, AddressType::Direct);
+
+        let (records, native) = manager
+            .validate_transport_address_records(&owner, vec![dial_recovery_record(address)], None)
+            .await
+            .unwrap();
+        // Applied as a record relayed in a lookup answer.
+        assert!(
+            manager
+                .store_transport_address_set(&owner, 10, records, native, false, None)
+                .await
+        );
+        assert!(
+            !manager
+                .dial_failure_cache
+                .is_failed_for_dial(&owner, &socket, AddressType::Direct),
+            "a relayed newer record clears the address's failure"
+        );
+        assert!(
+            manager.dial_failure_cache.exempt.is_empty(),
+            "a relayed record grants no exemption"
+        );
+        node.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_peer_is_dialled_again() {
+        let node = dial_recovery_node().await;
+        let manager = node.dht_manager();
+        let owner = PeerId::from_bytes([0x32; 32]);
+        let address = "/ip4/8.8.8.8/udp/9000/quic";
+        dial_recovery_seed(manager, owner, address).await;
+        let socket = address
+            .parse::<crate::MultiAddr>()
+            .unwrap()
+            .dialable_socket_addr()
+            .unwrap();
+        let failed = || {
+            manager
+                .dial_failure_cache
+                .is_failed_for_dial(&owner, &socket, AddressType::Direct)
+        };
+
+        // The peer's record at sequence n.
+        assert!(
+            manager
+                .apply_transport_address_set(&owner, 10, vec![dial_recovery_record(address)], None)
+                .await
+        );
+        // It goes down; a dial fails.
+        manager
+            .dial_failure_cache
+            .record_failure(socket, AddressType::Direct);
+        assert!(failed());
+
+        // It restarts at the same address and signs n+1 with the same set.
+        assert!(
+            manager
+                .apply_transport_address_set(&owner, 11, vec![dial_recovery_record(address)], None)
+                .await
+        );
+        assert!(!failed(), "the restarted peer is dialled again");
+
+        // A later failure is not cleared by n or n+1 again (not applied).
+        manager
+            .dial_failure_cache
+            .record_failure(socket, AddressType::Direct);
+        for seq in [10, 11] {
+            assert!(
+                !manager
+                    .apply_transport_address_set(
+                        &owner,
+                        seq,
+                        vec![dial_recovery_record(address)],
+                        None
+                    )
+                    .await
+            );
+            assert!(failed(), "an old or repeated record clears nothing");
+        }
+        node.stop().await.unwrap();
     }
 
     #[test]

@@ -112,7 +112,7 @@ note = "a modified copy of the crates.io release, kept in vendor/ant-protocol of
 
 [remark.saorsa-core]
 version = "0.30.0"
-note = "a modified copy of the crates.io release, kept in vendor/saorsa-core of the repository this release is built from; its Source above is that copy. The one change is the order a peer's addresses are dialled in, a verified direct address before a relay: AddressType::priority in src/peer_record.rs, the dial plan in src/dht_network_manager.rs and the stored order in src/dht/core_engine.rs, with upstream's order kept as AddressType::tag_rank for re-tagging and the lookup tie-break in src/client_routing.rs (see vendor/saorsa-core/VENDORED.md)."
+note = "a modified copy of the crates.io release, kept in vendor/saorsa-core of the repository this release is built from; its Source above is that copy. It has two changes. The first is the order a peer's addresses are dialled in, a verified direct address before a relay: AddressType::priority in src/peer_record.rs, the dial plan in src/dht_network_manager.rs and the stored order in src/dht/core_engine.rs, with upstream's order kept as AddressType::tag_rank for re-tagging and the lookup tie-break in src/client_routing.rs. The second, in src/dht_network_manager.rs, clears the dial failures of a peer's addresses when a newer address record signed by that peer is applied, so a peer that restarts at the same address is dialled again (see vendor/saorsa-core/VENDORED.md)."
 
 [remark.saorsa-transport]
 version = "0.39.0"
