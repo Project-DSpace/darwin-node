@@ -1272,7 +1272,9 @@ async fn verify_subtree_response(
         challenged_peer,
         ctx.config.audit_spotcheck_count(),
         |openings| async move {
-            opened_ref.lock().extend(openings.iter().map(|opening| opening.key));
+            opened_ref
+                .lock()
+                .extend(openings.iter().map(|opening| opening.key));
             let round = request_slice_proof(ctx, &openings).await;
 
             // Round 2 ended without a completed possession proof: drop the
