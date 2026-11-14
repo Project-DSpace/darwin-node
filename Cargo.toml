@@ -22,6 +22,14 @@ path = "src/bin/ant-node/main.rs"
 name = "ant-devnet"
 path = "src/bin/ant-devnet/main.rs"
 
+# Signs and checks a release archive as nodes check it (src/upgrade/signature.rs),
+# in place of upstream's ant-keygen: release.yml builds it from the tagged commit
+# to sign the release, and build.yml signs every build with a throwaway key.
+# Never shipped in the release archive or the image.
+[[bin]]
+name = "release-sign"
+path = "src/bin/release-sign/main.rs"
+
 # The client side of the mixed-version harness (scripts/test_mixed_versions.py):
 # paid uploads into a devnet, read back later. A test tool, built only with
 # test-utils, so no release or image carries it.

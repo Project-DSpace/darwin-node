@@ -130,6 +130,7 @@ const LEGACY_LEFTOVER: &str = "Part of removing, once the chunk store has opened
      every chunk the node kept was in the file store and every chunk it gave up was proven \
      held by its close group. Anything else there is kept.";
 const UPGRADE_CACHE: &str = "Upgrade cache files; no record data.";
+const RELEASE_SIGN: &str = "The release-signing tool (src/bin/release-sign, run by the release \n     and build workflows, never by a node) removes the signature it has just written beside its \n     output when the node's check refuses it, so no signature nodes would refuse is left; no \n     record data.";
 const LOG_FILES: &str = "The node's own log files, never record data.";
 const LISTING_METADATA: &str = "Listing metadata, not record data.";
 const DEVNET_RUN_DIR: &str = "The local devnet tool (ant-devnet, upstream v0.24.0's #263) \
@@ -650,6 +651,13 @@ const ERASE_SITES: &[EraseSite] = &[
         "delete_mark_last",
         1,
         LEGACY_LEFTOVER,
+    ),
+    site(
+        "src/bin/release-sign/main.rs",
+        "sign_with",
+        "remove_file",
+        2,
+        RELEASE_SIGN,
     ),
     site(
         "src/upgrade/binary_cache.rs",
