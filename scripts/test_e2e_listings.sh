@@ -104,6 +104,12 @@ ANT_MANIFEST="${MANIFEST_FILE}"
 RPC_URL=""
 WALLET_KEY=""
 VAULT_ADDRESS=""
+# The root vault the devnet manifest names, if any (evm.root_vault_address).
+ROOT_VAULT=""
+# What darwin-client says on stderr, from v0.3.11+ds.8, at every paid
+# command on a devnet whose manifest names no root vault: correct and
+# documented, so an upload expects it there and nowhere else.
+NO_ROOT_VAULT_WARNING="no root vault is known for this payment network (a devnet manifest names one as evm.root_vault_address): payments go through the payment vault"
 NODE_COUNT=""
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -984,7 +990,8 @@ def cmd_manifest(path):
         if not evm.get(key):
             problem(f"the manifest has no evm.{key}")
     finish(RPC_URL=evm.get("rpc_url"), WALLET_KEY=evm.get("wallet_private_key"),
-           VAULT_ADDRESS=evm.get("payment_vault_address"), NODE_COUNT=m.get("node_count"))
+           VAULT_ADDRESS=evm.get("payment_vault_address"), NODE_COUNT=m.get("node_count"),
+           ROOT_VAULT=evm.get("root_vault_address") or "")
 
 
 def cmd_chain_only(source, target):
@@ -1230,8 +1237,11 @@ upload_case() {
 
     # The same warnings on stderr, before anything is paid.
     warnings_got=$(grep '^warning: ' "${OUT_DIR}/up_${tag}.err" | sed 's/^warning: //' | sort || true)
-    warnings_want=$(py warnings "${readable}" "${index}" "${bits}" \
-        "$( [ -n "${name}${ctype}" ] && echo 1 || echo 0)" | sort)
+    warnings_want=$( {
+        py warnings "${readable}" "${index}" "${bits}" \
+            "$( [ -n "${name}${ctype}" ] && echo 1 || echo 0)"
+        if [ -z "${ROOT_VAULT}" ]; then echo "${NO_ROOT_VAULT_WARNING}"; fi
+    } | sort)
     if [ "${warnings_got}" = "${warnings_want}" ]; then
         pass "${label}: warnings on stderr ($(printf '%s' "${warnings_want}" | grep -c . || true))"
     else
