@@ -253,6 +253,33 @@ never ran.
   warning, skips the events it missed and carries on, as the replication
   engine already did; only a closed stream ends it. A census test fails if
   the loop stops reading through it.
+- **Requests wait their turn, as data** (from ds.23). A node answers
+  storage (chunk) requests with at most 64 handlers at once, upstream's
+  number, and listings requests with the listing service's own 16. Upstream
+  starts a task for every message as it arrives, and the task then waits
+  for one of the 64 slots, first come first served: the waiting tasks, each
+  holding its message, have no bound, and one source sending faster than
+  the node answers can hold every slot and grow everyone else's wait and
+  the node's memory. In this fork a request waits as plain data in its
+  topic's queue (`src/request_queue.rs`), and its handler task is started
+  only once a slot is free. The sources that have something waiting are
+  served in turn, one request each, and each source's requests in the
+  order they came. A source is the address a request came from (an IPv4
+  address, or an IPv6 /64, as the browser listener counts them), since
+  peer ids cost nothing to make; a request with no address counts by its
+  peer id. No source is capped: a source alone on a node, such as a
+  gateway, still gets every slot. Each queue holds at most 1,000 requests
+  (`MAX_QUEUED_REQUESTS`, the size of saorsa-core's event buffer in front
+  of it; to be confirmed by Dan). When one is full, the oldest request of
+  the source with the most waiting is dropped unanswered, so a source with
+  fewer waiting never loses one to a source with more; the node logs a
+  warning on the first drop and each time the count doubles. An answer to
+  one of the node's own listings requests is taken at once, as before.
+  Nothing on the wire changes, and replication between nodes, which has
+  its own admission, is not affected. A census test
+  (`inbound_requests_wait_their_turn_for_a_slot`) and `tests/fork_pins.rs`
+  (`request_turns`) fail if the loop goes back to a task per message, or the
+  bound stops matching the event buffer.
 - **Nodes keep data while the disk has room** (from ds.11). A node keeps the records and
   pointers it holds after it stops being responsible for them, and goes on
   serving them and offering them to their close group. Its prune passes erase
@@ -1864,7 +1891,8 @@ What is limited:
 | Limit | Where | Value |
 |-------|-------|-------|
 | Browser (WebRTC Direct) sessions and requests | `WebRtcDirectConfig` in `src/config.rs` | per IP, per session and in total |
-| Storage requests handled at once | `start_protocol_routing` in `src/node.rs` | 64 per node, from all peers together |
+| Storage requests handled at once | `start_protocol_routing` in `src/node.rs` | 64 per node, from all peers together; sources waiting are served in turn |
+| Requests waiting for a handler | `MAX_QUEUED_REQUESTS` in `src/request_queue.rs` | 1,000 per topic (storage, listings); when full, the oldest of the source with the most waiting is dropped |
 | Listings requests handled at once | `ListingService::request_permits` in `src/listings/service.rs`, taken in `src/node.rs` | 16 per node, from all peers together, apart from the storage requests' 64 |
 | Watches on a node's listing change feed | `ListingService::changes` in `src/listings/service.rs` | 4 at once, each for 3 minutes or until its reader's next request; a fifth is refused, its request answered |
 | Records read for one change feed request | `ListingService::changes` in `src/listings/service.rs` | 4,096, of which at most 256 are sent |

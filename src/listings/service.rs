@@ -186,8 +186,9 @@ pub struct ListingService {
     /// Bounds the repairs running at once.
     repairs: Semaphore,
     /// The permits listing requests from other nodes take while they are
-    /// answered ([`Self::request_permits`]).
-    requests: Semaphore,
+    /// answered ([`Self::request_permits`]). Shared, so the node's router
+    /// can hold one for each request's handler task.
+    requests: Arc<Semaphore>,
     /// When the next check made after its schedule has run out may start.
     next_recheck: Mutex<Instant>,
     /// Envelopes whose fresh offer is being looked up, so offering one again
@@ -394,7 +395,7 @@ impl ListingService {
             p2p: RwLock::new(None),
             waiting: Waiting::default(),
             repairs: Semaphore::new(MAX_REPAIRS),
-            requests: Semaphore::new(MAX_REQUESTS),
+            requests: Arc::new(Semaphore::new(MAX_REQUESTS)),
             next_recheck: Mutex::new(Instant::now()),
             fresh_offers: Mutex::new(HashSet::new()),
             watches,
@@ -482,8 +483,9 @@ impl ListingService {
     /// The permits listing requests from other nodes take while they are
     /// answered, until each answer has been sent: [`MAX_REQUESTS`], apart
     /// from those chunk requests take. Answers to this node's own requests
-    /// take none.
-    pub fn request_permits(&self) -> &Semaphore {
+    /// take none. The node's router takes one before it starts a request's
+    /// handler and holds it until the answer has been sent.
+    pub fn request_permits(&self) -> &Arc<Semaphore> {
         &self.requests
     }
 

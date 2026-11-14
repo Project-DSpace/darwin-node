@@ -2880,3 +2880,92 @@ fn the_per_recipient_send_counters_keep_their_names() {
         );
     }
 }
+
+/// Inbound requests wait their turn (from ds.23). The node answers chunk
+/// requests with at most 64 handlers at once and listings requests with the
+/// listing service's own 16; a request waits as plain data in its topic's
+/// queue (`src/request_queue.rs`) until a slot is free, and waiting sources
+/// (by address) are served in turn, with no cap on any one source. Before
+/// ds.23 each message became a task at once and waited for its slot inside
+/// it, as upstream's loop still does, so a later merge that rewrites the
+/// loop back to a task per message fails here, as does a bound that no longer
+/// matches saorsa-core's event buffer in front of it.
+mod request_turns {
+    use super::repo_text;
+    use ant_node::request_queue::MAX_QUEUED_REQUESTS;
+
+    #[test]
+    fn inbound_requests_wait_their_turn() {
+        let node = repo_text("src/node.rs");
+        for (needle, what) in [
+            (
+                "RequestQueue::new(\"chunk\", MAX_QUEUED_REQUESTS)",
+                "chunk requests wait in a RequestQueue",
+            ),
+            (
+                "RequestQueue::new(\"listings\", MAX_QUEUED_REQUESTS)",
+                "listings requests wait in a RequestQueue of their own",
+            ),
+            (
+                "request_queue::serve_in_turn(",
+                "handlers start only through serve_in_turn, holding a slot",
+            ),
+            (
+                "Semaphore::new(64)",
+                "chunk requests keep upstream's 64 slots",
+            ),
+            (
+                "listings.request_permits()",
+                "listings requests take the listing service's own permits",
+            ),
+        ] {
+            assert!(
+                node.contains(needle),
+                "src/node.rs: {what} (`{needle}` is gone). Inbound requests must wait as data \
+                 and start only with a slot held (src/request_queue.rs, from ds.23)"
+            );
+        }
+        assert!(
+            !node.contains("sem.acquire()"),
+            "src/node.rs takes a request slot inside a task again: each message must not \
+             become a task before its slot is held (src/request_queue.rs, from ds.23)"
+        );
+
+        let queue = repo_text("src/request_queue.rs");
+        assert!(queue.contains("fn serve_in_turn"));
+        assert!(
+            !queue.contains("max_per_source") && !queue.contains("MAX_PER_SOURCE"),
+            "the queue caps no source: a source alone keeps every slot"
+        );
+    }
+
+    /// The queue's bound is saorsa-core's `DEFAULT_EVENT_CHANNEL_CAPACITY`
+    /// (private to that crate), the events the router can already fall behind
+    /// by, so a queue never holds more than the stream in front of it.
+    #[test]
+    fn the_queue_bound_is_the_event_buffers() {
+        let lib = repo_text("vendor/saorsa-core/src/lib.rs");
+        let line = lib
+            .lines()
+            .find(|line| line.contains("const DEFAULT_EVENT_CHANNEL_CAPACITY: usize ="))
+            .expect("vendor/saorsa-core/src/lib.rs defines DEFAULT_EVENT_CHANNEL_CAPACITY");
+        let value: usize = line
+            .split('=')
+            .nth(1)
+            .and_then(|value| {
+                value
+                    .trim()
+                    .trim_end_matches(';')
+                    .replace('_', "")
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("can't read the capacity from {line:?}"));
+        assert_eq!(
+            MAX_QUEUED_REQUESTS, value,
+            "src/request_queue.rs MAX_QUEUED_REQUESTS ({MAX_QUEUED_REQUESTS}) no longer equals \
+             saorsa-core's DEFAULT_EVENT_CHANNEL_CAPACITY ({value}); decide the bound again \
+             (it is Dan's to confirm)"
+        );
+    }
+}

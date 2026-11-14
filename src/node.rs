@@ -16,6 +16,7 @@ use crate::payment::{
 use crate::replication::config::ReplicationConfig;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::replication::ReplicationEngine;
+use crate::request_queue::{self, QueuedRequest, RequestQueue, Turn, MAX_QUEUED_REQUESTS};
 use crate::storage::legacy_artifacts;
 use crate::storage::traffic as storage_traffic;
 use crate::storage::MIB;
@@ -35,7 +36,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -1343,176 +1344,191 @@ impl RunningNode {
     /// Start the protocol message routing background task.
     ///
     /// Subscribes to P2P events and routes incoming chunk protocol messages
-    /// to the `AntProtocol` handler, sending responses back to the sender.
+    /// to the `AntProtocol` handler, and listings messages to the listing
+    /// service, sending responses back to the sender ([`Self::route_requests`]).
     fn start_protocol_routing(&mut self) {
         let protocol = match self.ant_protocol {
             Some(ref p) => Arc::clone(p),
             None => return,
         };
 
-        let mut events = self.p2p_node.subscribe_events();
+        let events = self.p2p_node.subscribe_events();
         let p2p = Arc::clone(&self.p2p_node);
-        let semaphore = Arc::new(Semaphore::new(64));
-        let children = self.protocol_children.clone();
-        let stopping = self.shutdown.clone();
         let listings = protocol.listing_service().cloned();
-
-        self.protocol_task = Some(tokio::spawn(async move {
-            while let Some(event) = next_routing_event(&mut events).await {
-                if let P2PEvent::Message {
-                    topic,
-                    source: Some(source),
-                    data,
-                    ..
-                } = event
-                {
-                    if topic == ant_listings::TOPIC {
-                        if let Some(listings) = listings.clone() {
-                            Self::answer_listings_request(
-                                listings,
-                                Arc::clone(&p2p),
-                                source,
-                                data,
-                                stopping.clone(),
-                                &children,
-                            );
-                        }
-                        continue;
-                    }
-
-                    let handler_info: Option<(&str, &str)> = if topic == CHUNK_PROTOCOL_ID {
-                        Some(("chunk", CHUNK_PROTOCOL_ID))
-                    } else {
-                        None
-                    };
-
-                    if let Some((data_type, response_topic)) = handler_info {
-                        debug!("Received {data_type} protocol message from {source}");
-                        let received_at = Instant::now();
-                        let protocol = Arc::clone(&protocol);
-                        let p2p = Arc::clone(&p2p);
-                        let sem = semaphore.clone();
-                        let stopping = stopping.clone();
-                        children.spawn(async move {
-                            // A queued handler must not start work once shutdown has
-                            // begun. With 64 permits and a busy node the queue behind them
-                            // can be long, and every one of those would otherwise start
-                            // fresh storage reads while the store beneath is being torn
-                            // down.
-                            let _permit = {
-                                let acquired = tokio::select! {
-                                    biased;
-                                    () = stopping.cancelled() => return,
-                                    p = sem.acquire() => p,
-                                };
-                                match acquired {
-                                    Ok(permit) => permit,
-                                    Err(_) => return,
-                                }
-                            };
-                            // Checked again: the wait for a permit may have been long.
-                            if stopping.is_cancelled() {
-                                return;
-                            }
-                            Self::answer_one_request(
-                                &protocol,
-                                &p2p,
-                                &source,
-                                &data,
-                                data_type,
-                                response_topic,
-                                received_at,
-                            )
-                            .await;
-                        });
-                    }
+        let answer_chunk = {
+            let p2p = Arc::clone(&p2p);
+            move |request: QueuedRequest| {
+                let (protocol, p2p) = (Arc::clone(&protocol), Arc::clone(&p2p));
+                async move {
+                    Self::answer_one_request(
+                        &protocol,
+                        &p2p,
+                        &request.source,
+                        &request.data,
+                        "chunk",
+                        CHUNK_PROTOCOL_ID,
+                        request.received_at,
+                    )
+                    .await;
                 }
             }
-        }));
+        };
+        let answer_listing = move |listings, request| {
+            Self::answer_listings_request(listings, Arc::clone(&p2p), request)
+        };
+        self.protocol_task = Some(tokio::spawn(Self::route_requests(
+            events,
+            Arc::new(Semaphore::new(64)),
+            listings,
+            self.shutdown.clone(),
+            self.protocol_children.clone(),
+            answer_chunk,
+            answer_listing,
+        )));
         info!("Protocol message routing started");
     }
 
-    /// Answer one message on the listings topic, under the same shutdown
-    /// rule as chunk requests.
-    fn answer_listings_request(
-        listings: Arc<crate::listings::ListingService>,
-        p2p: Arc<P2PNode>,
-        source: saorsa_core::identity::PeerId,
-        data: Vec<u8>,
+    /// The routing loop and the dispatchers of both topics' queues, as one
+    /// future, which the node runs as its protocol task.
+    ///
+    /// A request waits as plain data in its topic's [`RequestQueue`] until a
+    /// handler slot is free (`chunk_slots`, 64 in a running node, for chunk
+    /// requests; the listing service's own permits for listings requests, so
+    /// neither kind holds up the other). Its handler task is started on
+    /// `handlers` only then, holding the slot, by `answer_chunk` or
+    /// `answer_listing` ([`request_queue::serve_in_turn`]). Waiting sources
+    /// are served in turn, with no cap on any one source. The loop and both
+    /// dispatchers run in this one future, so stopping it, or `stopping`,
+    /// starts no further handler; requests still waiting are dropped without
+    /// starting.
+    async fn route_requests<C, CF, L, LF>(
+        mut events: broadcast::Receiver<P2PEvent>,
+        chunk_slots: Arc<Semaphore>,
+        listings: Option<Arc<crate::listings::ListingService>>,
         stopping: CancellationToken,
-        children: &TaskTracker,
-    ) {
-        children.spawn(async move {
-            let (p2p, to) = (&p2p, &source);
-            Self::answer_listings(
-                &listings,
-                &source,
-                &data,
-                &stopping,
-                move |response| async move {
-                    if let Err(e) = p2p
-                        .send_message(to, ant_listings::TOPIC, response, &[])
-                        .await
-                    {
-                        warn!("Failed to send listings response to {to}: {e}");
+        handlers: TaskTracker,
+        answer_chunk: C,
+        mut answer_listing: L,
+    ) where
+        C: FnMut(QueuedRequest) -> CF,
+        CF: std::future::Future<Output = ()> + Send + 'static,
+        L: FnMut(Arc<crate::listings::ListingService>, QueuedRequest) -> LF,
+        LF: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let chunk_queue = Arc::new(RequestQueue::new("chunk", MAX_QUEUED_REQUESTS));
+        let listings_queue = Arc::new(RequestQueue::new("listings", MAX_QUEUED_REQUESTS));
+        let chunk_dispatch = request_queue::serve_in_turn(
+            Arc::clone(&chunk_queue),
+            chunk_slots,
+            stopping.clone(),
+            handlers.clone(),
+            answer_chunk,
+        );
+        let listings_dispatch = {
+            let (listings, queue) = (listings.clone(), Arc::clone(&listings_queue));
+            async move {
+                let Some(listings) = listings else {
+                    return;
+                };
+                let slots = Arc::clone(listings.request_permits());
+                request_queue::serve_in_turn(queue, slots, stopping, handlers, move |request| {
+                    answer_listing(Arc::clone(&listings), request)
+                })
+                .await;
+            }
+        };
+        let route = async move {
+            while let Some(event) = next_routing_event(&mut events).await {
+                let P2PEvent::Message {
+                    topic,
+                    source: Some(source),
+                    transport_source,
+                    data,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                let turn = Turn::of(&source, transport_source.as_ref());
+                let request = QueuedRequest {
+                    source,
+                    data,
+                    received_at: Instant::now(),
+                };
+                if topic == ant_listings::TOPIC {
+                    if let Some(listings) = &listings {
+                        Self::take_listings_message(listings, &listings_queue, turn, request);
                     }
-                },
-            )
-            .await;
-        });
+                } else if topic == CHUNK_PROTOCOL_ID {
+                    debug!("Received chunk protocol message from {source}");
+                    let _dropped = chunk_queue.push(turn, request);
+                }
+            }
+        };
+        tokio::join!(route, chunk_dispatch, listings_dispatch);
     }
 
-    /// Answer one message `source` sent on the listings topic, if it needs
-    /// one, by handing the answer to `send`. The permit the answer was built
-    /// under ([`Self::listings_answer`]) is held until `send` has finished,
-    /// so an answer waiting to go out to a peer that reads slowly counts
-    /// against the listing service's permits as one being built does: no
-    /// more answers than there are permits are held at once.
+    /// Take one message on the listings topic. An answer to one of this
+    /// node's own requests is handed to the request waiting for it at once,
+    /// taking no permit; a request waits in `queue` for one of the listing
+    /// service's own permits.
+    fn take_listings_message(
+        listings: &crate::listings::ListingService,
+        queue: &RequestQueue,
+        turn: Turn,
+        message: QueuedRequest,
+    ) {
+        if listings.handle_response(&message.source, &message.data) {
+            return;
+        }
+        let _dropped = queue.push(turn, message);
+    }
+
+    /// Answer one request on the listings topic and send the answer. Started
+    /// by [`request_queue::serve_in_turn`] holding one of the listing
+    /// service's permits, until the answer has been sent.
+    async fn answer_listings_request(
+        listings: Arc<crate::listings::ListingService>,
+        p2p: Arc<P2PNode>,
+        request: QueuedRequest,
+    ) {
+        let (p2p, to) = (&p2p, &request.source);
+        Self::answer_listings(
+            &listings,
+            &request.source,
+            &request.data,
+            move |response| async move {
+                if let Err(e) = p2p
+                    .send_message(to, ant_listings::TOPIC, response, &[])
+                    .await
+                {
+                    warn!("Failed to send listings response to {to}: {e}");
+                }
+            },
+        )
+        .await;
+    }
+
+    /// Answer one request `source` sent on the listings topic, if it needs
+    /// one, by handing the answer to `send`. The caller holds one of the
+    /// listing service's permits ([`crate::listings::ListingService::request_permits`])
+    /// until this returns, that is until `send` has finished, so an answer
+    /// waiting to go out to a peer that reads slowly counts against the
+    /// permits as one being built does: no more answers than there are
+    /// permits are held at once.
     async fn answer_listings<F, Fut>(
         listings: &crate::listings::ListingService,
         source: &saorsa_core::identity::PeerId,
         data: &[u8],
-        stopping: &CancellationToken,
         send: F,
     ) where
         F: FnOnce(Vec<u8>) -> Fut + Send,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        let Some((permit, answer)) = Self::listings_answer(listings, source, data, stopping).await
-        else {
+        let Some(answer) = listings.handle_message(source, data).await else {
             return;
         };
         send(answer).await;
-        drop(permit);
-    }
-
-    /// The answer to one message `source` sent on the listings topic, if it
-    /// needs one, with the permit it was built under. An answer to one of
-    /// this node's own requests is handed to it at once. A request waits for
-    /// one of the listing service's own permits
-    /// ([`crate::listings::ListingService::request_permits`]), never for one
-    /// of those chunk requests take, so neither kind of request holds up the
-    /// other; it is dropped if the node starts stopping meanwhile. The permit
-    /// is to be held until the answer has been sent.
-    async fn listings_answer<'a>(
-        listings: &'a crate::listings::ListingService,
-        source: &saorsa_core::identity::PeerId,
-        data: &[u8],
-        stopping: &CancellationToken,
-    ) -> Option<(SemaphorePermit<'a>, Vec<u8>)> {
-        if listings.handle_response(source, data) {
-            return None;
-        }
-        let permit = tokio::select! {
-            biased;
-            () = stopping.cancelled() => return None,
-            permit = listings.request_permits().acquire() => permit.ok()?,
-        };
-        if stopping.is_cancelled() {
-            return None;
-        }
-        let answer = listings.handle_message(source, data).await?;
-        Some((permit, answer))
     }
 
     /// Request the node to shut down.
@@ -2168,16 +2184,8 @@ mod tests {
     use super::*;
     use crate::config::NODES_SUBDIR;
 
-    /// Listing requests take permits of their own, 16, never those chunk
-    /// requests take: with all of them held, a request waits until one frees,
-    /// or is dropped once the node starts stopping. A request's permit is
-    /// held until its answer has been sent. An answer to one of the node's
-    /// own requests takes none.
-    #[tokio::test]
-    async fn listing_requests_take_permits_of_their_own() {
-        use ant_listings::{ListingKey, ListingsBody, ListingsMessage};
-
-        let dir = TempDir::new().expect("temp dir");
+    /// A listing service on a fresh store, reaching no chain.
+    async fn test_listing_service(dir: &TempDir) -> Arc<crate::listings::ListingService> {
         let chunks = Arc::new(
             ChunkStore::new(ChunkStoreConfig {
                 root_dir: dir.path().to_path_buf(),
@@ -2186,7 +2194,7 @@ mod tests {
             .await
             .expect("chunk store"),
         );
-        let listings = crate::listings::ListingService::new(
+        crate::listings::ListingService::new(
             dir.path(),
             0,
             chunks,
@@ -2195,10 +2203,288 @@ mod tests {
             None,
         )
         .await
-        .expect("listing service");
-        let permits = listings.request_permits();
+        .expect("listing service")
+    }
+
+    /// A message on `topic` from peer `source`, delivered from `address`.
+    fn routed_message(topic: &str, source: u8, address: Option<&str>, data: Vec<u8>) -> P2PEvent {
+        P2PEvent::Message {
+            topic: topic.to_string(),
+            source: Some(saorsa_core::identity::PeerId::from_bytes([source; 32])),
+            transport_source: address.map(|a| a.parse().expect("address")),
+            timestamp: 0,
+            data,
+        }
+    }
+
+    /// Wait until `done` holds, or fail after a few seconds.
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
+    /// A test handler's work.
+    type HandlerWork = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// Handlers that count themselves while they run and wait for `gate`
+    /// before finishing: (started, running now, most running at once,
+    /// finished).
+    #[derive(Clone, Default)]
+    struct HandlerCounts {
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        running: Arc<std::sync::atomic::AtomicUsize>,
+        most: Arc<std::sync::atomic::AtomicUsize>,
+        finished: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HandlerCounts {
+        fn get(counter: &std::sync::atomic::AtomicUsize) -> usize {
+            counter.load(Ordering::SeqCst)
+        }
+
+        fn handler(&self, gate: &Arc<Semaphore>) -> impl FnMut(QueuedRequest) -> HandlerWork {
+            let (counts, gate) = (self.clone(), Arc::clone(gate));
+            move |_request| {
+                let (counts, gate) = (counts.clone(), Arc::clone(&gate));
+                Box::pin(async move {
+                    counts.started.fetch_add(1, Ordering::SeqCst);
+                    let now = counts.running.fetch_add(1, Ordering::SeqCst) + 1;
+                    counts.most.fetch_max(now, Ordering::SeqCst);
+                    gate.acquire().await.expect("gate").forget();
+                    counts.running.fetch_sub(1, Ordering::SeqCst);
+                    counts.finished.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        }
+    }
+
+    /// Under a flood of chunk requests from many sources, no more than 64
+    /// handler tasks ever exist; the rest wait as data and are all answered
+    /// as slots free.
+    #[tokio::test]
+    async fn no_handler_starts_without_a_slot() {
+        let (tx, rx) = broadcast::channel(4_096);
+        let handlers = TaskTracker::new();
+        let stopping = CancellationToken::new();
+        let gate = Arc::new(Semaphore::new(0));
+        let counts = HandlerCounts::default();
+        let routing = tokio::spawn(RunningNode::route_requests(
+            rx,
+            Arc::new(Semaphore::new(64)),
+            None,
+            stopping.clone(),
+            handlers.clone(),
+            counts.handler(&gate),
+            |_, _| async {},
+        ));
+        let flood = 1_000;
+        for n in 0..flood {
+            let source = u8::try_from(n % 10).expect("small");
+            let address = format!("/ip4/203.0.113.{source}/udp/9000/quic");
+            tx.send(routed_message(
+                CHUNK_PROTOCOL_ID,
+                source,
+                Some(&address),
+                vec![0],
+            ))
+            .expect("sent");
+        }
+        eventually("64 handlers run", || {
+            HandlerCounts::get(&counts.running) == 64
+        })
+        .await;
+        // Give the router time to start more, if it could.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(HandlerCounts::get(&counts.started), 64);
+        assert_eq!(handlers.len(), 64, "a handler task exists only with a slot");
+
+        // Let them all through, a few at a time.
+        for _ in 0..flood / 50 {
+            gate.add_permits(50);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            assert!(handlers.len() <= 64);
+        }
+        eventually("every request is answered", || {
+            HandlerCounts::get(&counts.finished) == flood
+        })
+        .await;
+        assert_eq!(HandlerCounts::get(&counts.most), 64);
+        stopping.cancel();
+        drop(tx);
+        routing.await.expect("routing ends");
+    }
+
+    /// Requests still waiting when the node starts stopping never start: the
+    /// handlers holding slots finish, and nothing else begins.
+    #[tokio::test]
+    async fn queued_requests_never_start_once_the_node_stops() {
+        let (tx, rx) = broadcast::channel(1_024);
+        let handlers = TaskTracker::new();
+        let stopping = CancellationToken::new();
+        let gate = Arc::new(Semaphore::new(0));
+        let counts = HandlerCounts::default();
+        let routing = tokio::spawn(RunningNode::route_requests(
+            rx,
+            Arc::new(Semaphore::new(64)),
+            None,
+            stopping.clone(),
+            handlers.clone(),
+            counts.handler(&gate),
+            |_, _| async {},
+        ));
+        for n in 0..164 {
+            let source = u8::try_from(n % 4).expect("small");
+            tx.send(routed_message(CHUNK_PROTOCOL_ID, source, None, vec![0]))
+                .expect("sent");
+        }
+        eventually("64 handlers run", || {
+            HandlerCounts::get(&counts.running) == 64
+        })
+        .await;
+        stopping.cancel();
+        drop(tx);
+        routing
+            .await
+            .expect("routing ends once stopped and its stream is closed");
+        gate.add_permits(1_000);
+        handlers.close();
+        handlers.wait().await;
+        assert_eq!(HandlerCounts::get(&counts.finished), 64);
+        assert_eq!(
+            HandlerCounts::get(&counts.started),
+            64,
+            "a request still waiting started after the node began stopping"
+        );
+    }
+
+    /// Chunk requests and listings requests wait apart and take slots from
+    /// pools of their own: with every chunk slot held, a listings request is
+    /// still answered, and with every listing permit held, a chunk request
+    /// still starts.
+    #[tokio::test]
+    async fn listings_requests_wait_apart_from_chunk_requests() {
+        use ant_listings::{ListingKey, ListingsBody, ListingsMessage};
+
+        let dir = TempDir::new().expect("temp dir");
+        let listings = test_listing_service(&dir).await;
+        let request = ListingsMessage {
+            request_id: 7,
+            body: ListingsBody::ListRequest {
+                from: ListingKey::MIN,
+                limit: 1,
+            },
+        }
+        .encode()
+        .expect("encodes");
+        let (tx, rx) = broadcast::channel(1_024);
+        let handlers = TaskTracker::new();
+        let stopping = CancellationToken::new();
+        let gate = Arc::new(Semaphore::new(0));
+        let counts = HandlerCounts::default();
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let routing = tokio::spawn(RunningNode::route_requests(
+            rx,
+            Arc::new(Semaphore::new(64)),
+            Some(Arc::clone(&listings)),
+            stopping.clone(),
+            handlers.clone(),
+            counts.handler(&gate),
+            {
+                let answered = Arc::clone(&answered);
+                move |listings: Arc<crate::listings::ListingService>, request: QueuedRequest| {
+                    let answered = Arc::clone(&answered);
+                    async move {
+                        RunningNode::answer_listings(
+                            &listings,
+                            &request.source,
+                            &request.data,
+                            |_answer| async {
+                                answered.fetch_add(1, Ordering::SeqCst);
+                            },
+                        )
+                        .await;
+                    }
+                }
+            },
+        ));
+
+        // Every chunk slot held, more chunk requests waiting.
+        for _ in 0..100 {
+            tx.send(routed_message(CHUNK_PROTOCOL_ID, 1, None, vec![0]))
+                .expect("sent");
+        }
+        eventually("64 chunk handlers run", || {
+            HandlerCounts::get(&counts.running) == 64
+        })
+        .await;
+        tx.send(routed_message(
+            ant_listings::TOPIC,
+            2,
+            None,
+            request.clone(),
+        ))
+        .expect("sent");
+        eventually("the listings request is answered", || {
+            answered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        // Every listing permit held: a chunk request still starts.
+        let held = listings
+            .request_permits()
+            .acquire_many(16)
+            .await
+            .expect("permits");
+        tx.send(routed_message(
+            ant_listings::TOPIC,
+            2,
+            None,
+            request.clone(),
+        ))
+        .expect("sent");
+        gate.add_permits(1);
+        eventually("a chunk request starts", || {
+            HandlerCounts::get(&counts.started) == 65
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            1,
+            "a listings request was answered without a listing permit"
+        );
+        drop(held);
+        eventually("the waiting listings request is answered", || {
+            answered.load(Ordering::SeqCst) == 2
+        })
+        .await;
+
+        stopping.cancel();
+        drop(tx);
+        gate.add_permits(1_000);
+        routing.await.expect("routing ends");
+    }
+
+    /// Listing requests take permits of their own, 16, never those chunk
+    /// requests take: with all of them held, a request waits until one frees,
+    /// or is dropped once the node starts stopping. A request's permit is
+    /// held until its answer has been sent. An answer to one of the node's
+    /// own requests takes none. (Before ds.23 the permit was taken inside
+    /// each message's own task; now the router takes it before it starts the
+    /// task, and this test goes through the router.)
+    #[tokio::test]
+    async fn listing_requests_take_permits_of_their_own() {
+        use ant_listings::{ListingKey, ListingsBody, ListingsMessage};
+
+        let dir = TempDir::new().expect("temp dir");
+        let listings = test_listing_service(&dir).await;
+        let permits = Arc::clone(listings.request_permits());
         assert_eq!(permits.available_permits(), 16);
-        let source = saorsa_core::identity::PeerId::from_bytes([1; 32]);
         let message = |request_id, body| {
             ListingsMessage { request_id, body }
                 .encode()
@@ -2211,62 +2497,123 @@ mod tests {
                 limit: 1,
             },
         );
+        let response = message(8, ListingsBody::GetResponse { listing: None });
+
+        // An answer to a request of the node's is taken at once, with every
+        // permit held, and never waits in the queue; a request waits there.
+        let source = saorsa_core::identity::PeerId::from_bytes([1; 32]);
+        let queue = RequestQueue::new("listings", MAX_QUEUED_REQUESTS);
+        let held = permits.acquire_many(16).await.expect("permits");
+        RunningNode::take_listings_message(
+            &listings,
+            &queue,
+            Turn::Peer(source),
+            QueuedRequest {
+                source,
+                data: response.clone(),
+                received_at: Instant::now(),
+            },
+        );
+        assert!(
+            queue.is_empty(),
+            "an answer to the node's own request waited"
+        );
+        RunningNode::take_listings_message(
+            &listings,
+            &queue,
+            Turn::Peer(source),
+            QueuedRequest {
+                source,
+                data: request.clone(),
+                received_at: Instant::now(),
+            },
+        );
+        assert_eq!(queue.len(), 1);
+        drop(held);
+
+        // Through the router: answers go to `answers`, and each send waits
+        // for `finish` while it holds its permit.
+        let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel();
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = broadcast::channel(64);
         let stopping = CancellationToken::new();
+        let handlers = TaskTracker::new();
+        let routing = tokio::spawn(RunningNode::route_requests(
+            rx,
+            Arc::new(Semaphore::new(64)),
+            Some(Arc::clone(&listings)),
+            stopping.clone(),
+            handlers.clone(),
+            |_| async {},
+            {
+                let (permits, finish) = (Arc::clone(&permits), Arc::clone(&finish));
+                move |listings: Arc<crate::listings::ListingService>, request: QueuedRequest| {
+                    let (answers, permits, finish) =
+                        (answers.clone(), Arc::clone(&permits), Arc::clone(&finish));
+                    async move {
+                        RunningNode::answer_listings(
+                            &listings,
+                            &request.source,
+                            &request.data,
+                            |answer| async move {
+                                let in_use = 16 - permits.available_permits();
+                                answers.send((answer, in_use)).expect("answer taken");
+                                finish.notified().await;
+                            },
+                        )
+                        .await;
+                    }
+                }
+            },
+        ));
 
         // Every one held: a request waits, and is answered once one frees.
         let held = permits.acquire_many(16).await.expect("permits");
-        let answering = RunningNode::listings_answer(&listings, &source, &request, &stopping);
-        tokio::pin!(answering);
-        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut answering);
-        assert!(waited.await.is_err(), "answered without a permit");
+        tx.send(routed_message(
+            ant_listings::TOPIC,
+            1,
+            None,
+            request.clone(),
+        ))
+        .expect("sent");
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(200), answered.recv()).await;
+        assert!(waited.is_err(), "answered without a permit");
         drop(held);
-        let (permit, answer) = answering.await.expect("an answer");
+        let (answer, in_use) = answered.recv().await.expect("an answer");
         let answer = ListingsMessage::decode(&answer).expect("decodes");
         assert_eq!(answer.request_id, 7);
         assert!(matches!(answer.body, ListingsBody::ListResponse { .. }));
-        // The answer comes with its permit.
-        assert_eq!(permits.available_permits(), 15);
-        drop(permit);
-        assert_eq!(permits.available_permits(), 16);
-
-        // The permit is held until the answer has been sent: one waiting to
-        // go out counts against the 16 as one being built does.
-        let send_done = tokio::sync::Notify::new();
-        let finish = &send_done;
-        let sending = RunningNode::answer_listings(
-            &listings,
-            &source,
-            &request,
-            &stopping,
-            move |answer| async move {
-                let answer = ListingsMessage::decode(&answer).expect("decodes");
-                assert_eq!(answer.request_id, 7);
-                assert_eq!(permits.available_permits(), 15, "sent without its permit");
-                finish.notified().await;
-            },
-        );
-        tokio::pin!(sending);
-        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut sending);
-        assert!(waited.await.is_err(), "the send was not waited for");
+        // The answer is sent under its permit, held until the send ends: one
+        // waiting to go out counts against the 16 as one being built does.
+        assert_eq!(in_use, 1, "sent without its permit");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
             permits.available_permits(),
             15,
             "the permit was let go before the answer was sent"
         );
-        send_done.notify_one();
-        sending.await;
-        assert_eq!(permits.available_permits(), 16);
+        finish.notify_one();
+        eventually("the permit comes back", || {
+            permits.available_permits() == 16
+        })
+        .await;
 
-        // An answer to a request of the node's takes none.
-        let held = permits.acquire_many(16).await.expect("permits");
-        let response = message(8, ListingsBody::GetResponse { listing: None });
-        let taken = RunningNode::listings_answer(&listings, &source, &response, &stopping).await;
-        assert!(taken.is_none());
         // A request waiting when the node starts stopping is dropped.
-        let answering = RunningNode::listings_answer(&listings, &source, &request, &stopping);
+        let held = permits.acquire_many(16).await.expect("permits");
+        tx.send(routed_message(ant_listings::TOPIC, 1, None, request))
+            .expect("sent");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         stopping.cancel();
-        assert!(answering.await.is_none());
         drop(held);
+        drop(tx);
+        routing.await.expect("routing ends");
+        handlers.close();
+        handlers.wait().await;
+        assert!(
+            answered.try_recv().is_err(),
+            "a request was answered after the node began stopping"
+        );
     }
 
     /// What a node logs at start about where it is paid: the token, the vault
@@ -2616,7 +2963,10 @@ mod tests {
             super::user_agent(None, false),
             format!("node/{}", env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(super::user_agent(None, true), super::user_agent(None, false));
+        assert_eq!(
+            super::user_agent(None, true),
+            super::user_agent(None, false)
+        );
         let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
         assert_eq!(
             super::user_agent(Some(marker), false),

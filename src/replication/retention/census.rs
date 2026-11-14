@@ -1816,13 +1816,14 @@ fn unreviewed(counting: Counting, reviewed: &[Reviewed]) -> String {
 /// The protocol routing loop reads its events through `next_routing_event`,
 /// which carries on when the loop falls behind the event broadcast. Upstream's
 /// loop ended there, and the node then answered no request while it stayed
-/// connected.
+/// connected. From ds.23 the loop is `RunningNode::route_requests`, which
+/// `RunningNode::start_protocol_routing` runs as the node's protocol task.
 #[test]
 fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
     const READER: &[(Option<&str>, &str)] = &[(None, "next_routing_event")];
     const REVIEWED: &[Reviewed] = &[(
         "src/node.rs",
-        "RunningNode::start_protocol_routing",
+        "RunningNode::route_requests",
         "next_routing_event",
         1,
     )];
@@ -1831,10 +1832,87 @@ fn the_routing_loop_reads_its_events_through_the_lag_tolerant_reader() {
         report.is_empty(),
         "\nThe protocol routing loop no longer reads its events only through \
          next_routing_event.\n\n{report}\n\
-         RunningNode::start_protocol_routing (src/node.rs) must read saorsa-core's event \
+         RunningNode::route_requests (src/node.rs) must read saorsa-core's event \
          broadcast through next_routing_event, which warns and carries on past \
          RecvError::Lagged. A loop that ends there leaves the node connected and answering \
          no request until it restarts.\n"
+    );
+}
+
+/// Inbound requests wait their turn as data (from ds.23). The routing loop
+/// hands chunk and listings requests to their topic's `RequestQueue`, one
+/// each, and their handler tasks are started only by
+/// `request_queue::serve_in_turn`, once a slot is held: the 64 chunk slots,
+/// or the listing service's own permits. Before ds.23 every message became a
+/// task at once and waited for its slot inside it, so the waiting tasks had
+/// no bound and one busy source could take every slot. The handlers are
+/// reached only through the functions `start_protocol_routing` hands to
+/// `route_requests`; a loop that calls them, or spawns for a message, before
+/// a slot is held fails here.
+#[test]
+fn inbound_requests_wait_their_turn_for_a_slot() {
+    const QUEUES: &[(Option<&str>, &str)] = &[
+        (Some("RequestQueue"), "new"),
+        (None, "serve_in_turn"),
+        (None, "route_requests"),
+        (None, "answer_one_request"),
+        (None, "answer_listings_request"),
+        (None, "take_listings_message"),
+    ];
+    const REVIEWED: &[Reviewed] = &[
+        // One queue for each topic, each served by its own dispatcher.
+        (
+            "src/node.rs",
+            "RunningNode::route_requests",
+            "RequestQueue::new",
+            2,
+        ),
+        (
+            "src/node.rs",
+            "RunningNode::route_requests",
+            "serve_in_turn",
+            2,
+        ),
+        // A listings message: an answer to the node's own request is taken
+        // at once, a request goes to the queue.
+        (
+            "src/node.rs",
+            "RunningNode::route_requests",
+            "take_listings_message",
+            1,
+        ),
+        // The node's protocol task.
+        (
+            "src/node.rs",
+            "RunningNode::start_protocol_routing",
+            "route_requests",
+            1,
+        ),
+        // The handlers, inside the functions handed to route_requests, which
+        // serve_in_turn calls only with a slot held.
+        (
+            "src/node.rs",
+            "RunningNode::start_protocol_routing",
+            "answer_one_request",
+            1,
+        ),
+        (
+            "src/node.rs",
+            "RunningNode::start_protocol_routing",
+            "answer_listings_request",
+            1,
+        ),
+    ];
+    let report = unreviewed(Counting::Calls(QUEUES), REVIEWED);
+    assert!(
+        report.is_empty(),
+        "\nInbound requests no longer reach their handlers only through the request \
+         queues.\n\n{report}\n\
+         RunningNode::route_requests (src/node.rs) must hand each chunk and listings request \
+         to its topic's RequestQueue, and only request_queue::serve_in_turn, holding a slot, \
+         may start a handler (answer_one_request, answer_listings_request). A task spawned \
+         for each message before its slot is held lets one source grow the node's waiting \
+         work without bound (src/request_queue.rs).\n"
     );
 }
 
