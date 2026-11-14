@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.24.0+ds.22"
+version = "0.24.0+ds.23"
 dependencies = [
  "alloy",
  "ant-listings",
