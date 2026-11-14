@@ -33,6 +33,10 @@
 //! And that a peer reconnecting after a relay closed is answered again, which
 //! comes from the vendored saorsa-transport (`relay_reconnect` below).
 //!
+//! And that the erasure path keeps this fork's design (ADR-0024), not
+//! upstream's pressure-gated retention of v0.24.0 (ADR-0028), which the merge
+//! of that release held back (`retention_design` below).
+//!
 //! Upstream has no such file, so a merge can't drop it while resolving a
 //! conflict. Each test fails if its value changes. The payment reads need the
 //! `test-utils` feature, with which CI runs every test.
@@ -194,6 +198,28 @@ fn a_browser_source_opens_12_sessions_then_6_a_minute() {
             config.new_sessions_per_minute_per_ip, NEW_SESSIONS_PER_MINUTE,
             "{from}"
         );
+    }
+}
+
+/// The browser listener's sizes this fork chose (ds.5, ds.16): 128 sessions,
+/// 256 channels (two a session) and 16 request slots. Upstream v0.24.0
+/// raised its own defaults to 256 sessions and 512 channels and request
+/// slots (ADR-0023); that merge held them back, and git took upstream's 512
+/// request slots without a conflict, so a merge can change these silently.
+#[test]
+fn the_browser_listener_keeps_this_forks_sizes() {
+    let empty: NodeConfig = toml::from_str("").unwrap();
+    for (from, config) in [
+        (
+            "WebRtcDirectConfig::default()",
+            WebRtcDirectConfig::default(),
+        ),
+        ("NodeConfig::default()", NodeConfig::default().webrtc_direct),
+        ("an empty config file", empty.webrtc_direct),
+    ] {
+        assert_eq!(config.max_connections, 128, "{from}");
+        assert_eq!(config.max_channels, 256, "{from}");
+        assert_eq!(config.max_concurrent_requests, 16, "{from}");
     }
 }
 
@@ -440,7 +466,8 @@ fn a_notice_records_its_class_and_a_fetch_on_that_entry_alone_is_checked() {
 }
 
 /// A verified direct address is dialled before a relay (from ds.17). The node
-/// builds saorsa-core from `vendor/saorsa-core`, its 0.29.1 release with
+/// builds saorsa-core from `vendor/saorsa-core`, its 0.30.0 release (0.29.1
+/// until the merge of upstream node 0.24.0, ds.22) with
 /// `AddressType::priority` and the dial plan
 /// (`select_dial_candidates_with_context`) putting a verified Direct address
 /// ahead of the relay, so traffic to a reachable peer doesn't pass through
@@ -452,12 +479,13 @@ mod direct_first {
     use saorsa_core::{AddressType, DHTNode, MultiAddr, PeerId};
 
     /// The saorsa-core release the copy is, and upstream's commit for it.
-    const SAORSA_CORE_VERSION: &str = "0.29.1";
-    const SAORSA_CORE_COMMIT: &str = "29bb069691880de59f5157c315a6233b1c57b20f";
+    const SAORSA_CORE_VERSION: &str = "0.30.0";
+    const SAORSA_CORE_COMMIT: &str = "5fdeea2faa6858574597716499ec806dd297befe";
 
-    /// The saorsa-transport release the lock holds (ds.16's bump), vendored
-    /// in `vendor/saorsa-transport` from ds.21.
-    const SAORSA_TRANSPORT_VERSION: &str = "0.38.2";
+    /// The saorsa-transport release the lock holds (0.38.2 from ds.16, 0.39.0
+    /// from ds.22's merge of upstream node 0.24.0), vendored in
+    /// `vendor/saorsa-transport` from ds.21.
+    const SAORSA_TRANSPORT_VERSION: &str = "0.39.0";
 
     /// The vendored crate's tests of the change, by file, each of which must
     /// stay: the dial plan, the stored order, and the tag rank that keeps
@@ -545,7 +573,7 @@ mod direct_first {
             locked("saorsa-core"),
             vec![(SAORSA_CORE_VERSION.to_string(), None)]
         );
-        // One saorsa-transport: 0.38.2 (ds.16's bump, Cargo.toml's direct
+        // One saorsa-transport: 0.39.0 (ds.22's bump, Cargo.toml's direct
         // requirement), from the path, the vendored copy, which both this
         // package's requirement and the vendored saorsa-core's accept.
         let transport = locked("saorsa-transport");
@@ -627,9 +655,97 @@ mod direct_first {
     }
 }
 
+/// The erasure path keeps this fork's design (ds.11, ds.17, ADR-0024):
+/// erasure only under disk pressure, with the falling erase floor, free
+/// inodes, two-phase erasure, out-of-range clocks in `{root}/out_of_range.mdb`,
+/// a paid list whose value is each key's size class, and a prune pass of at
+/// most 256 audit requests. Upstream v0.24.0 replaced the same files with its
+/// own pressure-gated retention (ADR-0028: clock files
+/// `record_out_of_range.bin` and `pointer_out_of_range.bin`, a 1 GiB paid
+/// list that stores no class and evicts by count, a `DiskPressure` state and
+/// 1,024 audit requests a pass). The merge of v0.24.0 (ds.22) kept ours file by
+/// file; these checks fail if a later merge swaps any of it in unnoticed.
+mod retention_design {
+    use super::{repo_path, repo_text};
+
+    #[test]
+    fn pruning_retention_and_the_paid_list_carry_this_forks_design() {
+        let pruning = repo_text("src/replication/pruning.rs");
+        for ours in ["DiskRetention", "erase_floor", "records_beyond_floor"] {
+            assert!(
+                pruning.contains(ours),
+                "src/replication/pruning.rs no longer has {ours}: the falling erase floor"
+            );
+        }
+        let retention = repo_text("src/replication/retention.rs");
+        for ours in [
+            "pub const DISK_PRESSURE_START_PERCENT: u64 = 10;",
+            "pub const DISK_PRESSURE_END_PERCENT: u64 = 15;",
+            "pub const ERASE_FLOOR_MULTIPLE: u8 = 10;",
+            "pub const FLOOR_STEPS: [FloorStep; 4]",
+            "pub struct DiskRetention",
+        ] {
+            assert!(
+                retention.contains(ours),
+                "src/replication/retention.rs no longer has `{ours}`"
+            );
+        }
+        let erasure = repo_text("src/replication/erasure.rs");
+        assert!(
+            erasure.contains("pub const OUT_OF_RANGE_DB: &str = \"out_of_range.mdb\";"),
+            "the out-of-range clocks must stay in {{root}}/out_of_range.mdb, where every \
+             node since ds.17 keeps them"
+        );
+        let paid_list = repo_text("src/replication/paid_list.rs");
+        for ours in [
+            "const DEFAULT_MAP_SIZE: usize = 256 * 1_024 * 1_024;",
+            "pub async fn insert_class(&self, key: &XorName, class: PaidClass)",
+            "pub fn class(&self, key: &XorName) -> Result<Option<PaidClass>>",
+        ] {
+            assert!(
+                paid_list.contains(ours),
+                "src/replication/paid_list.rs no longer has `{ours}`: the paid list keeps \
+                 each key's size class (ds.18) in a 256 MiB map"
+            );
+        }
+        let config = repo_text("src/replication/config.rs");
+        assert!(config.contains("pub const MAX_PRUNE_AUDIT_REQUESTS_PER_PASS: usize = 256;"));
+    }
+
+    #[test]
+    fn upstreams_pressure_gated_retention_is_not_in_the_node() {
+        assert!(
+            !repo_path("src/replication/out_of_range_clocks.rs").exists(),
+            "upstream's ADR-0028 clock files are back"
+        );
+        let mut found = Vec::new();
+        super::rust_files(&repo_path("src"), &mut found);
+        for path in found {
+            let source = std::fs::read_to_string(&path).unwrap();
+            for theirs in [
+                "record_out_of_range.bin",
+                "pointer_out_of_range.bin",
+                "PAID_LIST_EVICT_START_ENTRIES",
+                "PAID_HINT_FULL_SCAN_ENTRIES",
+                "MAX_PAID_EVICTIONS_PER_PASS",
+                "PAID_LIST_MAP_SIZE",
+                "DiskPressure::",
+            ] {
+                assert!(
+                    !source.contains(theirs),
+                    "{} has upstream's ADR-0028 `{theirs}`: this fork keeps ADR-0024's \
+                     erasure (see tests/fork_pins.rs retention_design)",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
 /// A peer reconnecting after a relay closed is answered again (from ds.21).
 /// The node builds saorsa-transport from `vendor/saorsa-transport`, its
-/// 0.38.2 release with the bookkeeping of accepted connections changed
+/// 0.39.0 release (0.38.2 until ds.22) with the bookkeeping of accepted
+/// connections changed
 /// (`src/nat_traversal_api.rs`): both accept loops, the node's own
 /// endpoint's and a relay endpoint's, key a connection by its normalized
 /// address; removing a connection takes every form of its address that keys
@@ -648,8 +764,8 @@ mod relay_reconnect {
     use super::repo_text;
 
     /// The saorsa-transport release the copy is, and upstream's commit for it.
-    const SAORSA_TRANSPORT_VERSION: &str = "0.38.2";
-    const SAORSA_TRANSPORT_COMMIT: &str = "54382015dfae81f922389f1986bef904e9b6dc80";
+    const SAORSA_TRANSPORT_VERSION: &str = "0.39.0";
+    const SAORSA_TRANSPORT_COMMIT: &str = "c5b09fadd16d1d6487d590a29e9a7ddcb51b979b";
 
     const PATCHED_FILE: &str = "vendor/saorsa-transport/src/nat_traversal_api.rs";
 
@@ -762,6 +878,7 @@ const TEST_FILES: &[&str] = &[
     "tests/chunk_store_crash_safety.rs",
     "tests/darwin_image.rs",
     "tests/darwin_network.rs",
+    "tests/devnet_lifecycle.rs",
     "tests/e2e/anvil.rs",
     "tests/e2e/data_types/chunk.rs",
     "tests/e2e/data_types/mod.rs",
