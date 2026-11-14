@@ -4081,6 +4081,7 @@ impl ReplicationEngine {
     fn start_audit_loop(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
+        let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
         let sync_history = Arc::clone(&self.sync_history);
@@ -4115,6 +4116,7 @@ impl ReplicationEngine {
                     audit::audit_tick_with_repair_proofs(
                         &p2p,
                         &storage,
+                        &paid_list,
                         &config,
                         &history,
                         &repair_proofs,
@@ -4140,6 +4142,7 @@ impl ReplicationEngine {
                             audit::audit_tick_with_repair_proofs(
                                 &p2p,
                                 &storage,
+                                &paid_list,
                                 &config,
                                 &history,
                                 &repair_proofs,

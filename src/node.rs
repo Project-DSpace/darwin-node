@@ -1,6 +1,6 @@
 //! Node implementation - thin wrapper around saorsa-core's `P2PNode`.
 
-use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+use crate::ant_protocol::{CHUNK_PROTOCOL_ID, GET_OR_CLOSER_AGENT_TOKEN};
 use crate::config::{
     default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, RootVaultSetting,
     VaultDeploymentBlock, NODE_IDENTITY_FILENAME,
@@ -61,18 +61,29 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// version's build metadata: `node/0.23.0+ds.16.image.<commit>`. The node census reads a node's
 /// release as the semver after `node/` and the `ds.<n>` its build metadata starts with, so it
 /// still reads the release, and can count the nodes whose image gave no marker.
-fn user_agent(image: Option<&str>) -> String {
+///
+/// A node that serves chunks also carries the get-or-closer token (ADR-0020), after a space:
+/// `node/0.24.0+ds.22.image.<commit> get-or-closer/1`. Native peers exchange no capabilities,
+/// and a node built before that request drops it without a reply, so this token is how a client
+/// knows it may send one. A node with storage switched off never answers chunk requests, so it
+/// does not announce it.
+pub(crate) fn user_agent(image: Option<&str>, serves_chunks: bool) -> String {
     #[cfg(any(test, feature = "test-utils"))]
     let version = crate::test_seams::announced_version(env!("CARGO_PKG_VERSION"));
     #[cfg(not(any(test, feature = "test-utils")))]
     let version = env!("CARGO_PKG_VERSION");
-    image.map_or_else(
+    let agent = image.map_or_else(
         || format!("node/{version}"),
         |marker| {
             let separator = if version.contains('+') { '.' } else { '+' };
             format!("node/{version}{separator}image.{marker}")
         },
-    )
+    );
+    if serves_chunks {
+        format!("{agent} {GET_OR_CLOSER_AGENT_TOKEN}")
+    } else {
+        agent
+    }
 }
 
 /// The image marker this node reports: what `ANT_IMAGE_VERSION` gives (`--image-version`), if
@@ -404,8 +415,10 @@ impl NodeBuilder {
             }
         }
 
-        core_config.custom_user_agent =
-            Some(user_agent(image_marker(config.image_version.as_deref())));
+        core_config.custom_user_agent = Some(user_agent(
+            image_marker(config.image_version.as_deref()),
+            config.storage.enabled,
+        ));
 
         // Persist close group peers + trust scores across restarts.
         // Default to root_dir (alongside node_identity.key) when not explicitly set.
@@ -1198,6 +1211,28 @@ impl RunningNode {
         Ok(())
     }
 
+    /// Answer one inbound chunk-protocol message from `source` as a running
+    /// node's router does, and send the reply. For test networks that route
+    /// messages themselves.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn answer_chunk_request(
+        protocol: &Arc<AntProtocol>,
+        p2p: &Arc<P2PNode>,
+        source: &saorsa_core::identity::PeerId,
+        data: &[u8],
+    ) {
+        Self::answer_one_request(
+            protocol,
+            p2p,
+            source,
+            data,
+            "chunk",
+            CHUNK_PROTOCOL_ID,
+            Instant::now(),
+        )
+        .await;
+    }
+
     /// Handle one inbound protocol message and send whatever it produced.
     async fn answer_one_request(
         protocol: &Arc<AntProtocol>,
@@ -1215,11 +1250,10 @@ impl RunningNode {
         let handled = protocol
             .try_handle_request_with_context(
                 data,
-                Some(ChunkRequestContext::new(
-                    source.to_string(),
-                    received_at,
-                    queue_wait,
-                )),
+                Some(
+                    ChunkRequestContext::new(source.to_string(), received_at, queue_wait)
+                        .with_requester(*source),
+                ),
             )
             .await;
         let telemetry = handled.get_telemetry;
@@ -1607,11 +1641,14 @@ mod tests {
         };
 
         // What it tells every peer, in the user agent saorsa-core sends with each signed
-        // message: this build's version under the `node/` prefix, and nothing after it
-        // when it has no image marker.
+        // message: this build's version under the `node/` prefix with no image marker, and,
+        // since it serves chunks, the get-or-closer token after a space (ADR-0020).
         let agent = node.p2p_node.config().user_agent();
-        assert_eq!(agent, format!("node/{}", env!("CARGO_PKG_VERSION")));
-        assert_eq!(agent, user_agent(None));
+        assert_eq!(
+            agent,
+            format!("node/{} get-or-closer/1", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(agent, user_agent(None, true));
         node.shutdown.cancel();
     }
 
@@ -1623,12 +1660,19 @@ mod tests {
         let mut config = local_node_config(dir.path(), 0);
         config.image_version = Some(MARKER.to_string());
         let core = NodeBuilder::build_core_config(&config).expect("core config");
-        assert_eq!(core.user_agent(), user_agent(Some(MARKER)));
-        assert!(core.user_agent().ends_with(&format!("image.{MARKER}")));
+        assert_eq!(
+            core.user_agent(),
+            user_agent(Some(MARKER), config.storage.enabled)
+        );
+        assert!(core
+            .user_agent()
+            .split_whitespace()
+            .next()
+            .is_some_and(|version| version.ends_with(&format!("image.{MARKER}"))));
 
         config.image_version = Some("not a commit".to_string());
         let core = NodeBuilder::build_core_config(&config).expect("core config");
-        assert_eq!(core.user_agent(), user_agent(None));
+        assert_eq!(core.user_agent(), user_agent(None, config.storage.enabled));
     }
 
     /// The commit an image passes: 40 lowercase hex digits.
@@ -1652,10 +1696,12 @@ mod tests {
     }
 
     /// The release a node's user agent gives, read as darwin-client's node census reads it
-    /// (`listings_census::supports_feed`): the semver after `node/`, and the number after the
-    /// `ds.` its build metadata starts with.
+    /// (`listings_census::supports_feed`): the semver after `node/` in the agent's first word
+    /// (`listings_census::node_version`), and the number after the `ds.` its build metadata
+    /// starts with.
     fn census_release(agent: &str) -> Option<u64> {
-        let version = semver::Version::parse(agent.strip_prefix("node/")?).ok()?;
+        let first = agent.split_whitespace().next()?;
+        let version = semver::Version::parse(first.strip_prefix("node/")?).ok()?;
         version
             .build
             .as_str()
@@ -1670,8 +1716,8 @@ mod tests {
     /// census reads it, so the census reads a marked node's release as an unmarked one's.
     #[test]
     fn the_node_census_reads_the_release_of_a_marked_user_agent() {
-        let plain = user_agent(None);
-        let marked = user_agent(Some(MARKER));
+        let plain = user_agent(None, false);
+        let marked = user_agent(Some(MARKER), false);
         assert!(marked.starts_with("node/"), "{marked}");
         let release = census_release(&plain);
         assert!(
@@ -1679,6 +1725,10 @@ mod tests {
             "this build's version gives no ds release: {plain}"
         );
         assert_eq!(census_release(&marked), release, "{marked}");
+        // A node that serves chunks carries the get-or-closer token after its version;
+        // the census still reads its release.
+        let serving = user_agent(Some(MARKER), true);
+        assert_eq!(census_release(&serving), release, "{serving}");
         let version = semver::Version::parse(marked.strip_prefix("node/").unwrap()).unwrap();
         assert_eq!(
             version.build.as_str().rsplit('.').next(),
@@ -2521,19 +2571,31 @@ mod tests {
     }
 
     /// The prefix is what keeps this node in its peers' routing tables, and the version is
-    /// this build's, with nothing after it but the image marker.
+    /// this build's, then the image marker, then (on a node that serves chunks) the
+    /// get-or-closer token after a space.
     #[test]
     fn the_user_agent_is_this_builds_version_under_the_node_prefix() {
         assert_eq!(
-            super::user_agent(None),
+            super::user_agent(None, false),
             format!("node/{}", env!("CARGO_PKG_VERSION"))
         );
-        assert!(super::user_agent(None).starts_with("node/"));
+        assert!(super::user_agent(None, false).starts_with("node/"));
+        assert!(super::user_agent(None, true).starts_with("node/"));
         let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
         assert_eq!(
-            super::user_agent(Some(marker)),
+            super::user_agent(Some(marker), false),
             format!("node/{}.image.{marker}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn user_agent_advertises_get_or_closer_only_when_serving_chunks() {
+        assert!(crate::ant_protocol::advertises_get_or_closer(
+            &super::user_agent(None, true)
+        ));
+        assert!(!crate::ant_protocol::advertises_get_or_closer(
+            &super::user_agent(None, false)
+        ));
     }
 
     /// The first upgrade check comes a few minutes after start, at a random point, rather
