@@ -292,7 +292,7 @@ impl PqSession {
         let next = sequence
             .checked_add(1)
             .ok_or(PqSessionError::SequenceExhausted)?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.outbound_key));
+        let cipher = ChaCha20Poly1305::new(&Key::from(self.outbound_key));
         let sequence_bytes = sequence.to_be_bytes();
         let nonce = record_nonce(sequence_bytes);
         let aad = record_aad(sequence_bytes);
@@ -343,7 +343,7 @@ impl PqSession {
         let next = sequence
             .checked_add(1)
             .ok_or(PqSessionError::SequenceExhausted)?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.inbound_key));
+        let cipher = ChaCha20Poly1305::new(&Key::from(self.inbound_key));
         let nonce = record_nonce(sequence_bytes);
         let aad = record_aad(sequence_bytes);
         let plaintext = cipher
@@ -512,7 +512,7 @@ fn handshake_transcript(client_hello: &[u8], ciphertext: &[u8], peer_id: &[u8; 3
 fn record_nonce(sequence: [u8; 8]) -> Nonce {
     let mut bytes = [0u8; 12];
     bytes[4..].copy_from_slice(&sequence);
-    *Nonce::from_slice(&bytes)
+    Nonce::from(bytes)
 }
 
 fn record_aad(sequence: [u8; 8]) -> Vec<u8> {

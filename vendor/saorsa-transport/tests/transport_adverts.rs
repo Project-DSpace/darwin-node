@@ -32,7 +32,7 @@ const DEFAULT_LORA_FREQ_HZ: u32 = 868_000_000;
 
 #[test]
 fn test_add_address_udp_wire_format() {
-    // Test that UDP addresses encode correctly with transport type
+    // `AddAddress::udp()` builds a QUIC-over-UDP address (TransportType::Quic)
     let socket_addr: SocketAddr = "192.168.1.100:9000".parse().unwrap();
     let frame = AddAddress::udp(42, 100, socket_addr);
 
@@ -45,7 +45,7 @@ fn test_add_address_udp_wire_format() {
 
     assert_eq!(decoded.sequence, 42);
     assert_eq!(decoded.priority, 100);
-    assert_eq!(decoded.transport_type, TransportType::Udp);
+    assert_eq!(decoded.transport_type, TransportType::Quic);
     assert_eq!(decoded.socket_addr(), Some(socket_addr));
     assert!(!decoded.has_capabilities()); // UDP default has no caps
 }

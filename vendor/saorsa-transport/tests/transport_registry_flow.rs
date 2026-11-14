@@ -87,10 +87,12 @@ async fn test_transport_registry_flows_from_node_config_to_p2p_endpoint() {
         !registry.is_empty(),
         "Registry should not be empty after wiring"
     );
-    assert_eq!(registry.len(), 1, "Registry should have 1 provider");
+    // The configured provider plus the endpoint's own shared-socket UDP provider
+    assert_eq!(registry.len(), 2, "Registry should have 2 providers");
 
-    let udp_providers = registry.providers_by_type(TransportType::Udp);
-    assert_eq!(udp_providers.len(), 1, "Should have 1 UDP provider");
+    // UdpTransport reports TransportType::Quic (QUIC over UDP)
+    let udp_providers = registry.providers_by_type(TransportType::Quic);
+    assert_eq!(udp_providers.len(), 2, "Should have 2 UDP (QUIC) providers");
 
     // Cleanup
     node.shutdown().await;
@@ -129,9 +131,9 @@ async fn test_multiple_transport_providers_flow() {
         .await
         .expect("Node::with_config should succeed");
 
-    // Verify both providers are in the registry
+    // Verify both providers are in the registry, plus the endpoint's own shared-socket UDP provider
     let registry = node.transport_registry();
-    assert_eq!(registry.len(), 2, "Registry should have 2 providers");
+    assert_eq!(registry.len(), 3, "Registry should have 3 providers");
 
     node.shutdown().await;
 }
@@ -152,8 +154,9 @@ async fn test_build_transport_registry_helper() {
 
     assert_eq!(registry.len(), 1, "Registry should have 1 provider");
 
-    let udp_providers = registry.providers_by_type(TransportType::Udp);
-    assert_eq!(udp_providers.len(), 1, "Should have 1 UDP provider");
+    // UdpTransport reports TransportType::Quic (QUIC over UDP)
+    let udp_providers = registry.providers_by_type(TransportType::Quic);
+    assert_eq!(udp_providers.len(), 1, "Should have 1 UDP (QUIC) provider");
 }
 
 /// Test that default NodeConfig results in empty transport registry
@@ -211,7 +214,8 @@ async fn test_transport_registry_flows_to_nat_traversal_endpoint() {
     // Verify registry is accessible from Node (Phase 1.1 - already working)
     let registry = node.transport_registry();
     assert!(!registry.is_empty(), "Registry should not be empty");
-    assert_eq!(registry.len(), 1, "Registry should have 1 provider");
+    // The configured provider plus the endpoint's own shared-socket UDP provider
+    assert_eq!(registry.len(), 2, "Registry should have 2 providers");
 
     // Verify P2pConfig's to_nat_config() correctly passes the registry
     // This is the key Phase 1.2 wiring - P2pConfig must include transport_registry
@@ -364,9 +368,9 @@ async fn test_multi_transport_concurrent_io() {
 
     assert_eq!(registry.len(), 2, "Registry should have 2 providers");
     assert_eq!(
-        registry.providers_by_type(TransportType::Udp).len(),
+        registry.providers_by_type(TransportType::Quic).len(),
         1,
-        "Should have 1 UDP provider"
+        "Should have 1 UDP (QUIC) provider"
     );
     assert_eq!(
         registry.providers_by_type(TransportType::Ble).len(),
@@ -389,8 +393,8 @@ async fn test_multi_transport_concurrent_io() {
     let node1_registry = node1.transport_registry();
     assert_eq!(
         node1_registry.len(),
-        2,
-        "Node1 should have 2 transports registered"
+        3,
+        "Node1 should have 3 transports registered (UDP, BLE, endpoint UDP)"
     );
 
     // Create node2 with the same transports
@@ -406,8 +410,8 @@ async fn test_multi_transport_concurrent_io() {
     let node2_registry = node2.transport_registry();
     assert_eq!(
         node2_registry.len(),
-        2,
-        "Node2 should have 2 transports registered"
+        3,
+        "Node2 should have 3 transports registered (UDP, BLE, endpoint UDP)"
     );
 
     // Step 3: Verify transport capabilities and stats
@@ -416,12 +420,12 @@ async fn test_multi_transport_concurrent_io() {
     println!("Node2 local address: {:?}", node2.local_addr());
 
     // Verify both nodes can access their transport providers
-    let node1_udp_providers = node1_registry.providers_by_type(TransportType::Udp);
+    let node1_udp_providers = node1_registry.providers_by_type(TransportType::Quic);
     let node1_ble_providers = node1_registry.providers_by_type(TransportType::Ble);
     assert_eq!(
         node1_udp_providers.len(),
-        1,
-        "Node1 should have access to UDP transport"
+        2,
+        "Node1 should have the configured and endpoint UDP transports"
     );
     assert_eq!(
         node1_ble_providers.len(),
@@ -429,12 +433,12 @@ async fn test_multi_transport_concurrent_io() {
         "Node1 should have access to BLE transport"
     );
 
-    let node2_udp_providers = node2_registry.providers_by_type(TransportType::Udp);
+    let node2_udp_providers = node2_registry.providers_by_type(TransportType::Quic);
     let node2_ble_providers = node2_registry.providers_by_type(TransportType::Ble);
     assert_eq!(
         node2_udp_providers.len(),
-        1,
-        "Node2 should have access to UDP transport"
+        2,
+        "Node2 should have the configured and endpoint UDP transports"
     );
     assert_eq!(
         node2_ble_providers.len(),
@@ -510,8 +514,8 @@ async fn test_multi_transport_concurrent_io() {
     // Final verification: Check online providers count
     let online_count = node1_registry.online_providers().count();
     assert_eq!(
-        online_count, 1,
-        "Only 1 transport (UDP) should be online after BLE shutdown"
+        online_count, 2,
+        "Only the 2 UDP transports should be online after BLE shutdown"
     );
 
     // Cleanup

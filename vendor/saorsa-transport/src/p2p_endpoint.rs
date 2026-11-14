@@ -17,7 +17,7 @@
 //!
 //! # Features
 //!
-//! - Configuration via [`P2pConfig`](crate::unified_config::P2pConfig)
+//! - Configuration via [`P2pConfig`]
 //! - Event subscription via broadcast channels
 //! - TLS-based peer authentication via ML-DSA-65 (v0.2+)
 //! - NAT traversal with automatic fallback
@@ -25,15 +25,16 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::{P2pEndpoint, P2pConfig};
+//! use std::net::SocketAddr;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     // All nodes are symmetric - they can both connect and accept connections
 //!     let config = P2pConfig::builder()
-//!         .bind_addr("0.0.0.0:9000".parse()?)
-//!         .known_peer("quic.saorsalabs.com:9000".parse()?)
+//!         .bind_addr("0.0.0.0:9000".parse::<SocketAddr>()?)
+//!         .known_peer("203.0.113.10:9000".parse::<SocketAddr>()?)
 //!         .build()?;
 //!
 //!     let endpoint = P2pEndpoint::new(config).await?;
@@ -506,12 +507,14 @@ impl Default for EndpointStats {
 ///
 /// ## Handling events with transport awareness
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use saorsa_transport::{P2pEvent, transport::TransportAddr};
+/// use tokio::sync::broadcast::Receiver;
+/// # async fn example(mut events: Receiver<P2pEvent>) {
 ///
 /// while let Ok(event) = events.recv().await {
 ///     match event {
-///         P2pEvent::PeerConnected { peer_id, addr, side } => {
+///         P2pEvent::PeerConnected { addr, .. } => {
 ///             // Handle different transport types
 ///             match addr {
 ///                 TransportAddr::Quic(socket_addr) => {
@@ -532,13 +535,16 @@ impl Default for EndpointStats {
 ///         _ => {}
 ///     }
 /// }
+/// # }
 /// ```
 ///
 /// ## Address-based event handling
 ///
 /// Events use `SocketAddr` as the primary peer identifier:
 ///
-/// ```rust,ignore
+/// ```no_run
+/// use saorsa_transport::P2pEvent;
+/// # fn example(event: P2pEvent) {
 /// match event {
 ///     P2pEvent::PeerConnected { addr, public_key, .. } => {
 ///         if let Some(socket_addr) = addr.as_socket_addr() {
@@ -550,6 +556,7 @@ impl Default for EndpointStats {
 ///     }
 ///     _ => {}
 /// }
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub enum P2pEvent {
@@ -1796,19 +1803,23 @@ impl P2pEndpoint {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::P2pEndpoint;
     /// use saorsa_transport::transport::TransportAddr;
+    /// # async fn example(endpoint: &P2pEndpoint) -> anyhow::Result<()> {
     ///
     /// // Connect via UDP (uses QUIC)
     /// let udp_addr = TransportAddr::Quic("192.168.1.100:9000".parse()?);
-    /// let conn = endpoint.connect_transport(&udp_addr, None).await?;
+    /// let conn = endpoint.connect_transport(&udp_addr).await?;
     ///
     /// // Connect via BLE (uses Constrained engine)
     /// let ble_addr = TransportAddr::Ble {
     ///     mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
     ///     psm: 128,
     /// };
-    /// let conn = endpoint.connect_transport(&ble_addr, None).await?;
+    /// let conn = endpoint.connect_transport(&ble_addr).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn connect_transport(
         &self,
@@ -2007,7 +2018,10 @@ impl P2pEndpoint {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::P2pEndpoint;
+    /// use saorsa_transport::connection_strategy::ConnectionMethod;
+    /// # async fn example(endpoint: &P2pEndpoint) -> anyhow::Result<()> {
     /// let (conn, method) = endpoint.connect_with_fallback(
     ///     Some("1.2.3.4:9000".parse()?),
     ///     Some("[2001:db8::1]:9000".parse()?),
@@ -2020,6 +2034,8 @@ impl P2pEndpoint {
     ///     ConnectionMethod::HolePunched { coordinator } => println!("Via {}", coordinator),
     ///     ConnectionMethod::Relayed { relay } => println!("Relayed via {}", relay),
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     /// Set the target peer ID for a hole-punch attempt to a specific address.
     /// When set, the PUNCH_ME_NOW frame carries the peer ID instead of a

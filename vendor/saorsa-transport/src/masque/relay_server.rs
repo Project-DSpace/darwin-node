@@ -27,9 +27,8 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```
 //! use saorsa_transport::masque::relay_server::{MasqueRelayServer, MasqueRelayConfig};
-//! use std::net::SocketAddr;
 //!
 //! let config = MasqueRelayConfig::default();
 //! let public_addr = "203.0.113.50:9000".parse().unwrap();
@@ -736,11 +735,13 @@ impl MasqueRelayServer {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::masque::relay_server::{MasqueRelayConfig, MasqueRelayServer};
+    /// # let config = MasqueRelayConfig::default();
     /// let server = MasqueRelayServer::new_dual_stack(
     ///     config,
-    ///     "203.0.113.50:9000".parse()?,
-    ///     "[2001:db8::1]:9000".parse()?,
+    ///     "203.0.113.50:9000".parse().unwrap(),
+    ///     "[2001:db8::1]:9000".parse().unwrap(),
     /// );
     /// assert!(server.supports_dual_stack());
     /// ```
@@ -1421,7 +1422,7 @@ impl MasqueRelayServer {
     /// of unreliable QUIC datagrams. This avoids the MTU limitation that causes
     /// "datagram too large" errors for QUIC Initial packets (1200+ bytes).
     ///
-    /// Protocol: each forwarded packet is framed as [4-byte BE length][payload].
+    /// Protocol: each forwarded packet is framed as `[4-byte BE length][payload]`.
     pub async fn run_stream_forwarding_loop(
         self: &Arc<Self>,
         session_id: u64,

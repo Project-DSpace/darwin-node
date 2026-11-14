@@ -22,7 +22,7 @@
 //!
 //! # Zero Configuration
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::Node;
 //!
 //! #[tokio::main]
@@ -39,7 +39,7 @@
 //!     println!("Acting as relay: {}", status.is_relaying);
 //!
 //!     // Connect to a peer
-//!     let conn = node.connect_addr("quic.saorsalabs.com:9000".parse()?).await?;
+//!     let conn = node.connect_addr("203.0.113.10:9000".parse()?).await?;
 //!
 //!     // Accept connections
 //!     let incoming = node.accept().await;
@@ -109,18 +109,22 @@ pub enum NodeError {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// # async fn example() -> anyhow::Result<()> {
 /// use saorsa_transport::Node;
+/// # use saorsa_transport::crypto::raw_public_keys::pqc::generate_ml_dsa_keypair;
 ///
 /// // Zero configuration
 /// let node = Node::new().await?;
 ///
 /// // Or with known peers
-/// let node = Node::with_peers(vec!["quic.saorsalabs.com:9000".parse()?]).await?;
+/// let node = Node::with_peers(vec!["203.0.113.10:9000".parse()?]).await?;
 ///
 /// // Or with persistent identity
-/// let keypair = load_keypair()?;
-/// let node = Node::with_keypair(keypair).await?;
+/// let (public_key, secret_key) = generate_ml_dsa_keypair()?;
+/// let node = Node::with_keypair(public_key, secret_key).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Node {
     /// Inner P2pEndpoint
@@ -154,8 +158,12 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use saorsa_transport::Node;
+    /// # async fn example() -> anyhow::Result<()> {
     /// let node = Node::new().await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn new() -> Result<Self, NodeError> {
         Self::with_config(NodeConfig::default()).await
@@ -167,8 +175,12 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use saorsa_transport::Node;
+    /// # async fn example() -> anyhow::Result<()> {
     /// let node = Node::bind("0.0.0.0:9000".parse()?).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn bind(addr: SocketAddr) -> Result<Self, NodeError> {
         Self::with_config(NodeConfig::with_bind_addr(addr)).await
@@ -181,11 +193,15 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use saorsa_transport::Node;
+    /// # async fn example() -> anyhow::Result<()> {
     /// let node = Node::with_peers(vec![
-    ///     "quic.saorsalabs.com:9000".parse()?,
+    ///     "203.0.113.10:9000".parse()?,
     ///     "peer2.example.com:9000".parse()?,
     /// ]).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn with_peers(peers: Vec<SocketAddr>) -> Result<Self, NodeError> {
         Self::with_config(NodeConfig::with_known_peers(peers)).await
@@ -199,9 +215,14 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let (public_key, secret_key) = load_keypair_from_file("~/.saorsa-transport/identity.key")?;
+    /// ```no_run
+    /// # use saorsa_transport::Node;
+    /// # use saorsa_transport::crypto::raw_public_keys::pqc::generate_ml_dsa_keypair;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let (public_key, secret_key) = generate_ml_dsa_keypair()?;
     /// let node = Node::with_keypair(public_key, secret_key).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn with_keypair(
         public_key: MlDsaPublicKey,
@@ -223,7 +244,8 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # async fn example() -> anyhow::Result<()> {
     /// use saorsa_transport::{Node, HostIdentity};
     ///
     /// let host = HostIdentity::generate();
@@ -232,6 +254,8 @@ impl Node {
     ///     b"my-network",
     ///     "/var/lib/saorsa-transport",
     /// ).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn with_host_identity(
         host: &HostIdentity,
@@ -253,14 +277,20 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use saorsa_transport::{Node, NodeConfig};
+    /// # use saorsa_transport::crypto::raw_public_keys::pqc::generate_ml_dsa_keypair;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let (public_key, secret_key) = generate_ml_dsa_keypair()?;
     /// let config = NodeConfig::builder()
-    ///     .bind_addr("0.0.0.0:9000".parse()?)
-    ///     .known_peer("quic.saorsalabs.com:9000".parse()?)
-    ///     .keypair(load_keypair()?)
+    ///     .bind_addr("0.0.0.0:9000".parse::<std::net::SocketAddr>()?)
+    ///     .known_peer("203.0.113.10:9000".parse::<std::net::SocketAddr>()?)
+    ///     .keypair(public_key, secret_key)
     ///     .build();
     ///
     /// let node = Node::with_config(config).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn with_config(config: NodeConfig) -> Result<Self, NodeError> {
         // Convert NodeConfig to P2pConfig
@@ -414,9 +444,13 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let conn = node.connect_addr("quic.saorsalabs.com:9000".parse()?).await?;
-    /// println!("Connected to: {:?}", conn.peer_id);
+    /// ```no_run
+    /// # use saorsa_transport::Node;
+    /// # async fn example(node: Node) -> anyhow::Result<()> {
+    /// let conn = node.connect_addr("203.0.113.10:9000".parse()?).await?;
+    /// println!("Connected to: {:?}", conn.remote_addr);
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn connect_addr(&self, addr: SocketAddr) -> Result<PeerConnection, NodeError> {
         self.inner.connect(addr).await.map_err(NodeError::Endpoint)
@@ -429,11 +463,14 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use saorsa_transport::Node;
+    /// # async fn example(node: Node) {
     /// while let Some(conn) = node.accept().await {
-    ///     println!("Accepted connection from: {:?}", conn.peer_id);
+    ///     println!("Accepted connection from: {:?}", conn.remote_addr);
     ///     // Handle connection...
     /// }
+    /// # }
     /// ```
     pub async fn accept(&self) -> Option<PeerConnection> {
         self.inner.accept().await
@@ -501,11 +538,14 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use saorsa_transport::Node;
+    /// # async fn example(node: Node) {
     /// let status = node.status().await;
     /// println!("NAT type: {}", status.nat_type);
     /// println!("Connected peers: {}", status.connected_peers);
     /// println!("Acting as relay: {}", status.is_relaying);
+    /// # }
     /// ```
     pub async fn status(&self) -> NodeStatus {
         let stats = self.inner.stats().await;
@@ -620,18 +660,21 @@ impl Node {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # use saorsa_transport::{Node, NodeEvent};
+    /// # async fn example(node: Node) {
     /// let mut events = node.subscribe();
     /// tokio::spawn(async move {
     ///     while let Ok(event) = events.recv().await {
     ///         match event {
-    ///             NodeEvent::PeerConnected { peer_id, .. } => {
-    ///                 println!("Connected: {:?}", peer_id);
+    ///             NodeEvent::PeerConnected { addr, .. } => {
+    ///                 println!("Connected: {:?}", addr);
     ///             }
     ///             _ => {}
     ///         }
     ///     }
     /// });
+    /// # }
     /// ```
     pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
         self.event_tx.subscribe()

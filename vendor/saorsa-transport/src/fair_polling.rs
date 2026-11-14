@@ -90,12 +90,14 @@ impl Default for FairPoller {
 /// Macro to poll transports in fair order
 ///
 /// Usage:
-/// ```ignore
-/// poll_transports_fair!(
-///     poller,
-///     poll_direct_transport(),
-///     poll_relay_transport()
-/// )
+/// ```
+/// use saorsa_transport::fair_polling::FairPoller;
+/// use saorsa_transport::poll_transports_fair;
+///
+/// let poller = FairPoller::new();
+/// // Each source yields `Some(result)` when it has something ready.
+/// let ready = poll_transports_fair!(poller, None::<u32>, Some(7));
+/// assert_eq!(ready, Some(7));
 /// ```
 #[macro_export]
 macro_rules! poll_transports_fair {

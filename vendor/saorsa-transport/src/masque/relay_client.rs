@@ -25,20 +25,24 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::masque::relay_client::{MasqueRelayClient, RelayClientConfig};
+//! use bytes::Bytes;
 //! use std::net::SocketAddr;
+//! # async fn example(target_addr: SocketAddr, data: Bytes) -> anyhow::Result<()> {
 //!
-//! // Connect to a relay
+//! // Create a client for a relay
 //! let relay_addr: SocketAddr = "203.0.113.50:9000".parse().unwrap();
 //! let config = RelayClientConfig::default();
-//! let client = MasqueRelayClient::connect(relay_addr, config).await?;
+//! let client = MasqueRelayClient::new(relay_addr, config);
 //!
-//! // Get our public address
-//! let public_addr = client.public_address();
+//! // Once the CONNECT-UDP handshake completes, get our public address
+//! let public_addr = client.public_address().await;
 //!
-//! // Send datagram to target through relay
-//! client.send_datagram(target_addr, data).await?;
+//! // Wrap a datagram for the target to be sent through the relay
+//! let (datagram, _capsule) = client.create_datagram(target_addr, data).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use bytes::Bytes;

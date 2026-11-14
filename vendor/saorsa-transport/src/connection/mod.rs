@@ -23,13 +23,6 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
-/// qlog schema version emitted in the `qlog_version` header field.
-///
-/// Matches what `quiche` and `tokio-quiche` write so qvis / qlog tooling can
-/// parse our traces interchangeably.
-#[cfg(feature = "__qlog")]
-const QLOG_VERSION: &str = "0.3";
-
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, trace_span, warn};
@@ -542,23 +535,19 @@ impl Connection {
             flow: None,
         };
         let trace = qlog::TraceSeq::new(
-            vantage_point,
             title.clone(),
             description.clone(),
-            Some(qlog::Configuration {
-                time_offset: Some(0.0),
-                original_uris: None,
-            }),
             None,
+            Some(vantage_point),
+            vec![qlog::events::QUIC_URI.to_string()],
         );
         let mut streamer = qlog::streamer::QlogStreamer::new(
-            QLOG_VERSION.to_string(),
             title,
             description,
-            None,
             now,
             trace,
             qlog::events::EventImportance::Base,
+            qlog::streamer::EventTimePrecision::MicroSeconds,
             writer,
         );
         if streamer.start_log().is_err() {
@@ -580,7 +569,7 @@ impl Connection {
             return;
         };
         if let Err(e) = streamer
-            .add_event_data_with_instant(qlog::events::EventData::MetricsUpdated(metrics), now)
+            .add_event_data_with_instant(qlog::events::EventData::QuicMetricsUpdated(metrics), now)
         {
             trace!("qlog add_event failed: {:?}", e);
         }

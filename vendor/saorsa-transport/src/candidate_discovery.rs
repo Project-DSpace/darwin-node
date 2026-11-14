@@ -308,7 +308,7 @@ impl DiscoveryConfig {
     /// - Standard candidate limits
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```text
     /// let manager = CandidateDiscoveryManager::new(DiscoveryConfig::test_default());
     /// ```
     #[cfg(test)]

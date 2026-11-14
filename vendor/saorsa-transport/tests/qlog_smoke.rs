@@ -206,13 +206,13 @@ async fn qlog_streams_header_and_metrics_event() {
     let text = String::from_utf8_lossy(&bytes);
 
     assert!(
-        text.contains("\"qlog_format\":\"JSON-SEQ\""),
+        text.contains("\"serialization_format\":\"JSON-SEQ\""),
         "qlog header missing JSON-SEQ marker; first 256 bytes: {:?}",
         text.chars().take(256).collect::<String>(),
     );
     assert!(
-        text.contains("\"qlog_version\":\"0.3\""),
-        "qlog header missing version field; first 256 bytes: {:?}",
+        text.contains("\"file_schema\":\"urn:ietf:params:qlog:file:sequential\""),
+        "qlog header missing file_schema field; first 256 bytes: {:?}",
         text.chars().take(256).collect::<String>(),
     );
     assert!(

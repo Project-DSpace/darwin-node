@@ -233,7 +233,7 @@ impl fmt::Display for ProtocolEngine {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```text
 /// struct MyTransport {
 ///     // transport-specific state
 /// }
@@ -427,10 +427,13 @@ impl TransportRegistry {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::transport::TransportRegistry;
+    /// # fn example(registry: &TransportRegistry) {
     /// for provider in registry.online_providers() {
     ///     println!("Online: {} ({})", provider.name(), provider.transport_type());
     /// }
+    /// # }
     /// ```
     pub fn online_providers(&self) -> impl Iterator<Item = Arc<dyn TransportProvider>> + '_ {
         self.providers.iter().filter(|p| p.is_online()).cloned()
@@ -511,9 +514,13 @@ impl TransportRegistry {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::transport::{TransportAddr, TransportRegistry};
+    /// # async fn example(registry: &TransportRegistry) -> anyhow::Result<()> {
     /// let ble_addr = TransportAddr::ble([0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], 128);
     /// registry.send(b"hello", &ble_addr).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn send(&self, data: &[u8], dest: &TransportAddr) -> Result<(), TransportError> {
         let provider =

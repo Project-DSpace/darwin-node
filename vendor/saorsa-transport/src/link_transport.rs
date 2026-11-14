@@ -43,7 +43,7 @@
 //!
 //! ## Example: Implementing an Overlay
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::link_transport::{LinkTransport, LinkConn, LinkEvent, ProtocolId, LinkError};
 //! use std::sync::Arc;
 //! use futures_util::StreamExt;
@@ -51,7 +51,7 @@
 //! // Define your overlay's protocol identifier
 //! const DHT_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-dht/1.0.0");
 //!
-//! async fn run_overlay<T: LinkTransport>(transport: Arc<T>) -> anyhow::Result<()> {
+//! async fn run_overlay<T: LinkTransport + 'static>(transport: Arc<T>) -> anyhow::Result<()> {
 //!     // Register our protocol so peers know we support it
 //!     transport.register_protocol(DHT_PROTOCOL);
 //!
@@ -120,7 +120,9 @@
 //!
 //! ## Error Handling Patterns
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # use saorsa_transport::link_transport::{LinkTransport, ProtocolId};
+//! # use std::time::Duration;
 //! use saorsa_transport::link_transport::{LinkError, LinkResult};
 //! use std::net::SocketAddr;
 //!
@@ -836,7 +838,7 @@ pub enum LinkEvent {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use saorsa_transport::link_transport::{ProtocolHandler, StreamType, LinkResult};
 /// use async_trait::async_trait;
 /// use bytes::Bytes;
@@ -1025,7 +1027,7 @@ pub type BoxStream<'a, T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send + 
 ///
 /// This trait abstracts a single QUIC connection, providing methods to
 /// open streams and send/receive datagrams. Connections are obtained via
-/// [`LinkTransport::dial`] or [`LinkTransport::accept`].
+/// [`LinkTransport::dial_addr`] or [`LinkTransport::accept`].
 ///
 /// # Stream Types
 ///
@@ -1059,10 +1061,14 @@ pub trait LinkConn: Send + Sync {
     /// Use for one-way messages like notifications or log streams.
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::link_transport::LinkConn;
+    /// # async fn example(conn: &dyn LinkConn) -> anyhow::Result<()> {
     /// let mut stream = conn.open_uni().await?;
     /// stream.write_all(b"notification").await?;
     /// stream.finish()?; // Signal end of stream
+    /// # Ok(())
+    /// # }
     /// ```
     fn open_uni(&self) -> BoxFuture<'_, LinkResult<Box<dyn LinkSendStream>>>;
 
@@ -1072,11 +1078,15 @@ pub trait LinkConn: Send + Sync {
     /// Use for RPC, file transfers, or any interactive protocol.
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::link_transport::LinkConn;
+    /// # async fn example(conn: &dyn LinkConn) -> anyhow::Result<()> {
     /// let (mut send, mut recv) = conn.open_bi().await?;
     /// send.write_all(b"request").await?;
     /// send.finish()?;
     /// let response = recv.read_to_end(4096).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     fn open_bi(
         &self,
@@ -1088,10 +1098,14 @@ pub trait LinkConn: Send + Sync {
     /// The remote peer should use `accept_uni_typed` to receive.
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::link_transport::{LinkConn, StreamType};
+    /// # async fn example(conn: &dyn LinkConn) -> anyhow::Result<()> {
     /// let mut stream = conn.open_uni_typed(StreamType::Membership).await?;
     /// stream.write_all(b"membership update").await?;
     /// stream.finish()?;
+    /// # Ok(())
+    /// # }
     /// ```
     fn open_uni_typed(
         &self,
@@ -1104,11 +1118,15 @@ pub trait LinkConn: Send + Sync {
     /// The remote peer should use `accept_bi_typed` to receive.
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::link_transport::{LinkConn, StreamType};
+    /// # async fn example(conn: &dyn LinkConn) -> anyhow::Result<()> {
     /// let (mut send, mut recv) = conn.open_bi_typed(StreamType::DhtQuery).await?;
     /// send.write_all(b"query request").await?;
     /// send.finish()?;
     /// let response = recv.read_to_end(4096).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     fn open_bi_typed(
         &self,
@@ -1121,13 +1139,18 @@ pub trait LinkConn: Send + Sync {
     /// matching the filter. Use `StreamFilter::new()` to accept all types.
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::link_transport::{LinkConn, StreamFilter};
+    /// use futures_util::StreamExt;
+    /// # async fn example(conn: &dyn LinkConn) -> anyhow::Result<()> {
     /// let filter = StreamFilter::gossip_only();
     /// let mut incoming = conn.accept_uni_typed(filter);
     /// while let Some(result) = incoming.next().await {
     ///     let (stream_type, recv) = result?;
     ///     println!("Got {} stream", stream_type);
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     fn accept_uni_typed(
         &self,
@@ -1140,13 +1163,18 @@ pub trait LinkConn: Send + Sync {
     /// streams matching the filter. Use `StreamFilter::new()` to accept all types.
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::link_transport::{LinkConn, StreamFilter};
+    /// use futures_util::StreamExt;
+    /// # async fn example(conn: &dyn LinkConn) -> anyhow::Result<()> {
     /// let filter = StreamFilter::dht_only();
     /// let mut incoming = conn.accept_bi_typed(filter);
     /// while let Some(result) = incoming.next().await {
     ///     let (stream_type, send, recv) = result?;
     ///     // Handle DHT request/response
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     fn accept_bi_typed(
         &self,
@@ -1204,14 +1232,18 @@ pub trait LinkConn: Send + Sync {
 /// | Packet loss | <0.1% | 0.1-1% | >5% |
 ///
 /// # Example
-/// ```rust,ignore
+/// ```no_run
+/// use saorsa_transport::link_transport::LinkConn;
+/// use std::time::Duration;
+/// # fn example(conn: &dyn LinkConn) {
 /// let stats = conn.stats();
 /// if stats.rtt > Duration::from_millis(200) {
-///     log::warn!("High latency: {:?}", stats.rtt);
+///     eprintln!("High latency: {:?}", stats.rtt);
 /// }
 /// if stats.packets_lost > stats.bytes_sent / 100 {
-///     log::warn!("Significant packet loss detected");
+///     eprintln!("Significant packet loss detected");
 /// }
+/// # }
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionStats {
@@ -1288,12 +1320,18 @@ pub type Incoming<C> = BoxStream<'static, LinkResult<C>>;
 ///
 /// The default implementation wraps `P2pEndpoint`:
 ///
-/// ```rust,ignore
+/// ```no_run
+/// use saorsa_transport::{P2pConfig, P2pLinkConn, P2pLinkTransport};
+/// use saorsa_transport::link_transport::LinkTransport;
+/// use std::sync::Arc;
+/// # async fn example() -> anyhow::Result<()> {
 /// let config = P2pConfig::builder()
-///     .bind_addr("0.0.0.0:0".parse()?)
+///     .bind_addr("0.0.0.0:0".parse::<std::net::SocketAddr>()?)
 ///     .build()?;
-/// let endpoint = P2pEndpoint::new(config).await?;
-/// let transport: Arc<dyn LinkTransport<Conn = P2pLinkConn>> = Arc::new(endpoint);
+/// let transport: Arc<dyn LinkTransport<Conn = P2pLinkConn>> =
+///     Arc::new(P2pLinkTransport::new(config).await?);
+/// # Ok(())
+/// # }
 /// ```
 pub trait LinkTransport: Send + Sync + 'static {
     /// The connection type returned by this transport.
@@ -1345,13 +1383,19 @@ pub trait LinkTransport: Send + Sync + 'static {
     /// `register_protocol()`.
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::link_transport::{LinkConn, LinkTransport, ProtocolId};
+    /// use futures_util::StreamExt;
+    /// # const MY_PROTOCOL: ProtocolId = ProtocolId::from_static(b"my-app/1.0");
+    /// # async fn handle_connection<C: LinkConn>(conn: C) {}
+    /// # async fn example<T: LinkTransport>(transport: &T) {
     /// let mut incoming = transport.accept(MY_PROTOCOL);
     /// while let Some(result) = incoming.next().await {
     ///     if let Ok(conn) = result {
     ///         tokio::spawn(handle_connection(conn));
     ///     }
     /// }
+    /// # }
     /// ```
     fn accept(&self, proto: ProtocolId) -> Incoming<Self::Conn>;
 

@@ -346,91 +346,87 @@ impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let conn = &mut *self.0.state.lock("poll");
+        // Automatic channel binding is started after the `state` lock is released: the
+        // binding task holds a `Connection` handle, and taking or dropping one locks `state`
+        // (see `ConnectionRef`'s `Clone` and `Drop`), so doing that here deadlocked the driver.
+        let mut start_binding = None;
+        let poll = {
+            let conn = &mut *self.0.state.lock("poll");
 
-        let span = debug_span!("drive", id = conn.handle.0);
-        let _guard = span.enter();
+            let span = debug_span!("drive", id = conn.handle.0);
+            let _guard = span.enter();
 
-        if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
-            conn.terminate(e, &self.0.shared);
-            return Poll::Ready(Ok(()));
-        }
-        let mut keep_going = conn.drive_transmit(cx)?;
-        // If a timer expires, there might be more to transmit. When we transmit something, we
-        // might need to reset a timer. Hence, we must loop until neither happens.
-        keep_going |= conn.drive_timer(cx);
-        conn.forward_endpoint_events();
-        conn.forward_app_events(&self.0.shared);
+            if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
+                conn.terminate(e, &self.0.shared);
+                return Poll::Ready(Ok(()));
+            }
+            let mut keep_going = conn.drive_transmit(cx)?;
+            // If a timer expires, there might be more to transmit. When we transmit something, we
+            // might need to reset a timer. Hence, we must loop until neither happens.
+            keep_going |= conn.drive_timer(cx);
+            conn.forward_endpoint_events();
+            conn.forward_app_events(&self.0.shared);
 
-        // Kick off automatic channel binding once connected, if configured
-        if conn.connected && !conn.binding_started {
-            if let Some(rt) = crate::trust::global_runtime() {
-                // Delay NEW_TOKEN until binding completes
-                conn.inner.set_delay_new_token_until_binding(true);
+            // Kick off automatic channel binding once connected, if configured
+            if conn.connected && !conn.binding_started {
+                if let Some(rt) = crate::trust::global_runtime() {
+                    // Delay NEW_TOKEN until binding completes
+                    conn.inner.set_delay_new_token_until_binding(true);
+                    conn.binding_started = true;
+                    start_binding = Some((rt, conn.inner.side(), conn.runtime.clone()));
+                }
+            }
 
-                let hl_conn_server = Connection(self.0.clone());
-                let hl_conn_client = hl_conn_server.clone();
+            if !conn.inner.is_drained() {
+                if keep_going {
+                    // If the connection hasn't processed all tasks, schedule it again
+                    cx.waker().wake_by_ref();
+                } else {
+                    conn.driver = Some(cx.waker().clone());
+                }
+                Poll::Pending
+            } else {
+                if conn.error.is_none() {
+                    unreachable!("drained connections always have an error");
+                }
+                Poll::Ready(Ok(()))
+            }
+        };
+
+        if let Some((rt, side, runtime)) = start_binding {
+            let hl_conn = Connection(self.0.clone());
+            if side.is_server() {
                 let store = rt.store.clone();
                 let policy = rt.policy.clone();
+                runtime.spawn(Box::pin(async move {
+                    match crate::trust::recv_verify_binding(&hl_conn, &*store, &policy).await {
+                        Ok(peer) => {
+                            let mut state = hl_conn.0.state.lock("binding verified");
+                            state
+                                .inner
+                                .set_token_binding_peer_id(crate::nat_traversal_api::PeerId(peer));
+                            state.inner.set_delay_new_token_until_binding(false);
+                            // Send the held-back NEW_TOKEN frames now rather than on the next
+                            // unrelated poll
+                            state.wake();
+                        }
+                        Err(_e) => {
+                            hl_conn.close(0u32.into(), b"channel binding failed");
+                        }
+                    }
+                }));
+            } else {
                 let signer = rt.local_secret_key.clone();
                 let spki = rt.local_spki.clone();
-                let runtime = conn.runtime.clone();
-
-                if conn.inner.side().is_server() {
-                    runtime.spawn(Box::pin(async move {
-                        match crate::trust::recv_verify_binding(&hl_conn_server, &*store, &policy)
-                            .await
-                        {
-                            Ok(peer) => {
-                                hl_conn_server
-                                    .0
-                                    .state
-                                    .lock("set peer")
-                                    .inner
-                                    .set_token_binding_peer_id(crate::nat_traversal_api::PeerId(
-                                        peer,
-                                    ));
-                                hl_conn_server
-                                    .0
-                                    .state
-                                    .lock("allow tokens")
-                                    .inner
-                                    .set_delay_new_token_until_binding(false);
-                            }
-                            Err(_e) => {
-                                hl_conn_server.close(0u32.into(), b"channel binding failed");
-                            }
-                        }
-                    }));
-                }
-
-                if conn.inner.side().is_client() {
-                    runtime.spawn(Box::pin(async move {
-                        if let Ok(exp) = crate::trust::derive_exporter(&hl_conn_client) {
-                            let _ =
-                                crate::trust::send_binding(&hl_conn_client, &exp, &signer, &spki)
-                                    .await;
-                        }
-                    }));
-                }
-
-                conn.binding_started = true;
+                runtime.spawn(Box::pin(async move {
+                    if let Ok(exp) = crate::trust::derive_exporter(&hl_conn) {
+                        let _ = crate::trust::send_binding(&hl_conn, &exp, &signer, &spki).await;
+                    }
+                }));
             }
         }
 
-        if !conn.inner.is_drained() {
-            if keep_going {
-                // If the connection hasn't processed all tasks, schedule it again
-                cx.waker().wake_by_ref();
-            } else {
-                conn.driver = Some(cx.waker().clone());
-            }
-            return Poll::Pending;
-        }
-        if conn.error.is_none() {
-            unreachable!("drained connections always have an error");
-        }
-        Poll::Ready(Ok(()))
+        poll
     }
 }
 

@@ -1222,7 +1222,7 @@ pub struct NatTraversalEndpoint {
 /// BBRv2 is the default: its per-packet delivery-rate sampler, loss-aware
 /// startup exit, and short-term `inflight_hi`/`inflight_lo` caps handle
 /// lossy paths and shared bottlenecks better than BBRv1, while preserving
-/// BBR's rate-based pacing (wired through [`crate::connection::pacing::Pacer`])
+/// BBR's rate-based pacing (wired through the connection's internal `Pacer`)
 /// and BDP-sized congestion window that fill high-BDP paths like MASQUE
 /// relay hops. CUBIC remains available as a conservative fallback, and
 /// BBRv1 is kept for comparison / debugging.
@@ -1369,7 +1369,7 @@ pub struct NatTraversalConfig {
     /// Internally tunes the QUIC per-stream receive window so that a single
     /// message of this size can be transmitted without flow-control rejection.
     ///
-    /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`] (1 MiB).
+    /// Default: [`P2pConfig::DEFAULT_MAX_MESSAGE_SIZE`](crate::P2pConfig::DEFAULT_MAX_MESSAGE_SIZE) (1 MiB).
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
 
@@ -2285,7 +2285,10 @@ impl NatTraversalEndpoint {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// use saorsa_transport::nat_traversal_api::{NatTraversalConfig, NatTraversalEndpoint};
+    /// # async fn example() -> anyhow::Result<()> {
+    ///
     /// let config = NatTraversalConfig::default();
     /// let endpoint = NatTraversalEndpoint::new_with_shared_socket(
     ///     "0.0.0.0:9000".parse().unwrap(),
@@ -2293,6 +2296,8 @@ impl NatTraversalEndpoint {
     ///     None,
     ///     None,
     /// ).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn new_with_shared_socket(
         bind_addr: std::net::SocketAddr,
@@ -2754,14 +2759,19 @@ impl NatTraversalEndpoint {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// use saorsa_transport::transport::udp::UdpTransport;
+    /// ```no_run
+    /// use saorsa_transport::nat_traversal_api::{NatTraversalConfig, NatTraversalEndpoint};
+    /// use saorsa_transport::transport::{TransportRegistry, UdpTransport};
+    /// use std::sync::Arc;
+    /// # async fn example(config: NatTraversalConfig) -> anyhow::Result<()> {
+    /// let addr = "0.0.0.0:0".parse()?;
+    /// let mut registry = TransportRegistry::new();
     ///
     /// // Bind transport and get socket for Quinn
     /// let (udp_transport, quinn_socket) = UdpTransport::bind_for_quinn(addr).await?;
     ///
     /// // Register transport
-    /// registry.register(Arc::new(udp_transport))?;
+    /// registry.register(Arc::new(udp_transport));
     ///
     /// // Create endpoint with shared socket
     /// let endpoint = NatTraversalEndpoint::new_with_socket(
@@ -2770,6 +2780,8 @@ impl NatTraversalEndpoint {
     ///     None,
     ///     Some(quinn_socket),
     /// ).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn new_with_socket(
         config: NatTraversalConfig,
@@ -3277,7 +3289,7 @@ impl NatTraversalEndpoint {
     /// Emit an event to both the events vector and the callback (if present)
     ///
     /// This helper method eliminates the repeated pattern of:
-    /// ```ignore
+    /// ```text
     /// if let Some(ref callback) = self.event_callback {
     ///     callback(event.clone());
     /// }
@@ -6486,26 +6498,28 @@ impl NatTraversalEndpoint {
     /// * `capabilities` - Optional capability flags for the transport
     ///
     /// # Example
-    /// ```ignore
-    /// use saorsa_transport::transport::TransportAddr;
+    /// ```no_run
     /// use saorsa_transport::nat_traversal::CapabilityFlags;
+    /// use saorsa_transport::nat_traversal_api::NatTraversalEndpoint;
+    /// use saorsa_transport::transport::TransportAddr;
+    /// # fn example(endpoint: &NatTraversalEndpoint) -> Result<(), Box<dyn std::error::Error>> {
     ///
     /// // Advertise a UDP address
     /// endpoint.advertise_transport_address(
     ///     TransportAddr::Udp("192.168.1.100:9000".parse().unwrap()),
     ///     100,
     ///     Some(CapabilityFlags::broadband()),
-    /// );
+    /// )?;
     ///
-    /// // Advertise a BLE address
-    /// endpoint.advertise_transport_address(
-    ///     TransportAddr::Ble {
-    ///         mac: [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
-    ///         psm: 0x0080,
-    ///     },
-    ///     50,
-    ///     Some(CapabilityFlags::ble()),
-    /// );
+    /// // Non-UDP addresses (BLE, LoRa, ...) are not advertised through this API;
+    /// // it returns an error for them.
+    /// let ble = TransportAddr::Ble {
+    ///     mac: [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+    ///     psm: 0x0080,
+    /// };
+    /// assert!(endpoint.advertise_transport_address(ble, 50, Some(CapabilityFlags::ble())).is_err());
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn advertise_transport_address(
         &self,

@@ -22,7 +22,7 @@ use super::{
 use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, packet::SpaceId};
 
 #[cfg(feature = "__qlog")]
-use qlog::events::quic::MetricsUpdated;
+use qlog::events::quic::RecoveryMetricsUpdated;
 
 /// Description of a particular network path
 pub(super) struct PathData {
@@ -242,7 +242,10 @@ impl PathData {
 
     #[cfg(feature = "__qlog")]
     #[allow(dead_code)]
-    pub(super) fn qlog_congestion_metrics(&mut self, pto_count: u32) -> Option<MetricsUpdated> {
+    pub(super) fn qlog_congestion_metrics(
+        &mut self,
+        pto_count: u32,
+    ) -> Option<RecoveryMetricsUpdated> {
         let controller_metrics = self.congestion.metrics();
 
         let metrics = CongestionMetrics {
@@ -265,6 +268,12 @@ impl PathData {
         self.congestion_metrics = metrics;
         event
     }
+}
+
+/// RTT values in `recovery_metrics_updated` are milliseconds (quic-events-12).
+#[cfg(feature = "__qlog")]
+fn qlog_millis(rtt: Duration) -> f32 {
+    (rtt.as_secs_f64() * 1000.0) as f32
 }
 
 /// Congestion metrics as described in [`recovery_metrics_updated`].
@@ -315,20 +324,20 @@ impl CongestionMetrics {
         }
     }
 
-    /// Emit a `MetricsUpdated` event containing only updated values
+    /// Emit a `RecoveryMetricsUpdated` event containing only updated values
     #[allow(dead_code)]
-    fn to_qlog_event(&self, previous: &Self) -> Option<MetricsUpdated> {
+    fn to_qlog_event(&self, previous: &Self) -> Option<RecoveryMetricsUpdated> {
         let updated = self.retain_updated(previous);
 
         if updated == Self::default() {
             return None;
         }
 
-        Some(MetricsUpdated {
-            min_rtt: updated.min_rtt.map(|rtt| rtt.as_secs_f32()),
-            smoothed_rtt: updated.smoothed_rtt.map(|rtt| rtt.as_secs_f32()),
-            latest_rtt: updated.latest_rtt.map(|rtt| rtt.as_secs_f32()),
-            rtt_variance: updated.rtt_variance.map(|rtt| rtt.as_secs_f32()),
+        Some(RecoveryMetricsUpdated {
+            min_rtt: updated.min_rtt.map(qlog_millis),
+            smoothed_rtt: updated.smoothed_rtt.map(qlog_millis),
+            latest_rtt: updated.latest_rtt.map(qlog_millis),
+            rtt_variance: updated.rtt_variance.map(qlog_millis),
             pto_count: updated
                 .pto_count
                 .map(|count| count.try_into().unwrap_or(u16::MAX)),
@@ -337,6 +346,7 @@ impl CongestionMetrics {
             congestion_window: updated.congestion_window,
             ssthresh: updated.ssthresh,
             pacing_rate: updated.pacing_rate,
+            ..Default::default()
         })
     }
 }
@@ -1000,5 +1010,28 @@ mod tests {
         // Rate should be preserved, tokens should be reset
         assert_eq!(path.observation_rate_limiter.rate, 15.0);
         assert_eq!(path.observation_rate_limiter.tokens, 15.0); // Full tokens after reset
+    }
+
+    #[cfg(feature = "__qlog")]
+    #[test]
+    fn qlog_recovery_metrics_rtts_are_milliseconds() {
+        let metrics = CongestionMetrics {
+            min_rtt: Some(Duration::from_millis(100)),
+            smoothed_rtt: Some(Duration::from_micros(125_500)),
+            latest_rtt: Some(Duration::from_millis(150)),
+            rtt_variance: Some(Duration::from_millis(20)),
+            pacing_rate: Some(8_000),
+            ..CongestionMetrics::default()
+        };
+        let event = metrics
+            .to_qlog_event(&CongestionMetrics::default())
+            .expect("changed metrics produce an event");
+        let json = serde_json::to_value(&event).expect("event serializes");
+
+        assert_eq!(json["min_rtt"], 100.0);
+        assert_eq!(json["smoothed_rtt"], 125.5);
+        assert_eq!(json["latest_rtt"], 150.0);
+        assert_eq!(json["rtt_variance"], 20.0);
+        assert_eq!(json["pacing_rate"], 8_000);
     }
 }

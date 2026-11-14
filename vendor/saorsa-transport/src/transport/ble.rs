@@ -252,7 +252,7 @@ impl FragmentHeader {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let fragmenter = BlePacketFragmenter::new(244); // 244 byte MTU
 /// let fragments = fragmenter.fragment(b"large data...", 0);
 /// // Each fragment is <= 244 bytes with a 4-byte header
@@ -459,7 +459,7 @@ impl ReassemblyEntry {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let mut buffer = BleReassemblyBuffer::new(Duration::from_secs(30));
 ///
 /// // Process incoming fragments

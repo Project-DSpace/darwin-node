@@ -922,10 +922,12 @@ impl TransportParameters {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// Illustrative only: `TransportParameters::default()` and its fields are
+    /// crate-private, so this cannot be compiled from outside the crate.
+    ///
+    /// ```text
     /// use saorsa_transport::VarInt;
-    /// use saorsa_transport::TransportParameters;
-    /// use saorsa_transport::NatTraversalConfig;
+    /// use saorsa_transport::transport_parameters::{NatTraversalConfig, TransportParameters};
     ///
     /// // P2P: Both peers have ServerSupport - use minimum
     /// let local = NatTraversalConfig::ServerSupport {
@@ -975,10 +977,12 @@ impl TransportParameters {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// Illustrative only: `TransportParameters::default()` and its fields are
+    /// crate-private, so this cannot be compiled from outside the crate.
+    ///
+    /// ```text
     /// use saorsa_transport::VarInt;
-    /// use saorsa_transport::TransportParameters;
-    /// use saorsa_transport::NatTraversalConfig;
+    /// use saorsa_transport::transport_parameters::{NatTraversalConfig, TransportParameters};
     ///
     /// let mut params = TransportParameters::default();
     /// params.nat_traversal = Some(NatTraversalConfig::ServerSupport {

@@ -358,7 +358,7 @@ impl ConnectUdpResponse {
 
     /// Encode the response as wire format
     ///
-    /// Format: [status (2)] [flags (1)] [addr] [reason]
+    /// Format: `[status (2)] [flags (1)] [addr] [reason]`
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
 

@@ -96,7 +96,7 @@ impl UncompressedDatagram {
 
     /// Encode the datagram to bytes.
     ///
-    /// Pre-allocates the exact capacity needed via [`encoded_size`] so the
+    /// Pre-allocates the exact capacity needed via [`Self::encoded_size`] so the
     /// underlying `BytesMut` never reallocates during encoding. This is on
     /// the per-datagram hot path of the relay forwarding loops.
     pub fn encode(&self) -> Bytes {
@@ -200,7 +200,7 @@ impl CompressedDatagram {
 
     /// Encode the datagram to bytes.
     ///
-    /// Pre-allocates the exact capacity via [`encoded_size`] to avoid
+    /// Pre-allocates the exact capacity via [`Self::encoded_size`] to avoid
     /// `BytesMut` reallocations on the forwarding hot path.
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(self.encoded_size());

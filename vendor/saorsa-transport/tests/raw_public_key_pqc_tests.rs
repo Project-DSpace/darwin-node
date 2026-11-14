@@ -107,9 +107,9 @@ mod pqc_raw_public_key_tests {
     fn test_supported_signature_schemes() {
         let schemes = supported_signature_schemes();
 
-        // Should only contain ML-DSA-65 scheme (0x0901 per IANA)
+        // Should only contain the ML-DSA-65 scheme
         assert_eq!(schemes.len(), 1);
-        assert_eq!(schemes[0], SignatureScheme::Unknown(0x0901));
+        assert_eq!(schemes[0], SignatureScheme::ML_DSA_65);
     }
 
     #[test]
@@ -177,7 +177,7 @@ mod pqc_raw_public_key_tests {
                 &public_key,
                 message,
                 signature.as_bytes(),
-                SignatureScheme::Unknown(0x0901)
+                SignatureScheme::ML_DSA_65
             )
             .is_ok()
         );

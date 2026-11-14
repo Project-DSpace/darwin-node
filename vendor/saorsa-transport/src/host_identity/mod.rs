@@ -55,8 +55,8 @@
 //!
 //! ## Usage
 //!
-//! ```ignore
-//! use saorsa_transport::host_identity::{HostIdentity, EndpointKeyPolicy};
+//! ```
+//! use saorsa_transport::host_identity::HostIdentity;
 //!
 //! // Generate a new host identity (or load from storage)
 //! let host = HostIdentity::generate();

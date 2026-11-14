@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.95.0"
 name = "saorsa-transport"
-version = "0.38.2"
+version = "0.39.0"
 build = false
 exclude = [
     ".github/",
@@ -120,8 +120,6 @@ native = [
     "dep:dashmap",
     "dep:parking_lot",
     "dep:zeroize",
-    "dep:clap",
-    "dep:reqwest",
     "dep:tokio",
     "dep:tracing-subscriber",
     "dep:quinn-udp",
@@ -173,26 +171,6 @@ webrtc-direct = [
 [lib]
 name = "saorsa_transport"
 path = "src/lib.rs"
-
-[[bin]]
-name = "saorsa-transport"
-path = "src/bin/saorsa-transport.rs"
-required-features = ["native"]
-
-[[bin]]
-name = "interop-test"
-path = "src/bin/interop-test.rs"
-required-features = ["native"]
-
-[[bin]]
-name = "test-public-endpoints"
-path = "src/bin/test_public_endpoints.rs"
-required-features = ["native"]
-
-[[bin]]
-name = "e2e-test-node"
-path = "src/bin/e2e-test-node.rs"
-required-features = ["native"]
 
 [[example]]
 name = "ble_chat"
@@ -259,6 +237,10 @@ name = "address_discovery_security_simple"
 path = "tests/address_discovery_security_simple.rs"
 
 [[test]]
+name = "auto_binding_integration"
+path = "tests/auto_binding_integration.rs"
+
+[[test]]
 name = "ble_transport"
 path = "tests/ble_transport.rs"
 
@@ -295,10 +277,6 @@ name = "discovery"
 path = "tests/discovery.rs"
 
 [[test]]
-name = "docker_nat_integration"
-path = "tests/docker_nat_integration.rs"
-
-[[test]]
 name = "event_migration"
 path = "tests/event_migration.rs"
 
@@ -315,10 +293,6 @@ name = "fuzz_nat_traversal"
 path = "tests/fuzz_nat_traversal.rs"
 
 [[test]]
-name = "interop_test"
-path = "tests/interop_test.rs"
-
-[[test]]
 name = "ipv4_ipv6_bridging_tests"
 path = "tests/ipv4_ipv6_bridging_tests.rs"
 
@@ -329,10 +303,6 @@ path = "tests/ipv4_ipv6_nat_verification.rs"
 [[test]]
 name = "keep_alive_asymmetry"
 path = "tests/keep_alive_asymmetry.rs"
-
-[[test]]
-name = "live_network_e2e"
-path = "tests/live_network_e2e.rs"
 
 [[test]]
 name = "long"
@@ -353,18 +323,6 @@ path = "tests/ml_kem_768_tests.rs"
 [[test]]
 name = "multi_client_mixed_traffic"
 path = "tests/multi_client_mixed_traffic.rs"
-
-[[test]]
-name = "nat_docker_integration"
-path = "tests/nat_docker_integration.rs"
-
-[[test]]
-name = "nat_local"
-path = "tests/nat_local.rs"
-
-[[test]]
-name = "nat_test_harness"
-path = "tests/nat_test_harness.rs"
 
 [[test]]
 name = "nat_traversal_api_tests"
@@ -479,10 +437,6 @@ name = "smoke_quic_connect"
 path = "tests/smoke_quic_connect.rs"
 
 [[test]]
-name = "standard"
-path = "tests/standard/main.rs"
-
-[[test]]
 name = "stress_tests"
 path = "tests/stress_tests.rs"
 
@@ -525,14 +479,14 @@ optional = true
 default-features = false
 
 [dependencies.base64]
-version = "0.22"
+version = "0.23"
 
 [dependencies.blake3]
 version = "1"
 optional = true
 
 [dependencies.btleplug]
-version = "0.11"
+version = "0.13"
 optional = true
 
 [dependencies.bytes]
@@ -540,7 +494,7 @@ version = ">=1.11.1"
 optional = true
 
 [dependencies.chacha20poly1305]
-version = "0.10.1"
+version = "0.11.0"
 features = ["alloc"]
 optional = true
 default-features = false
@@ -550,17 +504,12 @@ version = "0.4"
 features = ["serde"]
 optional = true
 
-[dependencies.clap]
-version = "4"
-features = ["derive"]
-optional = true
-
 [dependencies.dashmap]
 version = "6"
 optional = true
 
 [dependencies.dirs]
-version = "6.0"
+version = "7.0"
 optional = true
 
 [dependencies.enum_dispatch]
@@ -576,7 +525,7 @@ version = "0.4"
 optional = true
 
 [dependencies.igd-next]
-version = "0.17"
+version = "0.18"
 features = ["aio_tokio"]
 optional = true
 default-features = false
@@ -619,11 +568,11 @@ features = ["std"]
 optional = true
 
 [dependencies.proptest-derive]
-version = "0.8"
+version = "0.9"
 optional = true
 
 [dependencies.qlog]
-version = "0.13"
+version = "0.18"
 optional = true
 
 [dependencies.quinn-udp]
@@ -645,15 +594,6 @@ optional = true
 [dependencies.regex]
 version = "1.11"
 optional = true
-
-[dependencies.reqwest]
-version = "0.13"
-features = [
-    "json",
-    "rustls",
-]
-optional = true
-default-features = false
 
 [dependencies.rustc-hash]
 version = "2"
@@ -696,7 +636,7 @@ features = ["derive"]
 optional = true
 
 [dependencies.serde-saphyr]
-version = "1.3"
+version = "2.0"
 features = ["deserialize"]
 optional = true
 default-features = false
@@ -719,7 +659,7 @@ features = ["all"]
 optional = true
 
 [dependencies.stun]
-version = "0.7"
+version = "0.17"
 optional = true
 
 [dependencies.thiserror]
@@ -829,7 +769,7 @@ version = "1.5"
 features = ["std"]
 
 [dev-dependencies.proptest-derive]
-version = "0.8"
+version = "0.9"
 
 [dev-dependencies.quickcheck]
 version = "1.0"

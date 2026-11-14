@@ -17,15 +17,19 @@
 //!
 //! # v0.13.0 Symmetric P2P API
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::P2pConfig;
+//! use std::net::SocketAddr;
+//! # fn example() -> anyhow::Result<()> {
 //!
 //! // All nodes are symmetric - no client/server roles
 //! let config = P2pConfig::builder()
-//!     .bind_addr("0.0.0.0:9000".parse()?)
-//!     .known_peer("peer1.example.com:9000".parse()?)
-//!     .known_peer("peer2.example.com:9000".parse()?)
+//!     .bind_addr("0.0.0.0:9000".parse::<SocketAddr>()?)
+//!     .known_peer("192.0.2.1:9000".parse::<SocketAddr>()?)
+//!     .known_peer("192.0.2.2:9000".parse::<SocketAddr>()?)
 //!     .build()?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::sync::Arc;
@@ -417,9 +421,10 @@ impl P2pConfigBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use saorsa_transport::P2pConfig;
     /// use std::net::SocketAddr;
+    /// # fn example() -> anyhow::Result<()> {
     ///
     /// // Backward compatible: SocketAddr auto-converts
     /// let config = P2pConfig::builder()
@@ -431,6 +436,8 @@ impl P2pConfigBuilder {
     /// let config = P2pConfig::builder()
     ///     .bind_addr(TransportAddr::Quic("0.0.0.0:9000".parse().unwrap()))
     ///     .build()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn bind_addr(mut self, addr: impl Into<TransportAddr>) -> Self {
         self.bind_addr = Some(addr.into());
@@ -448,14 +455,15 @@ impl P2pConfigBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use saorsa_transport::P2pConfig;
     /// use std::net::SocketAddr;
+    /// # fn example() -> anyhow::Result<()> {
     ///
     /// // Backward compatible: SocketAddr
     /// let config = P2pConfig::builder()
-    ///     .known_peer("peer1.example.com:9000".parse::<SocketAddr>().unwrap())
-    ///     .known_peer("peer2.example.com:9000".parse::<SocketAddr>().unwrap())
+    ///     .known_peer("192.0.2.1:9000".parse::<SocketAddr>().unwrap())
+    ///     .known_peer("192.0.2.2:9000".parse::<SocketAddr>().unwrap())
     ///     .build()?;
     ///
     /// // Multi-transport: Mix UDP and BLE
@@ -464,6 +472,8 @@ impl P2pConfigBuilder {
     ///     .known_peer(TransportAddr::Quic("192.168.1.1:9000".parse().unwrap()))
     ///     .known_peer(TransportAddr::ble([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 128))
     ///     .build()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn known_peer(mut self, addr: impl Into<TransportAddr>) -> Self {
         self.known_peers.push(addr.into());
@@ -477,15 +487,16 @@ impl P2pConfigBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use saorsa_transport::P2pConfig;
     /// use std::net::SocketAddr;
+    /// # fn example() -> anyhow::Result<()> {
     ///
     /// // Backward compatible: Vec<SocketAddr>
     /// let peers: Vec<SocketAddr> = vec![
-    ///     "peer1.example.com:9000".parse().unwrap(),
-    ///     "peer2.example.com:9000".parse().unwrap(),
-    ///     "peer3.example.com:9000".parse().unwrap(),
+    ///     "192.0.2.1:9000".parse().unwrap(),
+    ///     "192.0.2.2:9000".parse().unwrap(),
+    ///     "192.0.2.3:9000".parse().unwrap(),
     /// ];
     /// let config = P2pConfig::builder()
     ///     .known_peers(peers)
@@ -500,6 +511,8 @@ impl P2pConfigBuilder {
     /// let config = P2pConfig::builder()
     ///     .known_peers(mixed_peers)
     ///     .build()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn known_peers(
         mut self,
@@ -615,14 +628,18 @@ impl P2pConfigBuilder {
     /// * `storage_dir` - Directory for encrypted keypair storage
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
     /// use saorsa_transport::{P2pConfig, HostIdentity};
+    /// use std::net::SocketAddr;
+    /// # fn example() -> anyhow::Result<()> {
     ///
     /// let host = HostIdentity::generate();
     /// let config = P2pConfig::builder()
-    ///     .bind_addr("0.0.0.0:9000".parse()?)
+    ///     .bind_addr("0.0.0.0:9000".parse::<SocketAddr>()?)
     ///     .with_host_identity(&host, b"my-network", "/var/lib/saorsa-transport")?
     ///     .build()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_host_identity(
         mut self,
@@ -643,14 +660,17 @@ impl P2pConfigBuilder {
     /// connectivity (UDP, BLE, etc.).
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
     /// use saorsa_transport::{P2pConfig, transport::UdpTransport};
     /// use std::sync::Arc;
+    /// # async fn example() -> anyhow::Result<()> {
     ///
     /// let udp = UdpTransport::bind("0.0.0.0:0".parse()?).await?;
     /// let config = P2pConfig::builder()
     ///     .transport_provider(Arc::new(udp))
     ///     .build()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn transport_provider(mut self, provider: Arc<dyn TransportProvider>) -> Self {
         let registry = self
@@ -666,15 +686,18 @@ impl P2pConfigBuilder {
     /// a pre-configured registry with multiple providers.
     ///
     /// # Example
-    /// ```rust,ignore
+    /// ```no_run
     /// use saorsa_transport::{P2pConfig, transport::{TransportRegistry, UdpTransport}};
     /// use std::sync::Arc;
+    /// # async fn example() -> anyhow::Result<()> {
     ///
     /// let mut registry = TransportRegistry::new();
     /// registry.register(Arc::new(UdpTransport::bind("0.0.0.0:0".parse()?).await?));
     /// let config = P2pConfig::builder()
     ///     .transport_registry(registry)
     ///     .build()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn transport_registry(mut self, registry: TransportRegistry) -> Self {
         self.transport_registry = Some(registry);

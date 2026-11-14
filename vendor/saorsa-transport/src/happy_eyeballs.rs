@@ -29,9 +29,10 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::happy_eyeballs::{race_connect, HappyEyeballsConfig};
 //! use std::net::SocketAddr;
+//! # async fn example() -> anyhow::Result<()> {
 //!
 //! let addresses: Vec<SocketAddr> = vec![
 //!     "192.168.1.1:9000".parse().unwrap(),
@@ -43,6 +44,8 @@
 //!     // Your connection logic here
 //!     Ok::<_, String>("connected")
 //! }).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::future::Future;
@@ -154,8 +157,9 @@ fn format_error_summary(errors: &[(SocketAddr, String)]) -> String {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
 /// use saorsa_transport::happy_eyeballs::{sort_addresses, HappyEyeballsConfig, AddressFamily};
+/// use std::net::SocketAddr;
 ///
 /// let addrs: Vec<SocketAddr> = vec![
 ///     "192.168.1.1:80".parse().unwrap(),  // v4_a
@@ -173,6 +177,8 @@ fn format_error_summary(errors: &[(SocketAddr, String)]) -> String {
 ///
 /// let sorted = sort_addresses(&addrs, &config);
 /// // Result: [v6_a, v4_a, v6_b, v4_b, v4_c]
+/// # assert_eq!(sorted[0], addrs[1]);
+/// # assert_eq!(sorted[1], addrs[0]);
 /// ```
 pub fn sort_addresses(addresses: &[SocketAddr], config: &HappyEyeballsConfig) -> Vec<SocketAddr> {
     if addresses.is_empty() {

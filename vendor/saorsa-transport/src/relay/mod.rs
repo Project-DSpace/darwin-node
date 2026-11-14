@@ -33,16 +33,20 @@
 //! The primary relay implementation is in [`crate::masque`]. This module
 //! provides shared infrastructure components.
 //!
-//! ```rust,ignore
-//! use saorsa_transport::masque::{MasqueRelayServer, MasqueRelayClient, RelayManager};
-//! use saorsa_transport::relay::{RelayAuthenticator, RateLimiter};
+//! ```no_run
+//! use saorsa_transport::masque::{MasqueRelayServer, MasqueRelayClient, MasqueRelayConfig, RelayClientConfig};
+//! use saorsa_transport::relay::RelayAuthenticator;
+//! use std::net::SocketAddr;
+//! # fn example(relay_address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
 //!
 //! // Create a relay server with authentication
-//! let authenticator = RelayAuthenticator::new(keypair);
-//! let server = MasqueRelayServer::new(config, relay_address);
+//! let authenticator = RelayAuthenticator::new()?;
+//! let server = MasqueRelayServer::new(MasqueRelayConfig::default(), relay_address);
 //!
 //! // Create a relay client
-//! let client = MasqueRelayClient::new(relay_address, client_config);
+//! let client = MasqueRelayClient::new(relay_address, RelayClientConfig::default());
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! See [`crate::masque`] for the full MASQUE implementation.

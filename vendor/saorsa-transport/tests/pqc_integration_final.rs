@@ -26,12 +26,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
-/// Performance target: PQC overhead should be less than 150% in release builds.
-/// Note: Debug builds are significantly slower; allow a higher ceiling there.
-const MAX_PQC_OVERHEAD_PERCENT: f64 = 150.0;
-// Debug builds have significantly higher overhead due to unoptimized crypto operations
-const MAX_PQC_OVERHEAD_PERCENT_DEBUG: f64 = 10000.0;
-
 /// Security requirement: minimum key sizes
 const MIN_ML_KEM_KEY_SIZE: usize = 1184; // ML-KEM-768 public key size
 const MIN_ML_DSA_KEY_SIZE: usize = 1952; // ML-DSA-65 public key size
@@ -208,61 +202,6 @@ async fn test_ml_dsa_operations() {
 
 // v0.2: Hybrid mode test removed - pure PQC only
 // This is a greenfield network with no legacy compatibility requirements.
-
-#[tokio::test]
-async fn test_pqc_performance_overhead() {
-    // Create endpoints with different configurations
-    let max_overhead = if cfg!(debug_assertions) {
-        MAX_PQC_OVERHEAD_PERCENT_DEBUG
-    } else {
-        MAX_PQC_OVERHEAD_PERCENT
-    };
-
-    // Baseline: Classic crypto only
-    let classic_start = Instant::now();
-    let (cert_chain, private_key) = generate_test_cert();
-    let classic_config = ServerConfig::with_single_cert(cert_chain, private_key)
-        .expect("Failed to create classic config");
-    let _classic_endpoint = Endpoint::server(classic_config, "127.0.0.1:0".parse().unwrap())
-        .expect("Failed to create classic endpoint");
-    let classic_time = classic_start.elapsed();
-
-    // PQC: v0.13.0+ always PQC-only
-    let pqc_start = Instant::now();
-    let _pqc_config = PqcConfigBuilder::default()
-        .ml_kem(true)
-        .ml_dsa(true)
-        .build()
-        .expect("Failed to build PQC config");
-
-    // Note: In production, we'd integrate PQC config with ServerConfig
-    // For now, we measure the overhead of PQC operations separately
-    let ml_kem = MlKem768::new();
-    let ml_dsa = MlDsa65::new();
-
-    // Simulate PQC operations that would happen during handshake
-    let (kem_pub, _kem_sec) = ml_kem.generate_keypair().unwrap();
-    let (_ct, _ss) = ml_kem.encapsulate(&kem_pub).unwrap();
-    let (dsa_pub, dsa_sec) = ml_dsa.generate_keypair().unwrap();
-    let sig = ml_dsa.sign(&dsa_sec, b"handshake").unwrap();
-    let _ = ml_dsa.verify(&dsa_pub, b"handshake", &sig).unwrap();
-
-    let pqc_time = pqc_start.elapsed();
-
-    // Calculate overhead
-    let overhead_percent = ((pqc_time.as_secs_f64() / classic_time.as_secs_f64()) - 1.0) * 100.0;
-
-    println!("Performance Comparison:");
-    println!("  Classic crypto: {classic_time:?}");
-    println!("  PQC (always-on): {pqc_time:?}");
-    println!("  Overhead: {overhead_percent:.1}%");
-
-    // Verify we meet performance target
-    assert!(
-        overhead_percent < max_overhead,
-        "PQC overhead {overhead_percent:.1}% exceeds target of {max_overhead}%"
-    );
-}
 
 #[tokio::test]
 async fn test_backward_compatibility() {

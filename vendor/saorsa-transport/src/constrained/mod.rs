@@ -100,9 +100,10 @@
 //!
 //! # Example: Using with TransportAddr
 //!
-//! ```rust,ignore
-//! use saorsa_transport::constrained::{ConstrainedTransport, ConstrainedHandle};
+//! ```no_run
+//! use saorsa_transport::constrained::{AdapterEvent, ConstrainedTransport};
 //! use saorsa_transport::transport::TransportAddr;
+//! # fn example(received_data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
 //!
 //! // Create transport for BLE
 //! let transport = ConstrainedTransport::for_ble();
@@ -119,7 +120,7 @@
 //! handle.send(conn_id, b"Hello, BLE!")?;
 //!
 //! // Process incoming packets and check for events
-//! handle.process_incoming(&ble_addr, &received_data)?;
+//! handle.process_incoming(&ble_addr, received_data)?;
 //! while let Some(event) = handle.next_event() {
 //!     match event {
 //!         AdapterEvent::DataReceived { connection_id, data } => {
@@ -128,6 +129,8 @@
 //!         _ => {}
 //!     }
 //! }
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Module Organization

@@ -127,7 +127,7 @@ jobs:
           check "the rest of $dir" "$recorded" "$actual"
           exit $fail
 
-      # vendor/saorsa-transport is saorsa-transport 0.38.2 from crates.io
+      # vendor/saorsa-transport is saorsa-transport 0.39.0 from crates.io
       # with only the bookkeeping of accepted connections changed
       # (vendor/saorsa-transport/VENDORED.md): the patched file and the rest
       # of the copy are the git objects that file records.

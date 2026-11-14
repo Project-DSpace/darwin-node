@@ -22,7 +22,9 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
+//! use saorsa_transport::connection_strategy::{ConnectionStage, ConnectionStrategy, StrategyConfig};
+//! # fn example() {
 //! let config = StrategyConfig::default();
 //! let mut strategy = ConnectionStrategy::new(config);
 //!
@@ -50,6 +52,7 @@
 //!         }
 //!     }
 //! }
+//! # }
 //! ```
 
 use std::net::SocketAddr;

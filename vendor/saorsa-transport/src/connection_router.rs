@@ -46,9 +46,10 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::connection_router::{ConnectionRouter, RouterConfig};
 //! use saorsa_transport::transport::TransportAddr;
+//! # async fn example() -> anyhow::Result<()> {
 //!
 //! // Create router with default config
 //! let router = ConnectionRouter::new(RouterConfig::default());
@@ -59,11 +60,10 @@
 //!     psm: 128,
 //! };
 //!
-//! // This will use the Constrained engine
-//! let conn = router.connect(&ble_addr).await?;
-//!
-//! // Send data through the routed connection
-//! conn.send(b"Hello!").await?;
+//! // This will use the Constrained engine (no QUIC server name needed)
+//! let conn = router.connect_async(&ble_addr, None).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::fmt;

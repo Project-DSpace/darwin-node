@@ -196,7 +196,7 @@ impl Endpoint {
     ///
     /// When the `network-discovery` feature is enabled (the default), this
     /// also raises `SO_SNDBUF` / `SO_RCVBUF` on `socket` to the PQC-sized
-    /// recommendation (see [`buffer_defaults::recommended_buffer_size`]).
+    /// recommendation (see [`buffer_defaults::recommended_buffer_size`](crate::config::buffer_defaults::recommended_buffer_size)).
     /// saorsa-transport defaults to PQC handshakes, whose Initial flights
     /// and sustained throughput both benefit from multi-MB kernel buffers;
     /// the platform default (e.g. 512 KiB on macOS) is too small for bulk
@@ -590,7 +590,7 @@ pub struct EndpointStats {
     pub refused_handshakes: u64,
     /// Cummulative number of Quic handshakes ignored on this [Endpoint]
     pub ignored_handshakes: u64,
-    /// Cumulative count of [`ConnectionEvent`]s dropped because a
+    /// Cumulative count of `ConnectionEvent`s dropped because a
     /// per-connection inbox was full.
     ///
     /// Since the per-connection mailbox was converted from

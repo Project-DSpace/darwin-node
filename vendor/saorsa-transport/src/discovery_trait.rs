@@ -238,7 +238,7 @@ impl Stream for ConcurrentDiscoveryStream {
 
 /// A simple discovery source that yields addresses from a channel.
 ///
-/// The receiver is moved into the first stream returned by [`discover()`].
+/// The receiver is moved into the first stream returned by [`discover()`](Discovery::discover).
 /// Subsequent calls return an immediately-empty stream. This avoids
 /// holding a mutex across `.await` points, which would serialize
 /// concurrent consumers.

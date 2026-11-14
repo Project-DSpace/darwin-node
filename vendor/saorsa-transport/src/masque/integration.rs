@@ -26,9 +26,11 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::masque::integration::{RelayManager, RelayManagerConfig};
+//! use bytes::Bytes;
 //! use std::net::SocketAddr;
+//! # async fn example(relay_addr: SocketAddr, target: SocketAddr) -> anyhow::Result<()> {
 //!
 //! let config = RelayManagerConfig::default();
 //! let manager = RelayManager::new(config);
@@ -36,8 +38,10 @@
 //! // Add relay nodes
 //! manager.add_relay_node(relay_addr).await;
 //!
-//! // Attempt connection through relay
-//! let result = manager.connect_via_relay(target).await;
+//! // Encode a payload for `target` to be forwarded through the relay
+//! let result = manager.send_via_relay(relay_addr, target, Bytes::from_static(b"hello")).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::HashMap;

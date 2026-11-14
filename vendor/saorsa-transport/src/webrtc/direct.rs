@@ -20,7 +20,7 @@
 //!
 //! The browser keeps the ICE credentials generated for its local SDP offer and
 //! synthesizes the listener's SDP answer from the bootstrap endpoint. The
-//! answer's username fragment uses [`ICE_CREDENTIAL_PREFIX`] and carries the
+//! answer's username fragment uses [`ICE_CREDENTIAL_PREFIX`](crate::webrtc::direct::ICE_CREDENTIAL_PREFIX) and carries the
 //! browser-generated ICE password. The listener recovers that password, the
 //! browser's username fragment, and its observed address from the first STUN
 //! binding request, then constructs the corresponding peer connection locally.
@@ -42,8 +42,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use stun::attributes::ATTR_USERNAME;
-use stun::message::{Message as StunMessage, is_message as is_stun_message};
+use stun::attributes::{
+    ATTR_FINGERPRINT, ATTR_ICE_CONTROLLING, ATTR_MESSAGE_INTEGRITY, ATTR_USE_CANDIDATE,
+    ATTR_USERNAME,
+};
+use stun::fingerprint::FINGERPRINT;
+use stun::integrity::MessageIntegrity;
+use stun::message::{Message as StunMessage, Setter, is_message as is_stun_message};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -791,15 +796,31 @@ async fn create_inbound_connection(
     });
     // Admission consumed the authenticated Binding request that proved the
     // return path. Deliver it to this generation's ICE agent before it starts,
-    // so nomination does not depend on the client's next retransmission.
+    // so ICE answers it without waiting for the client's next retransmission.
+    //
+    // Deliver it as a nomination, so ICE connects, and DTLS starts, once this
+    // agent's own check of the pair succeeds. A browser starts DTLS when its
+    // first check succeeds but nominates an ICE-lite peer only on a later
+    // check, which libwebrtc sends up to about a second after that; the agent
+    // would otherwise hold the browser's ClientHello until then. Admission
+    // bound this credential to the one source that proved the return path, so
+    // this is the only pair the browser can ever select. This relies on
+    // webrtc-ice 0.14 remembering a nomination of a pair until its own check
+    // of the pair succeeds; rtc-ice 0.21 forgets it, and does not answer the
+    // nominating request either.
+    //
     // Keep this same writer alive in SettingEngine: UDPMuxConn holds it weakly.
     let writer: Arc<dyn UDPMuxWriter + Send + Sync> = association_mux.clone();
     let initial_conn = udp_mux
         .get_owned_conn(server_ufrag, Some(generation), writer)
         .await
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
+    let nominating = nominating_request(&association.initial_packet, server_ufrag);
     initial_conn
-        .write_packet(&association.initial_packet, remote_addr)
+        .write_packet(
+            nominating.as_deref().unwrap_or(&association.initial_packet),
+            remote_addr,
+        )
         .await
         .map_err(|error| WebRtcDirectError::Session(error.to_string()))?;
     settings.set_udp_network(UDPNetwork::Muxed(association_mux));
@@ -1637,6 +1658,47 @@ fn stun_ice_credentials(packet: &[u8]) -> Option<(String, String)> {
     Some((local.to_string(), remote.to_string()))
 }
 
+/// Return a copy of a controlling agent's Binding request that nominates its
+/// candidate pair, or `None` to deliver the request as it came: it already
+/// nominates, comes from an agent that may not nominate, or cannot be
+/// re-encoded.
+///
+/// The copy keeps the request's transaction, so the client takes the agent's
+/// answer as the answer to its own check. It is signed again with the
+/// listener's ICE password, the credential the client signed it with.
+fn nominating_request(request: &[u8], server_credential: &str) -> Option<Vec<u8>> {
+    let mut incoming = StunMessage::new();
+    incoming.unmarshal_binary(request).ok()?;
+    // MESSAGE-INTEGRITY signs only the attributes before it, and receivers
+    // ignore everything after it but FINGERPRINT (RFC 8489 §14.5), so decide
+    // on and copy only the signed ones. A FINGERPRINT among them is malformed
+    // and would make the new MESSAGE-INTEGRITY unencodable.
+    let signed: Vec<_> = incoming
+        .attributes
+        .0
+        .iter()
+        .take_while(|attribute| attribute.typ != ATTR_MESSAGE_INTEGRITY)
+        .filter(|attribute| attribute.typ != ATTR_FINGERPRINT)
+        .collect();
+    let signs = |typ| signed.iter().any(|attribute| attribute.typ == typ);
+    if signs(ATTR_USE_CANDIDATE) || !signs(ATTR_ICE_CONTROLLING) {
+        return None;
+    }
+    let mut nominating = StunMessage::new();
+    nominating.typ = incoming.typ;
+    nominating.transaction_id = incoming.transaction_id;
+    nominating.write_header();
+    for attribute in signed {
+        nominating.add(attribute.typ, &attribute.value);
+    }
+    nominating.add(ATTR_USE_CANDIDATE, &[]);
+    MessageIntegrity::new_short_term_integrity(server_credential.to_string())
+        .add_to(&mut nominating)
+        .ok()?;
+    FINGERPRINT.add_to(&mut nominating).ok()?;
+    Some(nominating.raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1644,21 +1706,28 @@ mod tests {
     use std::pin::pin;
     use std::task::Poll;
     use stun::agent::TransactionId;
-    use stun::attributes::ATTR_USE_CANDIDATE;
+    use stun::attributes::{ATTR_ICE_CONTROLLED, ATTR_PRIORITY, AttrType};
     use stun::message::{BINDING_REQUEST, BINDING_SUCCESS};
     use stun::textattrs::Username;
     use tokio::task::JoinSet;
+    use webrtc_stack::dtls::config::Config as DtlsConfig;
+    use webrtc_stack::dtls::conn::DTLSConn;
+    use webrtc_stack::dtls::crypto::Certificate as DtlsCertificate;
     use webrtc_stack::ice_transport::ice_connection_state::RTCIceConnectionState;
     use webrtc_stack::peer_connection::signaling_state::RTCSignalingState;
+
+    // The record content type of a DTLS handshake message (RFC 6347).
+    const DTLS_HANDSHAKE_CONTENT_TYPE: u8 = 22;
 
     // Relay STUN both ways and drop everything else, from one upstream port.
     // ICE connects and stays up, but the listener's DTLS server never sees a
     // ClientHello: what a browser that gives up after ICE leaves behind.
-    // While `nominate` is false, the client's nominating checks are dropped as
-    // well, so ICE does not connect and DTLS does not start.
+    // While `connect` is false, the listener's own checks are dropped as well,
+    // so its candidate pair never succeeds: ICE does not connect and DTLS does
+    // not start.
     async fn spawn_stun_only_relay(
         listener: SocketAddr,
-        nominate: Arc<AtomicBool>,
+        connect: Arc<AtomicBool>,
     ) -> std::io::Result<(SocketAddr, JoinSet<()>)> {
         let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -1675,7 +1744,6 @@ mod tests {
                     if let Some(packet) = buffer
                         .get(..length)
                         .filter(|packet| is_stun_message(packet))
-                        .filter(|packet| nominate.load(Ordering::Relaxed) || !is_nomination(packet))
                     {
                         let _ = back.send_to(packet, listener).await;
                     }
@@ -1684,22 +1752,29 @@ mod tests {
         }
         tasks.spawn(async move {
             let mut buffer = [0u8; 2048];
+            // Admission challenges are requests too, but admission never sends
+            // a success response. ICE answers the admitted request before it
+            // sends its first check, so requests after a success are ICE's.
+            let mut answered = false;
             while let Ok((length, _)) = back.recv_from(&mut buffer).await {
-                let packet = buffer
+                let mut message = StunMessage::new();
+                let Some(packet) = buffer
                     .get(..length)
-                    .filter(|packet| is_stun_message(packet));
+                    .filter(|packet| message.unmarshal_binary(packet).is_ok())
+                else {
+                    continue;
+                };
+                answered |= message.typ == BINDING_SUCCESS;
+                if answered && message.typ == BINDING_REQUEST && !connect.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let target = *client.lock();
-                if let (Some(packet), Some(target)) = (packet, target) {
+                if let Some(target) = target {
                     let _ = front.send_to(packet, target).await;
                 }
             }
         });
         Ok((relay_addr, tasks))
-    }
-
-    fn is_nomination(packet: &[u8]) -> bool {
-        let mut message = StunMessage::new();
-        message.unmarshal_binary(packet).is_ok() && message.contains(ATTR_USE_CANDIDATE)
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -1724,9 +1799,9 @@ mod tests {
     }
 
     // A listener with one accepted connection from a native client behind a
-    // STUN-only relay, which forwards nominations while `nominate` is true.
+    // STUN-only relay, which lets ICE connect while `connect` is true.
     async fn accept_through_stun_only_relay(
-        nominate: Arc<AtomicBool>,
+        connect: Arc<AtomicBool>,
     ) -> anyhow::Result<(
         WebRtcDirectListener,
         WebRtcDirectConnection,
@@ -1736,7 +1811,7 @@ mod tests {
         let certificate = WebRtcCertificate::generate()?;
         let certificate_hash = certificate.sha256_digest()?;
         let mut listener = WebRtcDirectListener::bind("127.0.0.1:0".parse()?, certificate).await?;
-        let (relay, relay_tasks) = spawn_stun_only_relay(listener.local_addr(), nominate).await?;
+        let (relay, relay_tasks) = spawn_stun_only_relay(listener.local_addr(), connect).await?;
         let endpoint = WebRtcDirectAddr::new(
             relay,
             crate::transport::WebRtcCertificateHash::new(certificate_hash),
@@ -1752,11 +1827,11 @@ mod tests {
     async fn assert_teardown_releases_pending_dtls_handshake(
         teardown: Teardown,
     ) -> anyhow::Result<()> {
-        let nominate = !matches!(teardown, Teardown::CloseOnAccept);
+        let connect = !matches!(teardown, Teardown::CloseOnAccept);
         let (_listener, connection, _relay, _client) =
-            accept_through_stun_only_relay(Arc::new(AtomicBool::new(nominate))).await?;
+            accept_through_stun_only_relay(Arc::new(AtomicBool::new(connect))).await?;
         let dtls = connection.peer_connection.dtls_transport();
-        if nominate {
+        if connect {
             // ICE is connected and the DTLS server is waiting for a ClientHello.
             tokio::time::timeout(Duration::from_secs(5), async {
                 while dtls.state() != RTCDtlsTransportState::Connecting {
@@ -1765,8 +1840,8 @@ mod tests {
             })
             .await?;
         } else {
-            // Nothing nominated a pair, so ICE has not connected and DTLS has
-            // not started.
+            // The listener's check of the pair never succeeded, so ICE has not
+            // connected and DTLS has not started.
             assert_eq!(dtls.state(), RTCDtlsTransportState::New);
         }
         let transport = Arc::downgrade(&dtls);
@@ -1907,16 +1982,16 @@ mod tests {
     // not count as a successful connection.
     #[tokio::test]
     async fn ice_connecting_after_dtls_stop_starts_no_handshake() -> anyhow::Result<()> {
-        let nominate = Arc::new(AtomicBool::new(false));
+        let connect = Arc::new(AtomicBool::new(false));
         let (listener, connection, _relay, _client) =
-            accept_through_stun_only_relay(Arc::clone(&nominate)).await?;
+            accept_through_stun_only_relay(Arc::clone(&connect)).await?;
         let diagnostics = listener.diagnostics();
         let peer = Arc::clone(&connection.peer_connection);
         let dtls = peer.dtls_transport();
         assert_eq!(dtls.state(), RTCDtlsTransportState::New);
 
         stop_unstarted_dtls(&dtls).await;
-        nominate.store(true, Ordering::Relaxed);
+        connect.store(true, Ordering::Relaxed);
         tokio::time::timeout(Duration::from_secs(5), async {
             while peer.ice_connection_state() != RTCIceConnectionState::Connected {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1965,6 +2040,177 @@ mod tests {
             released.is_ok(),
             "the closed connection kept its DTLS transport"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nominating_request_keeps_the_check_and_its_credentials() -> anyhow::Result<()> {
+        let password = "browserPassword0123456789";
+        let server = format!("{ICE_CREDENTIAL_PREFIX_V2}{password}");
+        let request = admission::tests::request(password);
+        let nominating = nominating_request(&request, &server)
+            .ok_or_else(|| anyhow::anyhow!("the request was not re-encoded"))?;
+
+        let mut original = StunMessage::new();
+        original.unmarshal_binary(&request)?;
+        let mut message = StunMessage::new();
+        message.unmarshal_binary(&nominating)?;
+        assert!(!original.contains(ATTR_USE_CANDIDATE));
+        assert!(message.contains(ATTR_USE_CANDIDATE));
+        assert_eq!(message.typ, original.typ);
+        assert_eq!(message.transaction_id, original.transaction_id);
+        for attribute in [ATTR_USERNAME, ATTR_ICE_CONTROLLING, ATTR_PRIORITY] {
+            assert_eq!(message.get(attribute)?, original.get(attribute)?);
+        }
+        MessageIntegrity::new_short_term_integrity(server.clone()).check(&mut message)?;
+        FINGERPRINT.check(&message)?;
+
+        // A request that already nominates is delivered as it came.
+        assert_eq!(nominating_request(&nominating, &server), None);
+        Ok(())
+    }
+
+    #[test]
+    fn nominating_request_leaves_requests_it_may_not_nominate() -> anyhow::Result<()> {
+        let server = format!("{ICE_CREDENTIAL_PREFIX_V2}browserPassword0123456789");
+        let request = |role| -> anyhow::Result<Vec<u8>> {
+            let mut message = StunMessage::new();
+            message.build(&[
+                Box::new(TransactionId::new()),
+                Box::new(BINDING_REQUEST),
+                Box::new(Username::new(
+                    ATTR_USERNAME,
+                    format!("{server}:browserClientUfrag"),
+                )),
+            ])?;
+            message.add(role, &1u64.to_be_bytes());
+            MessageIntegrity::new_short_term_integrity(server.clone()).add_to(&mut message)?;
+            FINGERPRINT.add_to(&mut message)?;
+            Ok(message.raw)
+        };
+        // Only the controlling agent nominates (RFC 8445 §7.1.2).
+        assert_eq!(
+            nominating_request(&request(ATTR_ICE_CONTROLLED)?, &server),
+            None
+        );
+        assert!(nominating_request(&request(ATTR_ICE_CONTROLLING)?, &server).is_some());
+        Ok(())
+    }
+
+    // Whether admission admits `packet` from a source that returns the
+    // challenge it answers with.
+    fn admits(packet: &[u8], password: &str) -> anyhow::Result<bool> {
+        let mut admission = admission::Admission::default();
+        let source = "127.0.0.1:5000".parse()?;
+        let now = tokio::time::Instant::now();
+        let admission::Decision::Challenge(challenge) = admission.receive(packet, source, now)
+        else {
+            return Ok(false);
+        };
+        let proof = admission::tests::response(&challenge, password, source);
+        admission.receive(&proof, source, now);
+        Ok(matches!(
+            admission.receive(packet, source, now),
+            admission::Decision::Admit(_)
+        ))
+    }
+
+    // MESSAGE-INTEGRITY signs only the attributes before it, so admission
+    // admits a request with attributes appended after it. The copy must
+    // decide on the signed attributes alone.
+    #[test]
+    fn nominating_request_ignores_attributes_after_message_integrity() -> anyhow::Result<()> {
+        let password = "browserPassword0123456789";
+        let server = format!("{ICE_CREDENTIAL_PREFIX_V2}{password}");
+        let tie_breaker = 1u64.to_be_bytes();
+        let request = |role: AttrType, unsigned: &[(AttrType, &[u8])]| -> anyhow::Result<Vec<u8>> {
+            let mut message = StunMessage::new();
+            message.build(&[
+                Box::new(TransactionId::new()),
+                Box::new(BINDING_REQUEST),
+                Box::new(Username::new(
+                    ATTR_USERNAME,
+                    format!("{server}:browserClientUfrag"),
+                )),
+            ])?;
+            message.add(role, &tie_breaker);
+            message.add(ATTR_PRIORITY, &1u32.to_be_bytes());
+            MessageIntegrity::new_short_term_integrity(server.clone()).add_to(&mut message)?;
+            for (typ, value) in unsigned {
+                message.add(*typ, value);
+            }
+            FINGERPRINT.add_to(&mut message)?;
+            Ok(message.raw)
+        };
+
+        // An unsigned ICE-CONTROLLING does not make a controlled agent's
+        // request nominate.
+        let controlled = request(ATTR_ICE_CONTROLLED, &[(ATTR_ICE_CONTROLLING, &tie_breaker)])?;
+        assert!(admits(&controlled, password)?);
+        assert_eq!(nominating_request(&controlled, &server), None);
+
+        // An unsigned USE-CANDIDATE neither stops a controlling agent's
+        // request from nominating nor survives into the copy.
+        let controlling = request(ATTR_ICE_CONTROLLING, &[(ATTR_USE_CANDIDATE, &[])])?;
+        assert!(admits(&controlling, password)?);
+        let nominating = nominating_request(&controlling, &server)
+            .ok_or_else(|| anyhow::anyhow!("the request was not re-encoded"))?;
+        let mut message = StunMessage::new();
+        message.unmarshal_binary(&nominating)?;
+        let types: Vec<_> = message
+            .attributes
+            .0
+            .iter()
+            .map(|attribute| attribute.typ)
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ATTR_USERNAME,
+                ATTR_ICE_CONTROLLING,
+                ATTR_PRIORITY,
+                ATTR_USE_CANDIDATE,
+                ATTR_MESSAGE_INTEGRITY,
+                ATTR_FINGERPRINT,
+            ]
+        );
+        MessageIntegrity::new_short_term_integrity(server).check(&mut message)?;
+        FINGERPRINT.check(&message)?;
+        Ok(())
+    }
+
+    // Admission's FINGERPRINT check reads the first FINGERPRINT but hashes up
+    // to the last one, so an admitted request can carry one before
+    // MESSAGE-INTEGRITY. The copy must still be signed.
+    #[test]
+    fn nominating_request_drops_a_fingerprint_before_message_integrity() -> anyhow::Result<()> {
+        let server = format!("{ICE_CREDENTIAL_PREFIX_V2}browserPassword0123456789");
+        let mut crafted = StunMessage::new();
+        crafted.build(&[
+            Box::new(TransactionId::new()),
+            Box::new(BINDING_REQUEST),
+            Box::new(Username::new(
+                ATTR_USERNAME,
+                format!("{server}:browserClientUfrag"),
+            )),
+        ])?;
+        crafted.add(ATTR_ICE_CONTROLLING, &1u64.to_be_bytes());
+        crafted.add(ATTR_FINGERPRINT, &[0; 4]);
+        crafted.add(ATTR_MESSAGE_INTEGRITY, &[0; 20]);
+
+        let nominating = nominating_request(&crafted.raw, &server)
+            .ok_or_else(|| anyhow::anyhow!("the request was not re-encoded"))?;
+        let mut message = StunMessage::new();
+        message.unmarshal_binary(&nominating)?;
+        let fingerprints = message
+            .attributes
+            .0
+            .iter()
+            .filter(|attribute| attribute.typ == ATTR_FINGERPRINT)
+            .count();
+        assert_eq!(fingerprints, 1);
+        MessageIntegrity::new_short_term_integrity(server).check(&mut message)?;
+        FINGERPRINT.check(&message)?;
         Ok(())
     }
 
@@ -2543,6 +2789,85 @@ mod tests {
         .expect("ICE waited for a retransmission after admission");
         connection.close().await.unwrap();
         listener.close().await.unwrap();
+    }
+
+    // The first datagram of a DTLS client's handshake: a ClientHello.
+    async fn dtls_client_hello() -> anyhow::Result<Vec<u8>> {
+        let capture = UdpSocket::bind("127.0.0.1:0").await?;
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        client.connect(capture.local_addr()?).await?;
+        let config = DtlsConfig {
+            certificates: vec![DtlsCertificate::generate_self_signed(vec![
+                "browser".to_string(),
+            ])?],
+            insecure_skip_verify: true,
+            srtp_protection_profiles: vec![SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm],
+            ..DtlsConfig::default()
+        };
+        let handshake = tokio::spawn(DTLSConn::new(Arc::new(client), config, true, None));
+        let mut buffer = [0u8; 2048];
+        let received =
+            tokio::time::timeout(Duration::from_secs(2), capture.recv_from(&mut buffer)).await;
+        handshake.abort();
+        let (length, _) = received??;
+        Ok(buffer[..length].to_vec())
+    }
+
+    // A browser marks ICE connected as soon as its first check succeeds and
+    // sends its ClientHello at once, but nominates an ICE-lite listener only on
+    // a later check, up to about a second later. The listener must answer the
+    // ClientHello without that nomination.
+    #[tokio::test]
+    async fn answers_a_client_hello_without_waiting_for_nomination() -> anyhow::Result<()> {
+        let mut listener =
+            WebRtcDirectListener::bind("127.0.0.1:0".parse()?, WebRtcCertificate::generate()?)
+                .await?;
+        let browser = UdpSocket::bind("127.0.0.1:0").await?;
+        let password = "browserPassword0123456789";
+        prove_association(&browser, &listener, password).await;
+        let connection = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await??;
+
+        // Answer the listener's own check, so the pair succeeds on both sides.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffer = [0u8; 2048];
+            loop {
+                let (length, _) = browser.recv_from(&mut buffer).await?;
+                let mut message = StunMessage::new();
+                message.unmarshal_binary(&buffer[..length])?;
+                if message.typ == BINDING_REQUEST {
+                    let response = admission::tests::response(
+                        &buffer[..length],
+                        password,
+                        browser.local_addr()?,
+                    );
+                    browser.send_to(&response, listener.local_addr()).await?;
+                    return anyhow::Ok(());
+                }
+            }
+        })
+        .await??;
+
+        // Send the ClientHello once and never nominate, so only an answer to
+        // this one flight can arrive.
+        browser
+            .send_to(&dtls_client_hello().await?, listener.local_addr())
+            .await?;
+        let answer = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut buffer = [0u8; 2048];
+            loop {
+                let (length, _) = browser.recv_from(&mut buffer).await?;
+                if !is_stun_message(&buffer[..length]) {
+                    return anyhow::Ok(buffer[0]);
+                }
+            }
+        })
+        .await;
+        connection.close().await?;
+        listener.close().await?;
+        let content_type =
+            answer.map_err(|_| anyhow::anyhow!("the listener waited for a nomination"))??;
+        assert_eq!(content_type, DTLS_HANDSHAKE_CONTENT_TYPE);
+        Ok(())
     }
 
     #[tokio::test]

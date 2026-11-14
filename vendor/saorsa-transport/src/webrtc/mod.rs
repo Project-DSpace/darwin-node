@@ -12,7 +12,7 @@
 //!
 //! WebRTC requests are split across ordered SCTP messages. A fixed deadline is
 //! appropriate for headers and small control requests, but not for a full
-//! [`MAX_BROWSER_RECORD_BYTES`] body competing with other replica uploads. Both
+//! [`MAX_BROWSER_RECORD_BYTES`](crate::webrtc::MAX_BROWSER_RECORD_BYTES) body competing with other replica uploads. Both
 //! sides use this module so the sender never waits longer than the receiver is
 //! willing to accept the same frame.
 

@@ -11,6 +11,11 @@
 //! Integration tests for automatic channel binding on connect and NEW_TOKEN v2 issuance.
 //!
 //! v0.2.0+: Updated for Pure PQC - uses ML-DSA-65 keypairs, no Ed25519.
+//!
+//! These tests install a process-wide trust runtime (`trust::set_global_runtime`), which turns
+//! on automatic channel binding for every connection in the process. They therefore live in
+//! their own test target rather than in `quick`, and take `GLOBAL_RUNTIME_LOCK` so they don't
+//! swap the runtime out from under each other.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -24,9 +29,12 @@ use saorsa_transport::crypto::raw_public_keys::pqc::{
 };
 use saorsa_transport::{
     TokenStore,
-    config::{ClientConfig, ServerConfig},
+    config::{ClientConfig, ServerConfig, ValidationTokenConfig},
     high_level::Endpoint,
 };
+
+/// Held for the whole of each test, since each one installs its own global trust runtime.
+static GLOBAL_RUNTIME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn gen_self_signed_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -57,6 +65,10 @@ async fn mk_server() -> (
     let token_key = quic::token_v2::test_key_from_rng(&mut rng);
     let mut server_cfg = ServerConfig::with_single_cert(chain.clone(), key).expect("server cfg");
     server_cfg.token_key(token_key);
+    // The server sends no NEW_TOKEN frames by default
+    let mut validation_token = ValidationTokenConfig::default();
+    validation_token.sent(2);
+    server_cfg.validation_token_config(validation_token);
     let ep = Endpoint::server(server_cfg, ([127, 0, 0, 1], 0).into()).expect("server ep");
     let addr = ep.local_addr().expect("server addr");
     (ep, addr, chain, token_key)
@@ -75,6 +87,7 @@ impl TokenStore for CollectingTokenStore {
 
 #[tokio::test]
 async fn auto_binding_emits_new_token_v2() {
+    let _lock = GLOBAL_RUNTIME_LOCK.lock().await;
     let (server, server_addr, chain, token_key) = mk_server().await;
 
     // Prepare client identity (ML-DSA-65) and trust runtime
@@ -151,6 +164,7 @@ async fn auto_binding_emits_new_token_v2() {
 
 #[tokio::test]
 async fn auto_binding_rejects_on_mismatch() {
+    let _lock = GLOBAL_RUNTIME_LOCK.lock().await;
     let (server, server_addr, chain, _token_key) = mk_server().await;
 
     // Prepare client identity (ML-DSA-65)

@@ -143,11 +143,14 @@ pub use ble::{
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
 /// use saorsa_transport::transport::default_registry;
+/// # async fn example() -> anyhow::Result<()> {
 ///
 /// let registry = default_registry("0.0.0.0:0").await?;
 /// assert!(registry.has_quic_capable_transport());
+/// # Ok(())
+/// # }
 /// ```
 #[cfg(feature = "native")]
 pub async fn default_registry(bind_addr: &str) -> Result<TransportRegistry, std::io::Error> {

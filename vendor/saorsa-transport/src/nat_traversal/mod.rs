@@ -45,19 +45,20 @@
 //!
 //! ## Example
 //!
-//! ```ignore
+//! ```no_run
 //! use saorsa_transport::nat_traversal::CapabilityFlags;
+//! use saorsa_transport::nat_traversal_api::NatTraversalEndpoint;
 //! use saorsa_transport::transport::TransportAddr;
+//! # fn example(endpoint: &NatTraversalEndpoint) -> Result<(), Box<dyn std::error::Error>> {
 //!
-//! // Advertise a BLE address with capability flags
+//! // Advertise a UDP address with capability flags
 //! endpoint.advertise_transport_address(
-//!     TransportAddr::Ble {
-//!         mac: [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
-//!         psm: 0x0080,
-//!     },
-//!     50,
-//!     Some(CapabilityFlags::ble()),
-//! );
+//!     TransportAddr::Udp("192.168.1.100:9000".parse().unwrap()),
+//!     100,
+//!     Some(CapabilityFlags::broadband()),
+//! )?;
+//! # Ok(())
+//! # }
 //! ```
 
 // Re-export public NAT traversal API

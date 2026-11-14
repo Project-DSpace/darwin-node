@@ -17,14 +17,14 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::{P2pConfig, P2pLinkTransport};
 //! use saorsa_transport::link_transport::{LinkTransport, ProtocolId};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let config = P2pConfig::builder()
-//!         .bind_addr("0.0.0.0:0".parse()?)
+//!         .bind_addr("0.0.0.0:0".parse::<std::net::SocketAddr>()?)
 //!         .build()?;
 //!
 //!     let transport = P2pLinkTransport::new(config).await?;
@@ -835,9 +835,14 @@ use crate::link_transport::BoxedHandler;
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use saorsa_transport::{SharedTransport, P2pLinkTransport, ProtocolHandler, StreamType};
-///
+/// ```no_run
+/// use saorsa_transport::{SharedTransport, P2pConfig, P2pLinkTransport, ProtocolHandler};
+/// use saorsa_transport::link_transport::ProtocolHandlerExt;
+/// # async fn example(
+/// #     config: P2pConfig,
+/// #     my_gossip_handler: impl ProtocolHandler + 'static,
+/// #     my_dht_handler: impl ProtocolHandler + 'static,
+/// # ) -> anyhow::Result<()> {
 /// let quic_transport = P2pLinkTransport::new(config).await?;
 /// let transport = SharedTransport::new(quic_transport);
 ///
@@ -845,6 +850,8 @@ use crate::link_transport::BoxedHandler;
 /// transport.register_handler(my_dht_handler.boxed()).await?;
 ///
 /// transport.run().await?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct SharedTransport<T: LinkTransport> {
     /// The underlying link transport.

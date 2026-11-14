@@ -18,8 +18,9 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use saorsa_transport::Node;
+//! ```no_run
+//! use saorsa_transport::{Node, NodeEvent};
+//! # async fn example() -> anyhow::Result<()> {
 //!
 //! let node = Node::new().await?;
 //! let mut events = node.subscribe();
@@ -27,8 +28,8 @@
 //! tokio::spawn(async move {
 //!     while let Ok(event) = events.recv().await {
 //!         match event {
-//!             NodeEvent::PeerConnected { peer_id, .. } => {
-//!                 println!("Connected to: {:?}", peer_id);
+//!             NodeEvent::PeerConnected { addr, .. } => {
+//!                 println!("Connected to: {:?}", addr);
 //!             }
 //!             NodeEvent::NatTypeDetected { nat_type } => {
 //!                 println!("NAT type: {:?}", nat_type);
@@ -37,6 +38,8 @@
 //!         }
 //!     }
 //! });
+//! # Ok(())
+//! # }
 //! ```
 
 use std::net::SocketAddr;

@@ -636,12 +636,8 @@ impl ValidationTokenConfig {
     #[allow(rustdoc::redundant_explicit_links)] // which links are redundant depends on features
     /// Set a custom token log
     ///
-    /// If the `bloom` feature is enabled (which it is by default), defaults to a bloom
-    /// token log, which is suitable for most internet applications.
-    ///
-    /// If the `bloom` feature is disabled, defaults to a none token log,
-    /// which makes the server ignore all address validation tokens (that is, tokens originating
-    /// from NEW_TOKEN frames--retry tokens are not affected).
+    /// Defaults to a none token log, which makes the server ignore all address validation tokens
+    /// (that is, tokens originating from NEW_TOKEN frames--retry tokens are not affected).
     pub fn log(&mut self, log: Arc<dyn TokenLog>) -> &mut Self {
         self.log = log;
         self
@@ -651,8 +647,7 @@ impl ValidationTokenConfig {
     ///
     /// This refers only to tokens sent in NEW_TOKEN frames, in contrast to retry tokens.
     ///
-    /// If the `bloom` feature is enabled (which it is by default), defaults to 2. Otherwise,
-    /// defaults to 0.
+    /// Defaults to 0.
     pub fn sent(&mut self, value: u32) -> &mut Self {
         self.sent = value;
         self

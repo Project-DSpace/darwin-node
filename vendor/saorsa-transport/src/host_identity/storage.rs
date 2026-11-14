@@ -27,17 +27,22 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```no_run
 //! use saorsa_transport::host_identity::storage::{HostKeyStorage, auto_storage};
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let hostkey_bytes = [0u8; 32];
 //!
 //! // Get the best available storage for this platform
-//! let storage = auto_storage()?;
+//! let selection = auto_storage()?;
+//! let storage = selection.storage;
 //!
 //! // Store a HostKey
 //! storage.store(&hostkey_bytes)?;
 //!
 //! // Load the HostKey
 //! let hostkey = storage.load()?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::PathBuf;

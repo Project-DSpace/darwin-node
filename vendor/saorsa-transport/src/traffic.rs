@@ -21,17 +21,17 @@
 //! process crosses, regardless of which object owns the socket, so their
 //! totals match the host NIC by construction:
 //!
-//! * [`SOCKET_TRAFFIC`] — bumped inside the one real
+//! * [`SOCKET_TRAFFIC`](crate::traffic::SOCKET_TRAFFIC) — bumped inside the one real
 //!   [`AsyncUdpSocket`](crate::high_level::AsyncUdpSocket) implementation
 //!   (every QUIC socket) and at the relay server's per-session plain UDP
 //!   sockets (its `recv_from` / `send_to`), i.e. every real UDP socket the
 //!   process owns. The virtual `MasqueRelaySocket` is excluded without any
 //!   per-call-site discrimination: its bytes ride a carrier connection that
 //!   *is* counted here.
-//! * [`FAILED_DIAL_TRAFFIC`] — the handshake bytes of dials that never became
+//! * [`FAILED_DIAL_TRAFFIC`](crate::traffic::FAILED_DIAL_TRAFFIC) — the handshake bytes of dials that never became
 //!   a registered connection. Folded from inside `Connecting`, because callers
 //!   never hold a `Connection` for a failed or timed-out dial.
-//! * [`RELAY_CLIENT_TRAFFIC`] — the client-side relay tunnel legs (stream
+//! * [`RELAY_CLIENT_TRAFFIC`](crate::traffic::RELAY_CLIENT_TRAFFIC) — the client-side relay tunnel legs (stream
 //!   bytes, keepalives, control frames, silent drops) across every
 //!   `MasqueRelaySocket` the process creates.
 //!

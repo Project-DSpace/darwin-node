@@ -36,7 +36,7 @@
 //! flow control eventually pauses the peer.  The sender path propagates
 //! backpressure up into Quinn: when the send channel is full,
 //! `try_send` returns [`io::ErrorKind::WouldBlock`] and the
-//! [`TunnelPoller`] blocks on a [`Notify`] until the stream writer
+//! `TunnelPoller` blocks on a [`Notify`] until the stream writer
 //! task drains an item and frees a slot.  This preserves the
 //! reliable-stream invariant of the MASQUE tunnel — packets are never
 //! silently dropped — at the cost of pausing the inner Quinn endpoint

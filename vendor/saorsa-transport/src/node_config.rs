@@ -17,24 +17,31 @@
 //!
 //! # Zero Configuration
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::Node;
+//! # async fn example() -> anyhow::Result<()> {
 //!
 //! // No configuration needed - just create a node
 //! let node = Node::new().await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Optional Configuration
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::{Node, NodeConfig};
+//! use std::net::SocketAddr;
+//! # async fn example() -> anyhow::Result<()> {
 //!
 //! // Only configure what you need
 //! let config = NodeConfig::builder()
-//!     .known_peer("quic.saorsalabs.com:9000".parse()?)
+//!     .known_peer("203.0.113.10:9000".parse::<SocketAddr>()?)
 //!     .build();
 //!
 //! let node = Node::with_config(config).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::path::Path;
@@ -55,20 +62,25 @@ use crate::unified_config::load_or_generate_endpoint_keypair;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```no_run
+/// use saorsa_transport::{NodeConfig, transport::UdpTransport};
+/// use std::net::SocketAddr;
+/// use std::sync::Arc;
+/// # async fn example() -> anyhow::Result<()> {
 /// // Zero configuration
 /// let config = NodeConfig::default();
 ///
 /// // Or with known peers
 /// let config = NodeConfig::builder()
-///     .known_peer("peer1.example.com:9000".parse()?)
+///     .known_peer("192.0.2.1:9000".parse::<SocketAddr>()?)
 ///     .build();
 ///
 /// // Or with additional transport providers
-/// #[cfg(feature = "ble")]
 /// let config = NodeConfig::builder()
-///     .transport_provider(Arc::new(BleTransport::new().await?))
+///     .transport_provider(Arc::new(UdpTransport::bind("0.0.0.0:0".parse()?).await?))
 ///     .build();
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Default)]
 pub struct NodeConfig {
@@ -160,7 +172,7 @@ impl NodeConfigBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use saorsa_transport::NodeConfig;
     /// use std::net::SocketAddr;
     ///
@@ -191,13 +203,13 @@ impl NodeConfigBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use saorsa_transport::NodeConfig;
     /// use std::net::SocketAddr;
     ///
     /// // Backward compatible: SocketAddr
     /// let config = NodeConfig::builder()
-    ///     .known_peer("peer.example.com:9000".parse::<SocketAddr>().unwrap())
+    ///     .known_peer("192.0.2.1:9000".parse::<SocketAddr>().unwrap())
     ///     .build();
     ///
     /// // Multi-transport: Mix different transport types
@@ -220,14 +232,14 @@ impl NodeConfigBuilder {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use saorsa_transport::NodeConfig;
     /// use std::net::SocketAddr;
     ///
     /// // Backward compatible: Vec<SocketAddr>
     /// let peers: Vec<SocketAddr> = vec![
-    ///     "peer1.example.com:9000".parse().unwrap(),
-    ///     "peer2.example.com:9000".parse().unwrap(),
+    ///     "192.0.2.1:9000".parse().unwrap(),
+    ///     "192.0.2.2:9000".parse().unwrap(),
     /// ];
     /// let config = NodeConfig::builder()
     ///     .known_peers(peers)
@@ -292,11 +304,15 @@ impl NodeConfigBuilder {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// #[cfg(feature = "ble")]
+    /// ```no_run
+    /// use saorsa_transport::{NodeConfig, transport::UdpTransport};
+    /// use std::sync::Arc;
+    /// # async fn example() -> anyhow::Result<()> {
     /// let config = NodeConfig::builder()
-    ///     .transport_provider(Arc::new(BleTransport::new().await?))
+    ///     .transport_provider(Arc::new(UdpTransport::bind("0.0.0.0:0".parse()?).await?))
     ///     .build();
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn transport_provider(mut self, provider: Arc<dyn TransportProvider>) -> Self {
         self.transport_providers.push(provider);

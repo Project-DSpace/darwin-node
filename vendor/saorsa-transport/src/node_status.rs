@@ -18,16 +18,19 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use saorsa_transport::Node;
+//! # async fn example() -> anyhow::Result<()> {
 //!
 //! let node = Node::new().await?;
-//! let status = node.status();
+//! let status = node.status().await;
 //!
 //! println!("NAT type: {:?}", status.nat_type);
 //! println!("Can receive direct: {}", status.can_receive_direct);
 //! println!("Acting as relay: {}", status.is_relaying);
 //! println!("Relay sessions: {}", status.relay_sessions);
+//! # Ok(())
+//! # }
 //! ```
 
 use std::net::SocketAddr;

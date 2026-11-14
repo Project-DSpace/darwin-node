@@ -19,12 +19,76 @@
 //! using raw public keys for authentication. It is designed to be minimal, focused,
 //! and highly testable, with exceptional cross-platform support.
 //!
-//! The library is organized into the following main modules:
-//! - `transport`: Core QUIC transport functionality
-//! - `nat_traversal`: QUIC-native NAT traversal protocol
-//! - `discovery`: Platform-specific network interface discovery
-//! - `crypto`: Raw public key authentication
-//! - `trust`: Trust management with TOFU pinning and channel binding
+//! # Module map
+//!
+//! Each area links to the ADR that records why it is built that way. All ADRs are in
+//! [`docs/adr`](https://github.com/WithAutonomi/saorsa-transport/tree/main/docs/adr), and
+//! the wire format of the QUIC extensions is in
+//! [`docs/architecture/PROTOCOL_EXTENSIONS.md`](https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/architecture/PROTOCOL_EXTENSIONS.md).
+//!
+//! **Entry points**
+//! - [`node`], [`node_config`], [`node_status`], [`node_event`]: the zero-config `Node` API.
+//! - [`p2p_endpoint`], [`unified_config`]: `P2pEndpoint` and `P2pConfig`, the full-control
+//!   API. Every node is a symmetric peer that both connects and accepts ([ADR-004]).
+//! - [`link_transport`]: the `LinkTransport` trait that overlay networks such as
+//!   saorsa-core build on ([ADR-001]).
+//!
+//! **QUIC core** (an evolved fork of Quinn)
+//! - [`endpoint`], [`connection`], [`frame`], [`packet`], [`transport_parameters`],
+//!   [`transport_error`], [`cid_generator`], [`shared`], [`coding`]: the protocol state
+//!   machines and wire encoding. Keep-alives and congestion handling: [ADR-012], [ADR-014],
+//!   [ADR-016], [ADR-018].
+//! - [`high_level`]: the async API over them.
+//!
+//! **NAT traversal and address discovery** ([ADR-005])
+//! - [`nat_traversal_api`]: `NatTraversalEndpoint`, which drives traversal.
+//! - [`nat_traversal`], [`candidate_discovery`], [`discovery`], [`discovery_trait`]:
+//!   candidate addresses, platform network-interface discovery, and the NAT traversal frames.
+//! - [`connection_strategy`], [`happy_eyeballs`], [`path_selection`],
+//!   [`transport_resilience`]: dual-stack sockets, how a connection is attempted and which
+//!   path wins ([ADR-008]).
+//! - [`upnp`]: best-effort UPnP IGD port mapping.
+//!
+//! **Relays**, for when hole punching fails
+//! - [`masque`]: the MASQUE CONNECT-UDP Bind relay ([ADR-006], [ADR-009], [ADR-011],
+//!   [ADR-013]).
+//! - [`relay`]: relay infrastructure for NAT traversal.
+//!
+//! **Crypto and identity** ([ADR-003], [ADR-007])
+//! - [`crypto`]: pure post-quantum TLS (ML-KEM-768, ML-DSA-65) with raw public keys.
+//! - [`trust`]: TOFU pinning, continuity-checked key rotation and channel binding.
+//! - [`host_identity`]: the local-only HostKey.
+//! - [`token_v2`]: address-validation tokens.
+//!
+//! **Other transports**
+//! - [`transport`]: the multi-transport abstraction (UDP, and BLE with the `ble` feature).
+//! - [`constrained`], [`connection_router`]: the protocol engine for low-bandwidth links, and
+//!   the router that picks it or QUIC for each connection.
+//! - `webrtc` (feature `webrtc`) and `webrtc_direct` (feature `webrtc-direct`): WebRTC
+//!   DataChannels for direct browser clients ([ADR-015], [ADR-017]).
+//!
+//! **Observability and support**
+//! - [`traffic`], [`metrics`], [`logging`], [`structured_events`],
+//!   [`tracing`], [`stats_dashboard`], [`terminal_ui`].
+//! - [`config`], [`shutdown`], [`watchable`], [`fair_polling`], [`bounded_pending_buffer`],
+//!   [`chat`].
+//!
+//! [ADR-001]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-001-link-transport-abstraction.md
+//! [ADR-003]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-003-pure-post-quantum-cryptography.md
+//! [ADR-004]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-004-symmetric-p2p-architecture.md
+//! [ADR-005]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-005-native-quic-nat-traversal.md
+//! [ADR-006]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-006-masque-relay-fallback.md
+//! [ADR-007]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-007-local-only-hostkey.md
+//! [ADR-008]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-008-universal-connectivity-architecture.md
+//! [ADR-009]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-009-masque-relay-data-plane.md
+//! [ADR-011]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-011-stable-relay-port-reservations.md
+//! [ADR-012]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-012-keep-alive-dial-accept-split.md
+//! [ADR-013]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-013-relay-tunnel-teardown-ordering.md
+//! [ADR-014]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-014-accept-side-keep-alive-backstop.md
+//! [ADR-015]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-015-direct-browser-webrtc.md
+//! [ADR-016]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-016-release-cc-state-for-withheld-acks.md
+//! [ADR-017]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-017-end-pending-dtls-handshakes-on-close.md
+//! [ADR-018]: https://github.com/WithAutonomi/saorsa-transport/blob/main/docs/adr/ADR-018-reap-finished-reader-tasks.md
 
 // Documentation warnings enabled - all public APIs must be documented
 #![cfg_attr(not(fuzzing), warn(missing_docs))]
@@ -177,8 +241,12 @@ pub mod structured_events;
 /// Zero-configuration P2P node - THE PRIMARY API
 ///
 /// Use [`Node`] for the simplest possible P2P experience:
-/// ```rust,ignore
+/// ```no_run
+/// # use saorsa_transport::Node;
+/// # async fn example() -> anyhow::Result<()> {
 /// let node = Node::new().await?;
+/// # Ok(())
+/// # }
 /// ```
 #[cfg(feature = "native")]
 pub mod node;
@@ -241,8 +309,8 @@ pub mod tracing;
 /// Best-effort UPnP IGD port mapping for NAT traversal assistance.
 ///
 /// This module is feature-gated behind `upnp` (enabled by default). When
-/// disabled, [`UpnpMappingService`] is still present but is a no-op stub
-/// that always reports [`UpnpState::Unavailable`].
+/// disabled, [`UpnpMappingService`](crate::upnp::UpnpMappingService) is still present but is a no-op stub
+/// that always reports [`UpnpState::Unavailable`](crate::upnp::UpnpState::Unavailable).
 #[cfg(feature = "native")]
 pub mod upnp;
 
@@ -305,23 +373,6 @@ pub mod stats_dashboard;
 /// Terminal user interface components
 #[cfg(feature = "native")]
 pub mod terminal_ui;
-
-// Compliance validation framework
-/// IETF compliance validation tools
-///
-/// Deprecated, to be removed in a future breaking release (V2-1658). The
-/// validators run `cargo test` in the caller's working directory and mostly
-/// return hard-coded results, so they give no real compliance signal.
-// `not(test)`: the test harness references the module's `#[test]` fns from
-// outside it, which would trip the deprecation lint on our own test build.
-#[cfg(feature = "native")]
-#[cfg_attr(
-    not(test),
-    deprecated(
-        note = "compliance_validator gives no real compliance signal and will be removed in a future breaking release; there is no replacement"
-    )
-)]
-pub mod compliance_validator;
 
 // Comprehensive logging system
 /// Structured logging and diagnostics
@@ -750,3 +801,9 @@ pub use token::TokenStore;
 pub(crate) use token::{NoneTokenLog, ResetToken, TokenLog};
 #[cfg(feature = "native")]
 pub(crate) use token_memory_cache::TokenMemoryCache;
+
+// Compile the README's Rust code blocks as doctests, so its Quick Start can't drift
+// from the API (V2-1798). `sh` blocks are not Rust and are skipped.
+#[cfg(all(doctest, feature = "native"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

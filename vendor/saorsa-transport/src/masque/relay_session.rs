@@ -26,13 +26,13 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```
 //! use saorsa_transport::masque::relay_session::{RelaySession, RelaySessionConfig};
-//! use std::net::SocketAddr;
 //!
 //! let config = RelaySessionConfig::default();
 //! let public_addr = "203.0.113.50:9000".parse().unwrap();
-//! let session = RelaySession::new(config, public_addr);
+//! let session_id = 1;
+//! let session = RelaySession::new(session_id, config, public_addr);
 //! ```
 
 use bytes::{Buf, Bytes};
