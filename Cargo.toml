@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -35,10 +35,10 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-ant-protocol = "5.0.0"
+ant-protocol = "6.0.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.29.1"
+saorsa-core = "0.30.0"
 saorsa-pqc = "0.5.2"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -96,7 +96,7 @@ serde_json = "1"
 # Archive extraction for auto-upgrade
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 # SHA-256 hashing for binary cache integrity
 sha2 = "0.10"
@@ -113,7 +113,7 @@ bao = "0.13.1"
 
 # Shared portable browser profile. The native listener is enabled separately
 # by the `webrtc-direct` feature.
-saorsa-transport = { version = "0.38.1", default-features = false, features = ["webrtc"] }
+saorsa-transport = { version = "0.39.0", default-features = false, features = ["webrtc"] }
 # Only the test-utils devnet helper that seeds public files for browser tests
 # uses it, so release builds do not link it.
 self_encryption = { version = "0.36", optional = true }
@@ -122,12 +122,18 @@ self_encryption = { version = "0.36", optional = true }
 libc = "0.2"
 # Safe wrappers for `openat`/`unlinkat`, so the storage-migration cleanup can delete relative
 # to a directory handle it opened `O_NOFOLLOW` rather than by re-resolving a path it has
-# already checked. Adds nothing to the build: `tempfile`, a direct dependency, already pulls
-# this exact crate and version in with the `fs` feature on.
-rustix = { version = "1", features = ["fs"] }
+# already checked. Adds no crate to the build: `tempfile`, a direct dependency, already pulls
+# this exact crate and version in with the `fs` feature on. `process` is for `geteuid`, which
+# the devnet uses to tell a run directory it created from one another user put in its place.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 self-replace = "1"
+# The volume serial number and file index of a directory handle, which tells
+# a devnet run directory from a copy put in its place. Already in Cargo.lock
+# (through walkdir), and what it needs, windows-sys 0.48, already ships in the
+# Windows build through `directories`.
+winapi-util = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
