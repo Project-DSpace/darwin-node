@@ -88,6 +88,46 @@ async fn a_recorded_wave_verifies_and_its_record_is_kept() {
     );
 }
 
+/// A root proof fails closed when the verifier has no routing table, as a
+/// single-node proof does (upstream's fail-closed test, V2-1808): it goes
+/// through the same paid-quote issuer check, with no closeness check of its
+/// own, so production refuses it before the wave's record is read. Only a
+/// test build can opt out, and then the same proof verifies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_root_proof_fails_closed_without_p2p() {
+    let chain = Chain::shared();
+    let (a, b, c) = three();
+    let wave = mock::wave_of(&[&a, &b, &c]);
+    chain.lock().record_wave(&wave);
+    let provider = mock::provider(&chain, Spec::default()).await;
+    let verifier = mock::root_verifier(&[&provider]);
+    // As production: no closest-peers override, no P2P node, no opt-out.
+    *verifier.test_paid_quote_k_closest_override.write() = None;
+    verifier.set_skip_closeness_without_p2p_for_tests(false);
+    let named = [mock::tx(0xAA)];
+    let proof = a.root_proof_in(&wave, &named);
+
+    let err = check(&verifier, &a, &proof, VerificationContext::ClientPut)
+        .await
+        .expect_err("with no P2PNode and no opt-out, a root proof must fail closed");
+    assert!(
+        err.to_string().contains("not wired to the P2P layer"),
+        "rejection must be the no-P2PNode branch, got: {err}"
+    );
+    assert!(
+        provider.calls("eth_call").is_empty(),
+        "refused before the wave's record is read"
+    );
+
+    verifier.set_skip_closeness_without_p2p_for_tests(true);
+    assert_eq!(
+        check(&verifier, &a, &proof, VerificationContext::ClientPut)
+            .await
+            .unwrap(),
+        PaymentStatus::PaymentVerified
+    );
+}
+
 /// A wave whose record reads empty is read once more, after the pause, and
 /// then refused. A per-quote payment of the same quote, in the transaction
 /// the proof names, never stands in for the wave's record.

@@ -162,14 +162,7 @@ pub async fn audit_tick_with_repair_proofs(
         }
     };
 
-    // Sample only records this node is in range for. Records it retains out
-    // of range (ADR-0028) are mostly far from the neighbours it audits, so
-    // the close-group filter below would drop them, and every sample slot
-    // they took would be one key fewer audited.
-    let in_range_keys: Vec<XorName> = all_keys
-        .into_iter()
-        .filter(|key| paid_list.record_out_of_range_since(key).is_none())
-        .collect();
+    let in_range_keys = audit_candidates(all_keys, paid_list);
     if in_range_keys.is_empty() {
         return AuditTickResult::Idle;
     }
@@ -915,10 +908,48 @@ pub async fn handle_audit_challenge(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The stored keys a responsible-chunk audit samples from: those this node
+/// is in range for (upstream v0.24.0, #271).
+///
+/// Records it keeps out of range while its disk has room (ADR-0024 in this
+/// fork, ADR-0028 upstream) are mostly far from the neighbours it audits, so
+/// the close-group filter after the sample would drop them, and every sample
+/// slot they took would be one key fewer audited. A key is out of range while
+/// its out-of-range clock runs (`PaidList::record_out_of_range_since`). This
+/// changes which keys a peer is audited on, never what any node stores or
+/// erases.
+pub(crate) fn audit_candidates(all_keys: Vec<XorName>, paid_list: &PaidList) -> Vec<XorName> {
+    all_keys
+        .into_iter()
+        .filter(|key| paid_list.record_out_of_range_since(key).is_none())
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A responsible-chunk audit samples only the keys this node is in range
+    /// for: a record it keeps out of range takes no sample slot, and is
+    /// sampled again once it is back in range.
+    #[tokio::test]
+    async fn audits_sample_only_in_range_keys() {
+        let dir = TempDir::new().unwrap();
+        let paid_list = PaidList::new(dir.path()).await.unwrap();
+        let near = [1u8; 32];
+        let retained = [2u8; 32];
+        paid_list.set_record_out_of_range(&retained);
+        assert_eq!(
+            audit_candidates(vec![near, retained], &paid_list),
+            vec![near]
+        );
+        paid_list.clear_record_out_of_range(&retained);
+        assert_eq!(
+            audit_candidates(vec![near, retained], &paid_list),
+            vec![near, retained]
+        );
+    }
 
     /// Simulated stored chunk count for tests. Large enough that the dynamic
     /// incoming audit limit (`2 * sqrt(N)`) never rejects small test challenges.
