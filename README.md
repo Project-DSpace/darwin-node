@@ -51,6 +51,21 @@ never ran.
   if production code reaches it (`the_merkle_payment_code_is_not_reached`),
   or if the vendored protocol gains a message or proof type nobody has
   reviewed (`the_wire_messages_are_the_reviewed_ones`).
+- **A payment proof may hold a single quote, as upstream's may** (pinned
+  from ds.23). Nodes accept a proof with between one and seven quotes and
+  check the median-priced one, as upstream does: upstream rejects a
+  minimum number of quotes on purpose (ADR-0006), this fork's client pays
+  with as few as one witnessed quote when fewer nodes can be used, and
+  every node from ds.19 on passes records to other nodes with slim proofs
+  (`src/payment/slim.rs`) that normally hold one quote. A minimum would
+  refuse honest uploads and all replication between releases. It also
+  means a node near an address can pay itself for storing a record there,
+  at the cost of gas, as on upstream's network; whether that should change
+  is an open decision, and a change would be to how payments are split, not
+  to this check. Tests in `src/payment/verifier.rs` show one-quote proofs,
+  slim ones included, accepted in every context, and `tests/fork_pins.rs`
+  (`quote_count`) fails if a later merge brings in a minimum or drops those
+  tests.
 - **Root payments are taken beside per-chunk payments.** A client can pay a
   wave of up to 512 chunks in one transaction through the root vault
   `0xf6675722f443132b045857546E57e35360Bb03b9`, which records the wave under

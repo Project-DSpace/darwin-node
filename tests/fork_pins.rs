@@ -2969,3 +2969,56 @@ mod request_turns {
         );
     }
 }
+
+/// A payment proof may hold a single quote (pinned from ds.23). Upstream rejects
+/// a minimum number of quotes on purpose (ADR-0006), this fork's client pays
+/// with as few as one witnessed quote, and every node from ds.19 on passes
+/// records to other nodes with slim proofs (`src/payment/slim.rs`) that
+/// normally hold one quote. A minimum would refuse honest uploads and all
+/// replication between releases, so a later merge that brings one in, or
+/// drops these tests while resolving a conflict, fails here. Whether paying
+/// oneself through a one-quote proof should change is an open decision for
+/// Dan and Victor; a real change would be to how payments are split, on chain.
+mod quote_count {
+    use super::repo_text;
+
+    /// The verifier's tests of one-quote proofs, each of which must stay.
+    const ONE_QUOTE_TESTS: &[&str] = &[
+        "test_legacy_single_quote_proof_accepted",
+        "a_slim_one_quote_proof_is_accepted_in_every_context",
+        "the_quote_structure_check_sets_no_minimum",
+    ];
+
+    #[test]
+    fn one_quote_proofs_stay_accepted() {
+        let verifier = repo_text("src/payment/verifier.rs");
+        for name in ONE_QUOTE_TESTS {
+            assert!(
+                verifier.contains(&format!("fn {name}()")),
+                "src/payment/verifier.rs lost {name}. One-quote proofs must stay accepted: \
+                 slim proofs between nodes (src/payment/slim.rs) normally hold one quote, \
+                 and the client pays with as few as one; a minimum number of quotes would \
+                 refuse replication from every release since ds.19 (ADR-0006 rejects one \
+                 upstream too)"
+            );
+        }
+        // The structure check's own refusals: none, too many, a repeated peer.
+        let start = verifier
+            .find("fn validate_quote_structure(")
+            .expect("src/payment/verifier.rs has validate_quote_structure");
+        let body = &verifier[start..];
+        let body = &body[..body
+            .find("\n    }\n")
+            .or_else(|| body.find("\r\n    }\r\n"))
+            .unwrap_or(body.len())];
+        assert!(body.contains("peer_quotes.is_empty()"));
+        assert!(body.contains("quote_count > CLOSE_GROUP_SIZE"));
+        for minimum in ["quote_count <", "MIN_QUOTE", "min_quote"] {
+            assert!(
+                !body.contains(minimum),
+                "validate_quote_structure now sets a minimum number of quotes ({minimum}); \
+                 one-quote proofs must stay accepted (see this module's documentation)"
+            );
+        }
+    }
+}

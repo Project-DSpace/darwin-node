@@ -6079,6 +6079,17 @@ mod tests {
         );
     }
 
+    /// A proof holding a single paid quote is accepted. This must stay, and
+    /// no minimum number of quotes may be added (pinned by
+    /// `tests/fork_pins.rs`, `quote_count`): upstream rejects a minimum on
+    /// purpose (ADR-0006: "omission is unprovable, and any count requirement
+    /// recreates the liveness failure #150 exists to fix"); this fork's
+    /// client pays with as few as one witnessed quote
+    /// (`SINGLE_NODE_MIN_QUOTE_COUNT` in darwin-client); and every node from
+    /// ds.19 on, ds.21 and ds.22 included, passes records on to other nodes
+    /// with slim proofs (`crate::payment::slim`) that normally hold one quote,
+    /// so a minimum would refuse all replication between releases
+    /// (`a_slim_one_quote_proof_is_accepted_in_every_context`).
     #[tokio::test]
     async fn test_legacy_single_quote_proof_accepted() {
         let verifier = create_test_verifier();
@@ -6101,6 +6112,117 @@ mod tests {
         assert_eq!(
             result.expect("single paid quote should verify"),
             PaymentStatus::PaymentVerified
+        );
+    }
+
+    /// Our nodes pass records to each other with slim proofs
+    /// (`crate::payment::slim`): only the quotes at the median price, normally
+    /// one. ds.21 and ds.22 nodes send them in every fresh offer, paid notice
+    /// and pointer offer, so a one-quote slim proof must verify in every
+    /// context, single-node and root alike, through the real reads against a
+    /// stub chain. A minimum number of quotes would refuse all of that
+    /// replication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slim_one_quote_proof_is_accepted_in_every_context() {
+        use crate::payment::proof::{deserialize_root_proof, deserialize_single_node_proof};
+        use crate::payment::settlement::mock::{self, Bundle, Chain, Spec};
+        use crate::payment::slim::{slim_proof, slim_root_proof};
+
+        const CONTEXTS: [VerificationContext; 3] = [
+            VerificationContext::ClientPut,
+            VerificationContext::FreshReplication,
+            VerificationContext::PaidListAdmission,
+        ];
+        let chain = Chain::shared();
+        // Single-node payments, one record for each context, so that each
+        // check reads for itself.
+        let paid: Vec<Bundle> = (0..3u8).map(|i| Bundle::new([0x61 + i; 32])).collect();
+        chain
+            .lock()
+            .pay(mock::tx(0xB1), paid.iter().map(Bundle::entry).collect());
+        // Root payments: one wave of three more.
+        let waved: Vec<Bundle> = (0..3u8).map(|i| Bundle::new([0x71 + i; 32])).collect();
+        let wave = mock::wave_of(&waved.iter().collect::<Vec<_>>());
+        chain.lock().record_wave(&wave);
+        let provider = mock::provider(&chain, Spec::default()).await;
+
+        for (bundle, context) in paid.iter().zip(CONTEXTS) {
+            let whole = deserialize_single_node_proof(&bundle.proof(&[mock::tx(0xB1)]))
+                .expect("the whole proof decodes");
+            assert_eq!(whole.proof_of_payment.peer_quotes.len(), CLOSE_GROUP_SIZE);
+            let slim = slim_proof(&whole, &bundle.address).expect("the proof slims");
+            assert_eq!(
+                deserialize_single_node_proof(&slim)
+                    .expect("the slim proof decodes")
+                    .proof_of_payment
+                    .peer_quotes
+                    .len(),
+                1,
+                "a slim proof of distinct prices holds one quote"
+            );
+            let verifier = mock::verifier(&[&provider]);
+            let status = verifier
+                .verify_payment(&bundle.address, FULL_CHUNK, Some(&slim), context)
+                .await
+                .unwrap_or_else(|e| panic!("a one-quote slim proof refused in {context:?}: {e}"));
+            assert_eq!(status, PaymentStatus::PaymentVerified, "{context:?}");
+        }
+
+        for (bundle, context) in waved.iter().zip(CONTEXTS) {
+            let whole = deserialize_root_proof(&bundle.root_proof_in(&wave, &[mock::tx(0xAA)]))
+                .expect("the whole root proof decodes");
+            assert_eq!(
+                whole.payment.proof_of_payment.peer_quotes.len(),
+                CLOSE_GROUP_SIZE
+            );
+            let slim = slim_root_proof(&whole, &bundle.address).expect("the root proof slims");
+            assert_eq!(
+                deserialize_root_proof(&slim)
+                    .expect("the slim root proof decodes")
+                    .payment
+                    .proof_of_payment
+                    .peer_quotes
+                    .len(),
+                1,
+                "a slim root proof of distinct prices holds one quote"
+            );
+            let verifier = mock::root_verifier(&[&provider]);
+            let status = verifier
+                .verify_payment(&bundle.address, FULL_CHUNK, Some(&slim), context)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("a one-quote slim root proof refused in {context:?}: {e}")
+                });
+            assert_eq!(status, PaymentStatus::PaymentVerified, "{context:?}");
+        }
+    }
+
+    /// The structure check sets no minimum number of quotes: one is
+    /// accepted, as are seven; none, more than the close group, or a peer
+    /// named twice are refused. See `test_legacy_single_quote_proof_accepted`
+    /// for why there is no minimum.
+    #[test]
+    fn the_quote_structure_check_sets_no_minimum() {
+        use crate::payment::settlement::mock::Bundle;
+
+        let quotes = Bundle::new([0x81; 32]).quotes;
+        assert_eq!(quotes.len(), CLOSE_GROUP_SIZE);
+        let check = |peer_quotes: Vec<(evmlib::EncodedPeerId, PaymentQuote)>| {
+            PaymentVerifier::validate_quote_structure(&ProofOfPayment { peer_quotes })
+        };
+
+        assert!(check(quotes[..1].to_vec()).is_ok(), "one quote is accepted");
+        assert!(check(quotes.clone()).is_ok(), "seven quotes are accepted");
+        assert!(check(Vec::new()).is_err(), "no quote is refused");
+        let mut eight = quotes.clone();
+        eight.push((evmlib::EncodedPeerId::new([0xEE; 32]), quotes[0].1.clone()));
+        assert!(
+            check(eight).is_err(),
+            "more quotes than the close group are refused"
+        );
+        assert!(
+            check(vec![quotes[0].clone(), quotes[0].clone()]).is_err(),
+            "a peer named twice is refused"
         );
     }
 
