@@ -255,7 +255,8 @@ never ran.
   stays as upstream's record. `tests/fork_pins.rs` (`retention_design`)
   fails if a later merge swaps any of it in. What the merge did take from
   that change is the responsible-chunk audit sampling only the keys a node
-  is in range for, which charges fewer peers, never more.
+  is in range for, so an audit asks peers about records they are likely
+  to be responsible for.
 - **Get-or-closer is answered, not announced** (ds.22). Upstream v0.24.0
   answers ADR-0020's get-or-closer request (a chunk, or the peers a
   FIND_NODE would name), and its nodes announce it with a token after their
