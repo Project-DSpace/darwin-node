@@ -222,8 +222,9 @@ never ran.
   the vendored saorsa-core both accept.
 - **A restarted node is dialled again once it signs a newer address
   record** (from ds.23). saorsa-core remembers a failed dial of an address
-  for 30 minutes and skips that address meanwhile, counting each skipped
-  attempt as a failed dial against the peer. Upstream clears the entry only
+  for 30 minutes and skips that address meanwhile; an attempt to reach the
+  peer in which every address failed or was skipped counts as one failed
+  dial against it. Upstream clears the entry only
   on a successful dial, which can't happen while the address is skipped, or
   when the peer publishes a record in which the address is new. A node that
   restarts at the same address publishes the same addresses, so other nodes
@@ -283,11 +284,14 @@ never ran.
   address, or an IPv6 /64, as the browser listener counts them), since
   peer ids cost nothing to make; a request with no address counts by its
   peer id. No source is capped: a source alone on a node, such as a
-  gateway, still gets every slot. Each queue holds at most 1,000 requests
-  (`MAX_QUEUED_REQUESTS`, the size of saorsa-core's event buffer in front
-  of it; to be confirmed by Dan). When one is full, the oldest request of
-  the source with the most waiting is dropped unanswered, so a source with
-  fewer waiting never loses one to a source with more; the node logs a
+  gateway, still gets every slot. Each of the two queues (storage and
+  listings) holds at most 1,000 waiting requests (`MAX_QUEUED_REQUESTS`),
+  the size of saorsa-core's own event buffer in front of them. At the 5 MiB
+  wire maximum that is at most about 10 GiB of waiting requests for both
+  together, a bound ds.22 did not have at all. When one is full, the
+  oldest request of the source with the most waiting is dropped unanswered,
+  so a source with fewer waiting never loses one to a source with more;
+  the node logs a
   warning on the first drop and each time the count doubles. The router
   decodes no listings message: it reads only the request id, and a message
   is decoded by its handler once a permit is held, so large listings

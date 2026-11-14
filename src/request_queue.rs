@@ -35,17 +35,16 @@ use tokio_util::task::TaskTracker;
 /// The most inbound requests one [`RequestQueue`] holds waiting for a
 /// handler slot, from all sources together.
 ///
-/// To be confirmed by Dan. Chosen by Claude under Dan's delegation of routine
-/// decisions (14 November 2026), as the plan for ds.23 recommends: it is
-/// saorsa-core's `DEFAULT_EVENT_CHANNEL_CAPACITY` (1,000, in
-/// `vendor/saorsa-core/src/lib.rs`, private to that crate), the number of
+/// The value, 1,000, is saorsa-core's `DEFAULT_EVENT_CHANNEL_CAPACITY` (in
+/// `vendor/saorsa-core/src/lib.rs`, private to that crate): the number of
 /// events the node's router can already fall behind by before it skips them
 /// (`next_routing_event`). So a queue never holds more waiting messages than
 /// the event stream in front of it already can, and that stream's lag rule
 /// stays the outer bound. `tests/fork_pins.rs` checks that the two still
-/// agree. In the worst case, 1,000 messages of the 5 MiB wire maximum are
-/// about 5 GiB; a bound in bytes would be tighter but needs a figure nobody
-/// has chosen.
+/// agree. The node has two queues of this bound, chunk and listings, so in
+/// the worst case 2,000 messages of the 5 MiB wire maximum, about 10 GiB,
+/// wait for both together, beside the event buffer itself; before ds.23
+/// the waiting requests had no bound at all.
 ///
 /// A message that arrives when the queue is full is kept, and the oldest
 /// message of the source with the most waiting is dropped instead (that

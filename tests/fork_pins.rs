@@ -2964,8 +2964,7 @@ mod request_turns {
         assert_eq!(
             MAX_QUEUED_REQUESTS, value,
             "src/request_queue.rs MAX_QUEUED_REQUESTS ({MAX_QUEUED_REQUESTS}) no longer equals \
-             saorsa-core's DEFAULT_EVENT_CHANNEL_CAPACITY ({value}); decide the bound again \
-             (it is Dan's to confirm)"
+             saorsa-core's DEFAULT_EVENT_CHANNEL_CAPACITY ({value}); decide the bound again"
         );
     }
 }
