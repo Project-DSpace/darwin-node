@@ -392,8 +392,16 @@ async fn two_nodes_at_the_full_line_keep_the_disk_clear_of_the_old_managers_line
         OLD_MANAGER_LINE + UPGRADE_SPACE_MARGIN + 2 * ARCHIVE + 2 * test_binary + 64 * MIB,
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
+    // A release newer than this build, whatever this build is: the upgrader
+    // takes no release that isn't (it was "0.23.0+ds.99" until this tree
+    // moved past it, to 0.24.0+ds.22).
+    let this_build = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    let newer = format!(
+        "{}.{}.{}+ds.999",
+        this_build.major, this_build.minor, this_build.patch
+    );
     let upgrade = UpgradeInfo {
-        version: semver::Version::parse("0.23.0+ds.99").unwrap(),
+        version: semver::Version::parse(&newer).unwrap(),
         download_url: "not a url".to_string(),
         signature_url: "not a url".to_string(),
         release_notes: String::new(),
