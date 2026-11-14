@@ -4,7 +4,7 @@
 
 darwin-node is the node software for Darwin, our storage network. It is a fork
 of [ant-node](https://github.com/WithAutonomi/ant-node)
-(MIT/Apache-2.0), built on upstream's v0.23.0, and keeps upstream's crate and
+(MIT/Apache-2.0), built on upstream's v0.24.0 (v0.23.0 until ds.22), and keeps upstream's crate and
 binary name, `ant-node`. Most of this README is upstream's. Where it talks
 about the "legacy" network, it means upstream's earlier network, which Darwin
 never ran.
@@ -198,7 +198,7 @@ never ran.
   switch above is unchanged. Weighing one view of a peer against another
   keeps upstream's order (`AddressType::tag_rank`): a lookup's hint still
   can't re-tag a relay address as direct, and a lookup breaks ties between
-  reports as upstream does. The change is a patch to saorsa-core 0.29.1,
+  reports as upstream does. The change is a patch to saorsa-core 0.30.0,
   vendored in `vendor/saorsa-core`. Its own tests pin the order, and the
   Test workflow runs them (`cargo test --locked -p saorsa-core --lib`);
   `tests/fork_pins.rs` pins the address priority, that those tests stay and
@@ -206,7 +206,7 @@ never ran.
   one saorsa-transport, the vendored copy of a release that `Cargo.toml` and
   the vendored saorsa-core both accept.
 - **A peer reconnecting after a relay closed is answered again** (from
-  ds.21). saorsa-transport 0.38.2 recorded a connection that came in
+  ds.21). saorsa-transport 0.38.2 (and 0.39.0) recorded a connection that came in
   through a relay endpoint under the address that endpoint's socket gives
   an IPv4 peer, `[::ffff:a.b.c.d]:p`, while the node announced the
   connection under `a.b.c.d:p`, so the peer counted as announced under
@@ -246,6 +246,27 @@ never ran.
   test (`src/replication/retention/census.rs`) lists the calls in `src/` that
   delete files, directories or table entries, with the reason each is there,
   so a change that adds one fails the test suite until it is reviewed.
+- **Upstream's pressure-gated retention (ADR-0028) is not taken** (ds.22).
+  Upstream v0.24.0 rewrote the same erasure path its own way: new clock
+  files, a 1 GiB paid list kept until it nears 15 million entries and then
+  evicted by count, with no size class, and 1,024 prune audit requests a
+  pass. This fork kept its own (the bullet above, ADR-0024), file by file,
+  in the merge of v0.24.0; `docs/adr/ADR-0028-pressure-gated-retention.md`
+  stays as upstream's record. `tests/fork_pins.rs` (`retention_design`)
+  fails if a later merge swaps any of it in. What the merge did take from
+  that change is the responsible-chunk audit sampling only the keys a node
+  is in range for, which charges fewer peers, never more.
+- **Get-or-closer, with the release first in the agent** (ds.22). Upstream
+  v0.24.0 answers ADR-0020's get-or-closer request (a chunk, or the peers a
+  FIND_NODE would name), and a node that serves chunks says so with a token
+  after its version: `node/0.24.0+ds.22.image.<commit> get-or-closer/1`.
+  This fork reads a peer's release from the first word only
+  (`sync_pages::agent_version`), so paged sync and full notices go on
+  between nodes that carry the token, and darwin-client reads it the same
+  way. The request reads its chunk through `get_or_quarantine`, as a GET
+  does, and the browser listener refuses it, as ADR-0020 wants. In a
+  `test-utils` build a test node can leave the token out
+  (`ANT_TEST_SEAM_LEAVE_OUT_GET_OR_CLOSER`), as nodes before ds.22 do.
 - **Audits remove rotted chunk files, and the census lists every removal**
   (from ds.13). As upstream 0.23.0 does, digest audits, possession checks,
   prune audits and the recheck of chunks a storage audit found rotted remove a
@@ -559,15 +580,16 @@ never ran.
   `cargo build --release --locked --bin ant-node`, and check it for test
   seams before packaging it.
 - **Five crates are vendored**, each with a `VENDORED.md` saying what it is:
-  `vendor/ant-protocol` is ant-protocol 5.0.0 with the changes its
+  `vendor/ant-protocol` is ant-protocol 6.0.0 with the changes its
   `VENDORED.md` lists, the price curve and the legacy curve still
   accepted, the functions that price a record by its size, and root
   payment proofs (tag `0x03`, settlement version 3); `vendor/webrtc` is webrtc
   0.14.0, whose `RTCDtlsTransport::stop()` cancels a DTLS handshake still
-  in progress; `vendor/saorsa-core` is saorsa-core 0.29.1, which dials a
+  in progress; `vendor/saorsa-core` is saorsa-core 0.30.0, which dials a
   verified direct address before a relay; `vendor/saorsa-transport` is
-  saorsa-transport 0.38.2, which answers a peer reconnecting after a relay
-  closed; and `vendor/ant-listings` is darwin-listings 0.4.0, unchanged:
+  saorsa-transport 0.39.0, which answers a peer reconnecting after a relay
+  closed; and `vendor/ant-listings` is darwin-listings 0.4.0 on ant-protocol
+  6.0.0, unchanged otherwise:
   the envelope format, listings, their payment checks, the listings
   protocol and its change feeds. `[patch.crates-io]` puts the
   first four in place of the crates.io releases. `vendor/ant-listings`,
