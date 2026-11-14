@@ -976,6 +976,11 @@ def run_one(name, network_release, joiner_release, args, harness, folder, old=No
         wait_for("the devnet's manifest", manifest_path.exists, 300, devnet)
         time.sleep(1)
         manifest = json.loads(manifest_path.read_text())
+        # The devnet's own data folder, which holds its nodes' folders. From
+        # upstream v0.24.0 (#263, this tree from ds.22) the devnet makes a run
+        # folder of its own inside --data-dir; before, it used --data-dir
+        # itself. Either way its manifest names the one it uses.
+        devnet_data = Path(manifest.get("data_dir") or devnet_data)
         evm = manifest.get("evm") or {}
         bootstrap = [socket_address(address) for address in manifest["bootstrap"]]
         log(f"{name}: devnet up ({network_release.name}), bootstrap {', '.join(bootstrap)}")
