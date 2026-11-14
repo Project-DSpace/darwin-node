@@ -66,12 +66,25 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// `node/0.24.0+ds.22.image.<commit> get-or-closer/1`. Native peers exchange no capabilities,
 /// and a node built before that request drops it without a reply, so this token is how a client
 /// knows it may send one. A node with storage switched off never answers chunk requests, so it
-/// does not announce it.
+/// does not announce it. This fork's readers of a peer's release read the first word only
+/// ([`crate::replication::sync_pages::agent_version`]), so the token changes no release a peer
+/// reads. In a `test-utils` build a test may leave the token out, as a node of a release
+/// before it does ([`crate::test_seams::LEAVE_OUT_GET_OR_CLOSER`]).
 pub(crate) fn user_agent(image: Option<&str>, serves_chunks: bool) -> String {
     #[cfg(any(test, feature = "test-utils"))]
     let version = crate::test_seams::announced_version(env!("CARGO_PKG_VERSION"));
     #[cfg(not(any(test, feature = "test-utils")))]
     let version = env!("CARGO_PKG_VERSION");
+    #[cfg(any(test, feature = "test-utils"))]
+    let announces_get_or_closer = serves_chunks && !crate::test_seams::leaves_out_get_or_closer();
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let announces_get_or_closer = serves_chunks;
+    agent_with(&version, image, announces_get_or_closer)
+}
+
+/// The agent of a node of `version`, with `image`'s marker and, if
+/// `get_or_closer`, the get-or-closer token: see [`user_agent`].
+fn agent_with(version: &str, image: Option<&str>, get_or_closer: bool) -> String {
     let agent = image.map_or_else(
         || format!("node/{version}"),
         |marker| {
@@ -79,7 +92,7 @@ pub(crate) fn user_agent(image: Option<&str>, serves_chunks: bool) -> String {
             format!("node/{version}{separator}image.{marker}")
         },
     );
-    if serves_chunks {
+    if get_or_closer {
         format!("{agent} {GET_OR_CLOSER_AGENT_TOKEN}")
     } else {
         agent
@@ -2586,6 +2599,54 @@ mod tests {
             super::user_agent(Some(marker), false),
             format!("node/{}.image.{marker}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    /// A node of this fork that serves chunks announces its release, its image
+    /// and the get-or-closer token, in that order, and its peers still read its
+    /// release from it: paging and full notices go on between merged nodes.
+    #[test]
+    fn a_merged_node_announces_its_release_image_and_get_or_closer() {
+        let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
+        let agent = super::agent_with("0.24.0+ds.22", Some(marker), true);
+        assert_eq!(
+            agent,
+            format!("node/0.24.0+ds.22.image.{marker} get-or-closer/1")
+        );
+        assert!(crate::ant_protocol::advertises_get_or_closer(&agent));
+        assert_eq!(
+            crate::replication::sync_pages::agent_version(&agent)
+                .and_then(crate::replication::sync_pages::release_of),
+            Some(22)
+        );
+        assert!(crate::replication::sync_pages::agent_reads_pages(
+            &agent, 17
+        ));
+        assert!(crate::replication::full::agent_reads_full_notice(
+            &agent, 17
+        ));
+        let built = super::user_agent(Some(marker), true);
+        assert_eq!(
+            built,
+            format!(
+                "node/{}.image.{marker} get-or-closer/1",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    /// The seam a test node uses to leave the token out, as a node of a release
+    /// before get-or-closer does: its agent is then the one such a node sends,
+    /// and clients read it as a node to ask with FIND_NODE and GET.
+    #[test]
+    fn a_test_node_can_leave_get_or_closer_out_of_its_agent() {
+        let marker = "9757a72afbf6b56617d2be28573cb8d4b3fb2f65";
+        let without = super::agent_with("0.24.0+ds.22", Some(marker), false);
+        assert_eq!(without, format!("node/0.24.0+ds.22.image.{marker}"));
+        assert!(!crate::ant_protocol::advertises_get_or_closer(&without));
+        assert!(crate::replication::sync_pages::agent_reads_pages(
+            &without, 17
+        ));
+        assert!(crate::test_seams::LEAVE_OUT_GET_OR_CLOSER.starts_with(crate::test_seams::PREFIX));
     }
 
     #[test]

@@ -91,15 +91,26 @@ pub fn release_of(version: &str) -> Option<u64> {
     })
 }
 
+/// The version a node's agent names: what follows `node/` in its first word.
+///
+/// The words after the first are capabilities, such as ADR-0020's
+/// `get-or-closer/1` (`node/0.24.0+ds.22.image.<commit> get-or-closer/1`), and
+/// say nothing of the release, so every reader of a peer's release reads the
+/// first word only.
+#[must_use]
+pub fn agent_version(user_agent: &str) -> Option<&str> {
+    user_agent.split_whitespace().next()?.strip_prefix("node/")
+}
+
 /// Whether `user_agent` is a node's of a release that reads paged sync.
 ///
 /// That is `node/<version>+ds.<n>` with `n` at least `from_release`, whatever
-/// the version before it. Anything else, an agent of no release this fork
-/// numbers among them, reads none.
+/// the version before it and whatever words follow it ([`agent_version`]).
+/// Anything else, an agent of no release this fork numbers among them, reads
+/// none.
 #[must_use]
 pub fn agent_reads_pages(user_agent: &str, from_release: u64) -> bool {
-    user_agent
-        .strip_prefix("node/")
+    agent_version(user_agent)
         .and_then(release_of)
         .is_some_and(|release| release >= from_release)
 }
@@ -839,6 +850,34 @@ mod tests {
         ] {
             assert!(!agent_reads_pages(agent, 17), "{agent}");
         }
+    }
+
+    /// A node that serves chunks carries ADR-0020's token after its version,
+    /// separated by a space. It still reads pages: the release is read from the
+    /// first word only. Without this, merged nodes would stop paging neighbour
+    /// sync to each other, silently.
+    #[test]
+    fn a_paging_agent_with_a_trailing_token_reads_pages() {
+        for agent in [
+            "node/0.24.0+ds.22 get-or-closer/1",
+            "node/0.24.0+ds.22.image.0123456789abcdef0123456789abcdef01234567 get-or-closer/1",
+            "node/0.23.0+ds.17 get-or-closer/1 some-later/2",
+            "node/0.24.0+ds.22\tget-or-closer/1",
+        ] {
+            assert!(agent_reads_pages(agent, 17), "{agent}");
+        }
+        for agent in [
+            "node/0.23.0+ds.16 get-or-closer/1",
+            "node/0.24.0 get-or-closer/1",
+            "get-or-closer/1 node/0.24.0+ds.22",
+            "client/0.24.0+ds.22 get-or-closer/1",
+        ] {
+            assert!(!agent_reads_pages(agent, 17), "{agent}");
+        }
+        assert_eq!(
+            agent_version("node/0.24.0+ds.22.image.abc get-or-closer/1"),
+            Some("0.24.0+ds.22.image.abc")
+        );
     }
 
     #[test]

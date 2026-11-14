@@ -29,7 +29,10 @@
 //! ([`BOOTSTRAP_SECS`]), for a run in which joiners must answer possession
 //! and audit challenges while it lasts; and the responsible-chunk audit's tick
 //! and the age a repair hint must reach before its key is audited
-//! ([`AUDIT_SECS`]), for a run that counts the audits each exchange gives.
+//! ([`AUDIT_SECS`]), for a run that counts the audits each exchange gives;
+//! and whether a node leaves the get-or-closer token out of its agent
+//! ([`LEAVE_OUT_GET_OR_CLOSER`]), for a test network that stands in for
+//! nodes of the releases before it.
 //! Each is compiled only with `test-utils` and named
 //! under [`PREFIX`], so the Build workflow's check covers it, and the harness
 //! refuses a run that needs a seam with a binary that lacks it, as it refuses
@@ -70,6 +73,17 @@ pub const SYNC_PAGES_FROM_RELEASE: &str = "ANT_TEST_SEAM_SYNC_PAGES_FROM_RELEASE
 /// and to no node of the release before. A value that isn't a whole number is
 /// ignored.
 pub const ANNOUNCED_RELEASE: &str = "ANT_TEST_SEAM_ANNOUNCED_RELEASE";
+
+/// Leaves the get-or-closer token (ADR-0020) out of this node's user agent.
+///
+/// Set to `1`, `true` or `yes`, a node announces what a node of a release
+/// before get-or-closer announces, its version alone, and clients then read
+/// from it with FIND_NODE and GET as they read from such a node. A test
+/// network of such nodes stands in for today's nodes during a rolling upgrade
+/// (darwin-client's `a_kad_read_reads_older_nodes_with_find_node_and_get`).
+/// The node still answers the request if one is sent. Any other value is
+/// ignored.
+pub const LEAVE_OUT_GET_OR_CLOSER: &str = "ANT_TEST_SEAM_LEAVE_OUT_GET_OR_CLOSER";
 
 /// Neighbour-sync requests a node admits at once, across peers.
 ///
@@ -118,6 +132,16 @@ pub fn announced_version(version: &str) -> String {
 fn with_release(version: &str, release: u64) -> String {
     let base = version.split('+').next().unwrap_or(version);
     format!("{base}+ds.{release}")
+}
+
+/// Whether a test set this process's nodes to leave the get-or-closer token
+/// out of their agents ([`LEAVE_OUT_GET_OR_CLOSER`]).
+pub(crate) fn leaves_out_get_or_closer() -> bool {
+    std::env::var(LEAVE_OUT_GET_OR_CLOSER).is_ok_and(|value| parse_leave_out(&value))
+}
+
+fn parse_leave_out(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "yes")
 }
 
 /// The admission limit a test set for this process, if it set a valid one.
@@ -520,6 +544,7 @@ mod tests {
             SYNC_PAGE_BYTES,
             SYNC_PAGES_FROM_RELEASE,
             ANNOUNCED_RELEASE,
+            LEAVE_OUT_GET_OR_CLOSER,
             SYNC_ADMISSION_LIMIT,
             FULL_FRESHNESS_SECS,
             FULL_NOTICE_FROM_RELEASE,
@@ -548,6 +573,16 @@ mod tests {
         assert!(!crate::replication::sync_pages::agent_reads_pages(
             &agent, 18
         ));
+    }
+
+    #[test]
+    fn only_a_yes_leaves_the_token_out() {
+        for yes in ["1", "true", "yes", " 1\n"] {
+            assert!(parse_leave_out(yes), "{yes:?}");
+        }
+        for no in ["", "0", "false", "no", "2", "YES please"] {
+            assert!(!parse_leave_out(no), "{no:?}");
+        }
     }
 
     #[test]

@@ -121,12 +121,13 @@ pub fn full_notice_from_release() -> u64 {
 }
 
 /// Whether `user_agent` is a node's of a release that reads the notice:
-/// `node/<version>+ds.<n>[...]` with `n` at least `from_release`. An agent of
-/// no release this fork numbers counts as old.
+/// `node/<version>+ds.<n>[...]` with `n` at least `from_release`, whatever
+/// words follow it (read from the first word only, as
+/// [`agent_version`](crate::replication::sync_pages::agent_version) reads
+/// it). An agent of no release this fork numbers counts as old.
 #[must_use]
 pub fn agent_reads_full_notice(user_agent: &str, from_release: u64) -> bool {
-    user_agent
-        .strip_prefix("node/")
+    crate::replication::sync_pages::agent_version(user_agent)
         .and_then(|version| semver::Version::parse(version).ok())
         .and_then(|version| {
             version
@@ -1344,6 +1345,28 @@ mod tests {
             assert!(!agent_reads_full_notice(agent, 17), "{agent}");
         }
         assert_eq!(FULL_NOTICE_FROM_RELEASE, 17);
+    }
+
+    /// A node that serves chunks carries ADR-0020's token after its version,
+    /// separated by a space. It still reads the notice: the release is read
+    /// from the first word only. Without this, merged nodes would stop sending
+    /// each other full notices, silently.
+    #[test]
+    fn a_full_notice_reader_with_a_trailing_token_reads_notices() {
+        for agent in [
+            "node/0.24.0+ds.22 get-or-closer/1",
+            "node/0.24.0+ds.22.image.0123456789abcdef0123456789abcdef01234567 get-or-closer/1",
+            "node/0.23.0+ds.17 get-or-closer/1 some-later/2",
+        ] {
+            assert!(agent_reads_full_notice(agent, 17), "{agent}");
+        }
+        for agent in [
+            "node/0.23.0+ds.16 get-or-closer/1",
+            "node/0.24.0 get-or-closer/1",
+            "get-or-closer/1 node/0.24.0+ds.22",
+        ] {
+            assert!(!agent_reads_full_notice(agent, 17), "{agent}");
+        }
     }
 
     /// The notice ships in ds.17 with paged sync: the release after ds.16,
