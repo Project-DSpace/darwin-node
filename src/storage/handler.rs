@@ -1153,6 +1153,11 @@ impl AntProtocol {
     /// holds it, otherwise the `FIND_NODE` answer it would give the requester
     /// for the address. With a request context, also returns the read's
     /// telemetry, as a GET's.
+    ///
+    /// The chunk is read as a GET reads it, through `get_or_quarantine`: a
+    /// file whose bytes, read again under the write lane, don't hash to its
+    /// name is removed rather than served, the request is answered with the
+    /// read's error, and replication restores the chunk from other nodes.
     async fn handle_get_or_closer(
         &self,
         request: ChunkGetOrCloserRequest,
@@ -1162,7 +1167,7 @@ impl AntProtocol {
         let address = request.address;
         let requester = context.as_ref().and_then(|context| context.requester);
         let storage_started = Instant::now();
-        let stored = self.storage.get(&address).await;
+        let stored = self.storage.get_or_quarantine(&address).await;
         let storage_read_ms = duration_ms(storage_started.elapsed());
         let response = match stored {
             Ok(Some(chunk)) => ChunkGetOrCloserResponse::Found {
@@ -1920,6 +1925,48 @@ pub mod tests {
         };
         assert_eq!(found, address);
         assert_eq!(found_content.as_ref(), content);
+    }
+
+    /// A get-or-closer read hands a chunk on as a GET does, through
+    /// `get_or_quarantine`: a stored file whose bytes don't hash to its name
+    /// is removed, not served (the plain `get` would leave it in place).
+    #[tokio::test]
+    async fn get_or_closer_quarantines_a_rotted_chunk_as_get_does() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let content = b"get-or-closer rotted content";
+        let address = compute_address(content);
+        protocol
+            .put_local(&address, content)
+            .await
+            .expect("store chunk");
+        let storage = protocol.storage();
+        let path = storage.test_chunk_path(&address);
+        std::fs::write(&path, b"rotted").expect("rot the stored file");
+
+        let request = ChunkMessage {
+            request_id: 32,
+            body: ChunkMessageBody::GetOrCloserRequest(ChunkGetOrCloserRequest::new(address)),
+        };
+        let response_bytes = protocol
+            .try_handle_request(&request.encode().expect("encode"))
+            .await
+            .expect("handle get-or-closer")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        assert!(
+            matches!(
+                response.body,
+                ChunkMessageBody::GetOrCloserResponse(ChunkGetOrCloserResponse::Error(_))
+            ),
+            "a rotted chunk is answered with the read's error, never served: {:?}",
+            response.body
+        );
+        assert!(
+            !path.exists(),
+            "the rotted file is removed, as a GET removes it"
+        );
+        assert!(!storage.exists(&address).expect("exists"));
     }
 
     #[tokio::test]

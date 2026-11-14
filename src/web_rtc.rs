@@ -3414,6 +3414,27 @@ mod tests {
         assert!(!resources.running.load(Ordering::Acquire));
     }
 
+    /// The browser listener refuses ADR-0020's get-or-closer request, as the
+    /// ADR wants (browsers cannot decode the native peer format): it has no
+    /// response bound, so it is refused before the node handles it, whatever
+    /// the record's length.
+    #[test]
+    fn the_browser_listener_refuses_get_or_closer() {
+        let request = ChunkMessageBody::GetOrCloserRequest(
+            crate::ant_protocol::ChunkGetOrCloserRequest::new([7; 32]),
+        );
+        for record_len in [None, Some(0), Some(MAX_CHUNK_SIZE)] {
+            assert_eq!(
+                binary_response_limit(&request, record_len),
+                Err("unsupported chunk protocol request".to_string()),
+                "{record_len:?}"
+            );
+        }
+        // A GET of the same address is answered.
+        let get = ChunkMessageBody::GetRequest(crate::ant_protocol::ChunkGetRequest::new([7; 32]));
+        assert!(binary_response_limit(&get, None).is_ok());
+    }
+
     #[test]
     fn default_resource_limits_preserve_headroom_for_other_sources() {
         let config = WebRtcDirectConfig::default();

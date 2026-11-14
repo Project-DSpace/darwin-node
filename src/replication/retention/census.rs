@@ -132,16 +132,96 @@ const LEGACY_LEFTOVER: &str = "Part of removing, once the chunk store has opened
 const UPGRADE_CACHE: &str = "Upgrade cache files; no record data.";
 const LOG_FILES: &str = "The node's own log files, never record data.";
 const LISTING_METADATA: &str = "Listing metadata, not record data.";
+const DEVNET_RUN_DIR: &str = "The local devnet tool (ant-devnet, upstream v0.24.0's #263) \
+     removes its own run directory, or a finished run's whose marker names that very \
+     directory and whose lock is free, never the parent and never a running node's store \
+     (src/devnet/run_dir.rs).";
 
 /// Every reviewed site. See the module documentation for what is counted.
 const ERASE_SITES: &[EraseSite] = &[
     site(
-        "src/devnet.rs",
-        "Devnet::shutdown",
+        "src/devnet/run_dir.rs",
+        "Parent::remove_empty",
+        "remove_dir",
+        1,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "Parent::remove_empty",
+        "unlinkat",
+        1,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "Run::remove_all_but",
         "remove_dir_all",
         1,
-        "The local devnet tool removes its own temporary data directory at shutdown; \
-         never a running node's store.",
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "Run::remove_all_but",
+        "remove_file",
+        1,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "Run::remove_file",
+        "remove_file",
+        1,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "Run::remove_file",
+        "unlinkat",
+        1,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "RunDir::remove",
+        "delete",
+        1,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "claim",
+        "remove_file",
+        1,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "delete",
+        "remove_file",
+        2,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "remove_entry",
+        "unlinkat",
+        2,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "sweep",
+        "delete",
+        1,
+        DEVNET_RUN_DIR,
+    ),
+    site(
+        "src/devnet/run_dir.rs",
+        "write_marker",
+        "remove_file",
+        1,
+        DEVNET_RUN_DIR,
     ),
     site(
         "src/listings/service.rs",
@@ -517,6 +597,16 @@ const ERASE_SITES: &[EraseSite] = &[
          lane, don't hash to its name is removed, as in v0.21.0+ds.11.",
     ),
     site(
+        "src/storage/handler.rs",
+        "AntProtocol::handle_get_or_closer",
+        "get_or_quarantine",
+        1,
+        "Hands a chunk to a client's get-or-closer request (ADR-0020, upstream v0.24.0) as \
+         a GET does; a copy whose bytes, read again under the write lane, don't hash to its \
+         name is removed, as in v0.21.0+ds.11, and the request is answered with the read's \
+         error.",
+    ),
+    site(
         "src/storage/legacy_artifacts.rs",
         "clean_up",
         "remove_all",
@@ -607,10 +697,11 @@ const ERASE_SITES: &[EraseSite] = &[
     ),
     site(
         "src/web_rtc.rs",
-        "spawn",
+        "remove_persisted_browser_endpoint",
         "remove_file",
         1,
-        "Removes the browser address file a previous run advertised; no record data.",
+        "Removes the browser address file a previous run advertised, or one a gateway \
+         mapping that has ended gave (upstream v0.24.0, ADR-0027); no record data.",
     ),
 ];
 
@@ -2644,9 +2735,19 @@ const CHUNK_MESSAGES: &[(&str, &str)] = &[
         "Refused before anything is signed.",
     ),
     ("GetRequest", "A read: nothing is stored or paid."),
+    (
+        "GetOrCloserRequest",
+        "A read (ADR-0020, upstream v0.24.0): the chunk, read through get_or_quarantine as \
+         a GET reads it, or the peers this node's FIND_NODE answer would name. Nothing is \
+         stored or paid. The browser listener refuses it (binary_response_limit).",
+    ),
     ("PointerGetRequest", "A read: nothing is stored or paid."),
     ("PutResponse", "A response: dropped, never answered."),
     ("GetResponse", "A response: dropped, never answered."),
+    (
+        "GetOrCloserResponse",
+        "A response: dropped, never answered. Nodes never send get-or-closer requests.",
+    ),
     ("QuoteResponse", "A response: dropped, never answered."),
     (
         "MerkleCandidateQuoteResponse",
