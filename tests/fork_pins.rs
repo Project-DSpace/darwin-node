@@ -752,6 +752,95 @@ mod direct_first {
             "test.yml no longer runs vendor/saorsa-core's own tests"
         );
     }
+
+    /// What the dial-recovery change relies on: a node signs a new address
+    /// record only when it starts or its addresses change. Clearing a peer's
+    /// dial failures on a newer record is right only because a newer record
+    /// with the same addresses means the peer has started again. If records
+    /// were re-signed on a timer, every periodic re-publication would be a
+    /// newer record, every peer's failed addresses would be cleared each
+    /// time and redialled (the redial loop upstream's own comments warn of),
+    /// and the clearing would have to be bounded before such a copy is taken.
+    /// So: in the copy's production code, records are signed in one place,
+    /// `local_signed_address_record`, which returns the cached signed record
+    /// whenever the records are unchanged; and the older-format publication
+    /// carries that signed record's sequence, not one of its own.
+    #[test]
+    fn address_records_are_re_signed_only_when_they_change() {
+        let path = "vendor/saorsa-core/src/dht_network_manager.rs";
+        let source = repo_text(path).replace("\r\n", "\n");
+        let code = source
+            .split("\nmod tests {")
+            .next()
+            .expect("split yields at least one part");
+        let why = "a node must sign a new address record only when it starts or its addresses \
+                   change: the dial-failure clearing on a newer record \
+                   (clear_dial_failures_for_newer_record, vendor/saorsa-core/VENDORED.md) treats \
+                   a newer record as proof the peer started again; if records are re-signed \
+                   on a timer, it would redial every failed address at each re-publication and \
+                   must be bounded first";
+        assert_eq!(
+            code.matches("SignedAddressRecord::sign(").count(),
+            1,
+            "{path}: address records are signed somewhere new; {why}"
+        );
+        let start = code
+            .find("fn local_signed_address_record(")
+            .unwrap_or_else(|| panic!("{path} lost local_signed_address_record; {why}"));
+        let body = &code[start..];
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        for needle in [
+            "proof.records() == records",
+            "return Some(proof.signed().clone());",
+            "SignedAddressRecord::sign(",
+        ] {
+            assert!(
+                body.contains(needle),
+                "{path}: local_signed_address_record no longer has `{needle}` (it must reuse \
+                 the cached signed record while the records are unchanged); {why}"
+            );
+        }
+        assert!(
+            body.find("return Some(proof.signed().clone());")
+                < body.find("SignedAddressRecord::sign("),
+            "{path}: local_signed_address_record signs before it checks the cached record; {why}"
+        );
+        assert!(
+            code.contains("let seq = verified.sequence();")
+                && code.contains("DhtNetworkOperation::PublishAddressSet {\n            seq,"),
+            "{path}: the older-format PublishAddressSet no longer carries the signed record's \
+             sequence; {why}"
+        );
+
+        // No other file of the copy signs records outside its tests.
+        let mut others = Vec::new();
+        let mut folders = vec![super::repo_path("vendor/saorsa-core/src")];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(&folder).expect("read the copy") {
+                let entry = entry.expect("an entry");
+                let file = entry.path();
+                if file.is_dir() {
+                    folders.push(file);
+                    continue;
+                }
+                let name = file.to_string_lossy().replace('\\', "/");
+                if !name.ends_with(".rs") || name.ends_with("_tests.rs") || name.ends_with(path) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&file)
+                    .expect("read")
+                    .replace("\r\n", "\n");
+                let code = text.split("\nmod tests {").next().unwrap_or("");
+                if code.contains("SignedAddressRecord::sign(") {
+                    others.push(name);
+                }
+            }
+        }
+        assert!(
+            others.is_empty(),
+            "address records are signed in {others:?} outside tests; {why}"
+        );
+    }
 }
 
 /// The erasure path keeps this fork's design (ds.11, ds.17, ADR-0024):
