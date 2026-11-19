@@ -12,8 +12,8 @@ container. They earn storage fees in DARWIN, paid to your wallet.
 - A wallet address (`0x…`, any Ethereum-style address).
 - Access to your router, to forward UDP ports.
 - An IPv4 address. The network runs on IPv4 only; IPv6 alone won't do.
-- At least 20 GB of disk per node (about 35 GB recommended). As a guide: a
-  4-core CPU, 8 GB of RAM and 8 Mbps up and down.
+- At least 20 GB of disk per node (about 35 GB recommended).
+- At least 2 CPU cores, 4 GB of RAM and 1 Mbps up and down.
 
 ## 1. Forward the ports
 
