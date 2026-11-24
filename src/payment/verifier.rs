@@ -4930,11 +4930,12 @@ mod tests {
             urls,
             [
                 "https://rpc.mainnet.chain.robinhood.com",
+                "https://robinhood-chain.gateway.tenderly.co",
                 "https://robinhood-rpc.publicnode.com",
             ]
         );
         // A node still on rpc.ordofi.network, retired from the defaults,
-        // reads through it and then both defaults.
+        // reads through it and then all three defaults.
         let urls: Vec<String> = verifier_reading_through("https://rpc.ordofi.network")
             .payment_rpc_urls()
             .iter()
@@ -4944,6 +4945,7 @@ mod tests {
             urls,
             [
                 "https://rpc.ordofi.network",
+                "https://robinhood-chain.gateway.tenderly.co",
                 "https://robinhood-rpc.publicnode.com",
                 "https://rpc.mainnet.chain.robinhood.com",
             ]
@@ -4974,7 +4976,7 @@ mod tests {
                 }
             })
             .await;
-        assert_eq!(answer.as_deref(), Ok("robinhood-rpc.publicnode.com"));
+        assert_eq!(answer.as_deref(), Ok("robinhood-chain.gateway.tenderly.co"));
         assert_eq!(calls, 2);
 
         // An answer settles the read, even one saying nothing was paid.
@@ -4998,8 +5000,8 @@ mod tests {
             })
             .await;
         let rounds = usize::try_from(PAYMENT_READ_ROUNDS).unwrap_or(usize::MAX);
-        assert_eq!(calls, 2 * rounds);
-        assert_eq!(answer, Err(format!("failure {}", 2 * rounds)));
+        assert_eq!(calls, 3 * rounds);
+        assert_eq!(answer, Err(format!("failure {}", 3 * rounds)));
     }
 
     /// One request a stub RPC received: its method, its parameters and when.

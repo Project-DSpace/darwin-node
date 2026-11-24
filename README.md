@@ -124,9 +124,12 @@ never ran.
 - **Payment checks fall back across RPCs** (from ds.8). A node reads a
   storage payment (`completedPayments`) through its own RPC and, when that is one of
   Robinhood Chain's public RPCs, through the others, in up to 2 rounds half a
-  second apart. The public RPCs built in are PublicNode and Robinhood Chain's
-  own. A node on `https://rpc.ordofi.network`, an earlier default, reads
-  through it first and then falls back to both of these (no node falls back to
+  second apart. The public RPCs built in are Tenderly's public gateway
+  (`robinhood-chain.gateway.tenderly.co`, from 2026-11-24), PublicNode and
+  Robinhood Chain's own, asked in that order after the node's own RPC.
+  A node on `https://rpc.ordofi.network`, an earlier default that stopped
+  answering in November 2026, reads
+  through it first and then falls back to all three (no node falls back to
   it), while any other form of it (`http://`, a path or a query) is read alone,
   and the image points out an `RPC_URL` or `RPC_URLS` that still names it; a
   node on any other RPC reads through it alone. Only a failed call moves on: any answer, even that nothing

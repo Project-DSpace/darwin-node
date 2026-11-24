@@ -93,8 +93,20 @@ impl Search {
 /// Robinhood Chain's public RPCs. A node on one of them reads listings'
 /// payments through the others too: a provider can refuse a method these
 /// reads need (PublicNode refuses `eth_getLogs`, which finding a payment
-/// whose transaction hash is hidden takes).
-const ROBINHOOD_PUBLIC_RPCS: [&str; 2] = [
+/// whose transaction hash is hidden takes, and reads at old blocks without a
+/// key).
+///
+/// The node's own RPC is always read first; the others follow in this
+/// order. Tenderly's public gateway (built in since 2026-11-24, when it
+/// answered `eth_getLogs` over the vault's whole history and reads at old
+/// blocks with no key) comes before `robinhood-rpc.publicnode.com`, so a
+/// node on Robinhood Chain's RPC, the image's default, falls back first to an
+/// RPC that answers every read these make. `robinhood-rpc.publicnode.com`
+/// stays before Robinhood Chain's RPC, as it was, so a node on another public
+/// RPC doesn't fall back first to the one every node on the image's default
+/// already reads through.
+const ROBINHOOD_PUBLIC_RPCS: [&str; 3] = [
+    "https://robinhood-chain.gateway.tenderly.co",
     "https://robinhood-rpc.publicnode.com",
     "https://rpc.mainnet.chain.robinhood.com",
 ];
@@ -1807,6 +1819,7 @@ pub mod tests {
             listings_rpc_urls("https://robinhood-rpc.publicnode.com/"),
             vec![
                 "https://robinhood-rpc.publicnode.com/",
+                "https://robinhood-chain.gateway.tenderly.co",
                 "https://rpc.mainnet.chain.robinhood.com",
             ]
         );
@@ -1814,15 +1827,25 @@ pub mod tests {
             listings_rpc_urls("https://rpc.mainnet.chain.robinhood.com"),
             vec![
                 "https://rpc.mainnet.chain.robinhood.com",
+                "https://robinhood-chain.gateway.tenderly.co",
                 "https://robinhood-rpc.publicnode.com",
             ]
         );
-        // A public RPC retired from the defaults: its own first, then both
+        assert_eq!(
+            listings_rpc_urls("https://robinhood-chain.gateway.tenderly.co/"),
+            vec![
+                "https://robinhood-chain.gateway.tenderly.co/",
+                "https://robinhood-rpc.publicnode.com",
+                "https://rpc.mainnet.chain.robinhood.com",
+            ]
+        );
+        // A public RPC retired from the defaults: its own first, then all
         // of the defaults; no node falls back to it.
         assert_eq!(
             listings_rpc_urls("https://rpc.ordofi.network/"),
             vec![
                 "https://rpc.ordofi.network/",
+                "https://robinhood-chain.gateway.tenderly.co",
                 "https://robinhood-rpc.publicnode.com",
                 "https://rpc.mainnet.chain.robinhood.com",
             ]

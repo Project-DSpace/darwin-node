@@ -1860,11 +1860,12 @@ mod payment_reads {
     /// The RPCs a node reads payments through, as the verifier lists them:
     /// its own first, then, if that is one of Robinhood Chain's public RPCs,
     /// the chain's others; a node on rpc.ordofi.network, no longer one of
-    /// them, still falls back to both, and no node falls back to it; any
-    /// other RPC (an operator's own, a local chain) alone.
+    /// them, still falls back to all of them, and no node falls back to it;
+    /// any other RPC (an operator's own, a local chain) alone.
     #[test]
     fn payments_are_read_through_the_nodes_rpc_then_the_chains_other_public_ones() {
         const MAINNET: &str = "https://rpc.mainnet.chain.robinhood.com";
+        const TENDERLY: &str = "https://robinhood-chain.gateway.tenderly.co";
         const PUBLICNODE: &str = "https://robinhood-rpc.publicnode.com";
         const ORDOFI: &str = "https://rpc.ordofi.network";
         let urls = |rpc: &str| -> Vec<String> {
@@ -1883,9 +1884,13 @@ mod payment_reads {
             .map(|url| url.as_str().trim_end_matches('/').to_string())
             .collect()
         };
-        assert_eq!(urls(MAINNET), [MAINNET, PUBLICNODE]);
-        assert_eq!(urls(&format!("{PUBLICNODE}/")), [PUBLICNODE, MAINNET]);
-        assert_eq!(urls(ORDOFI), [ORDOFI, PUBLICNODE, MAINNET]);
+        assert_eq!(urls(MAINNET), [MAINNET, TENDERLY, PUBLICNODE]);
+        assert_eq!(
+            urls(&format!("{PUBLICNODE}/")),
+            [PUBLICNODE, TENDERLY, MAINNET]
+        );
+        assert_eq!(urls(TENDERLY), [TENDERLY, PUBLICNODE, MAINNET]);
+        assert_eq!(urls(ORDOFI), [ORDOFI, TENDERLY, PUBLICNODE, MAINNET]);
         assert_eq!(urls("http://127.0.0.1:8545"), ["http://127.0.0.1:8545"]);
     }
 
